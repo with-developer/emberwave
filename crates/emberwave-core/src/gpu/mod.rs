@@ -15,7 +15,7 @@ mod resources;
 
 pub use context::{BACKEND_ENV, GpuContext, GpuOptions, parse_backends};
 pub use decoder::{Decoder, Frame, FramePlane, RgbFrame, StageTimings, TimedOutput, Timings};
-pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder};
+pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
 pub use error::GpuError;
 
 /// The WGSL sources of the pipeline stages, for offline validation.
@@ -26,6 +26,8 @@ pub mod shader_sources {
     pub const IDWT: &str = include_str!("shaders/idwt.wgsl");
     /// 8-bit YCbCr planes to RGB.
     pub const YUV2RGB: &str = include_str!("shaders/yuv2rgb.wgsl");
+    /// A picture in textures packed into the encoder's planes buffer.
+    pub const GATHER: &str = include_str!("shaders/gather.wgsl");
     /// Forward wavelet transform of one level, for the encoder.
     pub const FDWT: &str = include_str!("shaders/fdwt.wgsl");
     /// Quantisation and the cost tables of the rate control, behind the
@@ -45,10 +47,11 @@ pub mod shader_sources {
     );
 
     /// Every shader, by name, with its compute entry points.
-    pub const ALL: [(&str, &str, &[&str]); 8] = [
+    pub const ALL: [(&str, &str, &[&str]); 9] = [
         ("dequant", DEQUANT, &["main"]),
         ("idwt", IDWT, &["main"]),
         ("yuv2rgb", YUV2RGB, &["main"]),
+        ("gather", GATHER, &["main"]),
         ("fdwt", FDWT, &["main"]),
         ("equant", EQUANT, &["main"]),
         ("rate", RATE, &["analyse", "cutoff", "ties", "choose"]),

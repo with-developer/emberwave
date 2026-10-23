@@ -352,6 +352,47 @@ impl ScanParams {
     }
 }
 
+/// Uniform block of `gather.wgsl`: where each component's plane goes in the
+/// planes buffer, and which channel of its texture holds it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GatherParams {
+    /// Per component, Y, Cb and Cr (the fourth is unused): the plane's width
+    /// and height in samples.
+    pub width: [u32; 4],
+    pub height: [u32; 4],
+    /// Where the plane's rows start in the planes buffer, and words per row.
+    pub offset: [u32; 4],
+    pub stride: [u32; 4],
+    /// The channel of the component in its texture: 0 red, 1 green.
+    pub channel: [u32; 4],
+}
+
+impl GatherParams {
+    /// The parameters for pictures of `layout`, with Cr in the green channel
+    /// of its texture if `cr_in_green`.
+    pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout, cr_in_green: bool) -> Self {
+        let mut params = Self::zeroed();
+        for component in Component::ALL {
+            let i = component.index();
+            (params.width[i], params.height[i]) = layout.plane_size(component);
+            params.offset[i] = buffers.packed_offsets[i];
+            params.stride[i] = buffers.packed_strides[i];
+        }
+        params.channel[Component::Cr.index()] = u32::from(cr_in_green);
+        params
+    }
+
+    /// Workgroups of the dispatch: the words of the longest row in x and the
+    /// rows of the tallest plane in y, 16 of each to a workgroup, and the
+    /// components in z.
+    pub(crate) fn grid(&self) -> (u32, u32, u32) {
+        let words = self.stride.iter().copied().max().unwrap_or(0);
+        let rows = self.height.iter().copied().max().unwrap_or(0);
+        (words.div_ceil(16), rows.div_ceil(16), 3)
+    }
+}
+
 /// Per component part of a transform level's uniform block.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]

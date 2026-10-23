@@ -357,6 +357,44 @@ def encode_parts(results):
             rows,
         )
     )
+    rows = []
+    for stem, label in ENCODE_SOURCES:
+        planes = load(results, f"{stem}.encode-gpu")
+        textures = load(results, f"{stem}.encode-gpu-textures")
+        if planes and textures:
+            rows.append(
+                [label]
+                + [
+                    ms(value(result, *key))
+                    for result in (planes, textures)
+                    for key in (("total",), ("total", "p99"), ("cpu prepare",), ("transform",))
+                ]
+            )
+    if rows:
+        parts.append(
+            "From pictures on the GPU already, an R8 texture per plane as a screen capture "
+            "would hand them over (`Encoder::encode_textures`, `bench-encode --textures`), "
+            "against the same pictures in CPU memory. `gather.wgsl` packs the textures into "
+            "the planes that the upload fills otherwise, within the transform's time, and the "
+            "CPU only prepares the GPU work. A capture that would have to be read back to CPU "
+            "memory first, which is not measured here, saves more:"
+        )
+        parts.append(
+            table(
+                [
+                    "Picture",
+                    "from CPU memory mean",
+                    "p99",
+                    "CPU prepare",
+                    "transform",
+                    "from textures mean",
+                    "p99",
+                    "CPU prepare",
+                    "transform",
+                ],
+                rows,
+            )
+        )
     return parts
 
 

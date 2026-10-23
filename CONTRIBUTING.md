@@ -28,7 +28,7 @@ cargo test --workspace
 | CLI | `crates/emberwave-cli/tests/cli.rs` | The `emberwave-cli` binary end to end |
 | C API | `crates/emberwave-ffi/tests/api.rs`, `tests/header.rs` | The C functions called through raw pointers against the Rust decoder; the committed header against cbindgen's output |
 | Encoder | `crates/emberwave-core/tests/encoder.rs`, `src/encode/` | The encoder makes the committed bytes again, its frames fit their budgets, and emberwave decodes them as upstream does |
-| GPU encoder | `crates/emberwave-core/tests/gpu_encoder.rs`, `src/gpu/encoder/tests.rs` | Each stage of the GPU encoder given the CPU encoder's input, against the CPU's output; whole frames against the committed vectors, on a real adapter |
+| GPU encoder | `crates/emberwave-core/tests/gpu_encoder.rs`, `src/gpu/encoder/tests.rs` | Each stage of the GPU encoder given the CPU encoder's input, against the CPU's output; whole frames against the committed vectors, on a real adapter; pictures in textures against the same pictures in CPU memory |
 | C example | `scripts/check_c_example.sh` | The C example, built with CMake against the shared library, decodes every vector (CI runs it after the tests) |
 
 Environment variables:

@@ -1,6 +1,8 @@
 //! The wgpu encoder: the CPU encoder's stages ([`crate::encode`]) as compute
 //! shaders, so that a picture goes up once and its frame comes back once.
 //!
+//! The picture comes from CPU memory through an upload buffer, or from
+//! textures on the GPU, which `gather.wgsl` packs into the same planes.
 //! `fdwt.wgsl` transforms the planes level by level, from the finest.
 //! `equant.wgsl` quantises every block and measures it with 0 to 15
 //! bit-planes dropped. `rate.wgsl`, with the prefix sums of `scan.wgsl`,
@@ -26,12 +28,12 @@ use crate::encode::{
 use super::context::GpuContext;
 use super::error::GpuError;
 use super::layout::{
-    BufferLayout, CostRecord, FrameParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
+    BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
     RATE_STATE_BYTES, RateSummary, ScanParams, TransformLevel, rate_grid,
 };
 use super::pipelines::{EncoderPipelines, with_error_scope};
 use super::resources::{
-    StageQueries, buffer, buffer_limit, check_size, entry, read_back, uniform_buffer,
+    StageQueries, buffer, buffer_limit, check_size, entry, read_back, texture, uniform_buffer,
 };
 
 /// A dispatch of the forward transform for one decomposition level.
@@ -44,7 +46,8 @@ struct FdwtStage {
 /// the boundaries of its compute passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStageTimings {
-    /// The forward transform, all levels.
+    /// The forward transform, all levels, and for a picture in textures
+    /// the packing of its samples before.
     pub transform: Duration,
     /// Quantisation and the cost tables.
     pub quantisation: Duration,
@@ -74,6 +77,36 @@ pub struct EncodeTimings {
     /// [`GpuOptions::timestamps`](super::GpuOptions::timestamps) and the
     /// device supports them.
     pub stages: Option<EncodeStageTimings>,
+}
+
+/// A picture in GPU memory, for [`Encoder::encode_textures`]: views of 2D
+/// textures on the encoder's device, each texture of the size of the plane
+/// it holds, with one sample per texel and the `TEXTURE_BINDING` usage. A
+/// view shows the texture's first mip level and layer. Neither that nor the
+/// device can the encoder check, and wgpu does not always notice a texture
+/// of another device.
+#[derive(Debug, Clone, Copy)]
+pub enum TexturePicture<'a> {
+    /// Y, Cb and Cr, each in an `R8Unorm` texture.
+    Planes([&'a wgpu::TextureView; 3]),
+    /// The layout of NV12, or of its 4:4:4 counterpart: Y in an `R8Unorm`
+    /// texture, Cb and Cr together in an `Rg8Unorm` texture, Cb in red and
+    /// Cr in green.
+    LumaChroma {
+        /// The Y plane.
+        luma: &'a wgpu::TextureView,
+        /// The Cb and Cr planes, interleaved.
+        chroma: &'a wgpu::TextureView,
+    },
+}
+
+/// Where a picture to encode is.
+#[derive(Clone, Copy)]
+enum Input<'a> {
+    /// In CPU memory: the Y, Cb and Cr samples.
+    Planes([&'a [u8]; 3]),
+    /// In textures on the GPU.
+    Textures(TexturePicture<'a>),
 }
 
 /// The stages that are timed, in order: transform, quantisation, rate
@@ -117,6 +150,11 @@ pub struct Encoder {
     upload_mapped: bool,
     /// [`sample_level`] of every 8-bit value, for `fdwt.wgsl`.
     sample_levels: wgpu::Buffer,
+    /// `gather.wgsl`'s parameters for [`TexturePicture::Planes`] and for
+    /// [`TexturePicture::LumaChroma`], and its workgroups.
+    gather_planes: wgpu::Buffer,
+    gather_luma_chroma: wgpu::Buffer,
+    gather_grid: (u32, u32, u32),
     pyramid: wgpu::Buffer,
     /// A [`CostRecord`] per block, in block index order.
     costs: wgpu::Buffer,
@@ -226,6 +264,15 @@ impl Encoder {
                 std::mem::size_of::<FrameParams>() as u64,
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             );
+            let gather_planes_data = GatherParams::new(&layout, &buffers, false);
+            let gather_planes =
+                uniform_buffer(&device, &queue, "gather params", &gather_planes_data);
+            let gather_luma_chroma = uniform_buffer(
+                &device,
+                &queue,
+                "gather params, luma and chroma",
+                &GatherParams::new(&layout, &buffers, true),
+            );
             let quant_params_data = QuantParams::new(&layout, &buffers);
             let quant_params = uniform_buffer(&device, &queue, "equant params", &quant_params_data);
             let scan_params_buffer = uniform_buffer(&device, &queue, "scan params", &scan_params);
@@ -312,6 +359,9 @@ impl Encoder {
                 upload,
                 upload_mapped: true,
                 sample_levels,
+                gather_planes,
+                gather_luma_chroma,
+                gather_grid: gather_planes_data.grid(),
                 pyramid,
                 costs,
                 rate_state,
@@ -369,7 +419,7 @@ impl Encoder {
     /// the budget is [`GpuError::Encode`]. It waits for the GPU, so it cannot
     /// run in a browser, where nothing may block.
     pub fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, GpuError> {
-        self.run_encode(planes, budget, false)
+        self.run_encode(Input::Planes(planes), budget, false)
             .map(|(frame, _)| frame)
     }
 
@@ -382,17 +432,43 @@ impl Encoder {
         planes: [&[u8]; 3],
         budget: usize,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
-        self.run_encode(planes, budget, true)
+        self.run_encode(Input::Planes(planes), budget, true)
+    }
+
+    /// Encodes a picture that is in GPU memory already, as textures on the
+    /// encoder's device, like [`encode`](Self::encode) the same picture in
+    /// CPU memory and into the same bytes. Textures that cannot hold their
+    /// planes are [`GpuError::Texture`].
+    ///
+    /// The GPU reads the textures after the work submitted to the queue
+    /// before, and is done with them when this returns.
+    pub fn encode_textures(
+        &mut self,
+        picture: TexturePicture<'_>,
+        budget: usize,
+    ) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(Input::Textures(picture), budget, false)
+            .map(|(frame, _)| frame)
+    }
+
+    /// Encodes like [`encode_textures`](Self::encode_textures) and says
+    /// where the time went, as [`encode_timed`](Self::encode_timed) does.
+    pub fn encode_textures_timed(
+        &mut self,
+        picture: TexturePicture<'_>,
+        budget: usize,
+    ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
+        self.run_encode(Input::Textures(picture), budget, true)
     }
 
     fn run_encode(
         &mut self,
-        planes: [&[u8]; 3],
+        input: Input<'_>,
         budget: usize,
         timed: bool,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
         self.check_device()?;
-        let outcome = self.encode_on_device(planes, budget, timed);
+        let outcome = self.encode_on_device(input, budget, timed);
         // As in the decoder: a failure on a device that was lost meanwhile
         // is the loss, and whatever came back is not to be trusted.
         self.check_device()?;
@@ -403,12 +479,20 @@ impl Encoder {
     /// a lost device.
     fn encode_on_device(
         &mut self,
-        planes: [&[u8]; 3],
+        input: Input<'_>,
         budget: usize,
         timed: bool,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
         let prepare_start = Instant::now();
-        self.upload_planes(planes)?;
+        // The planes in the upload buffer, or a pass that gathers them from
+        // the textures.
+        let gather = match input {
+            Input::Planes(planes) => {
+                self.upload_planes(planes)?;
+                None
+            }
+            Input::Textures(picture) => Some(self.gather_bind_group(picture)?),
+        };
         // No frame takes more than every block at its largest, which fits
         // 32 bits; neither need the budget.
         let most_words = u64::from(self.layout.block_count()) * MAX_BLOCK_WORDS;
@@ -440,8 +524,10 @@ impl Encoder {
                     label: Some("encode"),
                 });
             encoder.clear_buffer(&self.rate_state, 0, None);
-            self.encode_upload(&mut encoder);
-            self.encode_transform(&mut encoder, queries);
+            if gather.is_none() {
+                self.encode_upload(&mut encoder);
+            }
+            self.encode_transform(&mut encoder, gather.as_ref(), queries);
             self.encode_quantisation(&mut encoder, queries);
             self.encode_rate_control(&mut encoder, queries);
             self.encode_packing(&mut encoder, queries);
@@ -627,6 +713,50 @@ impl Encoder {
         Ok(())
     }
 
+    /// The bind group of `gather.wgsl` for `picture`, or an error if its
+    /// textures cannot hold their planes.
+    fn gather_bind_group(&self, picture: TexturePicture<'_>) -> Result<wgpu::BindGroup, GpuError> {
+        let size = |component| self.layout.plane_size(component);
+        let (views, params) = match picture {
+            TexturePicture::Planes(views) => {
+                for ((view, component), name) in
+                    views.iter().zip(Component::ALL).zip(["Y", "Cb", "Cr"])
+                {
+                    check_texture(view, name, wgpu::TextureFormat::R8Unorm, size(component))?;
+                }
+                (views, &self.gather_planes)
+            }
+            TexturePicture::LumaChroma { luma, chroma } => {
+                check_texture(
+                    luma,
+                    "luma",
+                    wgpu::TextureFormat::R8Unorm,
+                    size(Component::Y),
+                )?;
+                check_texture(
+                    chroma,
+                    "chroma",
+                    wgpu::TextureFormat::Rg8Unorm,
+                    size(Component::Cb),
+                )?;
+                ([luma, chroma, chroma], &self.gather_luma_chroma)
+            }
+        };
+        with_error_scope(&self.device, || {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gather"),
+                layout: &self.pipelines.gather.layout,
+                entries: &[
+                    entry(0, &self.planes),
+                    entry(1, params),
+                    texture(2, views[0]),
+                    texture(3, views[1]),
+                    texture(4, views[2]),
+                ],
+            })
+        })
+    }
+
     /// Records the copy of the uploaded planes into the planes buffer.
     fn encode_upload(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.copy_buffer_to_buffer(
@@ -640,11 +770,24 @@ impl Encoder {
 
     /// Records the forward transform of the uploaded planes; with `queries`,
     /// timed.
-    fn encode_transform(&self, encoder: &mut wgpu::CommandEncoder, queries: Option<&StageQueries>) {
+    fn encode_transform(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gather: Option<&wgpu::BindGroup>,
+        queries: Option<&StageQueries>,
+    ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("fdwt"),
             timestamp_writes: queries.map(|q| q.writes(Some(TRANSFORM), Some(TRANSFORM))),
         });
+        // A dispatch of a compute pass sees the writes of the dispatches
+        // before it.
+        if let Some(bind_group) = gather {
+            pass.set_pipeline(&self.pipelines.gather.pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            let (x, y, z) = self.gather_grid;
+            pass.dispatch_workgroups(x, y, z);
+        }
         pass.set_pipeline(&self.pipelines.fdwt.pipeline);
         for stage in &self.fdwt_stages {
             pass.set_bind_group(0, &stage.bind_group, &[]);
@@ -803,6 +946,41 @@ impl PackBuffers<'_> {
 
 /// The payload buffer for `words` words and the read-back buffer that takes
 /// it with the summary.
+/// An error unless the texture of `view` can hold a plane of `width` x
+/// `height` samples in `format`; `name` names the plane in the error.
+fn check_texture(
+    view: &wgpu::TextureView,
+    name: &str,
+    format: wgpu::TextureFormat,
+    (width, height): (u32, u32),
+) -> Result<(), GpuError> {
+    let texture = view.texture();
+    let problem = if texture.dimension() != wgpu::TextureDimension::D2 {
+        format!("is {:?} rather than 2D", texture.dimension())
+    } else if texture.format() != format {
+        format!("is {:?} rather than {format:?}", texture.format())
+    } else if (texture.width(), texture.height()) != (width, height) {
+        format!(
+            "is {}x{} rather than {width}x{height}",
+            texture.width(),
+            texture.height()
+        )
+    } else if texture.sample_count() != 1 {
+        format!(
+            "has {} samples per texel rather than 1",
+            texture.sample_count()
+        )
+    } else if !texture
+        .usage()
+        .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+    {
+        "lacks the TEXTURE_BINDING usage".to_owned()
+    } else {
+        return Ok(());
+    };
+    Err(GpuError::Texture(format!("the {name} texture {problem}")))
+}
+
 fn payload_buffers(device: &wgpu::Device, words: u64) -> (wgpu::Buffer, wgpu::Buffer) {
     let payload = buffer(
         device,

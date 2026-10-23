@@ -94,7 +94,7 @@ Each milestone is tracked in its own issue.
 - [x] **M4** Benchmarks and documentation ([#5](https://github.com/with-developer/emberwave/issues/5))
 - [x] **M5** Stabilisation and the v0.1.0 release ([#6](https://github.com/with-developer/emberwave/issues/6))
 
-After the release: a [browser player](https://with-developer.github.io/emberwave/) (WebGPU, [#15](https://github.com/with-developer/emberwave/issues/15)) and a C API for clients such as Moonlight's ([#16](https://github.com/with-developer/emberwave/issues/16)); an encoder ([#14](https://github.com/with-developer/emberwave/issues/14)), on the CPU and on the GPU.
+After the release: a [browser player](https://with-developer.github.io/emberwave/) (WebGPU, [#15](https://github.com/with-developer/emberwave/issues/15)) and a C API for clients such as Moonlight's ([#16](https://github.com/with-developer/emberwave/issues/16)); an encoder ([#14](https://github.com/with-developer/emberwave/issues/14)), on the CPU and on the GPU, which also encodes pictures that are in GPU memory already, such as a screen capture's ([#33](https://github.com/with-developer/emberwave/issues/33)).
 
 ## Repository layout
 

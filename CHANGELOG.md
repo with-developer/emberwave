@@ -2,6 +2,12 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Encoding pictures that are on the GPU already ([#33](https://github.com/with-developer/emberwave/issues/33)): `gpu::Encoder::encode_textures` takes a `TexturePicture`, three `R8Unorm` textures or NV12's layout of an `R8Unorm` and an `Rg8Unorm` texture, and makes the bytes `encode` makes of the same picture in CPU memory, without the CPU writing the planes (decision D32). An unsuitable texture is the new `GpuError::Texture`. `emberwave-cli bench-encode --gpu --textures` times it.
+
 ## [0.5.0] - 2026-10-24
 
 The GPU encoder overtakes upstream's: on an Apple M3 Max it encodes a 4K frame in about 1.9 ms, against 3.4 ms for upstream's encoder at the same precision, and `bench-encode` measures both. Making a decoder or an encoder on a lost device, and making contexts on several threads with some Linux Vulkan loaders, no longer crash.

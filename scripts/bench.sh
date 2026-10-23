@@ -92,6 +92,9 @@ for entry in $ENCODE; do
     echo "== $source, encoded"
     measure "$OUT/$source.encode-gpu.json" \
         "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --gpu --frames "$FRAMES" --json
+    measure "$OUT/$source.encode-gpu-textures.json" \
+        "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --gpu --textures \
+        --frames "$FRAMES" --json
     measure "$OUT/$source.encode-cpu.json" \
         "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --frames "$CPU_FRAMES" --json
     if [ "$UPSTREAM" = 1 ]; then
