@@ -72,6 +72,20 @@ fn block8_scale(code: u32) -> f32 {
     return f32(code) * 0.125 + 0.25;
 }
 
+// (m + 0.5) * scale32 * scale8, in the same order as the CPU decoder, negated
+// if the sign bit is set.
+fn signed_value(magnitude: u32, scale: f32, negative: u32) -> f32 {
+    let value = (f32(magnitude) + 0.5) * scale;
+    return select(value, -value, negative != 0u);
+}
+
+// Stores one coefficient, if it lies inside its band.
+fn store(band: BandInfo, x: u32, y: u32, value: f32) {
+    if (x < band.width && y < band.height) {
+        pyramid[band.dst_offset + y * band.width + x] = value;
+    }
+}
+
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let block_index = wg.y * params.grid_width + wg.x;
@@ -147,7 +161,9 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         }
         let sign_base_bit = (tables_end + planes_total) * 8u;
 
-        // Phase B: decode this subblock's magnitudes.
+        // Phase B: decode this subblock's magnitudes. The eight values are
+        // handled one by one in the code rather than in loops over a variable
+        // index, which keeps them in registers (ARCHITECTURE.md, decision D24).
         var magnitudes: array<u32, 8>;
         var count = 0u;
         var scale = 0.0;
@@ -165,16 +181,24 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
             for (var plane = planes; plane > 0u; plane = plane - 1u) {
                 let bits = byte_at(byte_offset);
                 byte_offset = byte_offset + 1u;
-                for (var v = 0u; v < 8u; v = v + 1u) {
-                    magnitudes[v] = magnitudes[v] | (((bits >> v) & 1u) << (plane - 1u));
-                }
+                magnitudes[0] = magnitudes[0] | (((bits >> 0u) & 1u) << (plane - 1u));
+                magnitudes[1] = magnitudes[1] | (((bits >> 1u) & 1u) << (plane - 1u));
+                magnitudes[2] = magnitudes[2] | (((bits >> 2u) & 1u) << (plane - 1u));
+                magnitudes[3] = magnitudes[3] | (((bits >> 3u) & 1u) << (plane - 1u));
+                magnitudes[4] = magnitudes[4] | (((bits >> 4u) & 1u) << (plane - 1u));
+                magnitudes[5] = magnitudes[5] | (((bits >> 5u) & 1u) << (plane - 1u));
+                magnitudes[6] = magnitudes[6] | (((bits >> 6u) & 1u) << (plane - 1u));
+                magnitudes[7] = magnitudes[7] | (((bits >> 7u) & 1u) << (plane - 1u));
             }
 
-            for (var v = 0u; v < 8u; v = v + 1u) {
-                if (magnitudes[v] != 0u) {
-                    count = count + 1u;
-                }
-            }
+            count = count + select(0u, 1u, magnitudes[0] != 0u);
+            count = count + select(0u, 1u, magnitudes[1] != 0u);
+            count = count + select(0u, 1u, magnitudes[2] != 0u);
+            count = count + select(0u, 1u, magnitudes[3] != 0u);
+            count = count + select(0u, 1u, magnitudes[4] != 0u);
+            count = count + select(0u, 1u, magnitudes[5] != 0u);
+            count = count + select(0u, 1u, magnitudes[6] != 0u);
+            count = count + select(0u, 1u, magnitudes[7] != 0u);
             scale = block_scale(quant_code) * block8_scale(qscale >> 4u);
         }
 
@@ -218,26 +242,47 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         }
 
         var sign_index = 0u;
-        for (var v = 0u; v < 8u; v = v + 1u) {
-            let magnitude = magnitudes[v];
-            if (magnitude != 0u) {
-                // (m + 0.5) * scale32 * scale8, in the same order as the CPU decoder.
-                var value = (f32(magnitude) + 0.5) * scale;
-                if (((sign_bits >> sign_index) & 1u) != 0u) {
-                    value = -value;
-                }
-                values[v] = value;
-                sign_index = sign_index + 1u;
-            }
+        if (magnitudes[0] != 0u) {
+            values[0] = signed_value(magnitudes[0], scale, (sign_bits >> sign_index) & 1u);
+            sign_index = sign_index + 1u;
+        }
+        if (magnitudes[1] != 0u) {
+            values[1] = signed_value(magnitudes[1], scale, (sign_bits >> sign_index) & 1u);
+            sign_index = sign_index + 1u;
+        }
+        if (magnitudes[2] != 0u) {
+            values[2] = signed_value(magnitudes[2], scale, (sign_bits >> sign_index) & 1u);
+            sign_index = sign_index + 1u;
+        }
+        if (magnitudes[3] != 0u) {
+            values[3] = signed_value(magnitudes[3], scale, (sign_bits >> sign_index) & 1u);
+            sign_index = sign_index + 1u;
+        }
+        if (magnitudes[4] != 0u) {
+            values[4] = signed_value(magnitudes[4], scale, (sign_bits >> sign_index) & 1u);
+            sign_index = sign_index + 1u;
+        }
+        if (magnitudes[5] != 0u) {
+            values[5] = signed_value(magnitudes[5], scale, (sign_bits >> sign_index) & 1u);
+            sign_index = sign_index + 1u;
+        }
+        if (magnitudes[6] != 0u) {
+            values[6] = signed_value(magnitudes[6], scale, (sign_bits >> sign_index) & 1u);
+            sign_index = sign_index + 1u;
+        }
+        if (magnitudes[7] != 0u) {
+            values[7] = signed_value(magnitudes[7], scale, (sign_bits >> sign_index) & 1u);
+            sign_index = sign_index + 1u;
         }
     }
 
     // Values run down the columns of the 4x2 subblock.
-    for (var v = 0u; v < 8u; v = v + 1u) {
-        let x = x0 + (v >> 1u);
-        let y = y0 + (v & 1u);
-        if (x < band.width && y < band.height) {
-            pyramid[band.dst_offset + y * band.width + x] = values[v];
-        }
-    }
+    store(band, x0 + 0u, y0 + 0u, values[0]);
+    store(band, x0 + 0u, y0 + 1u, values[1]);
+    store(band, x0 + 1u, y0 + 0u, values[2]);
+    store(band, x0 + 1u, y0 + 1u, values[3]);
+    store(band, x0 + 2u, y0 + 0u, values[4]);
+    store(band, x0 + 2u, y0 + 1u, values[5]);
+    store(band, x0 + 3u, y0 + 0u, values[6]);
+    store(band, x0 + 3u, y0 + 1u, values[7]);
 }
