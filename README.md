@@ -48,6 +48,9 @@ emberwave-cli compare out/gradient_200x120_420.y4m testdata/gradient_200x120_420
 # Encode a Y4M video (8-bit 4:2:0 or 4:4:4), each frame within 6000 bytes;
 # --gpu encodes on the GPU
 emberwave-cli encode testdata/encoder/scene_200x120_420.source.y4m --out scene.pwv1 --bytes-per-frame 6000 --gpu
+
+# Time the encoder, on the GPU here
+emberwave-cli bench-encode testdata/encoder/scene_200x120_420.source.y4m --bytes-per-frame 6000 --gpu
 ```
 
 The decoder, and the encoder with `--gpu`, use whatever GPU the machine offers: Vulkan, Metal or DX12, or a software driver such as Mesa's lavapipe or Windows' WARP. `--backend vulkan|metal|dx12` and `--software` narrow the choice, as does the `EMBERWAVE_BACKEND` environment variable, and the adapter in use is printed. The RGB conversion follows what the file signals (matrix, range, chroma siting); `--matrix bt601|bt709|bt2020` and `--range full|limited` override it. [`ARCHITECTURE.md`](ARCHITECTURE.md#command-line-tool) lists every option and explains how the timings are measured.
@@ -63,11 +66,13 @@ Decode time per frame on an Apple M3 Max (Metal), RGB output kept in GPU memory,
 
 | Stream | mean | p99 |
 |---|---|---|
-| 1080p | 0.58 | 0.88 |
-| 1440p | 0.82 | 1.09 |
-| 4K | 1.37 | 1.66 |
+| 1080p | 0.57 | 0.84 |
+| 1440p | 0.82 | 1.20 |
+| 4K | 1.41 | 1.87 |
 
-Upstream's own Metal decoder is faster on the same machine: 0.81 ms for a 4K frame at FP32 against emberwave's 1.11 ms (planes only). [`BENCHMARKS.md`](BENCHMARKS.md) has the method and all the numbers.
+Upstream's own Metal decoder is faster on the same machine: 0.94 ms for a 4K frame at FP32 against emberwave's 1.11 ms (planes only). [`BENCHMARKS.md`](BENCHMARKS.md) has the method and all the numbers.
+
+Encoding a 4K frame within 1.2 MB takes 3.94 ms on the GPU, from the planes in CPU memory to the frame in CPU memory, and 2.98 ms with upstream's encoder.
 <!-- bench-summary:end -->
 
 ## Goals

@@ -2,6 +2,12 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Encoder benchmarks ([#29](https://github.com/with-developer/emberwave/issues/29)): `emberwave-cli bench-encode` times an encoder on the frames of a Y4M video, in the way `bench` times the decoder, and `Encoder::encode_timed` returns `EncodeTimings` with the GPU time of each stage. `refgen bench-encode` times upstream's encoder the same way, and `scripts/bench.sh` puts both in `BENCHMARKS.md`, with the pictures from `scripts/gen_bench_data.sh --sources`.
+
 ## [0.4.0] - 2026-10-24
 
 emberwave encodes: an encoder on the CPU and on the GPU whose streams upstream's decoder reads, at upstream's PSNR or above for the same bytes. On an Apple M3 Max the GPU encodes a 4K frame in about 4 ms, the CPU in about 240 ms.
