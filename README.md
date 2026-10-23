@@ -6,6 +6,8 @@
 
 A portable ([wgpu](https://wgpu.rs)) port of the [PyroWave](https://github.com/Themaister/pyrowave) low-latency intra-frame wavelet video codec.
 
+**[Play a stream in your browser](https://with-developer.github.io/emberwave/)**, decoded by WebGPU in the page (a recent Chrome or Edge has it).
+
 PyroWave is an intra-only codec built for very fast GPU encode and decode (upstream reports under ~0.1 ms at 1080p and ~0.2 ms at 4K) for local-network game streaming. Its reference implementation is written as Vulkan compute shaders. **emberwave reimplements the decoder in Rust + WGSL on top of wgpu**, so a single code base can target Vulkan, Metal, DX12 and WebGPU.
 
 > **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output, up to 4K (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode). CI runs the tests on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Decoding works, converts to RGB on the GPU and comes with a command line tool. A 4K frame decodes in about 1.1 ms on an Apple M3 Max (1.4 ms including the conversion to RGB), 1.4 times the time of upstream's own Metal decoder at FP32 (see [Performance](#performance)). Releases and their changes are in [`CHANGELOG.md`](CHANGELOG.md).
@@ -79,7 +81,7 @@ Each milestone is tracked in its own issue.
 - [x] **M4** Benchmarks and documentation ([#5](https://github.com/with-developer/emberwave/issues/5))
 - [x] **M5** Stabilisation and the v0.1.0 release ([#6](https://github.com/with-developer/emberwave/issues/6))
 
-Later, time permitting: an encoder port with round-trip tests, a WebGPU demo (wasm), and a C FFI for Moonlight-style clients.
+After the release: a [browser player](https://with-developer.github.io/emberwave/) (WebGPU, [#15](https://github.com/with-developer/emberwave/issues/15)), and, time permitting, an encoder port with round-trip tests and a C FFI for Moonlight-style clients.
 
 ## Repository layout
 
@@ -88,6 +90,7 @@ Later, time permitting: an encoder port with round-trip tests, a WebGPU demo (wa
 | `crates/emberwave-core` | Bitstream parser, CPU reference decoder, colour conversion and the wgpu/WGSL decoder |
 | `crates/emberwave-cli` | `emberwave-cli` command line tool |
 | `crates/emberwave-ffi` | C FFI (placeholder) |
+| `crates/emberwave-web`, `web/` | The browser player: WebAssembly module and page |
 | `testdata/` | Test vectors and how to regenerate them |
 | `scripts/` | Test data, 4K acceptance check and benchmark scripts |
 | `ARCHITECTURE.md` | Bitstream format, GPU pipeline and the decision log |
@@ -122,4 +125,5 @@ emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 
 - **빠른 시작**: Rust 1.87 이상과 GPU(없으면 Linux는 Mesa lavapipe, Windows는 내장 WARP)가 있으면 위 Quick start의 네 줄로 PNG를 얻습니다. 처음 빌드는 몇 분 걸립니다.
 - **성능**: Apple M3 Max(Metal)에서 4K 한 프레임을 약 1.1 ms(RGB 변환 포함 1.4 ms)에 디코딩하며, 같은 기계에서 원본 Metal 디코더(FP32)의 1.4배입니다. 측정 환경과 전체 수치는 위 Performance 표와 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.
 - **릴리스**: v0.1.0이 첫 릴리스, v0.2.0이 속도 개선 릴리스입니다. Linux(x86_64), macOS(Apple Silicon), Windows(x86_64)용 `emberwave-cli`를 [releases](https://github.com/with-developer/emberwave/releases)에서 받을 수 있습니다. 4K 1000프레임을 반복 디코딩해도 GPU 자원과 프로세스 메모리가 늘지 않는 것을 확인했습니다.
-- **남은 일**: Windows CI 시간(#12), WebGPU 데모(#15), C FFI(#16), 인코더 포팅(#14) 순서로 진행합니다.
+- **브라우저 플레이어**: [with-developer.github.io/emberwave](https://with-developer.github.io/emberwave/)에서 `.pwv1` 파일을 열면 WebGPU로 페이지 안에서 디코딩해 재생합니다. 파일은 어디에도 올라가지 않습니다.
+- **남은 일**: C FFI(#16), 인코더 포팅(#14) 순서로 진행합니다.
