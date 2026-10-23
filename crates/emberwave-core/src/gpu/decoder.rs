@@ -490,9 +490,6 @@ impl Decoder {
                 _ => {}
             }
 
-            if let Some(q) = queries {
-                q.encode_resolve(&mut encoder);
-            }
             self.queue.submit([encoder.finish()]);
         })?;
 
@@ -637,7 +634,7 @@ impl Decoder {
         queries: &StageQueries,
         with_rgb: bool,
     ) -> Result<Option<StageTimings>, GpuError> {
-        let Some(stages) = queries.read(&self.device)? else {
+        let Some(stages) = queries.read(&self.device, &self.queue)? else {
             return Ok(None);
         };
         Ok(match (stages[0], stages[1]) {

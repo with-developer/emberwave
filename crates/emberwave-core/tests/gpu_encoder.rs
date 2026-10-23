@@ -324,8 +324,12 @@ fn timing_an_encode_reports_where_the_time_goes() {
             Some(stages) => {
                 assert!(context.supports_timestamps());
                 // A short stage can be below the timer's resolution and read
-                // as zero, but the whole encode cannot.
+                // as zero, but the whole encode cannot, nor the stages of
+                // several dispatches: quantisation runs a workgroup per block
+                // and rate control four passes and two prefix sums.
                 assert!(stages.total() > std::time::Duration::ZERO);
+                assert!(stages.quantisation > std::time::Duration::ZERO);
+                assert!(stages.rate_control > std::time::Duration::ZERO);
                 // The GPU cannot take longer than the wall clock around it.
                 assert!(stages.total() <= timings.gpu_wall + timings.prepare);
             }

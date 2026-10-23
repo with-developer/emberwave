@@ -157,28 +157,30 @@ impl StageQueries {
         }
     }
 
-    /// Records the copy of the timestamps to where [`read`](Self::read)
-    /// finds them.
-    pub(crate) fn encode_resolve(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.resolve_query_set(&self.query_set, 0..2 * self.stages, &self.resolve, 0);
-        encoder.copy_buffer_to_buffer(
-            &self.resolve,
-            0,
-            &self.readback,
-            0,
-            u64::from(2 * self.stages) * 8,
-        );
-    }
-
     /// The time of each stage, once the work with the timestamps is done:
     /// `None` for a stage whose end came before its beginning, and `None`
     /// altogether if the device wrote no timestamps. A stage shorter than one
     /// tick of the timer is a valid measurement of zero, not a missing one.
+    ///
+    /// The timestamps are resolved here, in a submission of their own. With
+    /// the work, in its command buffer, Metal now and then resolved the last
+    /// stages before their timestamps were written, and gave the previous
+    /// frame's or an end before the beginning.
     pub(crate) fn read(
         &self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
     ) -> Result<Option<Vec<Option<Duration>>>, GpuError> {
-        let bytes = read_back(device, &self.readback, u64::from(2 * self.stages) * 8)?;
+        let bytes = u64::from(2 * self.stages) * 8;
+        with_error_scope(device, || {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("timestamps"),
+            });
+            encoder.resolve_query_set(&self.query_set, 0..2 * self.stages, &self.resolve, 0);
+            encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, bytes);
+            queue.submit([encoder.finish()]);
+        })?;
+        let bytes = read_back(device, &self.readback, bytes)?;
         let ticks: Vec<u64> = bytes
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))

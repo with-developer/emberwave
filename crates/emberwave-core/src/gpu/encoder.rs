@@ -423,9 +423,6 @@ impl Encoder {
             self.encode_rate_control(&mut encoder, queries);
             self.encode_packing(&mut encoder, queries);
             self.encode_read_back(&mut encoder, capacity_words);
-            if let Some(q) = queries {
-                q.encode_resolve(&mut encoder);
-            }
             self.queue.submit([encoder.finish()]);
         })?;
         let data = read_back(
@@ -435,7 +432,7 @@ impl Encoder {
         )?;
         let gpu_wall = gpu_start.elapsed();
         let stages = match queries {
-            Some(q) => q.read(&self.device)?.and_then(|stages| {
+            Some(q) => q.read(&self.device, &self.queue)?.and_then(|stages| {
                 Some(EncodeStageTimings {
                     transform: stages[TRANSFORM as usize]?,
                     quantisation: stages[QUANTISATION as usize]?,
