@@ -17,6 +17,8 @@ publish = false
 
 [workspace.dependencies]
 emberwave-core = { path = "crates/emberwave-core", version = "0.1.0" }
+thiserror = "2"
+proptest = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
