@@ -9,6 +9,7 @@ mod context;
 mod decoder;
 mod error;
 mod layout;
+mod pipelines;
 
 pub use context::{BACKEND_ENV, GpuContext, GpuOptions, parse_backends};
 pub use decoder::{Decoder, Frame, FramePlane};

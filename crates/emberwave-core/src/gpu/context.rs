@@ -1,6 +1,9 @@
 //! Creating the wgpu device.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use super::GpuError;
+use super::pipelines::Pipelines;
 
 /// Environment variable that restricts the backends considered, for example
 /// `vulkan`, `metal`, `dx12` or a comma separated list. Unset or `auto` means
@@ -61,6 +64,8 @@ pub struct GpuContext {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Built on first use, shared by every clone of the context.
+    pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
 }
 
 impl GpuContext {
@@ -109,6 +114,7 @@ impl GpuContext {
             adapter,
             device,
             queue,
+            pipelines: Arc::default(),
         })
     }
 
@@ -125,6 +131,20 @@ impl GpuContext {
     /// The wgpu queue.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// The compute pipelines, compiled the first time they are asked for.
+    pub(crate) fn pipelines(&self) -> Result<Arc<Pipelines>, GpuError> {
+        let mut cache = self
+            .pipelines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(pipelines) = cache.as_ref() {
+            return Ok(Arc::clone(pipelines));
+        }
+        let pipelines = Arc::new(Pipelines::new(&self.device)?);
+        *cache = Some(Arc::clone(&pipelines));
+        Ok(pipelines)
     }
 }
 

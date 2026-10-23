@@ -5,7 +5,7 @@
 //! (`dequant.wgsl`), runs the inverse transform level by level (`idwt.wgsl`),
 //! and converts the planes to 8 bits (`pack.wgsl`).
 
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use wgpu::util::DeviceExt;
 
@@ -15,10 +15,7 @@ use crate::bitstream::{Band, ChromaSubsampling, Component, FrameAssembler, Frame
 use super::context::GpuContext;
 use super::error::GpuError;
 use super::layout::{BufferLayout, DequantParams, IdwtLevel, PackParams};
-
-const DEQUANT_SHADER: &str = include_str!("shaders/dequant.wgsl");
-const IDWT_SHADER: &str = include_str!("shaders/idwt.wgsl");
-const PACK_SHADER: &str = include_str!("shaders/pack.wgsl");
+use super::pipelines::{Pipelines, Stage, with_error_scope};
 
 /// Zero words after the payload. The dequantiser may read a little past the
 /// end of the last block; this keeps those reads deterministic.
@@ -50,12 +47,6 @@ pub struct Frame {
     pub planes: [FramePlane; 3],
 }
 
-/// A compute pipeline with the bind group layout it was created with.
-struct Stage {
-    pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
-}
-
 /// A dispatch of the inverse transform for one decomposition level.
 struct IdwtStage {
     bind_group: wgpu::BindGroup,
@@ -79,15 +70,14 @@ pub struct Decoder {
     packed: wgpu::Buffer,
     readback: wgpu::Buffer,
 
-    dequant: Stage,
+    pipelines: Arc<Pipelines>,
+
     dequant_params: wgpu::Buffer,
     dequant_bind_group: wgpu::BindGroup,
     dequant_grid: (u32, u32),
 
-    idwt: Stage,
     idwt_stages: Vec<IdwtStage>,
 
-    pack: Stage,
     pack_bind_group: wgpu::BindGroup,
     pack_grid: (u32, u32, u32),
 }
@@ -106,6 +96,8 @@ impl Decoder {
         let buffers = BufferLayout::new(&layout)?;
         let device = context.device().clone();
         let queue = context.queue().clone();
+        // Compiled once per context, however many decoders are created.
+        let pipelines = context.pipelines()?;
 
         let limits = device.limits();
         let check = |what: &'static str, bytes: u64| {
@@ -168,44 +160,12 @@ impl Decoder {
                 wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             );
 
-            let dequant = create_stage(
-                &device,
-                "dequant",
-                DEQUANT_SHADER,
-                &[
-                    storage_entry(0, true),
-                    storage_entry(1, true),
-                    storage_entry(2, false),
-                    uniform_entry(3),
-                ],
-            );
-            let idwt = create_stage(
-                &device,
-                "idwt",
-                IDWT_SHADER,
-                &[
-                    storage_entry(0, false),
-                    storage_entry(1, false),
-                    uniform_entry(2),
-                ],
-            );
-            let pack = create_stage(
-                &device,
-                "pack",
-                PACK_SHADER,
-                &[
-                    storage_entry(0, true),
-                    storage_entry(1, false),
-                    uniform_entry(2),
-                ],
-            );
-
             let dequant_params_data = DequantParams::new(&layout, &buffers);
             let dequant_grid = dequant_params_data.grid();
             let dequant_params = uniform_buffer(&device, "dequant params", &dequant_params_data);
             let dequant_bind_group = dequant_bind_group(
                 &device,
-                &dequant,
+                &pipelines.dequant,
                 &payload,
                 &block_offsets,
                 &pyramid,
@@ -222,7 +182,7 @@ impl Decoder {
                     IdwtStage {
                         bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("idwt"),
-                            layout: &idwt.layout,
+                            layout: &pipelines.idwt.layout,
                             entries: &[entry(0, &pyramid), entry(1, &planes), entry(2, &params)],
                         }),
                         grid: stage.grid(),
@@ -235,7 +195,7 @@ impl Decoder {
             let pack_params = uniform_buffer(&device, "pack params", &pack_params_data);
             let pack_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pack"),
-                layout: &pack.layout,
+                layout: &pipelines.pack.layout,
                 entries: &[entry(0, &planes), entry(1, &packed), entry(2, &pack_params)],
             });
 
@@ -250,13 +210,11 @@ impl Decoder {
                 pyramid,
                 packed,
                 readback,
-                dequant,
+                pipelines: Arc::clone(&pipelines),
                 dequant_params,
                 dequant_bind_group,
                 dequant_grid,
-                idwt,
                 idwt_stages,
-                pack,
                 pack_bind_group,
                 pack_grid,
             }
@@ -315,7 +273,7 @@ impl Decoder {
                     label: Some("dequant"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.dequant.pipeline);
+                pass.set_pipeline(&self.pipelines.dequant.pipeline);
                 pass.set_bind_group(0, &self.dequant_bind_group, &[]);
                 pass.dispatch_workgroups(self.dequant_grid.0, self.dequant_grid.1, 1);
             }
@@ -325,7 +283,7 @@ impl Decoder {
                     label: Some("idwt"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.idwt.pipeline);
+                pass.set_pipeline(&self.pipelines.idwt.pipeline);
                 for stage in &self.idwt_stages {
                     pass.set_bind_group(0, &stage.bind_group, &[]);
                     pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
@@ -337,7 +295,7 @@ impl Decoder {
                     label: Some("pack"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.pack.pipeline);
+                pass.set_pipeline(&self.pipelines.pack.pipeline);
                 pass.set_bind_group(0, &self.pack_bind_group, &[]);
                 pass.dispatch_workgroups(self.pack_grid.0, self.pack_grid.1, self.pack_grid.2);
             }
@@ -418,7 +376,7 @@ impl Decoder {
         self.payload_capacity_words = capacity;
         self.dequant_bind_group = dequant_bind_group(
             &self.device,
-            &self.dequant,
+            &self.pipelines.dequant,
             &self.payload,
             &self.block_offsets,
             &self.pyramid,
@@ -507,67 +465,11 @@ impl std::fmt::Debug for Decoder {
     }
 }
 
-fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
 fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
     }
-}
-
-fn create_stage(
-    device: &wgpu::Device,
-    label: &str,
-    source: &str,
-    entries: &[wgpu::BindGroupLayoutEntry],
-) -> Stage {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some(label),
-        entries,
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(label),
-        bind_group_layouts: &[Some(&layout)],
-        immediate_size: 0,
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
-    Stage { pipeline, layout }
 }
 
 fn uniform_buffer<T: bytemuck::Pod>(device: &wgpu::Device, label: &str, value: &T) -> wgpu::Buffer {
@@ -596,20 +498,4 @@ fn dequant_bind_group(
             entry(3, params),
         ],
     })
-}
-
-/// Runs `body` and turns validation and out-of-memory errors raised inside it
-/// into an error value instead of letting the default handler panic.
-fn with_error_scope<T>(device: &wgpu::Device, body: impl FnOnce() -> T) -> Result<T, GpuError> {
-    let memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let value = body();
-    // Scopes are popped innermost first.
-    let validation = pollster::block_on(validation_scope.pop());
-    let memory = pollster::block_on(memory_scope.pop());
-
-    match validation.or(memory) {
-        Some(error) => Err(GpuError::Device(error.to_string())),
-        None => Ok(value),
-    }
 }

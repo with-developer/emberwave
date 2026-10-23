@@ -66,7 +66,17 @@ fn assembled(layout: &FrameLayout, frame: &[u8]) -> FrameAssembler {
 }
 
 fn decoder_for(context: &GpuContext, layout: &FrameLayout) -> Decoder {
-    Decoder::new(context, layout.width(), layout.height(), layout.chroma()).expect("decoder")
+    let start = std::time::Instant::now();
+    let decoder =
+        Decoder::new(context, layout.width(), layout.height(), layout.chroma()).expect("decoder");
+    // The first decoder of a context compiles the shaders; later ones reuse them.
+    eprintln!(
+        "decoder for {}x{} created in {:?}",
+        layout.width(),
+        layout.height(),
+        start.elapsed()
+    );
+    decoder
 }
 
 /// Compares the planes of a GPU frame with a reference frame, plane by plane.
