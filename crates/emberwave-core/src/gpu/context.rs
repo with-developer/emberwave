@@ -84,6 +84,11 @@ pub fn parse_backends(text: &str) -> Option<wgpu::Backends> {
     (!backends.is_empty()).then_some(backends)
 }
 
+/// Held while [`GpuContext::new`] makes a context, so that two never overlap
+/// (decision D31).
+#[cfg(not(target_arch = "wasm32"))]
+static CREATING: Mutex<()> = Mutex::new(());
+
 /// An adapter, a device and its queue.
 #[derive(Debug, Clone)]
 pub struct GpuContext {
@@ -103,8 +108,19 @@ pub struct GpuContext {
 impl GpuContext {
     /// Creates a context, blocking until the device is ready. Not in a
     /// browser, where nothing may block: use [`new_async`](Self::new_async).
+    ///
+    /// The contexts of a process are made here one at a time. On Linux,
+    /// Vulkan loaders 1.3.284 to 1.4.344 can crash the process when one
+    /// thread creates a device while another lists the adapters of a new
+    /// instance (decision D31; loader 1.4.345 fixed it). That covers the
+    /// contexts made here and nothing else: not those of
+    /// [`new_async`](Self::new_async) or [`from_adapter`](Self::from_adapter),
+    /// not other users of Vulkan in the process, and not, in debug builds,
+    /// the naming of every object wgpu creates, which can crash in the same
+    /// way while another thread makes a context.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(options: &GpuOptions) -> Result<Self, GpuError> {
+        let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
         pollster::block_on(Self::new_async(options))
     }
 

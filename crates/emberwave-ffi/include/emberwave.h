@@ -205,6 +205,12 @@ enum EmberwaveStatus emberwave_probe_packet(const uint8_t *data,
 // a comma separated list of them, or `auto`; a value that names no backend is
 // ignored. A discrete GPU is preferred to an integrated one.
 //
+// Contexts are created one at a time: calls from several threads wait for
+// each other. On Linux, Vulkan loaders 1.3.284 to 1.4.344 can crash the
+// process when one thread creates a device while another lists the
+// adapters of a new instance (loader 1.4.345 fixed it). The waiting covers
+// the contexts created here, not other users of Vulkan in the process.
+//
 // # Safety
 //
 // `options` is `NULL` or points to an `EmberwaveContextOptions`. `context`

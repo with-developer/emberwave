@@ -79,7 +79,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
-          vulkaninfo --summary
+          # lavapipe alone: Vulkan loaders 1.3.284 to 1.4.344 unload the
+          # drivers that find no device while other threads may be reading
+          # their list, which crashes tests that create contexts in parallel
+          # (decision D31). Ubuntu 24.04's loader predates that; 26.04's has it.
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n 1)
+          test -f "$icd"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          VK_DRIVER_FILES=$icd vulkaninfo --summary
       - name: Install stable toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
