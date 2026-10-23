@@ -32,6 +32,31 @@ pub fn vector_names() -> Vec<String> {
     names
 }
 
+/// The directory of the encoder's vectors (`scripts/gen_encoder_vectors.sh`).
+pub fn encoder_dir() -> PathBuf {
+    testdata_dir().join("encoder")
+}
+
+/// The encoder's vectors from `testdata/encoder/vectors.txt`: name and bytes
+/// per frame.
+pub fn encoder_vectors() -> Vec<(String, usize)> {
+    let list = std::fs::read_to_string(encoder_dir().join("vectors.txt")).expect("vectors.txt");
+    let vectors: Vec<(String, usize)> = list
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 7, "{line}");
+            (
+                fields[0].to_owned(),
+                fields[6].parse().expect("bytes per frame"),
+            )
+        })
+        .collect();
+    assert!(!vectors.is_empty());
+    vectors
+}
+
 /// A vector file.
 pub fn read_vector(name: &str) -> Vec<u8> {
     std::fs::read(testdata_dir().join(format!("{name}.pwv1"))).expect("vector file")
