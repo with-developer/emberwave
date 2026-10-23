@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (M3).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. `emberwave-cli` decodes files with them. Benchmarks come in M4. The decision log at the end is kept up to date.
+> **Status (M4).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. `emberwave-cli` decodes files with them. Decode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
 
 ## Overview
 
@@ -592,3 +592,16 @@ Warm-up is both a number of frames and a time: at least 10 frames and at least o
 **Context.** The definition of done asks for a 4K stream decoded by the CLI and matched to the reference at the PSNR criterion. A 4K frame needs a source picture, and a committed 4K stream is megabytes.
 
 **Decision.** `scripts/verify_4k.sh` creates the stream when it runs. The input picture is a synthetic scene (colour bars, a gradient, a moving shaded disc, a fine diagonal grid and a little film grain, defined in `scripts/refgen/refgen.mm`), encoded by upstream's own encoder, so the bitstream is still the original encoder's output and only the picture is ours. The same scene feeds the benchmark streams in M4. Generated files go to `testdata/generated/`, which git ignores. Like the vectors, the script needs Apple Silicon macOS, because the reference decoder is upstream's Metal one (D1).
+
+### 2026-10-23 — D21: How benchmarks are run and published
+
+**Context.** `CLAUDE.md` asks for the mean and 99th percentile decode time of 60-frame sequences at 1080p, 1440p and 4K on Metal, written into `BENCHMARKS.md` by a script and always with the environment, and for lavapipe numbers if possible. A number alone does not say whether it is good.
+
+**Decision.**
+- `scripts/bench.sh` measures and then rewrites the generated blocks of `BENCHMARKS.md` and of the README (between `bench` markers) with `scripts/bench_report.py`, which needs only Python's standard library. The same run records the environment: computer, OS, power source, wgpu and Rust versions, commit and date. The raw JSON stays in `target/bench/`.
+- Each number is over 600 frames, ten passes over the 60-frame sequence, so that the 99th percentile is not just the slowest frame.
+- Upstream's own decoder is the yardstick: `refgen bench` times its Metal port on the same streams in the same way, at both of its precisions. The first run puts emberwave's GPU time at about seven times upstream's FP32 at 4K, which issue #11 takes up.
+- lavapipe is measured in a Linux container on the same computer (`scripts/bench_lavapipe.sh`, which needs Docker) and labelled as a reference.
+- Text that interprets the numbers is written by hand outside the generated blocks and names the run it is about.
+
+**Consequence.** Running the script again updates every published number at once.

@@ -70,4 +70,4 @@ Streams of real size are never committed. Two scripts generate them into `testda
 | Script | What it does |
 |---|---|
 | `scripts/verify_4k.sh [frames]` | The 4K acceptance check. Encodes a 4K scene, decodes it with the upstream decoder at both precisions and with `emberwave-cli` (to PNG and to Y4M), and requires 60 dB against the default precision and 80 dB against the FP32 decode. See `ARCHITECTURE.md`, decision D20 |
-| `scripts/gen_bench_data.sh` | 60-frame scene streams at 1080p, 1440p and 4K for the benchmarks, and with `--noise` a 4K stream of white noise |
+| `scripts/gen_bench_data.sh` | 60-frame scene streams at 1080p, 1440p and 4K for the benchmarks, and with `--noise` a 4K stream of white noise. `scripts/bench.sh` times the decoder on them; see `BENCHMARKS.md` |
