@@ -23,6 +23,9 @@ bytemuck = { workspace = true, optional = true }
 [dev-dependencies]
 proptest.workspace = true
 naga.workspace = true
+# The tests count wgpu's live resources to show that decoding allocates
+# nothing per frame; the counters cost a little, so only tests turn them on.
+wgpu = { workspace = true, features = ["counters"] }
 
 [lints]
 workspace = true

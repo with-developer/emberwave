@@ -8,7 +8,7 @@ A portable ([wgpu](https://wgpu.rs)) port of the [PyroWave](https://github.com/T
 
 PyroWave is an intra-only codec built for very fast GPU encode and decode (upstream reports under ~0.1 ms at 1080p and ~0.2 ms at 4K) for local-network game streaming. Its reference implementation is written as Vulkan compute shaders. **emberwave reimplements the decoder in Rust + WGSL on top of wgpu**, so a single code base can target Vulkan, Metal, DX12 and WebGPU.
 
-> **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output, up to 4K (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode). CI runs the tests on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Decoding works, converts to RGB on the GPU and comes with a command line tool; it is not yet as fast as upstream's own decoder (see [Performance](#performance)). The first release comes next.
+> **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output, up to 4K (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode). CI runs the tests on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Decoding works, converts to RGB on the GPU and comes with a command line tool; it is not yet as fast as upstream's own decoder (see [Performance](#performance)). v0.1.0 is the first release ([`CHANGELOG.md`](CHANGELOG.md)).
 
 ## Quick start
 
@@ -22,6 +22,8 @@ target/release/emberwave-cli decode testdata/gradient_200x120_420.pwv1 --out-dir
 ```
 
 The first build takes a few minutes. The last command prints the adapter it uses and the time of each frame, and leaves `out/gradient_200x120_420_000000.png` to `000002.png`: a colour gradient. The `.pwv1` files in `testdata/` are small streams made by upstream's encoder.
+
+Without Rust, take `emberwave-cli` for Linux (x86_64), macOS (Apple Silicon) or Windows (x86_64) from the [releases](https://github.com/with-developer/emberwave/releases) and decode a `.pwv1` file from `testdata/` with it. The macOS binary is not signed, so run `xattr -d com.apple.quarantine emberwave-cli` once after downloading it.
 
 ## Usage
 
@@ -75,7 +77,7 @@ Each milestone is tracked in its own issue.
 - [x] **M2** GPU decode pipeline: dequantisation and inverse DWT ([#3](https://github.com/with-developer/emberwave/issues/3))
 - [x] **M3** Colour conversion and CLI ([#4](https://github.com/with-developer/emberwave/issues/4))
 - [x] **M4** Benchmarks and documentation ([#5](https://github.com/with-developer/emberwave/issues/5))
-- [ ] **M5** Stabilisation and the v0.1.0 release ([#6](https://github.com/with-developer/emberwave/issues/6))
+- [x] **M5** Stabilisation and the v0.1.0 release ([#6](https://github.com/with-developer/emberwave/issues/6))
 
 Later, time permitting: an encoder port with round-trip tests, a WebGPU demo (wasm), and a C FFI for Moonlight-style clients.
 
@@ -91,6 +93,7 @@ Later, time permitting: an encoder port with round-trip tests, a WebGPU demo (wa
 | `ARCHITECTURE.md` | Bitstream format, GPU pipeline and the decision log |
 | `BENCHMARKS.md` | How decode times are measured, and the results |
 | `CONTRIBUTING.md` | How to build, test and change the code |
+| `CHANGELOG.md` | What each release changed |
 
 ## Development
 
@@ -118,4 +121,5 @@ emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 
 - **현재 상태(프리알파)**: 비트스트림 파서, GPU 디코더(역양자화, 역 DWT, YUV→RGB), CLI(`emberwave-cli`)가 동작합니다. 원본 인코더가 만든 스트림을 원본 디코더와 PSNR 64 dB 이상(원본 FP32 모드 기준 86 dB 이상)으로 일치하게 디코딩하고, 4K 스트림도 같은 기준을 통과합니다. CI는 Linux(lavapipe), macOS(Metal), Windows(DX12, WARP)에서 테스트를 돌립니다.
 - **빠른 시작**: Rust 1.87 이상과 GPU(없으면 Linux는 Mesa lavapipe, Windows는 내장 WARP)가 있으면 위 Quick start의 네 줄로 PNG를 얻습니다. 처음 빌드는 몇 분 걸립니다.
 - **성능**: 위 Performance 표와 [`BENCHMARKS.md`](BENCHMARKS.md)에 측정 환경과 함께 있습니다. 같은 기계에서 원본의 Metal 디코더보다 아직 몇 배 느리고, 개선은 별도 이슈에서 다룹니다.
-- **남은 일**: 안정화와 v0.1.0 릴리스(M5). 이후 여유가 있으면 인코더 포팅, WebGPU 데모, C FFI를 진행합니다.
+- **릴리스**: v0.1.0이 첫 릴리스입니다. Linux(x86_64), macOS(Apple Silicon), Windows(x86_64)용 `emberwave-cli`를 [releases](https://github.com/with-developer/emberwave/releases)에서 받을 수 있습니다. 4K 1000프레임을 반복 디코딩해도 GPU 자원과 프로세스 메모리가 늘지 않는 것을 확인했습니다.
+- **남은 일**: 원본 대비 성능 격차 개선(#11). 여유가 있으면 인코더 포팅, WebGPU 데모, C FFI를 진행합니다(각각 이슈로 등록).

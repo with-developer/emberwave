@@ -25,7 +25,7 @@ mkdir -p "$WORK"
 PYROWAVE_PRECISION=2 "$REFGEN" decode "$WORK/scene_4k.pwv1" "$WORK/reference-fp32.y4m"
 
 cargo build --release -p emberwave-cli --manifest-path "$ROOT/Cargo.toml"
-CLI=$ROOT/target/release/emberwave-cli
+CLI=${CARGO_TARGET_DIR:-$ROOT/target}/release/emberwave-cli
 
 "$CLI" decode "$WORK/scene_4k.pwv1" --out-dir "$WORK/out" --format png
 "$CLI" decode "$WORK/scene_4k.pwv1" --out-dir "$WORK/out" --format y4m

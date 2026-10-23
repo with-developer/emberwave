@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (M4).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. `emberwave-cli` decodes files with them. Decode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
+> **Status (M5, v0.1.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. `emberwave-cli` decodes files with them. Decode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
 
 ## Overview
 
@@ -332,6 +332,8 @@ The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 
 
 Per-dispatch parameters (band table, tile sizes, buffer offsets) depend only on the picture size, so they are computed once and live in small uniform buffers.
 
+No GPU resource outlives a frame. The decoder's own buffers are created once (the payload buffer grows when a frame needs more room), and the only allocations of a frame are the staging buffers wgpu uses for `Queue::write_buffer`, three or four of them, which it frees when the frame is done. The test `decoding_frame_after_frame_allocates_nothing` compares every count wgpu keeps of live objects and memory (buffers, textures, bind groups, pipelines, command encoders, query sets and so on; Metal does not count memory) after a first pass over every frame and every way of decoding with the counts after 48 more decodes. The same check over 1000 frames of a 4K stream, `a_thousand_4k_frames_leave_no_trace`, which runs on request, found 21 buffers, 9 bind groups, 3 command encoders and 1 query set before and after on an Apple M3 Max (2026-10-23). `scripts/soak.sh` found the resident memory of `emberwave-cli` flat at 178 MiB while it decoded 1000 4K frames to RGB and read them back.
+
 ### Dequantisation
 
 One workgroup per block index, found by a lookup in a table of the (at most 48) transmitted bands. Each invocation decodes the 8 values of one 4x2 subblock. If a block was not received, a value that comes through `workgroupUniformLoad` makes the whole workgroup write zeros and return, so the later barriers stay in uniform control flow.
@@ -605,3 +607,23 @@ Warm-up is both a number of frames and a time: at least 10 frames and at least o
 - Text that interprets the numbers is written by hand outside the generated blocks and names the run it is about.
 
 **Consequence.** Running the script again updates every published number at once.
+
+### 2026-10-23 — D22: Errors instead of panics, and the panics that stay
+
+**Context.** M5 asks for clean error types and no panics.
+
+**Decision.**
+- Everything that input or the environment can cause is an error value, made with `thiserror`: `bitstream::Error` for streams, `GpuError` for adapters, devices and limits, and `ColorError` for planes smaller than the picture size says. `color::yuv_to_rgb8` used to panic in that case and now returns a `Result`. The CLI prints errors and exits with status 1.
+- All GPU work runs inside wgpu error scopes for validation, out-of-memory and internal errors, the last being what a driver's failure to compile a shader or build a pipeline becomes. That now includes the uploads, the parameter writes and the mapping and unmapping of readback buffers of each frame, and `Decoder::read_band`. Such an error becomes `GpuError::Device` or `GpuError::Readback` instead of reaching wgpu's default handler, which panics. An out-of-memory error can cost the device itself.
+- A lost device (a driver reset, a GPU that went away, a destroyed device) reports through a callback, not through the scopes. The context records it, and a decoder checks the record before and after each frame: a frame on a lost device is `GpuError::DeviceLost`, never a stale result, and so is every later frame. Before this a timed decode on a destroyed device returned plausible numbers. The context and its decoders have to be created again.
+- One path is out of reach: wgpu 30 treats a device error while waiting in `Device::poll` as fatal and panics, whatever the error scopes. A timeout comes back as an error.
+- Three `expect`s stay, in `gpu::layout`. They assert that the band tables of a `FrameLayout` and of the `BufferLayout` built from it agree, which no input can change. A property test builds the parameter blocks for random picture sizes across the whole range the format allows, in both chroma formats, to back that up. If one of them fired it would be a bug, which is what a panic is for.
+- Malformed streams are covered by the property tests of M1, which feed random and damaged packets to the parser.
+
+**Consequence.** `ColorError`, `GpuError::DeviceLost` and `GpuContext::lost` are new public API.
+
+### 2026-10-23 — D23: Releases
+
+**Decision.** A tag `vX.Y.Z` runs `.github/workflows/release.yml`. It first checks that the tag names the version in `Cargo.toml` and a commit on `main`. Then it builds `emberwave-cli` on GitHub's runners for x86_64 Linux, Apple Silicon macOS and x86_64 Windows, packs each binary with the README, the licence and the changelog (`.tar.gz`, `.zip` on Windows), and publishes a GitHub release with SHA-256 checksums, whose notes are the version's section of `CHANGELOG.md`. The release workflow uses only first-party actions and the `gh` CLI. The binaries are not signed or notarised; the README says how to run the macOS one.
+
+**Consequence.** Intel Macs and ARM Linux build from source for now.

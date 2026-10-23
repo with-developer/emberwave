@@ -93,6 +93,8 @@ pub struct GpuContext {
     timestamps: bool,
     /// Built on first use, shared by every clone of the context.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
+    /// Why the device was lost, once it has been; shared with the decoders.
+    lost: Arc<Mutex<Option<String>>>,
 }
 
 impl GpuContext {
@@ -146,13 +148,37 @@ impl GpuContext {
             })
             .await?;
 
+        // A lost device stays lost. Errors of a lost device do not reach the
+        // error scopes, so the decoders check this record before and after
+        // their work instead of returning whatever is in their buffers.
+        let lost: Arc<Mutex<Option<String>>> = Arc::default();
+        let record = Arc::clone(&lost);
+        device.set_device_lost_callback(move |reason, message| {
+            if let Ok(mut lost) = record.lock() {
+                lost.get_or_insert_with(|| format!("{reason:?}: {message}"));
+            }
+        });
+
         Ok(Self {
             adapter,
             device,
             queue,
             timestamps,
             pipelines: Arc::default(),
+            lost,
         })
+    }
+
+    /// Why the device was lost, if it was: a driver reset, a GPU that went
+    /// away, or [`wgpu::Device::destroy`]. A lost device does not come back;
+    /// create a new context.
+    pub fn lost(&self) -> Option<String> {
+        self.lost.lock().ok().and_then(|lost| lost.clone())
+    }
+
+    /// The record of a lost device, shared with the decoders of this context.
+    pub(crate) fn lost_record(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.lost)
     }
 
     /// Name, backend and driver of the adapter in use.
