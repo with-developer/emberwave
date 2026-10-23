@@ -9,7 +9,8 @@
 // is `yuv_to_rgb8` in color.rs; both evaluate the same expressions in the same
 // order.
 //
-// Reads the packed 8-bit planes written by pack.wgsl and writes one RGBA word
+// Reads the packed 8-bit planes written by the last level of idwt.wgsl and
+// writes one RGBA word
 // per pixel (red in the low byte, alpha 255).
 
 struct YuvParams {

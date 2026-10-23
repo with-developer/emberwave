@@ -229,10 +229,14 @@ impl Decoder {
                 buffers.pyramid_floats * 4,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             );
+            // COPY_DST lets a test fill the planes before a decode, to see
+            // that the decode writes every word of them.
             let packed = storage(
                 "packed planes",
                 buffers.packed_words * 4,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             );
             let readback = storage(
                 "readback",
@@ -931,7 +935,9 @@ mod tests {
     fn to_unorm8_on_gpu(context: &GpuContext, values: &[f32]) -> Vec<u8> {
         let source = super::super::shader_sources::IDWT;
         let start = source.find("fn to_unorm8").expect("to_unorm8 in idwt.wgsl");
-        let end = start + source[start..].find("\n}\n").expect("end of to_unorm8") + 3;
+        // The function ends with the first line that starts with a brace; "\n}"
+        // finds it whatever the line endings.
+        let end = start + source[start..].find("\n}").expect("end of to_unorm8") + 2;
         let shader = format!(
             "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n{}\n\
              @compute @workgroup_size(64)\n\
@@ -990,6 +996,68 @@ mod tests {
         let levels: Vec<f32> =
             bytemuck::cast_slice(&slice.get_mapped_range().expect("range")).to_vec();
         levels.iter().map(|&level| level as u8).collect()
+    }
+
+    /// A frame without blocks: all coefficients zero, every sample mid-grey.
+    fn empty_frame(width: u32, height: u32, chroma: ChromaSubsampling) -> Vec<u8> {
+        let word0 = (width - 1) | ((height - 1) << 14) | (1 << 28) | (1 << 31);
+        let word1 = u32::from(chroma == ChromaSubsampling::Yuv444) << 26;
+        [word0.to_le_bytes(), word1.to_le_bytes()].concat()
+    }
+
+    #[test]
+    fn the_last_level_writes_every_word_with_zero_padding() {
+        let Some(context) = context() else {
+            return;
+        };
+
+        // Odd widths leave padding in the last word of a row; 4:2:0 chroma
+        // ends at level 1, whose size need not be a multiple of the tile.
+        let mut shapes = Vec::new();
+        for width in [1u32, 2, 3, 5, 31, 33, 127, 129, 131] {
+            for height in [1u32, 2, 3, 33, 131] {
+                shapes.push((width, height, ChromaSubsampling::Yuv444));
+            }
+        }
+        for width in [2u32, 6, 30, 34, 98, 130, 194, 226] {
+            for height in [2u32, 6, 34, 130] {
+                shapes.push((width, height, ChromaSubsampling::Yuv420));
+            }
+        }
+
+        for (width, height, chroma) in shapes {
+            let mut decoder = Decoder::new(&context, width, height, chroma).unwrap();
+            // Anything the decode leaves unwritten keeps this pattern.
+            let size = decoder.buffers.packed_words as usize * 4;
+            decoder
+                .queue
+                .write_buffer(&decoder.packed, 0, &vec![0xA5; size]);
+            decoder
+                .assemble_complete(&empty_frame(width, height, chroma))
+                .unwrap();
+            let (packed, _) = decoder
+                .run_gpu(None, Read::Yuv, false, Duration::ZERO)
+                .unwrap();
+
+            for component in Component::ALL {
+                let i = component.index();
+                let (w, h) = decoder.layout().plane_size(component);
+                let stride = decoder.buffers.packed_strides[i] as usize * 4;
+                let start = decoder.buffers.packed_offsets[i] as usize * 4;
+                for row in 0..h as usize {
+                    let line = &packed[start + row * stride..start + (row + 1) * stride];
+                    let (samples, padding) = line.split_at(w as usize);
+                    assert!(
+                        samples.iter().all(|&s| s == 128),
+                        "{width}x{height} {chroma:?} {component:?} row {row}: {samples:?}"
+                    );
+                    assert!(
+                        padding.iter().all(|&p| p == 0),
+                        "{width}x{height} {chroma:?} {component:?} row {row}, padding {padding:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
