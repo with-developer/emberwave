@@ -345,10 +345,10 @@ fn timing_an_encode_reports_where_the_time_goes() {
 #[test]
 fn nothing_is_made_on_a_lost_device() {
     // Making a decoder or an encoder on a lost device used to panic in wgpu
-    // (issue #35). Each on a context of its own, since the first failure on
-    // a context records the loss and stops the later ones at the record; and
-    // before as well as after the context compiled its pipelines, the loss
-    // being found by the first call that fails in either case.
+    // (issue #35). Each on a context of its own: the first constructor that
+    // fails on a destroyed device records the loss, and a later one would
+    // stop at the record before making anything. Before as well as after
+    // the context compiled its pipelines, whose failure is then the first.
     for compiled in [false, true] {
         let lost = || {
             let context = create_context(&GpuOptions::default())?;

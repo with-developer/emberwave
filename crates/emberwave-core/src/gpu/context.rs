@@ -192,14 +192,20 @@ impl GpuContext {
     }
 
     /// The error of a call that failed on this context's device: the loss of
-    /// the device, if it was lost, and `error` otherwise. wgpu learns of a
-    /// loss, a destroyed device for one, when it is polled, so this polls
-    /// once, without waiting.
+    /// the device, if it was lost, and `error` otherwise.
+    ///
+    /// A device that the driver lost has called back already. A destroyed
+    /// one calls back only when it is polled with no work left on it, so
+    /// this polls once, without waiting, while no loss is recorded, and not
+    /// once one is: wgpu panics when a poll finds the driver lost the device
+    /// (decision D22).
     pub(crate) fn explain(&self, error: GpuError) -> GpuError {
         if matches!(error, GpuError::DeviceLost(_)) {
             return error;
         }
-        let _ = self.device.poll(wgpu::PollType::Poll);
+        if self.lost().is_none() {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+        }
         match self.lost() {
             Some(reason) => GpuError::DeviceLost(reason),
             None => error,
