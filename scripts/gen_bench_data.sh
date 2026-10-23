@@ -12,8 +12,9 @@
 #                the amount of data per frame
 #
 # The pictures are the synthetic "scene" of scripts/refgen: colour bars, a
-# gradient, a moving disc and a fine grid. The byte budget per frame is roughly
-# what a 400 to 800 Mbit/s stream at 60 fps would carry.
+# gradient, a moving disc and a fine grid. The byte budgets per frame (400, 700
+# and 1200 kB) are about 190, 340 and 580 Mbit/s at 60 frames per second; the
+# noise stream's 3 MB is 1.4 Gbit/s.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
