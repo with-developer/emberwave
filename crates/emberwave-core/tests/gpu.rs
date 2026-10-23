@@ -12,7 +12,9 @@ use std::sync::OnceLock;
 
 use common::{Reference, max_abs_diff, psnr, read_reference, vector_frames, vector_names};
 use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
-use emberwave_core::bitstream::{Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout};
+use emberwave_core::bitstream::{
+    Band, BlockHeader, ChromaSubsampling, Component, FrameAssembler, FrameLayout,
+};
 use emberwave_core::cpu;
 use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuOptions};
 
@@ -285,6 +287,16 @@ fn an_incomplete_frame_is_an_error_until_it_is_allowed_to_be_partial() {
     assert!(!decoder.is_ready(false));
     let frame = decoder.decode_assembled().unwrap();
     assert_eq!(frame.planes[0].data.len(), 200 * 120);
+
+    // It is what the CPU decoder makes of the same blocks, and it is not the
+    // complete picture.
+    let assembler = assembled(&layout, &cut[..end]);
+    let expected = cpu::decode_frame(&assembler.frame()).unwrap();
+    for (plane, cpu_plane) in frame.planes.iter().zip(&expected.planes) {
+        assert!(max_abs_diff(&cpu_plane.to_unorm8(), &plane.data) <= 1);
+    }
+    let complete = decoder.decode(&frames[0]).unwrap();
+    assert_ne!(frame, complete, "the missing blocks must make a difference");
 }
 
 #[test]
@@ -387,14 +399,17 @@ fn synthetic_block(rng: &mut Rng, block_index: u32, quant_code: u8, sequence: u8
     [word0.to_le_bytes().as_slice(), &word1.to_le_bytes(), &body].concat()
 }
 
-/// A whole synthetic frame: every block index gets a block (some are left out),
-/// and the quantiser code cycles through all 256 values.
-fn synthetic_frame(layout: &FrameLayout, seed: u32) -> Vec<u8> {
+/// A whole synthetic frame: every block index gets a block, except that about
+/// one in ten is left out if `drop_blocks` is set. The quantiser code cycles
+/// through all 256 values by block index.
+fn synthetic_frame(layout: &FrameLayout, seed: u32, drop_blocks: bool) -> Vec<u8> {
     let mut rng = Rng(seed);
     let mut blocks = Vec::new();
     let mut included = 0u32;
     for block_index in 0..layout.block_count() {
-        if rng.next().is_multiple_of(10) {
+        // The random number is drawn either way so that the content of the
+        // blocks does not depend on `drop_blocks`.
+        if rng.next().is_multiple_of(10) && drop_blocks {
             continue; // missing block
         }
         let quant_code = (block_index % 256) as u8;
@@ -417,18 +432,33 @@ fn synthetic_frame(layout: &FrameLayout, seed: u32) -> Vec<u8> {
 fn synthetic_frames_dequantise_identically_on_gpu_and_cpu() {
     let context = gpu_or_return!();
 
-    // 512x288 has 285 blocks, so every quantiser code from 0 to 255 occurs.
-    for (width, height, chroma, seed) in [
-        (512, 288, ChromaSubsampling::Yuv420, 0x1234_5678),
-        (512, 288, ChromaSubsampling::Yuv420, 0x9E37_79B9),
-        (130, 66, ChromaSubsampling::Yuv444, 0x0BAD_CAFE),
+    // 512x288 has 285 blocks, more than the 256 quantiser codes. The first frame
+    // keeps every block, so every code occurs; the others drop some blocks to
+    // exercise missing ones.
+    let mut codes_seen = [false; 256];
+    for (width, height, chroma, seed, drop_blocks) in [
+        (512, 288, ChromaSubsampling::Yuv420, 0x1234_5678, false),
+        (512, 288, ChromaSubsampling::Yuv420, 0x9E37_79B9, true),
+        (130, 66, ChromaSubsampling::Yuv444, 0x0BAD_CAFE, true),
     ] {
         let layout = FrameLayout::new(width, height, chroma).unwrap();
-        let frame = synthetic_frame(&layout, seed);
+        let frame = synthetic_frame(&layout, seed, drop_blocks);
         let mut decoder = decoder_for(context, &layout);
         decoder.decode(&frame).expect("GPU decode");
 
         let assembler = assembled(&layout, &frame);
+        assert_eq!(
+            assembler.received_blocks() == layout.block_count(),
+            !drop_blocks,
+            "{width}x{height} seed {seed:#x}"
+        );
+        for block_index in 0..layout.block_count() {
+            if let Some(words) = assembler.frame().block(block_index) {
+                codes_seen[usize::from(BlockHeader::from_words(words[0], words[1]).quant_code)] =
+                    true;
+            }
+        }
+
         let bands = cpu::dequant::dequantize(&assembler.frame()).expect("CPU dequantisation");
         let mut nonzero = 0usize;
         for (component, level, band, _) in layout.bands() {
@@ -448,13 +478,19 @@ fn synthetic_frames_dequantise_identically_on_gpu_and_cpu() {
             "the synthetic frame is too empty ({nonzero})"
         );
     }
+
+    let missing: Vec<usize> = (0..256).filter(|&code| !codes_seen[code]).collect();
+    assert!(
+        missing.is_empty(),
+        "quantiser codes never decoded: {missing:?}"
+    );
 }
 
 #[test]
 fn a_large_payload_grows_the_buffer_and_still_decodes() {
     let context = gpu_or_return!();
     let layout = FrameLayout::new(512, 288, ChromaSubsampling::Yuv420).unwrap();
-    let frame = synthetic_frame(&layout, 0x5EED_0001);
+    let frame = synthetic_frame(&layout, 0x5EED_0001, true);
     assert!(
         frame.len() > 64 * 1024,
         "needs more than the initial buffer: {}",
