@@ -1,7 +1,7 @@
 //! A minimal reader and writer of 8-bit planar YUV4MPEG2 (`.y4m`) files.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use emberwave_core::bitstream::{ChromaSiting, ChromaSubsampling, YcbcrRange};
@@ -95,6 +95,79 @@ pub struct Video {
     pub frames: Vec<[Vec<u8>; 3]>,
 }
 
+/// What the header line of a Y4M file says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    pub width: usize,
+    pub height: usize,
+    pub chroma: ChromaSubsampling,
+    /// Where 4:2:0 chroma sits: left for `C420mpeg2` and `C420paldv`, whose
+    /// chroma is co-sited with the left luma sample, otherwise the centre.
+    pub siting: ChromaSiting,
+    /// `XCOLORRANGE=FULL`, or video range otherwise.
+    pub range: YcbcrRange,
+    /// Numerator and denominator of the `F` field, or 0/0 without one.
+    pub frame_rate: (u32, u32),
+    /// Bytes of the Y, Cb and Cr planes of a frame.
+    sizes: [usize; 3],
+}
+
+/// Reads an 8-bit 4:2:0 or 4:4:4 Y4M stream one frame at a time, so that
+/// only one frame is in memory.
+pub struct Reader<R> {
+    input: R,
+    header: Header,
+}
+
+impl<R: BufRead> Reader<R> {
+    /// Reads the header line.
+    pub fn new(mut input: R) -> Result<Self> {
+        let mut line = Vec::new();
+        input.read_until(b'\n', &mut line)?;
+        if line.last() != Some(&b'\n') {
+            return Err("not a Y4M file: no header line".into());
+        }
+        let header = parse_header(std::str::from_utf8(&line[..line.len() - 1])?)?;
+        Ok(Self { input, header })
+    }
+
+    /// What the header line says.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// The Y, Cb and Cr planes of the next frame, or `None` at the end.
+    pub fn next_frame(&mut self) -> Result<Option<[Vec<u8>; 3]>> {
+        let mut marker = Vec::new();
+        if self.input.read_until(b'\n', &mut marker)? == 0 {
+            return Ok(None);
+        }
+        if marker.last() != Some(&b'\n') {
+            return Err("truncated frame marker".into());
+        }
+        if !marker.starts_with(b"FRAME") {
+            return Err("expected a FRAME marker".into());
+        }
+        let mut planes: [Vec<u8>; 3] = Default::default();
+        for (plane, size) in planes.iter_mut().zip(self.header.sizes) {
+            // Grows with the data that is there, so that a header naming an
+            // absurd size gives an error rather than a failed allocation.
+            let wanted = u64::try_from(size)?;
+            (&mut self.input).take(wanted).read_to_end(plane)?;
+            if plane.len() != size {
+                return Err("truncated frame data".into());
+            }
+        }
+        Ok(Some(planes))
+    }
+}
+
+/// Opens a Y4M file to read frame by frame.
+pub fn open(path: &Path) -> Result<Reader<BufReader<File>>> {
+    Reader::new(BufReader::new(File::open(path)?))
+        .map_err(|error| format!("{}: {error}", path.display()).into())
+}
+
 /// Reads a whole 8-bit 4:2:0 or 4:4:4 Y4M file.
 pub fn read(path: &Path) -> Result<Video> {
     let data = std::fs::read(path)?;
@@ -103,17 +176,30 @@ pub fn read(path: &Path) -> Result<Video> {
 
 /// Parses the contents of an 8-bit 4:2:0 or 4:4:4 Y4M file.
 fn parse(data: &[u8]) -> Result<Video> {
-    let newline = data
-        .iter()
-        .position(|&b| b == b'\n')
-        .ok_or("not a Y4M file: no header line")?;
-    let header = std::str::from_utf8(&data[..newline])?;
-    if !header.starts_with("YUV4MPEG2") {
+    let mut reader = Reader::new(data)?;
+    let mut frames = Vec::new();
+    while let Some(frame) = reader.next_frame()? {
+        frames.push(frame);
+    }
+    let header = *reader.header();
+    Ok(Video {
+        width: header.width,
+        height: header.height,
+        chroma: header.chroma,
+        frames,
+    })
+}
+
+/// Parses the header line, without its newline.
+fn parse_header(line: &str) -> Result<Header> {
+    if !line.starts_with("YUV4MPEG2") {
         return Err("not a Y4M file".into());
     }
 
     let (mut width, mut height, mut chroma) = (0usize, 0usize, ChromaSubsampling::Yuv420);
-    for token in header.split_whitespace().skip(1) {
+    let (mut siting, mut range, mut frame_rate) =
+        (ChromaSiting::Center, YcbcrRange::Limited, (0, 0));
+    for token in line.split_whitespace().skip(1) {
         // The first character names the field; a token that does not start
         // with a one-byte character is none of the fields we know.
         let Some((tag, value)) = token.split_at_checked(1) else {
@@ -122,7 +208,18 @@ fn parse(data: &[u8]) -> Result<Video> {
         match tag {
             "W" => width = value.parse()?,
             "H" => height = value.parse()?,
+            "F" => {
+                frame_rate = value
+                    .split_once(':')
+                    .and_then(|(num, den)| Some((num.parse().ok()?, den.parse().ok()?)))
+                    .ok_or_else(|| format!("unreadable frame rate F{value}"))?;
+            }
+            "X" if value == "COLORRANGE=FULL" => range = YcbcrRange::Full,
             "C" => {
+                siting = match value {
+                    "420mpeg2" | "420paldv" => ChromaSiting::Left,
+                    _ => ChromaSiting::Center,
+                };
                 chroma = match value {
                     "420" | "420jpeg" | "420mpeg2" | "420paldv" => ChromaSubsampling::Yuv420,
                     "444" => ChromaSubsampling::Yuv444,
@@ -157,36 +254,14 @@ fn parse(data: &[u8]) -> Result<Video> {
         plane_size(chroma_width, chroma_height)?,
     ];
 
-    let mut frames = Vec::new();
-    let mut position = newline + 1;
-    while position < data.len() {
-        let marker_end = data[position..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|i| position + i + 1)
-            .ok_or("truncated frame marker")?;
-        if !data[position..marker_end].starts_with(b"FRAME") {
-            return Err("expected a FRAME marker".into());
-        }
-        position = marker_end;
-
-        let mut planes: [Vec<u8>; 3] = Default::default();
-        for (plane, size) in planes.iter_mut().zip(sizes) {
-            let end = position.checked_add(size).ok_or("truncated frame data")?;
-            *plane = data
-                .get(position..end)
-                .ok_or("truncated frame data")?
-                .to_vec();
-            position = end;
-        }
-        frames.push(planes);
-    }
-
-    Ok(Video {
+    Ok(Header {
         width,
         height,
         chroma,
-        frames,
+        siting,
+        range,
+        frame_rate,
+        sizes,
     })
 }
 
@@ -259,6 +334,28 @@ mod tests {
         assert_eq!(video.frames[1][0], [8, 9, 10, 11]);
         assert_eq!(video.frames[1][1], [12, 13]);
         assert_eq!(video.frames[1][2], [14, 15]);
+        // What the header signals comes back too.
+        let data = file(&stream.header_line(), 2);
+        let header = *Reader::new(data.as_slice()).unwrap().header();
+        assert_eq!(header.siting, ChromaSiting::Left);
+        assert_eq!(header.range, YcbcrRange::Limited);
+        assert_eq!(header.frame_rate, stream.frame_rate);
+
+        let full = StreamInfo {
+            range: YcbcrRange::Full,
+            ..stream
+        };
+        let data = file(&full.header_line(), 1);
+        assert_eq!(
+            Reader::new(data.as_slice()).unwrap().header().range,
+            YcbcrRange::Full
+        );
+        assert!(parse(b"YUV4MPEG2 W4 H1 F30 C444\n").is_err());
+        let paldv = b"YUV4MPEG2 W4 H2 C420paldv\n";
+        assert_eq!(
+            Reader::new(&paldv[..]).unwrap().header().siting,
+            ChromaSiting::Left
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@ mod common;
 use std::sync::OnceLock;
 
 use common::{
-    Reference, frames_of, max_abs_diff, psnr, read_reference, testdata_dir, vector_frames,
-    vector_names,
+    Reference, encoder_dir, encoder_vectors, frames_of, max_abs_diff, psnr, read_reference,
+    read_y4m, testdata_dir, vector_frames, vector_names,
 };
 use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
 use emberwave_core::bitstream::{
@@ -103,6 +103,32 @@ fn assert_matches_reference(
         );
         *worst = worst.min(db);
     }
+}
+
+#[test]
+fn the_encoders_streams_decode_as_upstreams_decoder_decodes_them() {
+    // emberwave's encoder's vectors, against upstream's FP32 decode of them
+    // (testdata/encoder/, decision D28).
+    let context = gpu_or_return!();
+    let mut worst = f64::INFINITY;
+    for (name, _) in encoder_vectors() {
+        let bytes = std::fs::read(encoder_dir().join(format!("{name}.pwv1"))).expect("stream");
+        let (layout, frames) = frames_of(&name, &bytes);
+        let reference = read_y4m(&encoder_dir().join(format!("{name}.ref-fp32.y4m")));
+        let mut decoder = decoder_for(context, &layout);
+        for (index, frame) in frames.iter().enumerate() {
+            let decoded = decoder.decode(frame).expect("GPU decode");
+            assert_matches_reference(
+                &name,
+                index,
+                &decoded,
+                &reference.frames[index],
+                Reference::Fp32,
+                &mut worst,
+            );
+        }
+    }
+    assert!(worst >= Reference::Fp32.min_psnr(), "{worst:.2} dB");
 }
 
 #[test]

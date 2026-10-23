@@ -92,6 +92,17 @@ impl BlockHeader {
     pub fn payload_bytes(&self) -> usize {
         usize::from(self.payload_words) * 4
     }
+
+    /// Encodes the two header words, the inverse of [`from_words`](Self::from_words).
+    /// Fields wider than the bitstream allows are cut to their bits:
+    /// `payload_words` to 12, `sequence` to 3 and `block_index` to 24.
+    pub fn to_words(&self) -> (u32, u32) {
+        let word0 = u32::from(self.ballot)
+            | (u32::from(self.payload_words) & 0xfff) << 16
+            | (u32::from(self.sequence) & 0x7) << 28;
+        let word1 = u32::from(self.quant_code) | (self.block_index & 0x00ff_ffff) << 8;
+        (word0, word1)
+    }
 }
 
 /// The start of frame header (`BitstreamSequenceHeader` in `bitstream.md`).
@@ -125,6 +136,33 @@ pub struct SequenceHeader {
 }
 
 impl SequenceHeader {
+    /// Encodes the two words of a start of frame header, the inverse of
+    /// [`from_words`](Self::from_words), with the `extended` bit set.
+    pub fn start_of_frame_words(&self) -> (u32, u32) {
+        let (word0, word1) = self.stream_words();
+        (word0 | 1 << 31, word1)
+    }
+
+    /// Encodes the two words without the `extended` bit, as the stream
+    /// description of a PWV1 file header has them. Width and height must be
+    /// in `1..=16384`; fields wider than the bitstream allows are cut to their
+    /// bits.
+    pub fn stream_words(&self) -> (u32, u32) {
+        let word0 = (self.width.wrapping_sub(1) & 0x3fff)
+            | (self.height.wrapping_sub(1) & 0x3fff) << 14
+            | (u32::from(self.sequence) & 0x7) << 28;
+        let bit = |set: bool, shift: u32| u32::from(set) << shift;
+        let word1 = (self.total_blocks & 0x00ff_ffff)
+            | (u32::from(self.code) & 0x3) << 24
+            | bit(self.chroma == ChromaSubsampling::Yuv444, 26)
+            | bit(self.color_primaries == ColorPrimaries::Bt2020, 27)
+            | bit(self.transfer_function == TransferFunction::Pq, 28)
+            | bit(self.ycbcr_transform == YcbcrTransform::Bt2020, 29)
+            | bit(self.ycbcr_range == YcbcrRange::Limited, 30)
+            | bit(self.chroma_siting == ChromaSiting::Left, 31);
+        (word0, word1)
+    }
+
     /// Decodes the two header words. The `extended` bit is not looked at.
     pub fn from_words(word0: u32, word1: u32) -> Self {
         Self {
@@ -256,6 +294,25 @@ mod tests {
         assert_eq!(h.ycbcr_transform, YcbcrTransform::Bt2020);
         assert_eq!(h.ycbcr_range, YcbcrRange::Limited);
         assert_eq!(h.chroma_siting, ChromaSiting::Left);
+    }
+
+    #[test]
+    fn headers_encode_to_the_bytes_they_decode_from() {
+        let block = [0xC3, 0xA5, 0x23, 0x51, 0x9D, 0xEF, 0xCD, 0xAB];
+        let Header::Block(h) = Header::parse(&block).unwrap() else {
+            panic!("expected a block header");
+        };
+        let (word0, word1) = h.to_words();
+        assert_eq!([word0.to_le_bytes(), word1.to_le_bytes()].concat(), block);
+
+        let start = [0x7F, 0xC7, 0x0D, 0xB1, 0xD2, 0x04, 0x00, 0xFC];
+        let Header::StartOfFrame(h) = Header::parse(&start).unwrap() else {
+            panic!("expected a start of frame header");
+        };
+        let (word0, word1) = h.start_of_frame_words();
+        assert_eq!([word0.to_le_bytes(), word1.to_le_bytes()].concat(), start);
+        // Without the extended bit, as in a PWV1 file header.
+        assert_eq!(h.stream_words(), (word0 & !(1 << 31), word1));
     }
 
     #[test]

@@ -452,7 +452,7 @@ The last two rows come from `scripts/verify_4k.sh`: it encodes two 3840x2160 fra
 
 ## Command line tool
 
-`emberwave-cli` (`crates/emberwave-cli`) is a thin front end: the decoder, the colour conversion and the timing API are the library's, and the tool adds file formats and reporting.
+`emberwave-cli` (`crates/emberwave-cli`) is a thin front end: the decoder, the encoder, the colour conversion and the timing API are the library's, and the tool adds file formats and reporting.
 
 | Command | What it does |
 |---|---|
@@ -460,8 +460,9 @@ The last two rows come from `scripts/verify_4k.sh`: it encodes two 3840x2160 fra
 | `bench FILE [--output yuv\|rgb] [--readback] [--frames N] [--warmup N] [--warmup-seconds S] [--json]` | Decodes in a loop and prints mean, median, 99th percentile, minimum and maximum of the numbers described under [Timing](#timing); `--json` prints them as JSON. The frames of the file are used in turn when more are asked for than it holds. Warm-up lasts for at least N frames and at least S seconds (10 and 1 by default, see D19). `--readback` copies the picture back and reports the total only |
 | `info FILE [--verbose]` | Prints the PWV1 header, the colour signalling and the frame sizes, without a GPU |
 | `compare A.y4m B.y4m [--min-psnr DB]` | Prints the PSNR and the largest difference per plane of every frame; with `--min-psnr` the exit status tells whether every plane reached it |
+| `encode FILE.y4m --out FILE.pwv1 --bytes-per-frame B [--frames N] [--matrix bt709\|bt2020]` | Encodes an 8-bit 4:2:0 or 4:4:4 Y4M video with the CPU encoder, each frame within B bytes, and prints the size and time of every frame. Range, chroma siting and frame rate come from the Y4M header; `--matrix` names the colours to signal. The file appears only when it is complete, and the video is read a frame at a time |
 
-`decode` and `bench` choose the GPU with `--backend auto|vulkan|metal|dx12` (`auto` honours `EMBERWAVE_BACKEND`, otherwise any backend the machine has) and `--software`, which insists on a software adapter such as lavapipe or WARP. The adapter in use is printed to stderr. `--matrix auto|bt601|bt709|bt2020` and `--range auto|full|limited` set the colour conversion; `auto` takes the PWV1 header's signalling. They belong to the RGB conversion, so `decode --format y4m`, which keeps the planes as decoded, refuses them. Options that cannot work (`--frames 0`) are refused before anything is read or written. An error is printed as `error: ...` and ends the program with status 1.
+`decode` and `bench` choose the GPU with `--backend auto|vulkan|metal|dx12` (`auto` honours `EMBERWAVE_BACKEND`, otherwise any backend the machine has) and `--software`, which insists on a software adapter such as lavapipe or WARP. The adapter in use is printed to stderr. `--matrix auto|bt601|bt709|bt2020` and `--range auto|full|limited` set the colour conversion; `auto` takes the PWV1 header's signalling. They belong to the RGB conversion, so `decode --format y4m`, which keeps the planes as decoded, refuses them. Options that cannot work (`--frames 0`, a budget below the 8 bytes of a frame header, a 4:2:0 picture of odd size) are refused before anything is read or written. An error is printed as `error: ...` and ends the program with status 1.
 
 PNG output is 8-bit RGB with fast compression. The Y4M writer takes range, chroma format and chroma siting from the stream: `XCOLORRANGE`, and `C420jpeg` (centred chroma), `C420mpeg2` (chroma on the left luma column) or `C444`. A stream without a frame rate gets 30:1, which Y4M needs, and a warning says so. The Y4M reader of `compare` takes 8-bit 4:2:0 and 4:4:4 only, and a file whose header names a picture size that overflows, or that has no frames, is an error rather than a pass. Percentiles are nearest-rank.
 
@@ -506,6 +507,38 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 The C API copies the picture to the CPU, which costs more than decoding it: a 4K frame to RGB takes 7.5 ms with the copy and 1.4 ms without (`BENCHMARKS.md`). Handing the picture to the caller's graphics API on the GPU would need the Vulkan, Metal or Direct3D 12 object behind a wgpu buffer and a way for each API to import it; that is left for later.
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
+
+## Encoder
+
+`emberwave_core::encode` turns 8-bit pictures into frames of bitstream v1 within a byte budget, on the CPU; `emberwave-cli encode` runs it on a Y4M file. It is the reference for a GPU encoder to come (issue #14), as `emberwave_core::cpu` is for the GPU decoder, and like that it is plain sequential Rust. Its frames decode with any decoder of the format: the tests check emberwave's against upstream's, and the vectors in `testdata/encoder/` carry upstream's decode of emberwave's streams.
+
+The format fixes the transform and what the decoder does with the numbers; the rest is the encoder's choice:
+
+| Step | Fixed by the format | emberwave's choice |
+|---|---|---|
+| Transform | CDF 9/7 lifting and gains, whole-sample symmetric extension at every level, the DC shift | The picture is padded to the aligned size by repeating its last column and row (`fdwt.rs`) |
+| Quantisation | Reconstruction `(m + 0.5) * block_scale * block8_scale` | A band's coefficients are scaled by `2^b`, `b = 8 + (2 for LL, 1 for HL and LH) + level − 1 for chroma`, at most 12, so that a step costs about the same in the picture in every band. An 8x8 block takes the finest scale that needs no more bit-planes than scale 1; magnitudes are `trunc(|t| / scale)`, a dead zone around zero (`quant.rs`) |
+| Bit-planes | Base planes plus 0 to 3 per 4x2 subblock, most significant first | The base is all but the top three planes of the block's largest magnitude |
+| Rate | — | Each 32x32 block drops 0 to 15 of its least significant planes; which, see below (`rate.rs`) |
+| Framing | Start of frame header, then blocks; `total_blocks` counts the blocks sent | Blocks in block index order, unused sign bits zero, and the stream's colours in every start of frame header (`pack.rs`) |
+
+Rate control. For every block and every number of dropped planes the encoder knows the block's size in words and its distortion: the squared difference between coefficients and reconstruction, weighted per band by the contrast sensitivity of the eye at the band's frequency and by the energy the inverse transform gives the band (`weights.rs`, generated by `scripts/gen_encoder_weights.py`). A block can be sent at a few sizes, and at each it takes the number of dropped planes with the least distortion: dropping a plane sometimes costs no word and still lands the reconstruction nearer. Going from one size to the next smaller is a step, which saves words and adds distortion. A step's key is its added distortion per saved word, rounded down to one of 512 thresholds a quarter of a power of two apart; a step's key is at least that of the step before it, so a block's steps keep their order. All steps of the frame are applied in key order, ties by block index, until the frame fits. A frame that cannot fit even with every block dropping all it may is an error rather than an overshoot; that takes a budget below the 8 bytes of the header.
+
+The keys are integers found by exact comparisons, with no division and no logarithm, the weights are literals, and every sum runs in a fixed order without fused multiply-adds. The encoder therefore makes the same bytes on every system, which `tests/encoder.rs` checks against the committed vectors, and a GPU given the same sizes and distortions can make the same choices.
+
+At the same budget and frame size, decoded by upstream's FP32 decoder (Apple M3 Max, 2026-10-24, `refgen` pictures, one frame each), emberwave's encoder reaches the luma PSNR of upstream's or more:
+
+| Picture | Budget | Upstream | emberwave |
+|---|---|---|---|
+| 1280x720 scene, 4:2:0 | 60 kB | 33.96 dB | 37.32 dB |
+| 1280x720 scene, 4:2:0 | 150 kB | 42.32 dB | 45.04 dB |
+| 1280x720 scene, 4:2:0 | 400 kB | 50.11 dB | 50.27 dB |
+| 1920x1080 scene, 4:2:0 | 100 kB | 32.20 dB | 32.77 dB |
+| 640x360 scene, 4:4:4 | 40 kB | 39.49 dB | 42.56 dB |
+| 1280x720 gradient, 4:2:0 | 40 kB | 57.88 dB | 62.61 dB |
+| 640x360 noise, 4:2:0 | 60 and 200 kB | 11.90 and 25.79 dB | 11.95 and 25.78 dB |
+
+Noise, which no budget compresses, comes out the same. Without the contrast weighting the encoder would gain another 0 to 6.5 dB of PSNR (decision D28).
 
 ## Decisions
 
@@ -720,3 +753,16 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 - The release workflow can be started by hand to rehearse: it then builds and packages everything, the C library included, and publishes nothing.
 
 **Consequence.** C and C++ programs can decode PyroWave on all three systems with a prebuilt library. The picture goes through the CPU; sharing it with the caller's graphics API on the GPU is a separate piece of work.
+
+### 2026-10-24 — D28: An encoder, on the CPU first
+
+**Context.** Issue #14 asks for an encoder: forward transform, quantisation, bit-plane packing and rate control to a byte budget, interoperable with upstream's decoder and encoder in both directions, its PSNR at equal bytes measured against upstream's, and round trips in CI on three systems. Upstream's encoder runs entirely on the GPU with subgroup operations, 8-bit stores and atomics; a study of it, checked against its output byte for byte, describes its algorithm without its code.
+
+**Decision.**
+- A CPU encoder comes first, in `emberwave_core::encode`, as the reference for a GPU encoder, like the CPU decoder of D8. The GPU encoder is to be compared with it stage by stage: coefficients within a tolerance, everything after them exact given the same inputs. Its rate control is to run on the GPU too: reading costs back for the CPU to choose would put a stall in every frame.
+- The algorithm is upstream's in kind, written anew: the same band exponents and the same idea for the 8x8 scale, dead-zone magnitudes, and drop-the-least-significant-planes rate control weighted by the eye's contrast sensitivity, so that the comparison with upstream is of like with like. The rate control is emberwave's own: steps keyed by their marginal distortion per word, monotone per block, applied in one frame-wide order, where upstream keys each step by its cumulative distortion since no plane was dropped, in buckets of 1.5 dB.
+- Determinism over bit-exactness with upstream: integer keys from exact comparisons, weights as `f32` literals generated once, fixed sums, zero padding where upstream leaves leftover memory. One committed stream per vector is compared byte for byte on every system.
+- Tests: the encoder's vectors live in `testdata/encoder/` with upstream's FP32 decode of them (`scripts/gen_encoder_vectors.sh`, macOS); emberwave's decoders must match it at 80 dB (D9). The decoder's conformance vectors stay upstream-encoded. Round trips in CI use small pictures; quality against upstream's encoder is measured locally and recorded, not a CI gate.
+- New tooling: `refgen encode --source` writes the pictures it synthesises, and `--input` encodes a Y4M file with upstream's encoder, so that both encoders can be given the same pictures.
+
+**Consequence.** emberwave can make streams, at the PSNR of upstream's encoder or above at equal bytes (see [Encoder](#encoder)); a 640x360 frame takes about 7 ms on one CPU core. Turning off the contrast weighting was tried once: PSNR rose by 0 dB on the gradient, 1.6 to 4.4 dB on the 1280x720 scene, 2.8 dB at 4:4:4 and 6.5 dB on the 1920x1080 scene, as a pure squared-error allocation keeps the fine detail the weighting gives up first. The weighting stays, as upstream's does. Next is the GPU encoder, measured against this one.

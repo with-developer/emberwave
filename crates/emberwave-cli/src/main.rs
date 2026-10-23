@@ -4,6 +4,7 @@
 mod bench;
 mod compare;
 mod decode;
+mod encode;
 mod info;
 mod stats;
 mod y4m;
@@ -22,7 +23,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[command(
     name = "emberwave-cli",
     version,
-    about = "Decode PyroWave (.pwv1) files with wgpu"
+    about = "Decode PyroWave (.pwv1) files with wgpu, and encode them"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,6 +34,8 @@ struct Cli {
 enum Command {
     /// Decode a file to PNG images or a Y4M video
     Decode(decode::Args),
+    /// Encode a Y4M video to a file, each frame within a byte budget
+    Encode(encode::Args),
     /// Measure decode time per frame
     Bench(bench::Args),
     /// Print the header and frame statistics of a file
@@ -168,6 +171,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Decode(args) => decode::run(&args),
+        Command::Encode(args) => encode::run(&args),
         Command::Bench(args) => bench::run(&args),
         Command::Info(args) => info::run(&args),
         Command::Compare(args) => compare::run(&args),

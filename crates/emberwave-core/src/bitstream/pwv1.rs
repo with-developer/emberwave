@@ -72,6 +72,24 @@ impl Pwv1Header {
             reference_bit_depth: header[BIT_DEPTH_OFFSET],
         })
     }
+
+    /// The 24 header bytes, the inverse of [`parse`](Self::parse). The
+    /// reserved fields of the stream description (`sequence`,
+    /// `total_blocks`, `code`) are written as they are; a file has them zero.
+    pub fn to_bytes(&self) -> [u8; HEADER_BYTES] {
+        let mut bytes = [0u8; HEADER_BYTES];
+        bytes[..MAGIC.len()].copy_from_slice(&MAGIC);
+        let (word0, word1) = self.stream.stream_words();
+        bytes[STREAM_OFFSET..STREAM_OFFSET + 4].copy_from_slice(&word0.to_le_bytes());
+        bytes[STREAM_OFFSET + 4..STREAM_OFFSET + 8].copy_from_slice(&word1.to_le_bytes());
+        bytes[FRAME_RATE_OFFSET..FRAME_RATE_OFFSET + 4]
+            .copy_from_slice(&self.frame_rate_num.to_le_bytes());
+        bytes[FRAME_RATE_OFFSET + 4..FRAME_RATE_OFFSET + 8]
+            .copy_from_slice(&self.frame_rate_den.to_le_bytes());
+        bytes[BIT_DEPTH_OFFSET] = self.reference_bit_depth;
+        bytes[VERSION_OFFSET] = HEADER_VERSION;
+        bytes
+    }
 }
 
 /// A PWV1 file held in memory.
@@ -161,6 +179,13 @@ mod tests {
         assert_eq!(h.stream.chroma_siting, ChromaSiting::Center);
         assert_eq!((h.frame_rate_num, h.frame_rate_den), (60, 1));
         assert_eq!(h.reference_bit_depth, 10);
+    }
+
+    #[test]
+    fn a_header_writes_back_to_its_bytes() {
+        let bytes = header_bytes();
+        let header = Pwv1Header::parse(&bytes).unwrap();
+        assert_eq!(header.to_bytes().as_slice(), bytes.as_slice());
     }
 
     #[test]

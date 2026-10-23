@@ -8,6 +8,14 @@
 //   refgen encode --out F.pwv1 --pattern solid|gradient|noise|scene --width W
 //                 --height H --chroma 420|444 --frames N --bytes-per-frame B
 //                 [--seed S] [--range full|limited] [--siting center|left]
+//                 [--source S.y4m]
+//   refgen encode --out F.pwv1 --input IN.y4m --bytes-per-frame B [--frames N]
+//
+// --source also writes the synthesised pictures, as the encoder got them, to
+// an 8-bit Y4M file. --input encodes the frames of an 8-bit 4:2:0 or 4:4:4
+// Y4M file instead (all of them, or the first N); the picture size, chroma
+// format, frame rate and range come from its header. Together they let
+// emberwave's encoder and upstream's encode the same pictures.
 //   refgen decode IN.pwv1 OUT.y4m [--bit-depth 8|16]
 //   refgen bench IN.pwv1 [--frames N] [--warmup N] [--warmup-seconds S] [--json]
 //
@@ -23,6 +31,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -315,9 +324,99 @@ Picture synthesize(const std::string &pattern, int frame, int width, int height,
 //////
 // encode
 
+// An 8-bit Y4M file read frame by frame.
+struct Y4mReader
+{
+	File file;
+	Stream stream;
+};
+
+// Opens a Y4M file and reads its header into the stream description: size,
+// chroma format, frame rate and range. Only 8-bit 4:2:0 and 4:4:4 will do.
+Y4mReader open_y4m(const std::string &path)
+{
+	Y4mReader r{open_file(path, "rb"), {}};
+	char line[512];
+	if (!fgets(line, sizeof(line), r.file.get()) || strncmp(line, "YUV4MPEG2 ", 10) != 0)
+		fail("%s is not a Y4M file", path.c_str());
+	r.stream.frame_rate_num = FrameRateNum;
+	r.stream.frame_rate_den = FrameRateDen;
+	r.stream.bit_depth = 8;
+	std::string chroma = "420";
+	char *save = nullptr;
+	for (char *token = strtok_r(line + 10, " \n", &save); token; token = strtok_r(nullptr, " \n", &save))
+	{
+		switch (token[0])
+		{
+		case 'W':
+			r.stream.width = atoi(token + 1);
+			break;
+		case 'H':
+			r.stream.height = atoi(token + 1);
+			break;
+		case 'C':
+			chroma = token + 1;
+			break;
+		case 'F':
+			if (sscanf(token + 1, "%u:%u", &r.stream.frame_rate_num, &r.stream.frame_rate_den) != 2)
+				fail("%s: bad frame rate %s", path.c_str(), token);
+			break;
+		case 'X':
+			if (strcmp(token, "XCOLORRANGE=FULL") == 0)
+				r.stream.full_range = 1;
+			break;
+		default:
+			break;
+		}
+	}
+	if (chroma == "444")
+		r.stream.chroma_444 = 1;
+	else if (chroma == "420" || chroma == "420jpeg" || chroma == "420mpeg2")
+		r.stream.siting_left = chroma == "420mpeg2";
+	else
+		fail("%s: only 8-bit 4:2:0 and 4:4:4 Y4M files can be encoded, not C%s", path.c_str(), chroma.c_str());
+	if (r.stream.width <= 0 || r.stream.height <= 0)
+		fail("%s: the header gives no picture size", path.c_str());
+	return r;
+}
+
+// Reads the next frame into p, or returns false at the end of the file.
+bool read_y4m_frame(Y4mReader &r, Picture &p)
+{
+	char line[256];
+	if (!fgets(line, sizeof(line), r.file.get()))
+		return false;
+	if (strncmp(line, "FRAME", 5) != 0)
+		fail("expected a FRAME line in the Y4M file");
+	const Stream &s = r.stream;
+	p.w[0] = s.width;
+	p.h[0] = s.height;
+	p.w[1] = p.w[2] = s.chroma_444 ? s.width : (s.width + 1) / 2;
+	p.h[1] = p.h[2] = s.chroma_444 ? s.height : (s.height + 1) / 2;
+	for (int c = 0; c < 3; c++)
+	{
+		p.plane[c].resize(size_t(p.w[c]) * size_t(p.h[c]));
+		if (fread(p.plane[c].data(), 1, p.plane[c].size(), r.file.get()) != p.plane[c].size())
+			fail("the Y4M file ends inside a frame");
+	}
+	return true;
+}
+
+void write_y4m_header(FILE *f, const Stream &s, int bit_depth);
+
+void write_y4m_frame(FILE *f, const Picture &p)
+{
+	fputs("FRAME\n", f);
+	for (int c = 0; c < 3; c++)
+		if (fwrite(p.plane[c].data(), 1, p.plane[c].size(), f) != p.plane[c].size())
+			fail("short write of a Y4M frame");
+}
+
 struct Options
 {
 	std::string out;
+	std::string input;
+	std::string source;
 	std::string pattern = "solid";
 	int width = 0;
 	int height = 0;
@@ -332,6 +431,7 @@ struct Options
 int run_encode(int argc, char **argv)
 {
 	Options o;
+	bool frames_given = false;
 	for (int i = 2; i < argc; i++)
 	{
 		const std::string key = argv[i];
@@ -343,6 +443,10 @@ int run_encode(int argc, char **argv)
 
 		if (key == "--out")
 			o.out = value();
+		else if (key == "--input")
+			o.input = value();
+		else if (key == "--source")
+			o.source = value();
 		else if (key == "--pattern")
 			o.pattern = value();
 		else if (key == "--width")
@@ -352,7 +456,10 @@ int run_encode(int argc, char **argv)
 		else if (key == "--chroma")
 			o.chroma = atoi(value());
 		else if (key == "--frames")
+		{
 			o.frames = atoi(value());
+			frames_given = true;
+		}
 		else if (key == "--bytes-per-frame")
 			o.bytes_per_frame = size_t(strtoull(value(), nullptr, 0));
 		else if (key == "--seed")
@@ -365,8 +472,21 @@ int run_encode(int argc, char **argv)
 			fail("unknown option %s", key.c_str());
 	}
 
+	Y4mReader input;
+	if (!o.input.empty())
+	{
+		input = open_y4m(o.input);
+		o.width = input.stream.width;
+		o.height = input.stream.height;
+		o.chroma = input.stream.chroma_444 ? 444 : 420;
+		o.full_range = input.stream.full_range;
+		o.siting_left = input.stream.siting_left;
+		// All frames unless --frames limits them.
+		if (!frames_given)
+			o.frames = INT_MAX;
+	}
 	if (o.out.empty() || o.width <= 0 || o.height <= 0 || o.frames <= 0 || o.bytes_per_frame == 0)
-		fail("encode needs --out, --width, --height, --frames and --bytes-per-frame");
+		fail("encode needs --out, --bytes-per-frame, and either --input or --width, --height and --frames");
 	if (o.chroma != 420 && o.chroma != 444)
 		fail("--chroma must be 420 or 444");
 	const bool chroma_444 = o.chroma == 444;
@@ -390,19 +510,31 @@ int run_encode(int argc, char **argv)
 	stream.chroma_444 = chroma_444;
 	stream.siting_left = o.siting_left;
 	stream.full_range = o.full_range;
-	stream.frame_rate_num = FrameRateNum;
-	stream.frame_rate_den = FrameRateDen;
+	stream.frame_rate_num = o.input.empty() ? FrameRateNum : input.stream.frame_rate_num;
+	stream.frame_rate_den = o.input.empty() ? FrameRateDen : input.stream.frame_rate_den;
 	stream.bit_depth = 8;
 
 	File out = open_file(o.out, "wb");
 	write_pwv1_header(out.get(), stream);
+	File source;
+	if (!o.source.empty())
+	{
+		source = open_file(o.source, "wb");
+		write_y4m_header(source.get(), stream, 8);
+	}
 
 	// The packer may overshoot the target a little, so leave generous slack.
 	std::vector<uint8_t> bitstream(2 * o.bytes_per_frame + (1u << 20));
 
 	for (int frame = 0; frame < o.frames; frame++)
 	{
-		Picture pic = synthesize(o.pattern, frame, o.width, o.height, chroma_444, o.seed);
+		Picture pic;
+		if (o.input.empty())
+			pic = synthesize(o.pattern, frame, o.width, o.height, chroma_444, o.seed);
+		else if (!read_y4m_frame(input, pic))
+			break;
+		if (source)
+			write_y4m_frame(source.get(), pic);
 
 		pyrowave_cpu_buffer input = {};
 		for (int c = 0; c < 3; c++)

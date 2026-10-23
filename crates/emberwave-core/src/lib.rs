@@ -11,6 +11,7 @@
 pub mod bitstream;
 pub mod color;
 pub mod cpu;
+pub mod encode;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 

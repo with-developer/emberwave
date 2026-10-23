@@ -506,3 +506,84 @@ fn an_unknown_backend_name_is_rejected_by_the_parser() {
         stderr(&output)
     );
 }
+
+/// The encoder's vectors: name and bytes per frame (testdata/encoder/vectors.txt).
+fn encoder_vectors() -> Vec<(String, String)> {
+    std::fs::read_to_string(testdata("encoder/vectors.txt"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields[0].to_owned(), fields[6].to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn encode_makes_the_committed_streams_again() {
+    // The whole file: the PWV1 header with the stream's size, chroma format,
+    // range, siting and frame rate taken from the Y4M header, the size of
+    // every frame and the frames themselves.
+    let dir = scratch("encode_vectors");
+    for (name, budget) in encoder_vectors() {
+        let out = dir.join(format!("{name}.pwv1"));
+        let output = cli()
+            .arg("encode")
+            .arg(testdata(&format!("encoder/{name}.source.y4m")))
+            .arg("--out")
+            .arg(&out)
+            .args(["--bytes-per-frame", &budget])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{name}: {}", stderr(&output));
+        let written = std::fs::read(&out).unwrap();
+        let committed = std::fs::read(testdata(&format!("encoder/{name}.pwv1"))).unwrap();
+        assert!(written == committed, "{name}: the file differs");
+    }
+}
+
+#[test]
+fn encode_refuses_before_it_writes_and_leaves_no_partial_file() {
+    let dir = scratch("encode_refusals");
+    let source = testdata("encoder/scene_200x120_420.source.y4m");
+    let out = dir.join("out.pwv1");
+    std::fs::write(&out, b"what was there before").unwrap();
+
+    let empty = dir.join("empty.y4m");
+    std::fs::write(&empty, b"YUV4MPEG2 W4 H2 F30:1 C444\n").unwrap();
+    let odd = dir.join("odd.y4m");
+    std::fs::write(&odd, b"YUV4MPEG2 W5 H3 C420\nFRAME\n").unwrap();
+
+    for (input, extra, message) in [
+        (&source, vec!["--bytes-per-frame", "7"], "8 bytes"),
+        (
+            &source,
+            vec!["--bytes-per-frame", "100", "--frames", "0"],
+            "nothing to encode",
+        ),
+        (&empty, vec!["--bytes-per-frame", "100"], "no frames"),
+        (&odd, vec!["--bytes-per-frame", "100"], "even"),
+    ] {
+        let output = cli()
+            .arg("encode")
+            .arg(input)
+            .arg("--out")
+            .arg(&out)
+            .args(&extra)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{extra:?}");
+        assert!(
+            stderr(&output).contains(message),
+            "{extra:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"what was there before",
+            "{extra:?}"
+        );
+        assert!(!dir.join("out.pwv1.partial").exists(), "{extra:?}");
+    }
+}

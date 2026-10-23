@@ -65,6 +65,18 @@ Tests decode a vector and compare plane by plane: at least 60 dB PSNR against `r
 
 The upstream encoder does not write byte-for-byte reproducible bitstreams (the unused bits of a block's last sign byte are leftover GPU memory), so regenerating changes the committed `.pwv1` files. Regenerate only when adding a vector or changing its parameters.
 
+## Encoder vectors
+
+`testdata/encoder/` tests emberwave's encoder, not the decoder: the decoder's conformance rests on the upstream-encoded vectors above. `scripts/gen_encoder_vectors.sh` makes them from the list in `testdata/encoder/vectors.txt` (pattern, size, chroma format, frames and bytes per frame):
+
+| File | Content |
+|---|---|
+| `NAME.source.y4m` | The pictures, synthesised by `refgen` (`--source`) |
+| `NAME.pwv1` | emberwave's encoder's stream of them, at the budget of the list |
+| `NAME.ref-fp32.y4m` | Upstream's FP32 decode of that stream |
+
+`tests/encoder.rs` encodes the sources again and expects the committed bytes, so that a change to the encoder's output is a deliberate one: after such a change, run the script again. emberwave's decoders must match upstream's decode at 80 dB (D9). Like the other vectors, these need Apple Silicon macOS to make.
+
 ## Large streams
 
 Streams of real size are never committed. Two scripts generate them into `testdata/generated/`, which git ignores. The picture is a synthetic scene that `refgen` feeds to the upstream encoder: colour bars, a gradient, a moving shaded disc, a fine diagonal grid and a little film grain. Like `gen_testdata.sh` they need Apple Silicon macOS.
