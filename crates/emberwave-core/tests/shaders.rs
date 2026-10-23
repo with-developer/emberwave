@@ -93,12 +93,11 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("subblock_largest_magnitude", 512),
     ];
     let equant: &[Variable] = &[
-        ("absolute", 4096),
-        ("magnitudes", 4096),
+        ("subblock_error", 8192),
+        ("subblock_signs", 1024),
         ("subblock_planes", 512),
         ("block8_pairs", 64),
         ("block8_base", 64),
-        ("block8_scale_code", 64),
         ("pair_sizes", 1024),
         ("pair_distortion", 1024),
     ];

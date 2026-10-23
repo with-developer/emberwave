@@ -262,16 +262,24 @@ pub(crate) fn analyse_block8(
         }
 
         let drop_scale = exact_pow2(i32::from(drop)) * step;
+        // Each 4x2 subblock's values in order, then the subblocks in order:
+        // the grouping in which the GPU's invocations add them up.
         let error: f32 = magnitudes
-            .iter()
-            .zip(&scaled)
-            .map(|(&m, &t)| {
-                let reconstructed = match kept(m) {
-                    0 => 0.0,
-                    k => (k as f32 + DEADZONE_OFFSET) * drop_scale,
-                };
-                let difference = t * to_coefficient - reconstructed;
-                difference * difference
+            .chunks_exact(VALUES_PER_SUBBLOCK)
+            .zip(scaled.chunks_exact(VALUES_PER_SUBBLOCK))
+            .map(|(magnitudes, scaled)| {
+                magnitudes
+                    .iter()
+                    .zip(scaled)
+                    .map(|(&m, &t)| {
+                        let reconstructed = match kept(m) {
+                            0 => 0.0,
+                            k => (k as f32 + DEADZONE_OFFSET) * drop_scale,
+                        };
+                        let difference = t * to_coefficient - reconstructed;
+                        difference * difference
+                    })
+                    .sum::<f32>()
             })
             .sum();
         distortion[usize::from(drop)] = quant.weight * error;
