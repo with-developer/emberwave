@@ -34,7 +34,7 @@ Environment variables:
 - `EMBERWAVE_REFERENCE_DIR=DIR` compares against reference decodes made elsewhere, for example by upstream's Vulkan decoder.
 - `PROPTEST_CASES=100000` runs a deeper robustness pass than the default 256 cases.
 
-`scripts/verify_4k.sh` is the 4K acceptance check, and [`BENCHMARKS.md`](BENCHMARKS.md) explains the benchmark scripts.
+`scripts/verify_4k.sh` is the 4K acceptance check, and [`BENCHMARKS.md`](BENCHMARKS.md) explains the benchmark scripts. Two leak checks run on request, both on the 4K stream of `scripts/gen_bench_data.sh`: `cargo test --release -p emberwave-core --test gpu -- --ignored` counts the GPU resources over 1000 frames, and `scripts/soak.sh` watches the memory of `emberwave-cli` over as many.
 
 ## Test vectors and acceptance bars
 
