@@ -3,12 +3,14 @@
 //!
 //! - [`bitstream`]: the PyroWave v1 bitstream (pure Rust, GPU independent).
 //! - [`cpu`]: a slow reference decoder used as a test oracle.
+//! - [`gpu`] (feature `gpu`, on by default): the wgpu/WGSL decoder.
 //!
-//! The wgpu/WGSL decode pipeline arrives in milestone M2. See
-//! `ARCHITECTURE.md` for the plan.
+//! See `ARCHITECTURE.md` for the design.
 
 pub mod bitstream;
 pub mod cpu;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 /// Version of the `emberwave-core` crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
