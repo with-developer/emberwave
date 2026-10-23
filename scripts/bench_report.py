@@ -5,7 +5,8 @@
         Records the machine the benchmark runs on.
     bench_report.py write RESULTS_DIR BENCHMARKS.md README.md
         Rewrites the generated blocks of both files from the JSON results that
-        `emberwave-cli bench --json` and `refgen bench --json` wrote.
+        `emberwave-cli bench --json`, `emberwave-cli bench-encode --json`,
+        `refgen bench --json` and `refgen bench-encode --json` wrote.
 
 Only the Python standard library is used.
 """
@@ -30,6 +31,14 @@ STREAMS = [
 
 # Frames per stream, as gen_bench_data.sh writes them.
 STREAM_FRAMES = 60
+
+# The pictures of the encoder benchmarks, gen_bench_data.sh --sources, and
+# the bytes per frame bench.sh gives them.
+ENCODE_SOURCES = [
+    ("scene_1080p_420", "1080p scene", 400),
+    ("scene_1440p_420", "1440p scene", 700),
+    ("scene_4k_420", "4K scene", 1200),
+]
 
 
 def run(*command):
@@ -253,7 +262,85 @@ def benchmarks_block(results, env):
         )
         parts.append(table(["Stream", "mean", "p50", "p99", "frames"], rows))
 
+    parts += encode_parts(results)
     return "\n\n".join(parts) + "\n"
+
+
+def encode_parts(results):
+    """The tables of the encoder benchmarks, if there are results."""
+    rows = []
+    for stem, label, kilobytes in ENCODE_SOURCES:
+        gpu = load(results, f"{stem}.encode-gpu")
+        if not gpu:
+            continue
+        upstream = load(results, f"{stem}.encode-upstream")
+        cpu = load(results, f"{stem}.encode-cpu")
+        rows.append(
+            [label, f"{kilobytes} kB"]
+            + [ms(value(gpu, "total", k)) for k in ("mean", "p50", "p99")]
+            + [ms(value(upstream, "total", k)) for k in ("mean", "p50", "p99")]
+            + [ms(value(cpu, "total"))]
+        )
+    if not rows:
+        return []
+    parts = [
+        "### Encode, next to upstream\n\n"
+        "From the picture's planes in CPU memory to the frame in CPU memory, the upload and the "
+        "read-back included, which is what `Encoder::encode` does and what upstream's encoder "
+        "does with `pyrowave_encoder_encode_cpu` and `pyrowave_encoder_packetize`, timed by "
+        "`refgen bench-encode`. The pictures are 20 frames of the scene, taken in turn; reading "
+        "them is not timed. The CPU encoder is timed over a tenth of the frames.",
+        table(
+            [
+                "Picture",
+                "budget",
+                "emberwave GPU mean",
+                "p50",
+                "p99",
+                "upstream mean",
+                "p50",
+                "p99",
+                "emberwave CPU mean",
+            ],
+            rows,
+        ),
+        "Where the GPU encoder's time goes, the pass times from GPU timestamps:",
+    ]
+    rows = []
+    for stem, label, _ in ENCODE_SOURCES:
+        gpu = load(results, f"{stem}.encode-gpu")
+        if gpu:
+            rows.append(
+                [label]
+                + [
+                    ms(value(gpu, s))
+                    for s in (
+                        "cpu prepare",
+                        "gpu wall",
+                        "gpu (timestamps)",
+                        "transform",
+                        "quantisation",
+                        "rate control",
+                        "packing",
+                    )
+                ]
+            )
+    parts.append(
+        table(
+            [
+                "Picture",
+                "CPU prepare",
+                "GPU wall",
+                "GPU passes",
+                "transform",
+                "quantisation",
+                "rate control",
+                "packing",
+            ],
+            rows,
+        )
+    )
+    return parts
 
 
 def readme_block(results, env):
@@ -277,6 +364,15 @@ def readme_block(results, env):
             f"{ms(value(theirs, 'total'))} ms for a 4K frame at FP32 against emberwave's "
             f"{ms(value(ours, 'total'))} ms (planes only). "
             "[`BENCHMARKS.md`](BENCHMARKS.md) has the method and all the numbers.\n"
+        )
+    encoded = load(results, "scene_4k_420.encode-gpu")
+    upstream = load(results, "scene_4k_420.encode-upstream")
+    if encoded:
+        text += (
+            f"\nEncoding a 4K frame within 1.2 MB takes {ms(value(encoded, 'total'))} ms on the GPU, "
+            "from the planes in CPU memory to the frame in CPU memory"
+            + (f", and {ms(value(upstream, 'total'))} ms with upstream's encoder." if upstream else ".")
+            + "\n"
         )
     return text
 

@@ -18,10 +18,15 @@
 // emberwave's encoder and upstream's encode the same pictures.
 //   refgen decode IN.pwv1 OUT.y4m [--bit-depth 8|16]
 //   refgen bench IN.pwv1 [--frames N] [--warmup N] [--warmup-seconds S] [--json]
+//   refgen bench-encode IN.y4m --bytes-per-frame B [--frames N] [--warmup N]
+//                 [--warmup-seconds S] [--json]
 //
 // bench times upstream's decoder the way `emberwave-cli bench --output yuv`
 // times emberwave's: planes left in GPU memory, the same warm-up rule, the
 // same statistics and the same output, so the two can be put side by side.
+// bench-encode times upstream's encoder the way `emberwave-cli bench-encode`
+// times emberwave's: from the planes in CPU memory to the frame's packet in
+// CPU memory, the video's frames in turn.
 //
 // PWV1 container layout: bitstream/bitstream.md in the upstream repository,
 // section "Raw disk format specification".
@@ -940,6 +945,148 @@ int run_bench(int argc, char **argv)
 	}
 	return 0;
 }
+//////
+// bench-encode
+
+int run_bench_encode(int argc, char **argv)
+{
+	if (argc < 3)
+		fail("usage: refgen bench-encode IN.y4m --bytes-per-frame B [--frames N] [--warmup N] "
+		     "[--warmup-seconds S] [--json]");
+	const std::string in_path = argv[2];
+	size_t bytes_per_frame = 0;
+	long frames_to_measure = 0;
+	long warmup_frames = 10;
+	double warmup_seconds = 1.0;
+	bool json = false;
+	for (int i = 3; i < argc; i++)
+	{
+		const std::string arg = argv[i];
+		if (arg == "--bytes-per-frame" && i + 1 < argc)
+			bytes_per_frame = size_t(atol(argv[++i]));
+		else if (arg == "--frames" && i + 1 < argc)
+			frames_to_measure = atol(argv[++i]);
+		else if (arg == "--warmup" && i + 1 < argc)
+			warmup_frames = atol(argv[++i]);
+		else if (arg == "--warmup-seconds" && i + 1 < argc)
+			warmup_seconds = atof(argv[++i]);
+		else if (arg == "--json")
+			json = true;
+		else
+			fail("unknown option %s", argv[i]);
+	}
+	if (bytes_per_frame == 0)
+		fail("bench-encode needs --bytes-per-frame");
+	if (warmup_frames < 0 || !(warmup_seconds >= 0.0 && warmup_seconds <= 3600.0))
+		fail("the warm-up must be at least 0 frames and between 0 and 3600 seconds");
+
+	// One pass over the video unless --frames says otherwise.
+	Y4mReader input = open_y4m(in_path);
+	const Stream stream = input.stream;
+	if (frames_to_measure <= 0)
+	{
+		Picture pic;
+		while (read_y4m_frame(input, pic))
+			frames_to_measure++;
+		if (frames_to_measure == 0)
+			fail("the Y4M file has no frames");
+		input = open_y4m(in_path);
+	}
+
+	// The frames in turn, from the start again after the last; reading them
+	// is not timed.
+	auto next_frame = [&](Picture &pic) {
+		if (read_y4m_frame(input, pic))
+			return;
+		input = open_y4m(in_path);
+		if (!read_y4m_frame(input, pic))
+			fail("the Y4M file has no frames");
+	};
+
+	pyrowave_device device = nullptr;
+	check(pyrowave_create_default_device(&device), "create device");
+	pyrowave_encoder_create_info info = {};
+	info.device = device;
+	info.width = stream.width;
+	info.height = stream.height;
+	info.chroma = stream.chroma_444 ? PYROWAVE_CHROMA_SUBSAMPLING_444 : PYROWAVE_CHROMA_SUBSAMPLING_420;
+	pyrowave_encoder encoder = nullptr;
+	check(pyrowave_encoder_create(&info, &encoder), "create encoder");
+	std::vector<uint8_t> bitstream(2 * bytes_per_frame + (1u << 20));
+
+	// One frame: the planes go to the encoder, which submits its GPU work;
+	// counting the packets waits for it; packetizing copies the frame out.
+	Picture pic;
+	auto encode = [&]() -> double {
+		next_frame(pic);
+		pyrowave_cpu_buffer buffer = {};
+		for (int c = 0; c < 3; c++)
+		{
+			buffer.data[c] = pic.plane[c].data();
+			buffer.row_stride_in_bytes[c] = size_t(pic.w[c]);
+			buffer.plane_size_in_bytes[c] = pic.plane[c].size();
+		}
+		buffer.width = stream.width;
+		buffer.height = stream.height;
+		buffer.format = stream.chroma_444 ? PYROWAVE_CPU_BUFFER_FORMAT_YUV444P : PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+		pyrowave_rate_control rate = { bytes_per_frame };
+
+		const Clock::time_point start = Clock::now();
+		check(pyrowave_encoder_encode_cpu(encoder, &buffer, &rate), "encode");
+		size_t num_packets = 0;
+		check(pyrowave_encoder_compute_num_packets(encoder, SinglePacketBoundary, &num_packets), "count packets");
+		if (num_packets != 1)
+			fail("expected one packet per frame, got %zu", num_packets);
+		pyrowave_packet packet = {};
+		size_t written = 0;
+		check(pyrowave_encoder_packetize(encoder, &packet, SinglePacketBoundary, &written, bitstream.data(),
+		                                 bitstream.size()),
+		      "packetize");
+		return ms_between(start, Clock::now());
+	};
+
+	// Warm up for a number of frames and for a while, like emberwave-cli.
+	size_t warmed = 0;
+	const Clock::time_point warmup_start = Clock::now();
+	while (warmed < size_t(warmup_frames) || ms_between(warmup_start, Clock::now()) < warmup_seconds * 1000.0)
+	{
+		encode();
+		warmed++;
+	}
+
+	Series total = { "total", {} };
+	for (long i = 0; i < frames_to_measure; i++)
+		total.samples.push_back(encode());
+
+	const std::string adapter = [MTLCreateSystemDefaultDevice() name].UTF8String;
+	const std::string description = std::to_string(stream.width) + "x" + std::to_string(stream.height) +
+	                                (stream.chroma_444 ? " 4:4:4" : " 4:2:0") + ", " +
+	                                std::to_string(bytes_per_frame) +
+	                                " bytes per frame, encoded by upstream's Metal encoder from planes in CPU memory";
+	const Summary s = summarize(total.samples);
+	if (json)
+	{
+		printf("{\"input\":%s,\"adapter\":%s,\"backend\":\"Metal\",\"description\":%s,\"frames\":%ld,"
+		       "\"warmup\":%zu,\"bytes_per_frame\":%zu,\"unit\":\"ms\",\"series\":{",
+		       json_string(in_path).c_str(), json_string(adapter).c_str(), json_string(description).c_str(),
+		       frames_to_measure, warmed, bytes_per_frame);
+		printf("%s:{\"mean\":%.6f,\"p50\":%.6f,\"p99\":%.6f,\"min\":%.6f,\"max\":%.6f}", json_string(total.name).c_str(),
+		       s.mean, s.p50, s.p99, s.min, s.max);
+		printf("}}\n");
+	}
+	else
+	{
+		printf("adapter:  %s (Metal, upstream encoder)\n", adapter.c_str());
+		printf("encoding: %s\n", description.c_str());
+		printf("frames:   %ld measured after %zu warm-up frames\n\n", frames_to_measure, warmed);
+		printf("%-20s%9s%9s%9s%9s%9s   (ms per frame)\n", "", "mean", "p50", "p99", "min", "max");
+		printf("%-20s%9.3f%9.3f%9.3f%9.3f%9.3f\n", total.name, s.mean, s.p50, s.p99, s.min, s.max);
+	}
+
+	pyrowave_encoder_destroy(encoder);
+	pyrowave_device_destroy(device);
+	return 0;
+}
 } // namespace
 
 int main(int argc, char **argv)
@@ -950,6 +1097,8 @@ int main(int argc, char **argv)
 		return run_decode(argc, argv);
 	if (argc >= 2 && std::string(argv[1]) == "bench")
 		return run_bench(argc, argv);
-	fprintf(stderr, "usage: refgen encode|decode|bench ...\n");
+	if (argc >= 2 && std::string(argv[1]) == "bench-encode")
+		return run_bench_encode(argc, argv);
+	fprintf(stderr, "usage: refgen encode|decode|bench|bench-encode ...\n");
 	return 2;
 }

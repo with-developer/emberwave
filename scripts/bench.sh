@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# Measures decode times on this machine and rewrites the generated tables of
-# BENCHMARKS.md and README.md.
+# Measures decode and encode times on this machine and rewrites the generated
+# tables of BENCHMARKS.md and README.md.
 #
 # Usage: scripts/bench.sh [--frames N] [--no-upstream]
 #
 #   --frames N     frames measured per number (default 600: ten passes over
 #                  each 60-frame stream, so that the 99th percentile is not
-#                  simply the slowest frame)
-#   --no-upstream  do not time upstream's Metal decoder for comparison
+#                  simply the slowest frame); the CPU encoder, which takes a
+#                  quarter of a second for a 4K frame, gets a tenth of it
+#   --no-upstream  do not time upstream's Metal decoder and encoder for
+#                  comparison
 #
-# The streams come from scripts/gen_bench_data.sh, which is run first if they
-# are missing (that, and timing upstream, need Apple Silicon macOS). Raw
-# results stay in target/bench/ as JSON. Needs python3 for the report.
+# The streams and pictures come from scripts/gen_bench_data.sh, which is run
+# first if they are missing (that, and timing upstream, need Apple Silicon
+# macOS). Raw results stay in target/bench/ as JSON. Needs python3 for the
+# report.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -36,6 +39,15 @@ for stream in $STREAMS; do
         break
     fi
 done
+# The pictures the encoder benchmarks encode, and the bytes per frame they
+# get: those of the decoder's streams of the same size.
+ENCODE="scene_1080p_420:400000 scene_1440p_420:700000 scene_4k_420:1200000"
+for entry in $ENCODE; do
+    if [ ! -f "$GENERATED/${entry%%:*}.y4m" ]; then
+        "$ROOT/scripts/gen_bench_data.sh" --sources
+        break
+    fi
+done
 
 cargo build --release -p emberwave-cli --manifest-path "$ROOT/Cargo.toml"
 CLI=${CARGO_TARGET_DIR:-$ROOT/target}/release/emberwave-cli
@@ -55,6 +67,21 @@ for stream in $STREAMS; do
         "$REFGEN" bench "$input" --frames "$FRAMES" --json > "$OUT/$stream.upstream.json"
         PYROWAVE_PRECISION=2 "$REFGEN" bench "$input" --frames "$FRAMES" --json \
             > "$OUT/$stream.upstream-fp32.json"
+    fi
+done
+
+for entry in $ENCODE; do
+    source=${entry%%:*}
+    budget=${entry##*:}
+    input=$GENERATED/$source.y4m
+    echo "== $source, encoded"
+    "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --gpu --frames "$FRAMES" --json \
+        > "$OUT/$source.encode-gpu.json"
+    "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --frames $((FRAMES / 10)) --json \
+        > "$OUT/$source.encode-cpu.json"
+    if [ "$UPSTREAM" = 1 ]; then
+        "$REFGEN" bench-encode "$input" --bytes-per-frame "$budget" --frames "$FRAMES" --json \
+            > "$OUT/$source.encode-upstream.json"
     fi
 done
 
