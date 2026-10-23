@@ -8,7 +8,6 @@ use super::error::GpuError;
 
 const DEQUANT_SHADER: &str = include_str!("shaders/dequant.wgsl");
 const IDWT_SHADER: &str = include_str!("shaders/idwt.wgsl");
-const PACK_SHADER: &str = include_str!("shaders/pack.wgsl");
 const YUV2RGB_SHADER: &str = include_str!("shaders/yuv2rgb.wgsl");
 
 /// A compute pipeline with the bind group layout it was created with.
@@ -23,7 +22,6 @@ pub(crate) struct Stage {
 pub(crate) struct Pipelines {
     pub dequant: Stage,
     pub idwt: Stage,
-    pub pack: Stage,
     pub yuv2rgb: Stage,
 }
 
@@ -47,16 +45,6 @@ impl Pipelines {
                 IDWT_SHADER,
                 &[
                     storage_entry(0, false),
-                    storage_entry(1, false),
-                    uniform_entry(2),
-                ],
-            ),
-            pack: create_stage(
-                device,
-                "pack",
-                PACK_SHADER,
-                &[
-                    storage_entry(0, true),
                     storage_entry(1, false),
                     uniform_entry(2),
                 ],

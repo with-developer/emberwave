@@ -17,9 +17,6 @@ use super::GpuError;
 pub(crate) const MAX_BANDS: usize =
     NUM_COMPONENTS * (BANDS_PER_LEVEL + (DECOMPOSITION_LEVELS - 1) * (BANDS_PER_LEVEL - 1));
 
-/// Invocations per workgroup of `pack.wgsl`.
-const PACK_GROUP_SIZE: u64 = 256;
-
 /// Invocations per workgroup of `yuv2rgb.wgsl`.
 const YUV_GROUP_SIZE: u64 = 256;
 
@@ -33,10 +30,6 @@ pub(crate) struct BufferLayout {
     band_offsets: [[[u32; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
     /// Size of the pyramid in floats.
     pub pyramid_floats: u64,
-    /// Float offset of each final plane in the plane buffer.
-    pub plane_offsets: [u32; NUM_COMPONENTS],
-    /// Size of the plane buffer in floats.
-    pub plane_floats: u64,
     /// Word offset of each packed 8-bit plane.
     pub packed_offsets: [u32; NUM_COMPONENTS],
     /// Words per row of each packed plane.
@@ -69,16 +62,11 @@ impl BufferLayout {
             }
         }
 
-        let mut plane_offsets = [0; NUM_COMPONENTS];
         let mut packed_offsets = [0; NUM_COMPONENTS];
         let mut packed_strides = [0; NUM_COMPONENTS];
-        let mut plane_floats = 0u64;
         let mut packed_words = 0u64;
         for component in Component::ALL {
             let (width, height) = layout.plane_size(component);
-            plane_offsets[component.index()] = to_offset(plane_floats)?;
-            plane_floats += u64::from(width) * u64::from(height);
-
             let stride = width.div_ceil(4);
             packed_offsets[component.index()] = to_offset(packed_words)?;
             packed_strides[component.index()] = stride;
@@ -88,8 +76,6 @@ impl BufferLayout {
         Ok(Self {
             band_offsets,
             pyramid_floats,
-            plane_offsets,
-            plane_floats,
             packed_offsets,
             packed_strides,
             packed_words,
@@ -241,8 +227,8 @@ impl IdwtLevel {
             comp.band_offset = offsets;
             if level == layout.finest_level(component) {
                 let (width, height) = layout.plane_size(component);
-                comp.dst_offset = buffers.plane_offsets[component.index()];
-                comp.dst_stride = width;
+                comp.dst_offset = buffers.packed_offsets[component.index()];
+                comp.dst_stride = buffers.packed_strides[component.index()];
                 comp.crop_width = width;
                 comp.crop_height = height;
                 comp.is_final = 1;
@@ -269,61 +255,6 @@ impl IdwtLevel {
             self.params.out_height.div_ceil(32),
             self.components,
         )
-    }
-}
-
-/// Per component part of the packing pass's uniform block.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub(crate) struct PackComp {
-    pub src_offset: u32,
-    pub width: u32,
-    pub height: u32,
-    pub dst_offset: u32,
-    pub dst_stride: u32,
-    pub pad: [u32; 3],
-}
-
-/// Uniform block of `pack.wgsl`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub(crate) struct PackParams {
-    pub grid_width: u32,
-    pub pad: [u32; 3],
-    pub comps: [PackComp; NUM_COMPONENTS],
-}
-
-impl PackParams {
-    pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout) -> Self {
-        let mut params = Self::zeroed();
-        let mut largest = 0u64;
-        for component in Component::ALL {
-            let (width, height) = layout.plane_size(component);
-            let i = component.index();
-            params.comps[i] = PackComp {
-                src_offset: buffers.plane_offsets[i],
-                width,
-                height,
-                dst_offset: buffers.packed_offsets[i],
-                dst_stride: buffers.packed_strides[i],
-                pad: [0; 3],
-            };
-            largest = largest.max(u64::from(buffers.packed_strides[i]) * u64::from(height));
-        }
-        params.grid_width = grid_for(largest.div_ceil(PACK_GROUP_SIZE)).0;
-        params
-    }
-
-    /// Workgroup grid: enough groups for the largest plane, three planes in z.
-    pub(crate) fn grid(&self) -> (u32, u32, u32) {
-        let largest = self
-            .comps
-            .iter()
-            .map(|c| u64::from(c.dst_stride) * u64::from(c.height))
-            .max()
-            .unwrap_or(0);
-        let (x, y) = grid_for(largest.div_ceil(PACK_GROUP_SIZE));
-        (x, y, NUM_COMPONENTS as u32)
     }
 }
 
@@ -403,8 +334,6 @@ mod tests {
         assert_eq!(size_of::<DequantParams>(), 16 + 32 * MAX_BANDS);
         assert_eq!(size_of::<CompParams>(), 48);
         assert_eq!(size_of::<IdwtParams>(), 16 + 3 * 48);
-        assert_eq!(size_of::<PackComp>(), 32);
-        assert_eq!(size_of::<PackParams>(), 16 + 3 * 32);
         assert_eq!(size_of::<YuvParams>(), 64 + 3 * 16);
         assert_eq!(MAX_BANDS, 48);
     }
@@ -447,11 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn plane_and_packed_sizes() {
+    fn packed_plane_sizes() {
         let layout = layout_420(); // 200x120, chroma 100x60
         let buffers = BufferLayout::new(&layout).unwrap();
-        assert_eq!(buffers.plane_offsets, [0, 200 * 120, 200 * 120 + 100 * 60]);
-        assert_eq!(buffers.plane_floats, 200 * 120 + 2 * 100 * 60);
         assert_eq!(buffers.packed_strides, [50, 25, 25]);
         assert_eq!(buffers.packed_words, 50 * 120 + 2 * 25 * 60);
 
@@ -507,8 +434,10 @@ mod tests {
                 let comp = this.params.comps[component.index()];
                 if level == layout.finest_level(component) {
                     // 4:2:0 chroma finishes at level 1.
+                    // The last level writes the packed plane, in words.
                     assert_eq!(comp.is_final, 1);
-                    assert_eq!(comp.dst_offset, buffers.plane_offsets[component.index()]);
+                    assert_eq!(comp.dst_offset, buffers.packed_offsets[component.index()]);
+                    assert_eq!(comp.dst_stride, buffers.packed_strides[component.index()]);
                 } else {
                     // The destination is the LL band the next level reads.
                     let next = buffers.band_offset(component, level - 1, Band::Ll).unwrap();
@@ -596,18 +525,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pack_grid_covers_the_largest_plane() {
-        let layout = layout_420();
-        let buffers = BufferLayout::new(&layout).unwrap();
-        let params = PackParams::new(&layout, &buffers);
-        let (x, y, z) = params.grid();
-        assert_eq!(z, 3);
-        // 50 words per row x 120 rows = 6000 words = 24 groups of 256.
-        assert_eq!((x, y), (24, 1));
-        assert_eq!(params.grid_width, 24);
-    }
-
     proptest::proptest! {
         // DequantParams and IdwtLevel look bands up in the BufferLayout of the
         // same FrameLayout and `expect` to find them. Every picture size the
@@ -634,7 +551,6 @@ mod tests {
             for level in 0..DECOMPOSITION_LEVELS {
                 IdwtLevel::new(&layout, &buffers, level);
             }
-            PackParams::new(&layout, &buffers);
             YuvParams::new(&layout, &buffers, &ColorParams::default());
         }
     }

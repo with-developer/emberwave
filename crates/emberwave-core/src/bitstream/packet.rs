@@ -200,7 +200,7 @@ impl FrameAssembler {
 
                     // Validate before anything is changed, so a rejected block
                     // never discards the frame being assembled.
-                    BlockStructure::parse_bytes(&data[..size])?;
+                    BlockStructure::check_bytes(&data[..size])?;
 
                     if freshness == Freshness::Newer {
                         self.restart(header.sequence);

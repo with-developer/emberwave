@@ -24,6 +24,19 @@ use super::header::BlockHeader;
 /// Words in a block header.
 const HEADER_WORDS: usize = HEADER_BYTES / 4;
 
+/// The low bit of each of the eight 2-bit fields of a control word.
+const CONTROL_LOW_BITS: u16 = 0x5555;
+
+/// Bytes of bit-planes of an 8x8 block: one byte per plane of each subblock,
+/// `base` planes for every subblock plus the 2-bit field of each in the control
+/// word. The sum of the fields is the number of their low bits set plus twice
+/// the number of their high bits set.
+fn block8_plane_bytes(control_word: u16, qscale: u8) -> usize {
+    let extra = (control_word & CONTROL_LOW_BITS).count_ones()
+        + 2 * (control_word & !CONTROL_LOW_BITS).count_ones();
+    extra as usize + SUBBLOCKS_PER_BLOCK8 * usize::from(qscale & QSCALE_PLANES_MASK)
+}
+
 /// Little-endian byte view over the words of a block.
 ///
 /// Reads outside the block return 0. Callers check sizes first, and this
@@ -135,6 +148,47 @@ impl BlockStructure {
         )
     }
 
+    /// Checks what [`parse_bytes`](Self::parse_bytes) checks, with the same
+    /// errors, without building the structure: that the tables and bit-planes
+    /// fit in the block. This is what the frame assembler does for every block
+    /// it receives, so it is kept to a tight loop over the tables.
+    pub fn check_bytes(bytes: &[u8]) -> Result<(), Error> {
+        let words = bytes.len() / 4;
+        if words < HEADER_WORDS {
+            return Err(Error::BlockTooSmall { words });
+        }
+        let size = words * 4;
+        let ballot = u16::from_le_bytes([bytes[0], bytes[1]]);
+
+        let active = ballot.count_ones() as usize;
+        let tables_end = HEADER_BYTES + active * (CONTROL_WORD_BYTES + QSCALE_BYTES);
+        if tables_end > size {
+            return Err(Error::BlockContentOverrun {
+                needed: tables_end,
+                available: size,
+            });
+        }
+
+        let qscale_base = HEADER_BYTES + active * CONTROL_WORD_BYTES;
+        let controls = &bytes[HEADER_BYTES..qscale_base];
+        let qscales = &bytes[qscale_base..tables_end];
+        let planes_end = tables_end
+            + controls
+                .chunks_exact(CONTROL_WORD_BYTES)
+                .zip(qscales)
+                .map(|(control, &qscale)| {
+                    block8_plane_bytes(u16::from_le_bytes([control[0], control[1]]), qscale)
+                })
+                .sum::<usize>();
+        if planes_end > size {
+            return Err(Error::BlockContentOverrun {
+                needed: planes_end,
+                available: size,
+            });
+        }
+        Ok(())
+    }
+
     /// The parsing itself, over any way of reading a byte of the block.
     fn parse_with(
         header: BlockHeader,
@@ -167,10 +221,7 @@ impl BlockStructure {
             let qscale = byte_at(qscale_base + index * QSCALE_BYTES);
             let base_planes = qscale & QSCALE_PLANES_MASK;
 
-            let extra_planes: usize = (0..SUBBLOCKS_PER_BLOCK8)
-                .map(|subblock| usize::from((control_word >> (2 * subblock)) & 0x3))
-                .sum();
-            let plane_bytes = extra_planes + SUBBLOCKS_PER_BLOCK8 * usize::from(base_planes);
+            let plane_bytes = block8_plane_bytes(control_word, qscale);
 
             *slot = Some(ActiveBlock8 {
                 control_word,
@@ -363,6 +414,45 @@ mod tests {
             BlockStructure::parse_bytes(&[0; 7]),
             Err(Error::BlockTooSmall { words: 1 })
         );
+    }
+
+    #[test]
+    fn plane_bytes_are_the_sum_of_the_fields() {
+        for control in [0u16, 0b01, 0b10, 0b11, 0x5555, 0xAAAA, 0xFFFF, 0b1001_1100] {
+            for qscale in [0u8, 1, 0x0F, 0xF3] {
+                let fields: usize = (0..8).map(|s| usize::from((control >> (2 * s)) & 3)).sum();
+                let base = usize::from(qscale & 0x0F);
+                assert_eq!(block8_plane_bytes(control, qscale), fields + 8 * base);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        // The quick check the assembler uses agrees with the full parse, error
+        // for error, on any bytes at all.
+        #[test]
+        fn checking_agrees_with_parsing(bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..400)) {
+            proptest::prop_assert_eq!(
+                BlockStructure::check_bytes(&bytes),
+                BlockStructure::parse_bytes(&bytes).map(drop)
+            );
+        }
+
+        // Real-looking blocks: a header with a random ballot and size, then
+        // tables and planes that may or may not fit.
+        #[test]
+        fn checking_agrees_with_parsing_on_blocks(
+            ballot in proptest::num::u16::ANY,
+            words in 2usize..60,
+            tables in proptest::collection::vec(proptest::num::u8::ANY, 0..60),
+        ) {
+            let block = block(ballot, &tables, words);
+            let bytes: Vec<u8> = block.iter().flat_map(|w| w.to_le_bytes()).collect();
+            proptest::prop_assert_eq!(
+                BlockStructure::check_bytes(&bytes),
+                BlockStructure::parse_bytes(&bytes).map(drop)
+            );
+        }
     }
 
     #[test]

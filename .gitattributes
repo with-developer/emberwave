@@ -3,3 +3,7 @@
 # rewrite its line endings and corrupt it.
 *.pwv1 binary
 *.y4m binary
+
+# Shaders keep LF on every checkout: a test cuts a function out of idwt.wgsl
+# by its text, and the shaders are compiled from these files as they are.
+*.wgsl text eol=lf

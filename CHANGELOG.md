@@ -2,6 +2,22 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-10-23
+
+Faster decoding: on an Apple M3 Max a 4K frame decodes to planes in 1.38 ms instead of 4.28 ms (1.63 instead of 4.53 ms with the conversion to RGB), 1.8 times the time of upstream's own Metal decoder at FP32 ([#11](https://github.com/with-developer/emberwave/issues/11)). The decoded pictures are the same up to rounding ties: in the test vectors 5 of 464,790 samples now differ by one level, as the compiler fuses a multiply and an add differently in the rewritten transform.
+
+### Changed
+
+- The inverse transform and the dequantiser keep the values of an invocation in registers, written out with constant indices: the transform is 4.5 times faster.
+- The dequantiser finds the band of a block by binary search. With the change above it is 2.6 times faster.
+- The last level of the inverse transform writes the 8-bit planes itself. The separate packing pass and the float planes (47.5 MiB at 4K) are gone.
+- The frame assembler validates blocks without building their full structure, 2.8 times faster.
+- Software rendering on lavapipe is about a third faster too (4K: 46 ms instead of 69 ms).
+
+### Removed
+
+- `StageTimings::pack`: there is no packing pass any more, and the time of the 8-bit output is part of `idwt`.
+
 ## [0.1.0] - 2026-10-23
 
 The first release: a decoder for PyroWave bitstream v1 that runs the same WGSL on Vulkan, Metal and DX12 through wgpu, and a command line tool.

@@ -2,9 +2,9 @@
 //!
 //! The split follows upstream. The CPU assembles packets
 //! ([`FrameAssembler`]); the GPU decodes coefficients and dequantises them
-//! (`dequant.wgsl`), runs the inverse transform level by level (`idwt.wgsl`),
-//! and converts the planes to 8 bits (`pack.wgsl`). On request a last stage
-//! converts YCbCr to RGB (`yuv2rgb.wgsl`).
+//! (`dequant.wgsl`) and runs the inverse transform level by level
+//! (`idwt.wgsl`), whose last level writes the 8-bit planes. On request a last
+//! stage converts YCbCr to RGB (`yuv2rgb.wgsl`).
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use crate::color::ColorParams;
 
 use super::context::GpuContext;
 use super::error::GpuError;
-use super::layout::{BufferLayout, DequantParams, IdwtLevel, PackParams, YuvParams};
+use super::layout::{BufferLayout, DequantParams, IdwtLevel, YuvParams};
 use super::pipelines::{Pipelines, Stage, with_error_scope};
 
 /// Zero words after the payload. The dequantiser may read a little past the
@@ -78,10 +78,9 @@ pub enum TimedOutput {
 pub struct StageTimings {
     /// Coefficient decoding and dequantisation.
     pub dequant: Duration,
-    /// The inverse transform, all levels.
+    /// The inverse transform, all levels, including the conversion of the
+    /// planes to 8 bits at the last one.
     pub idwt: Duration,
-    /// Conversion of the planes to 8 bits.
-    pub pack: Duration,
     /// Colour conversion, if it was part of the decode.
     pub yuv2rgb: Option<Duration>,
 }
@@ -89,7 +88,7 @@ pub struct StageTimings {
 impl StageTimings {
     /// The sum of the stages.
     pub fn total(&self) -> Duration {
-        self.dequant + self.idwt + self.pack + self.yuv2rgb.unwrap_or_default()
+        self.dequant + self.idwt + self.yuv2rgb.unwrap_or_default()
     }
 }
 
@@ -122,8 +121,8 @@ struct ColorResources {
     grid: (u32, u32),
 }
 
-/// Number of timestamps: a begin and an end for each of four passes.
-const TIMESTAMP_QUERIES: u32 = 8;
+/// Number of timestamps: a begin and an end for each of three passes.
+const TIMESTAMP_QUERIES: u32 = 6;
 
 /// What it takes to read timestamps.
 struct TimestampResources {
@@ -165,9 +164,6 @@ pub struct Decoder {
 
     idwt_stages: Vec<IdwtStage>,
 
-    pack_bind_group: wgpu::BindGroup,
-    pack_grid: (u32, u32, u32),
-
     color: Option<ColorResources>,
     timestamps: Option<TimestampResources>,
 
@@ -205,7 +201,6 @@ impl Decoder {
             }
         };
         check("the wavelet pyramid", buffers.pyramid_floats * 4)?;
-        check("the float planes", buffers.plane_floats * 4)?;
         check("the packed planes", buffers.packed_words * 4)?;
 
         with_error_scope(&device, || {
@@ -234,15 +229,14 @@ impl Decoder {
                 buffers.pyramid_floats * 4,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             );
-            let planes = storage(
-                "float planes",
-                buffers.plane_floats * 4,
-                wgpu::BufferUsages::STORAGE,
-            );
+            // COPY_DST lets a test fill the planes before a decode, to see
+            // that the decode writes every word of them.
             let packed = storage(
                 "packed planes",
                 buffers.packed_words * 4,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             );
             let readback = storage(
                 "readback",
@@ -273,21 +267,12 @@ impl Decoder {
                         bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("idwt"),
                             layout: &pipelines.idwt.layout,
-                            entries: &[entry(0, &pyramid), entry(1, &planes), entry(2, &params)],
+                            entries: &[entry(0, &pyramid), entry(1, &packed), entry(2, &params)],
                         }),
                         grid: stage.grid(),
                     }
                 })
                 .collect();
-
-            let pack_params_data = PackParams::new(&layout, &buffers);
-            let pack_grid = pack_params_data.grid();
-            let pack_params = uniform_buffer(&device, "pack params", &pack_params_data);
-            let pack_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("pack"),
-                layout: &pipelines.pack.layout,
-                entries: &[entry(0, &planes), entry(1, &packed), entry(2, &pack_params)],
-            });
 
             let timestamps = context.supports_timestamps().then(|| TimestampResources {
                 query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -326,8 +311,6 @@ impl Decoder {
                 dequant_bind_group,
                 dequant_grid,
                 idwt_stages,
-                pack_bind_group,
-                pack_grid,
                 color: None,
                 timestamps,
                 lost: context.lost_record(),
@@ -506,20 +489,10 @@ impl Decoder {
                 }
             }
 
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pack"),
-                    timestamp_writes: writes(2),
-                });
-                pass.set_pipeline(&self.pipelines.pack.pipeline);
-                pass.set_bind_group(0, &self.pack_bind_group, &[]);
-                pass.dispatch_workgroups(self.pack_grid.0, self.pack_grid.1, self.pack_grid.2);
-            }
-
             if let (Some(_), Some(resources)) = (color, self.color.as_ref()) {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("yuv2rgb"),
-                    timestamp_writes: writes(3),
+                    timestamp_writes: writes(2),
                 });
                 pass.set_pipeline(&self.pipelines.yuv2rgb.pipeline);
                 pass.set_bind_group(0, &resources.bind_group, &[]);
@@ -674,12 +647,11 @@ impl Decoder {
             (end >= begin)
                 .then(|| Duration::from_secs_f64((end - begin) as f64 * queries.period_ns * 1e-9))
         };
-        Ok(match (stage(0), stage(1), stage(2)) {
-            (Some(dequant), Some(idwt), Some(pack)) => Some(StageTimings {
+        Ok(match (stage(0), stage(1)) {
+            (Some(dequant), Some(idwt)) => Some(StageTimings {
                 dequant,
                 idwt,
-                pack,
-                yuv2rgb: if with_rgb { stage(3) } else { None },
+                yuv2rgb: if with_rgb { stage(2) } else { None },
             }),
             _ => None,
         })
@@ -957,56 +929,63 @@ mod tests {
         }
     }
 
-    /// Runs the packing stage on `values` as the first samples of the luma
-    /// plane of a 256x4 picture and returns the bytes it produces for them.
-    fn pack(context: &GpuContext, values: &[f32]) -> Vec<u8> {
-        let layout = FrameLayout::new(256, 4, ChromaSubsampling::Yuv444).unwrap();
-        let buffers = BufferLayout::new(&layout).unwrap();
-        let pipelines = context.pipelines().unwrap();
-        let device = context.device();
+    /// Runs `to_unorm8` of `idwt.wgsl`, the rounding of the last level, on
+    /// `values` on the GPU and returns the 8-bit levels. The function is cut out
+    /// of the shader's source, so the test runs exactly the code the decoder runs.
+    fn to_unorm8_on_gpu(context: &GpuContext, values: &[f32]) -> Vec<u8> {
+        let source = super::super::shader_sources::IDWT;
+        let start = source.find("fn to_unorm8").expect("to_unorm8 in idwt.wgsl");
+        // The function ends with the first line that starts with a brace; "\n}"
+        // finds it whatever the line endings.
+        let end = start + source[start..].find("\n}").expect("end of to_unorm8") + 2;
+        let shader = format!(
+            "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n{}\n\
+             @compute @workgroup_size(64)\n\
+             fn main(@builtin(global_invocation_id) id: vec3<u32>) {{\n\
+                 if (id.x < arrayLength(&data)) {{ data[id.x] = to_unorm8(data[id.x]); }}\n\
+             }}\n",
+            &source[start..end]
+        );
 
-        let mut planes = vec![0.0f32; buffers.plane_floats as usize];
-        planes[..values.len()].copy_from_slice(values);
-        let planes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("planes"),
-            contents: bytemuck::cast_slice(&planes),
-            usage: wgpu::BufferUsages::STORAGE,
+        let device = context.device();
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("to_unorm8 test"),
+            source: wgpu::ShaderSource::Wgsl(shader.into()),
         });
-        let packed_bytes = buffers.packed_words * 4;
-        let packed = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("packed"),
-            size: packed_bytes,
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("to_unorm8 test"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let bytes = (values.len() * 4) as u64;
+        let data = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("values"),
+            contents: bytemuck::cast_slice(values),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
         });
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
-            size: packed_bytes,
+            size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        let params = PackParams::new(&layout, &buffers);
-        let params_buffer = uniform_buffer(device, "pack params", &params);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pack"),
-            layout: &pipelines.pack.layout,
-            entries: &[
-                entry(0, &planes_buffer),
-                entry(1, &packed),
-                entry(2, &params_buffer),
-            ],
+            label: Some("to_unorm8 test"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[entry(0, &data)],
         });
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_pipeline(&pipelines.pack.pipeline);
+            pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let (x, y, z) = params.grid();
-            pass.dispatch_workgroups(x, y, z);
+            pass.dispatch_workgroups((values.len() as u32).div_ceil(64), 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&packed, 0, &readback, 0, packed_bytes);
+        encoder.copy_buffer_to_buffer(&data, 0, &readback, 0, bytes);
         context.queue().submit([encoder.finish()]);
 
         let slice = readback.slice(..);
@@ -1014,8 +993,71 @@ mod tests {
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll");
-        let data = slice.get_mapped_range().expect("range");
-        data[..values.len()].to_vec()
+        let levels: Vec<f32> =
+            bytemuck::cast_slice(&slice.get_mapped_range().expect("range")).to_vec();
+        levels.iter().map(|&level| level as u8).collect()
+    }
+
+    /// A frame without blocks: all coefficients zero, every sample mid-grey.
+    fn empty_frame(width: u32, height: u32, chroma: ChromaSubsampling) -> Vec<u8> {
+        let word0 = (width - 1) | ((height - 1) << 14) | (1 << 28) | (1 << 31);
+        let word1 = u32::from(chroma == ChromaSubsampling::Yuv444) << 26;
+        [word0.to_le_bytes(), word1.to_le_bytes()].concat()
+    }
+
+    #[test]
+    fn the_last_level_writes_every_word_with_zero_padding() {
+        let Some(context) = context() else {
+            return;
+        };
+
+        // Odd widths leave padding in the last word of a row; 4:2:0 chroma
+        // ends at level 1, whose size need not be a multiple of the tile.
+        let mut shapes = Vec::new();
+        for width in [1u32, 2, 3, 5, 31, 33, 127, 129, 131] {
+            for height in [1u32, 2, 3, 33, 131] {
+                shapes.push((width, height, ChromaSubsampling::Yuv444));
+            }
+        }
+        for width in [2u32, 6, 30, 34, 98, 130, 194, 226] {
+            for height in [2u32, 6, 34, 130] {
+                shapes.push((width, height, ChromaSubsampling::Yuv420));
+            }
+        }
+
+        for (width, height, chroma) in shapes {
+            let mut decoder = Decoder::new(&context, width, height, chroma).unwrap();
+            // Anything the decode leaves unwritten keeps this pattern.
+            let size = decoder.buffers.packed_words as usize * 4;
+            decoder
+                .queue
+                .write_buffer(&decoder.packed, 0, &vec![0xA5; size]);
+            decoder
+                .assemble_complete(&empty_frame(width, height, chroma))
+                .unwrap();
+            let (packed, _) = decoder
+                .run_gpu(None, Read::Yuv, false, Duration::ZERO)
+                .unwrap();
+
+            for component in Component::ALL {
+                let i = component.index();
+                let (w, h) = decoder.layout().plane_size(component);
+                let stride = decoder.buffers.packed_strides[i] as usize * 4;
+                let start = decoder.buffers.packed_offsets[i] as usize * 4;
+                for row in 0..h as usize {
+                    let line = &packed[start + row * stride..start + (row + 1) * stride];
+                    let (samples, padding) = line.split_at(w as usize);
+                    assert!(
+                        samples.iter().all(|&s| s == 128),
+                        "{width}x{height} {chroma:?} {component:?} row {row}: {samples:?}"
+                    );
+                    assert!(
+                        padding.iter().all(|&p| p == 0),
+                        "{width}x{height} {chroma:?} {component:?} row {row}, padding {padding:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1058,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn packing_rounds_ties_to_even_like_the_cpu() {
+    fn the_last_level_rounds_ties_to_even_like_the_cpu() {
         let Some(context) = context() else {
             return;
         };
@@ -1082,6 +1124,6 @@ mod tests {
         // Round-half-up would get half of the ties wrong, so there must be plenty.
         assert!(ties >= 40, "only {ties} exact ties");
 
-        assert_eq!(pack(&context, &values), expected);
+        assert_eq!(to_unorm8_on_gpu(&context, &values), expected);
     }
 }

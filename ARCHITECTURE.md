@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (M5, v0.1.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. `emberwave-cli` decodes files with them. Decode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
+> **Status (v0.2.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. `emberwave-cli` decodes files with them. Decode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
 
 ## Overview
 
@@ -13,10 +13,8 @@ bytes ──► [CPU] packet parser ──► block table + payload words
                          [GPU] dequantisation (bit-planes + signs → float coefficients)
                                        │
                                        ▼
-                         [GPU] inverse DWT, level by level (5 levels)
-                                       │
-                                       ▼
-                         [GPU] Y / Cb / Cr planes, packed to 8 bits
+                         [GPU] inverse DWT, level by level (5 levels);
+                               the last level writes 8-bit Y / Cb / Cr planes
                                        │
                                        ▼
                          [GPU] YUV → RGB (optional)
@@ -304,13 +302,12 @@ The gap to the default precision is the reference decoder's own FP16 storage. In
 
 ### Stages
 
-A frame takes seven dispatches in three compute passes, whatever its size, and an eighth dispatch in a fourth pass when it is converted to RGB:
+A frame takes six dispatches in two compute passes, whatever its size, and a seventh dispatch in a third pass when it is converted to RGB:
 
 | Stage | Shader | Dispatch | Reads | Writes |
 |---|---|---|---|---|
 | Dequantisation | `dequant.wgsl` | 1: one workgroup of 128 invocations per block index | payload, block offsets | the pyramid |
-| Inverse DWT | `idwt.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or the float planes |
-| Packing | `pack.wgsl` | 1: one invocation per output word | float planes | packed 8-bit planes |
+| Inverse DWT | `idwt.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or, at the last level of a component, the packed 8-bit planes |
 | Colour conversion (optional) | `yuv2rgb.wgsl` | 1: one invocation per pixel | packed planes | RGBA words |
 
 The packed planes are copied to a mappable buffer and returned as a `Frame`. When the frame is converted to RGB, the RGBA words are copied instead, as an `RgbFrame`, and the packed planes stay in GPU memory.
@@ -322,7 +319,6 @@ The packed planes are copied to a mappable buffer and returned as a `Frame`. Whe
 | payload (`array<u32>`) | received blocks, padded with four zero words | grows on demand, 64 KiB at least |
 | block offsets (`array<u32>`) | word offset of every block, `u32::MAX` if missing | 49 KiB |
 | pyramid (`array<f32>`) | the four bands of every level of every component, back to back | 63.6 MiB |
-| float planes (`array<f32>`) | the finished planes, in `[0, 1]` | 47.5 MiB |
 | packed planes (`array<u32>`) | 8-bit planes, four pixels per word, rows padded to words | 11.9 MiB |
 | readback (`MAP_READ`) | copy of the packed planes for the CPU | 11.9 MiB |
 | RGBA words (`array<u32>`) | one word per pixel, created on the first RGB decode | 31.6 MiB |
@@ -332,7 +328,7 @@ The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 
 
 Per-dispatch parameters (band table, tile sizes, buffer offsets) depend only on the picture size, so they are computed once and live in small uniform buffers.
 
-No GPU resource outlives a frame. The decoder's own buffers are created once (the payload buffer grows when a frame needs more room), and the only allocations of a frame are the staging buffers wgpu uses for `Queue::write_buffer`, three or four of them, which it frees when the frame is done. The test `decoding_frame_after_frame_allocates_nothing` compares every count wgpu keeps of live objects and memory (buffers, textures, bind groups, pipelines, command encoders, query sets and so on; Metal does not count memory) after a first pass over every frame and every way of decoding with the counts after 48 more decodes. The same check over 1000 frames of a 4K stream, `a_thousand_4k_frames_leave_no_trace`, which runs on request, found 21 buffers, 9 bind groups, 3 command encoders and 1 query set before and after on an Apple M3 Max (2026-10-23). `scripts/soak.sh` found the resident memory of `emberwave-cli` flat at 178 MiB while it decoded 1000 4K frames to RGB and read them back.
+No GPU resource outlives a frame. The decoder's own buffers are created once (the payload buffer grows when a frame needs more room), and the only allocations of a frame are the staging buffers wgpu uses for `Queue::write_buffer`, three or four of them, which it frees when the frame is done. The test `decoding_frame_after_frame_allocates_nothing` compares every count wgpu keeps of live objects and memory (buffers, textures, bind groups, pipelines, command encoders, query sets and so on; Metal does not count memory) after a first pass over every frame and every way of decoding with the counts after 48 more decodes. The same check over 1000 frames of a 4K stream, `a_thousand_4k_frames_leave_no_trace`, which runs on request, found 19 buffers, 8 bind groups, 3 command encoders and 1 query set before and after on an Apple M3 Max (2026-10-23, v0.2.0). `scripts/soak.sh` found the resident memory of `emberwave-cli` flat at 178 MiB while it decoded 1000 4K frames to RGB and read them back.
 
 ### Dequantisation
 
@@ -351,13 +347,15 @@ A workgroup of 256 invocations produces a 32x32 tile of one level's output:
 
 1. It loads a 40x40 window of the interleaved image into workgroup memory (6400 bytes). Each window coordinate is mirrored about the level's true size, using whole-sample symmetry, which preserves the parity of the coordinate; the parity picks the band (LL, HL, LH or HH) and the mirrored coordinate halved picks the sample. Four samples of extension on each side are what four lifting steps need.
 2. Horizontal pass: 160 invocations each take 16 samples of a window row, apply the gain and the four lifting steps in registers and keep the 8 valid results (workgroup memory, 5120 bytes). The apron of a segment is recomputed rather than shared.
-3. Vertical pass: 128 invocations do the same down a column and store the 8 results: into the LL band of the next level, or, at the finest level of a component, shifted by +0.5 and clamped into the float plane.
+3. Vertical pass: 128 invocations do the same down a column and store the 8 results into the LL band of the next level. At the last level of a component they are 8-bit samples instead, packed as described next.
 
-Total workgroup memory is 11520 bytes. Tiles that stick out of the image (the coarsest levels can be 8x8) are computed in full and stored with bounds checks, and mirroring always uses the true level size, never the picture size. The component is the z index of the dispatch; at level 0 a 4:2:0 frame has luma only.
+The lifting, and the loads and stores around it, are written out with constant indices, which keeps the samples in registers (D24). Total workgroup memory is 11520 bytes. Tiles that stick out of the image (the coarsest levels can be 8x8) are computed in full and stored with bounds checks, and mirroring always uses the true level size, never the picture size. The component is the z index of the dispatch; at level 0 a 4:2:0 frame has luma only.
 
-### Packing
+### 8-bit output
 
-Float planes become 8-bit samples with `round(v * 255)`. WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words; the CPU side cuts the padding off.
+The last level of each component writes the decoded plane as 8-bit samples, which is what upstream's UNORM storage images hold. A sample is `round(clamp(v + 0.5, 0, 1) * 255)` (`to_unorm8` in `idwt.wgsl`); the float picture never goes to memory. The vertical pass leaves the 8-bit levels of its 32x32 tile in the window array, which is free by then, and after one barrier each of the 256 invocations writes one word: four samples of a tile row. Every level waits at that barrier, though only the last needs it. Inside `if (is_final)` the barrier would be legal, since `is_final` is the same for the whole workgroup, but there it crashed WARP, Direct3D's software rasteriser, in CI; a bisection of the commits pinned the crash on it.
+
+WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words with zero samples; the CPU side cuts the padding off.
 
 ### Colour conversion
 
@@ -407,11 +405,11 @@ What the stage leaves alone: the result is the encoded, non-linear R'G'B' of the
 |---|---|
 | `prepare` | CPU time to assemble the frame, upload the payload and the block table and, for RGB, write the conversion parameters |
 | `gpu_wall` | Wall-clock time from creating the command encoder until the GPU is idle again: encoding, submission, execution and the wait. With a readback it includes that |
-| `stages` | GPU time per pass, from timestamp queries: dequantisation, the inverse transform (all five levels together), packing and, for RGB, the colour conversion |
+| `stages` | GPU time per pass, from timestamp queries: dequantisation, the inverse transform (all five levels together, including the 8-bit output) and, for RGB, the colour conversion |
 
 Timestamps are written at the beginning and the end of each compute pass and resolved into a small buffer that is read after the frame. That needs only `Features::TIMESTAMP_QUERY`, which the browser offers too. Writes between dispatches (`TIMESTAMP_QUERY_INSIDE_PASSES`) are not available on Apple GPUs, so a pass is the finest granularity, which is why the five levels of the inverse transform are timed together. Where the feature is missing `stages` is `None` and the tools print the CPU and wall-clock numbers only.
 
-The wall-clock time exceeds the sum of the stages, because submitting work and noticing that it has finished take time of their own. For the 192x136 test vector, decoded to RGB on an Apple M3 Max (Metal, wgpu 30.0.1, 2026-10-23), the stages add up to about 0.15 ms and `gpu_wall` is about 0.42 ms, with 0.04 ms of `prepare` on top. Both are reported: the first says how long the GPU works, the second how long the application waits for its picture.
+The wall-clock time exceeds the sum of the stages, because submitting work and noticing that it has finished take time of their own. For the 192x136 test vector, decoded to RGB on an Apple M3 Max (Metal, wgpu 30.0.1, 2026-10-23), the stages add up to about 0.07 ms and `gpu_wall` is about 0.32 ms, with 0.03 ms of `prepare` on top (v0.2.0; v0.1.0 took 0.15 and 0.42 ms). Both are reported: the first says how long the GPU works, the second how long the application waits for its picture.
 
 ### Portability
 
@@ -419,7 +417,7 @@ The shaders use only what WebGPU guarantees: no subgroup operations, no 8-bit or
 
 - `tests/shaders.rs` validates the WGSL with naga using an empty capability set, without a GPU, and checks the workgroup sizes and memory.
 - `tests/gpu.rs` creates a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decodes a vector on it.
-- The rounding rule of the packing stage is checked on the real backend against the CPU's, on inputs that are exact ties (`gpu::decoder` unit test).
+- The rounding rule of the last level is checked on the real backend against the CPU's, on inputs that are exact ties: a unit test of `gpu::decoder` cuts `to_unorm8` out of `idwt.wgsl` and runs it.
 
 What upstream uses and what replaces it:
 
@@ -429,7 +427,7 @@ What upstream uses and what replaces it:
 | `uint8_t` / `uint16_t` buffer access | `array<u32>` with shifts |
 | `textureGather` with a mirrored sampler | Explicit mirroring, then a load from the band buffer |
 | FP16 storage images, `PYROWAVE_PRECISION` modes | FP32 buffers |
-| 8-bit UNORM storage images for the output | A packing pass into `array<u32>` |
+| 8-bit UNORM storage images for the output | The last inverse transform level packs four samples per `array<u32>` word |
 | Dozens of dispatches, one per band | One dequantisation dispatch and one per level |
 | Hardware bilinear filtering of the chroma textures (viewer) | Integer taps and weights in the shader |
 
@@ -441,12 +439,12 @@ Run on 2026-10-23 with the committed vectors on an Apple M3 Max (Metal):
 |---|---|
 | Dequantised coefficients, GPU against CPU, all vectors | Bit-identical |
 | The same on synthetic frames with every quantiser code, sparse ballots, all-zero control words and missing blocks | Bit-identical |
-| LL bands after each inverse level, GPU against CPU | Largest difference 8.0e-7 (the tolerance is 1e-5) |
+| LL bands after each inverse level, GPU against CPU | Largest difference 6.6e-7 (the tolerance is 1e-5) |
 | Decoded planes against the default-precision reference | Worst 64.83 dB (needs 60), largest difference 1 LSB |
 | Decoded planes against the FP32 reference | Worst 86.28 dB (needs 80), most planes bit-identical |
 | RGB output, GPU against the CPU conversion: all vectors, three matrices, both ranges, both sitings | Largest difference 1; at most 0.003 % of the samples differ |
 | 4K stream decoded by `emberwave-cli`, planes against the default-precision reference | Worst 65.64 dB (needs 60), largest difference 1 LSB |
-| The same stream against the FP32 reference | Worst 96.31 dB (needs 80), largest difference 1 LSB |
+| The same stream against the FP32 reference | Worst 96.56 dB (needs 80), largest difference 1 LSB |
 
 The GPU numbers equal the CPU decoder's, which is the point: the GPU pipeline adds no error of its own beyond float rounding.
 
@@ -551,7 +549,7 @@ Short-form ADRs, newest last. Each entry is dated.
 
 ### 2026-10-23 — D14: Output as packed 8-bit buffers
 
-**Decision.** The planes are packed to `u32` words by a separate pass because `r8unorm` storage textures are outside the portable set. The same buffer serves the readback now and will feed the colour conversion in M3.
+**Decision.** (Superseded by D24: the last inverse transform level packs, there is no separate pass.) The planes are packed to `u32` words by a separate pass because `r8unorm` storage textures are outside the portable set. The same buffer serves the readback now and will feed the colour conversion in M3.
 
 ### 2026-10-23 — D15: What is compared exactly
 
@@ -627,3 +625,16 @@ Warm-up is both a number of frames and a time: at least 10 frames and at least o
 **Decision.** A tag `vX.Y.Z` runs `.github/workflows/release.yml`. It first checks that the tag names the version in `Cargo.toml` and a commit on `main`. Then it builds `emberwave-cli` on GitHub's runners for x86_64 Linux, Apple Silicon macOS and x86_64 Windows, packs each binary with the README, the licence and the changelog (`.tar.gz`, `.zip` on Windows), and publishes a GitHub release with SHA-256 checksums, whose notes are the version's section of `CHANGELOG.md`. The release workflow uses only first-party actions and the `gh` CLI. The binaries are not signed or notarised; the README says how to run the macOS one.
 
 **Consequence.** Intel Macs and ARM Linux build from source for now.
+
+### 2026-10-23 — D24: Decode speed: registers, 8-bit output in the transform, a cheaper block check
+
+**Context.** v0.1.0 decoded a 4K frame in 4.28 ms, 3.58 ms of it on the GPU, on an Apple M3 Max, where upstream's Metal decoder takes 0.78 ms (0.49 ms on the GPU) at FP32 (issue #11). The inverse transform was 82 % of the GPU time.
+
+**Decision.**
+- Arrays local to an invocation are indexed with constants only. The inverse transform loaded 16 samples into a local array, lifted them and stored 8, all with loops over a variable index, and passed the array to `lift()` by pointer; the compiler kept the array in memory rather than in registers. Written out sample by sample, the transform takes 0.65 ms instead of 2.93 ms. The same change to the eight values of a subblock in the dequantiser takes it from 0.45 to 0.36 ms (0.72 to 0.51 ms on the noise stream).
+- The last level of the inverse transform writes the 8-bit planes itself (see [8-bit output](#8-bit-output)), which replaces the float planes and the packing pass of D14: a 0.19 ms pass and 47.5 MiB of GPU memory at 4K go away. Its barrier sits outside the branch for the last level, because a barrier inside it crashed WARP.
+- The dequantiser finds the band of its block by a binary search of the band table instead of scanning all of it: every invocation read up to 48 entries from the uniform block. Dequantisation then takes 0.17 ms instead of 0.34 ms.
+- The frame assembler validates incoming blocks with `BlockStructure::check_bytes`, the checks of building the full structure without building it: 0.057 ms instead of 0.161 ms for a 4K frame, which is what upstream's `push_packet` takes.
+- Two other ideas were measured and dropped. Padding the workgroup arrays against bank conflicts gained nothing, and on the faster transform cost 7 %. Writing dequantised blocks through workgroup memory so that their stores are coalesced cost 13 %: the caches of Apple GPUs absorb the scattered stores.
+
+**Consequence.** A 4K frame decodes to planes in 1.38 ms, 0.80 ms of it on the GPU: 1.8 and 1.7 times upstream's FP32 times on the same machine. With the conversion to RGB it takes 1.63 ms instead of 4.53 ms; `BENCHMARKS.md` has the numbers. `StageTimings` lost its `pack` field, so the next release is 0.2.0. Shaders in this project index function-scope arrays with constants only (`CONTRIBUTING.md`).
