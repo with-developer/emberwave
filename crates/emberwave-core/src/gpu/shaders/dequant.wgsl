@@ -117,8 +117,8 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     let origin_y = (relative / band.blocks_x) * BLOCK_SIZE;
 
     // The offset is loaded by one invocation and shared through
-    // workgroupUniformLoad, which makes it uniform: the early return below
-    // then leaves the later barriers legal.
+    // workgroupUniformLoad, which makes it uniform: the branch on a missing
+    // block below may then contain barriers.
     if (tid == 0u) {
         shared_offset = block_offsets[block_index];
     }
