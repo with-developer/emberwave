@@ -10,7 +10,10 @@ mod common;
 
 use std::sync::OnceLock;
 
-use common::{Reference, max_abs_diff, psnr, read_reference, vector_frames, vector_names};
+use common::{
+    Reference, frames_of, max_abs_diff, psnr, read_reference, testdata_dir, vector_frames,
+    vector_names,
+};
 use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
 use emberwave_core::bitstream::{
     Band, BlockHeader, ChromaSiting, ChromaSubsampling, Component, FrameAssembler, FrameLayout,
@@ -672,6 +675,79 @@ fn timing_a_frame_reports_where_the_time_goes() {
     }
 }
 
+/// Every count of live GPU objects and memory that wgpu keeps for a context's
+/// device (the tests build wgpu with its `counters` feature), as text: buffers,
+/// textures and their views, bind groups and their layouts, pipelines,
+/// samplers, command encoders, shader modules, query sets, fences, memory.
+/// wgpu 30 keeps the object counts on Vulkan, Metal and DX12; Metal leaves the
+/// memory at zero, and no backend counts memory allocations.
+fn live_resources(context: &GpuContext) -> String {
+    format!("{:?}", context.device().get_internal_counters().hal)
+}
+
+/// Decodes `frame` in the way `round` selects, so that a loop goes through
+/// all of them: planes, RGB, and both timed variants.
+fn decode_one_way(decoder: &mut Decoder, frame: &[u8], round: usize) {
+    let color = ColorParams::default();
+    match round % 4 {
+        0 => drop(decoder.decode(frame).expect("decode")),
+        1 => drop(decoder.decode_rgb(frame, &color).expect("RGB decode")),
+        2 => drop(
+            decoder
+                .time_frame(frame, TimedOutput::Yuv)
+                .expect("timed decode"),
+        ),
+        _ => drop(
+            decoder
+                .time_frame(frame, TimedOutput::Rgb(color))
+                .expect("timed RGB decode"),
+        ),
+    }
+}
+
+/// Decodes `count` frames, cycling through `frames` and through the ways of
+/// decoding, and returns the live resources before and after the loop.
+fn resources_around(
+    context: &GpuContext,
+    decoder: &mut Decoder,
+    frames: &[Vec<u8>],
+    count: usize,
+) -> (String, String) {
+    // First every frame once and every way of decoding once: that creates
+    // everything a decoder ever needs, including the payload buffer at the
+    // size of the largest frame (it grows, and stays grown).
+    for round in 0..frames.len().max(4) {
+        decode_one_way(decoder, &frames[round % frames.len()], round);
+    }
+    assert!(
+        context.device().get_internal_counters().hal.buffers.read() > 0,
+        "wgpu's counters read zero: are they enabled for the tests?"
+    );
+    let before = live_resources(context);
+    for (round, frame) in frames.iter().cycle().take(count).enumerate() {
+        decode_one_way(decoder, frame, round);
+    }
+    (before, live_resources(context))
+}
+
+#[test]
+fn decoding_frame_after_frame_allocates_nothing() {
+    // A context of its own: the counters belong to the device, and the shared
+    // context is busy with the other tests.
+    let options = GpuOptions {
+        timestamps: true,
+        ..GpuOptions::default()
+    };
+    let Some(context) = create_context(&options) else {
+        return;
+    };
+    let (layout, frames) = vector_frames("noise_192x136_420");
+    let mut decoder = decoder_for(&context, &layout);
+
+    let (before, after) = resources_around(&context, &mut decoder, &frames, 48);
+    assert_eq!(after, before, "live GPU objects and memory");
+}
+
 #[test]
 fn a_lost_device_is_an_error_rather_than_a_stale_result() {
     // A context of its own, since destroying the device loses it for good.
@@ -702,4 +778,35 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
         );
     }
     assert!(context.lost().is_some());
+}
+
+/// The leak check of milestone M5: 1000 frames of a 4K stream, decoded in
+/// every way in turn, leave the GPU resources as they were after the first
+/// frames. It needs the streams of `scripts/gen_bench_data.sh` and takes a
+/// while, so it only runs on request:
+/// `cargo test --release -p emberwave-core --test gpu -- --ignored --nocapture`.
+/// `scripts/soak.sh` watches the memory of the process for the same purpose.
+#[test]
+#[ignore = "decodes 1000 4K frames; needs scripts/gen_bench_data.sh"]
+fn a_thousand_4k_frames_leave_no_trace() {
+    const FRAMES: usize = 1000;
+    let path = testdata_dir().join("generated/scene_4k_420.pwv1");
+    let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+        panic!("{}: {error}; run scripts/gen_bench_data.sh", path.display())
+    });
+    let options = GpuOptions {
+        timestamps: true,
+        ..GpuOptions::default()
+    };
+    let context = create_context(&options).expect("this test needs a GPU");
+    let (layout, frames) = frames_of("scene_4k_420", &bytes);
+    let mut decoder = decoder_for(&context, &layout);
+
+    let start = std::time::Instant::now();
+    let (before, after) = resources_around(&context, &mut decoder, &frames, FRAMES);
+    eprintln!(
+        "{FRAMES} 4K frames in {:.1?}\nbefore: {before}\nafter:  {after}",
+        start.elapsed()
+    );
+    assert_eq!(after, before);
 }
