@@ -8,7 +8,7 @@ A portable ([wgpu](https://wgpu.rs)) port of the [PyroWave](https://github.com/T
 
 PyroWave is an intra-only codec built for very fast GPU encode and decode (upstream reports under ~0.1 ms at 1080p and ~0.2 ms at 4K) for local-network game streaming. Its reference implementation is written as Vulkan compute shaders. **emberwave reimplements the decoder in Rust + WGSL on top of wgpu**, so a single code base can target Vulkan, Metal, DX12 and WebGPU.
 
-> **Status: pre-alpha.** The bitstream parser and a CPU reference decoder exist and match the original decoder on real encoder output; the GPU decoder is next. Follow progress in the roadmap below.
+> **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode, tested on Metal and on a software Vulkan driver in CI). Colour conversion, the CLI and benchmarks come next. Follow progress in the roadmap below.
 
 ## Goals
 
@@ -24,7 +24,7 @@ Each milestone is tracked in its own issue.
 
 - [x] **M0** Bootstrap: workspace, CI, documentation skeleton, license ([#1](https://github.com/with-developer/emberwave/issues/1))
 - [x] **M1** Bitstream format and parser ([#2](https://github.com/with-developer/emberwave/issues/2))
-- [ ] **M2** GPU decode pipeline: dequantisation and inverse DWT ([#3](https://github.com/with-developer/emberwave/issues/3))
+- [x] **M2** GPU decode pipeline: dequantisation and inverse DWT ([#3](https://github.com/with-developer/emberwave/issues/3))
 - [ ] **M3** Colour conversion and CLI ([#4](https://github.com/with-developer/emberwave/issues/4))
 - [ ] **M4** Benchmarks and documentation ([#5](https://github.com/with-developer/emberwave/issues/5))
 - [ ] **M5** Stabilisation and the v0.1.0 release ([#6](https://github.com/with-developer/emberwave/issues/6))

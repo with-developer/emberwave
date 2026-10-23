@@ -20,6 +20,7 @@ jobs:
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -35,18 +36,41 @@ jobs:
   build-test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # Linux runs the GPU tests on lavapipe, a software Vulkan driver, and
+          # a missing adapter there is a failure. On macOS and Windows the GPU
+          # tests use whatever adapter the runner has (Metal, or DX12 with
+          # WARP) and skip if there is none.
+          - os: ubuntu-latest
+            require_gpu: "1"
+          - os: macos-latest
+            require_gpu: ""
+          - os: windows-latest
+            require_gpu: ""
+    env:
+      EMBERWAVE_REQUIRE_GPU: ${{ matrix.require_gpu }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install a software Vulkan driver (lavapipe)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
+          vulkaninfo --summary
       - name: Install stable toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --workspace --all-targets
+      # Prints which adapter the GPU tests run on, how long creating a decoder
+      # takes (shader compilation) and how close the GPU is to the CPU.
+      - name: Report the GPU adapter
+        run: cargo test -p emberwave-core --test gpu inverse_transform -- --nocapture
       - run: cargo test --workspace

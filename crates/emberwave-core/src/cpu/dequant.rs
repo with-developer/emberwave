@@ -272,7 +272,7 @@ mod tests {
         bytes.extend_from_slice(&control_word.to_le_bytes());
         bytes.push(qscale);
         bytes.extend_from_slice(&[sb0_plane, sb1_msb, sb1_lsb, signs]);
-        while bytes.len() % 4 != 0 {
+        while !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
         let words: Vec<u32> = bytes
@@ -317,7 +317,7 @@ mod tests {
         bytes.extend_from_slice(&control_word.to_le_bytes());
         bytes.push(0x00);
         bytes.push(0x01); // the plane: value 0 set; this is the last byte of the block
-        while bytes.len() % 4 != 0 {
+        while !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
         let mut words: Vec<u32> = bytes
@@ -350,7 +350,7 @@ mod tests {
         bytes.push(0x40);
         bytes.push(0xFF); // all 8 values have magnitude 1
         bytes.push(0x00); // 8 sign bits, all positive
-        while bytes.len() % 4 != 0 {
+        while !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
         let mut words: Vec<u32> = bytes

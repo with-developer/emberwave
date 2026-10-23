@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (M1).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`. The GPU pipeline is written in M2. The decision log at the end is kept up to date.
+> **Status (M2).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu` and the wgpu/WGSL decoder in `emberwave_core::gpu`. Colour conversion and the CLI come in M3. The decision log at the end is kept up to date.
 
 ## Overview
 
@@ -25,7 +25,7 @@ Steps that upstream runs on the CPU stay on the CPU, and steps that upstream run
 |---|---|
 | `bitstream` | Pure Rust, GPU independent: headers, block layout, packet assembly, PWV1 files. Never panics on malformed input. This is the CPU stage. |
 | `cpu` | Dequantisation and inverse DWT as plain sequential Rust, following `bitstream.md` literally. A test oracle and the yardstick for shader stages, not a product feature. |
-| `gpu` (M2) | wgpu pipelines and WGSL shaders for the GPU stages. |
+| `gpu` | wgpu pipelines and WGSL shaders for the GPU stages (cargo feature `gpu`, on by default). |
 
 ## Bitstream format
 
@@ -296,7 +296,92 @@ The gap to the default precision is the reference decoder's own FP16 storage. In
 
 ## GPU pipeline
 
-To be written in M2.
+`gpu::Decoder` decodes frames of one size and chroma format. All GPU memory is allocated when it is created and reused for every frame. The payload buffer is the one exception: it grows when a frame needs more room.
+
+### Stages
+
+A frame takes seven dispatches in three compute passes, whatever its size:
+
+| Stage | Shader | Dispatch | Reads | Writes |
+|---|---|---|---|---|
+| Dequantisation | `dequant.wgsl` | 1: one workgroup of 128 invocations per block index | payload, block offsets | the pyramid |
+| Inverse DWT | `idwt.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or the float planes |
+| Packing | `pack.wgsl` | 1: one invocation per output word | float planes | packed 8-bit planes |
+
+The packed planes are copied to a mappable buffer and returned as a `Frame`.
+
+### Memory
+
+| Buffer | Content | Size for 4K 4:2:0 |
+|---|---|---|
+| payload (`array<u32>`) | received blocks, padded with four zero words | grows on demand, 64 KiB at least |
+| block offsets (`array<u32>`) | word offset of every block, `u32::MAX` if missing | 49 KiB |
+| pyramid (`array<f32>`) | the four bands of every level of every component, back to back | 63.6 MiB |
+| float planes (`array<f32>`) | the finished planes, in `[0, 1]` | 47.5 MiB |
+| packed planes (`array<u32>`) | 8-bit planes, four pixels per word, rows padded to words | 11.9 MiB |
+| readback (`MAP_READ`) | copy of the packed planes for the CPU | 11.9 MiB |
+
+The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 to 0 have room where the inverse transform of the level above writes them. Every band is rewritten for every frame, with zeros for blocks that were not received, so nothing needs clearing. The sizes of the pyramid and the planes are checked against the device limits when the decoder is created. The payload buffer is checked the same way every time it grows: a frame whose payload does not fit gives `GpuError::LimitExceeded` instead of an allocation that fails. With the WebGPU default of 128 MiB that can only happen for a stream of maximal blocks (a 4K frame of them is about 200 MiB); real frames are a few MiB.
+
+Per-dispatch parameters (band table, tile sizes, buffer offsets) depend only on the picture size, so they are computed once and live in small uniform buffers.
+
+### Dequantisation
+
+One workgroup per block index, found by a lookup in a table of the (at most 48) transmitted bands. Each invocation decodes the 8 values of one 4x2 subblock. If a block was not received, a value that comes through `workgroupUniformLoad` makes the whole workgroup write zeros and return, so the later barriers stay in uniform control flow.
+
+1. Sixteen invocations read the control word and scale byte of one 8x8 block each and compute its number of bit-plane bytes into workgroup memory.
+2. After a barrier every invocation adds up the sizes before its own 8x8 block, and the sizes of the preceding subblocks of its block, to find its bit-planes, and decodes its magnitudes.
+3. Every non-zero value takes one sign bit. Each invocation writes its count to workgroup memory; after a barrier sixteen invocations total the counts of one 8x8 block each; after a second barrier every invocation adds the totals of the earlier 8x8 blocks and the counts of the earlier subblocks of its block to find its first sign bit.
+4. Values are computed as `(m + 0.5) * (scale32 * scale8)`, the same expression and order as the CPU decoder, and stored with bounds checks.
+
+Without subgroup operations the prefix sum costs two barriers and about 20 workgroup memory reads per invocation.
+
+### Inverse transform
+
+A workgroup of 256 invocations produces a 32x32 tile of one level's output:
+
+1. It loads a 40x40 window of the interleaved image into workgroup memory (6400 bytes). Each window coordinate is mirrored about the level's true size, using whole-sample symmetry, which preserves the parity of the coordinate; the parity picks the band (LL, HL, LH or HH) and the mirrored coordinate halved picks the sample. Four samples of extension on each side are what four lifting steps need.
+2. Horizontal pass: 160 invocations each take 16 samples of a window row, apply the gain and the four lifting steps in registers and keep the 8 valid results (workgroup memory, 5120 bytes). The apron of a segment is recomputed rather than shared.
+3. Vertical pass: 128 invocations do the same down a column and store the 8 results: into the LL band of the next level, or, at the finest level of a component, shifted by +0.5 and clamped into the float plane.
+
+Total workgroup memory is 11520 bytes. Tiles that stick out of the image (the coarsest levels can be 8x8) are computed in full and stored with bounds checks, and mirroring always uses the true level size, never the picture size. The component is the z index of the dispatch; at level 0 a 4:2:0 frame has luma only.
+
+### Packing
+
+Float planes become 8-bit samples with `round(v * 255)`. WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words; the CPU side cuts the padding off.
+
+### Portability
+
+The shaders use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. Two tests hold this to account:
+
+- `tests/shaders.rs` validates the WGSL with naga using an empty capability set, without a GPU, and checks the workgroup sizes and memory.
+- `tests/gpu.rs` creates a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decodes a vector on it.
+- The rounding rule of the packing stage is checked on the real backend against the CPU's, on inputs that are exact ties (`gpu::decoder` unit test).
+
+What upstream uses and what replaces it:
+
+| Upstream (Vulkan) | emberwave (WGSL) |
+|---|---|
+| Subgroup scans in the dequantiser | Workgroup memory sums, two barriers |
+| `uint8_t` / `uint16_t` buffer access | `array<u32>` with shifts |
+| `textureGather` with a mirrored sampler | Explicit mirroring, then a load from the band buffer |
+| FP16 storage images, `PYROWAVE_PRECISION` modes | FP32 buffers |
+| 8-bit UNORM storage images for the output | A packing pass into `array<u32>` |
+| Dozens of dispatches, one per band | One dequantisation dispatch and one per level |
+
+### Verification
+
+Run on 2026-10-23 with the committed vectors on an Apple M3 Max (Metal):
+
+| Check | Result |
+|---|---|
+| Dequantised coefficients, GPU against CPU, all vectors | Bit-identical |
+| The same on synthetic frames with every quantiser code, sparse ballots, all-zero control words and missing blocks | Bit-identical |
+| LL bands after each inverse level, GPU against CPU | Largest difference 8.0e-7 (the tolerance is 1e-5) |
+| Decoded planes against the default-precision reference | Worst 64.83 dB (needs 60), largest difference 1 LSB |
+| Decoded planes against the FP32 reference | Worst 86.28 dB (needs 80), most planes bit-identical |
+
+The GPU numbers equal the CPU decoder's, which is the point: the GPU pipeline adds no error of its own beyond float rounding.
 
 ## Decisions
 
@@ -365,3 +450,33 @@ Short-form ADRs, newest last. Each entry is dated.
 ### 2026-10-23 — D11: New dependencies
 
 **Decision.** `thiserror` for the error type (`CLAUDE.md` lists it for M5; adding it now avoids rewriting the error type later). `proptest` as a dev-dependency for the "must not panic on malformed input" requirement: unlike `cargo fuzz` it runs on stable inside `cargo test`, so CI exercises it on every push, and `PROPTEST_CASES` scales it up for a deeper pass.
+
+### 2026-10-23 — D12: One dequantisation dispatch for the whole frame
+
+**Context.** Upstream dispatches the dequantiser once per band, about 50 dispatches for a frame, each with its own push constants. wgpu has no push constants in the portable set.
+
+**Decision.** One dispatch with one workgroup per block index. The workgroup finds its band in a table of at most 48 entries (a uniform block) and its block's offset in the block table. The grid is two-dimensional once there are more than 65535 blocks. The prefix sum over sign bits uses per-8x8-block totals (two barriers) instead of a scan over 128 invocations.
+
+**Consequence.** A frame is seven dispatches. Parameters never change between frames, so they are written once.
+
+### 2026-10-23 — D13: Own inverse transform kernel, FP32 buffers
+
+**Context.** Upstream loads the inverse transform's input through `textureGather` and a mirrored sampler, and stores the wavelet pyramid as FP16 or FP32 storage images. `r16float` storage images are not in the portable set, and the sampler's mirroring is not the whole-sample symmetric extension the format needs without per-coordinate fix-ups.
+
+**Decision.** Explicit mirroring of the interleaved coordinates and plain `f32` storage buffers. A 32x32 output tile per workgroup with a 40x40 window in workgroup memory, as described above. FP16 packing of the pyramid is an optimisation for later, to be weighed against the accuracy it costs (the original's default FP16 storage is why it sits about 20 dB below its FP32 mode).
+
+### 2026-10-23 — D14: Output as packed 8-bit buffers
+
+**Decision.** The planes are packed to `u32` words by a separate pass because `r8unorm` storage textures are outside the portable set. The same buffer serves the readback now and will feed the colour conversion in M3.
+
+### 2026-10-23 — D15: What is compared exactly
+
+**Decision.** Dequantised coefficients are compared bit for bit between GPU and CPU: they come from integer decoding and one multiplication, so they have no excuse to differ. The inverse transform is compared with a tolerance (1e-5; 8.0e-7 observed), because a GPU compiler may fuse a multiply and an add, which a CPU build does not, and WGSL cannot switch that off. Whole frames are compared with the PSNR bars of D9.
+
+### 2026-10-23 — D16: wgpu 30, the `gpu` feature and its dependencies
+
+**Decision.** `wgpu` 30.0.1 with the `vulkan`, `metal`, `dx12`, `wgsl`, `std` and `parking_lot` features, without GLES (which would need EGL) and without the browser backend (the wasm build gets its own crate later). The `rust-version` is raised to 1.87, wgpu's. The GPU code is behind the cargo feature `gpu`, on by default, so the parser and the CPU decoder can be used without wgpu.
+
+New crates: `wgpu`; `pollster` to block on wgpu's futures in the synchronous API; `bytemuck` (with `derive`) to hand `u32` and parameter structs to buffers without `unsafe`, which the workspace forbids; `naga` as a dev-dependency for the offline shader validation, at the version wgpu uses.
+
+The GPU tests skip when there is no adapter, unless `EMBERWAVE_REQUIRE_GPU` is set; CI sets it on Linux, where it installs lavapipe, a software Vulkan driver.
