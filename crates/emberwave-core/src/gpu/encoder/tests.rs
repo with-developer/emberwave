@@ -575,7 +575,7 @@ fn workgroups_past_the_end_change_nothing() {
     // 1995 blocks in rows of 1000: five workgroups past the last block.
     let mut params = QuantParams::new(&gpu.layout, &gpu.buffers);
     params.grid_width = 1000;
-    let params = uniform_buffer(device, "test params", &params);
+    let params = uniform_buffer(device, &gpu.queue, "test params", &params);
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("test equant"),
         layout: &gpu.pipelines.equant.layout,
@@ -604,7 +604,7 @@ fn workgroups_past_the_end_change_nothing() {
         .write_buffer(&gpu.tie_savings, 0, bytemuck::cast_slice(&values));
     let mut scan = gpu.scan_params;
     scan.grid_width = scan.chunk_count + 3;
-    let scan_params = uniform_buffer(device, "test scan params", &scan);
+    let scan_params = uniform_buffer(device, &gpu.queue, "test scan params", &scan);
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("test scan"),
         layout: &gpu.pipelines.scan.chunks.layout,

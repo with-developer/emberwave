@@ -15,6 +15,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 ### Fixed
 
 - `Decoder::time_frame` sometimes reported the previous frame's time for its last stages, or none at all, on Metal: the timestamps were resolved in the frame's command buffer, before the GPU had written them. They are now resolved once the frame is done, in a submission of their own, which `gpu_wall` does not include.
+- `gpu::Decoder::new` and `gpu::Encoder::new` panicked inside wgpu when the context's device had been lost, a destroyed device for one ([#35](https://github.com/with-developer/emberwave/issues/35)). They now return `GpuError::DeviceLost`, as decoding and encoding do, and `emberwave_decoder_create` in the C API returns `EMBERWAVE_STATUS_DEVICE_LOST` rather than `EMBERWAVE_STATUS_INTERNAL`.
 
 ## [0.4.0] - 2026-10-24
 

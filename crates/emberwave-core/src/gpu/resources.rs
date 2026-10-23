@@ -3,8 +3,6 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use wgpu::util::DeviceExt;
-
 use super::error::GpuError;
 use super::pipelines::with_error_scope;
 
@@ -58,17 +56,23 @@ pub(crate) fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry
     }
 }
 
-/// A uniform buffer holding `value`.
+/// A uniform buffer holding `value`, written through the queue. Not
+/// `DeviceExt::create_buffer_init`, which maps the buffer at its creation
+/// and panics when the device is lost (issue #35).
 pub(crate) fn uniform_buffer<T: bytemuck::Pod>(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     label: &str,
     value: &T,
 ) -> wgpu::Buffer {
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        contents: bytemuck::bytes_of(value),
-        usage: wgpu::BufferUsages::UNIFORM,
-    })
+        size: std::mem::size_of::<T>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytemuck::bytes_of(value));
+    buffer
 }
 
 /// Waits for the GPU and copies a mappable buffer's first `bytes` bytes out.

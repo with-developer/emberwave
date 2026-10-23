@@ -909,6 +909,15 @@ mod tests {
         // SAFETY: a live decoder.
         assert!(unsafe { lost(decoder) }.is_some());
 
+        // So does making another decoder on the context, which panicked
+        // (issue #35).
+        let mut other = std::ptr::null_mut();
+        // SAFETY: a live context, and a pointer to store the decoder.
+        let status =
+            unsafe { emberwave_decoder_create(context, 64, 64, EMBERWAVE_CHROMA_420, &mut other) };
+        assert_eq!(status, EmberwaveStatus::DeviceLost);
+        assert!(other.is_null());
+
         // What wgpu does when the device fails while it is waited for.
         let status = run_or_lost(
             || panic!("the device failed while it was waited for"),
