@@ -15,14 +15,19 @@ const canvas = document.getElementById("screen");
 const info = document.getElementById("info");
 const stats = document.getElementById("stats");
 
-function fail(message) {
-  info.textContent = message;
-  info.className = "error";
-}
-
 let player;
 // Bumped for every file, so that the loop of the previous one stops.
 let generation = 0;
+// Bumped for every file asked for, so that only the last one asked for plays
+// when reading an earlier one takes longer.
+let request = 0;
+
+function fail(message) {
+  generation += 1;
+  info.textContent = message;
+  info.className = "error";
+  stats.textContent = "";
+}
 
 function play(bytes, name) {
   let description;
@@ -41,21 +46,26 @@ function play(bytes, name) {
 
   const mine = ++generation;
   const interval = 1000 / player.frame_rate();
-  let last = -Infinity;
+  // When the next frame is due. Advancing it by the interval, not to the
+  // time of drawing, keeps a rate that does not divide the display's.
+  let due = 0;
   let frames = 0;
   let cpu = 0;
-  let gpu = 0;
   let since = performance.now();
 
   function frame(now) {
     if (mine !== generation) {
       return;
     }
-    if (now - last >= interval - 1) {
-      last = now;
+    // A millisecond of slack, as animation frames do not come exactly on time.
+    if (now >= due - 1) {
+      due += interval;
+      // After a pause, such as a hidden tab, start over rather than catch up.
+      if (due < now) {
+        due = now + interval;
+      }
       try {
         cpu += player.draw_next();
-        gpu += player.last_gpu_ms();
       } catch (error) {
         fail(`${name}: ${error}`);
         return;
@@ -65,10 +75,9 @@ function play(bytes, name) {
         stats.textContent =
           `${(frames * 1000 / (now - since)).toFixed(1)} frames per second · ` +
           `CPU ${(cpu / frames).toFixed(2)} ms · ` +
-          `submitted to done ${(gpu / frames).toFixed(2)} ms per frame`;
+          `submitted to done ${player.take_gpu_ms().toFixed(2)} ms per frame`;
         frames = 0;
         cpu = 0;
-        gpu = 0;
         since = now;
       }
     }
@@ -77,13 +86,55 @@ function play(bytes, name) {
   requestAnimationFrame(frame);
 }
 
+// Reads a file the user chose and plays it, unless another was chosen since.
+async function playFile(file) {
+  const mine = ++request;
+  let bytes;
+  try {
+    bytes = await file.arrayBuffer();
+  } catch (error) {
+    if (mine === request) {
+      fail(`${file.name}: ${error}`);
+    }
+    return;
+  }
+  if (mine === request) {
+    play(bytes, file.name);
+  }
+}
+
+async function playSample(name) {
+  const mine = ++request;
+  let bytes;
+  try {
+    const response = await fetch(`samples/${name}.pwv1`);
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}`);
+    }
+    bytes = await response.arrayBuffer();
+  } catch (error) {
+    if (mine === request) {
+      fail(`${name}: ${error}`);
+    }
+    return;
+  }
+  if (mine === request) {
+    play(bytes, name);
+  }
+}
+
 async function start() {
+  // A file dropped anywhere is the player's; without this, a drop outside the
+  // drop zone, or before the player is ready, would open the file instead.
+  window.addEventListener("dragover", (event) => event.preventDefault());
+  window.addEventListener("drop", (event) => event.preventDefault());
+
   if (!navigator.gpu) {
     fail("This browser has no WebGPU. A recent Chrome or Edge has it.");
     return;
   }
-  await init();
   try {
+    await init();
     player = await Player.create(canvas);
   } catch (error) {
     fail(`WebGPU did not start: ${error}`);
@@ -91,25 +142,24 @@ async function start() {
   }
   info.textContent = `GPU: ${player.adapter()}. Open a file or play a sample.`;
 
-  document.getElementById("file").addEventListener("change", async (event) => {
-    const file = event.target.files[0];
+  const input = document.getElementById("file");
+  input.addEventListener("change", () => {
+    const file = input.files[0];
+    // Cleared, so that choosing the same file again plays it again.
+    input.value = "";
     if (file) {
-      play(await file.arrayBuffer(), file.name);
+      playFile(file);
     }
   });
 
   const drop = document.getElementById("drop");
-  drop.addEventListener("dragover", (event) => {
-    event.preventDefault();
-    drop.classList.add("over");
-  });
+  drop.addEventListener("dragover", () => drop.classList.add("over"));
   drop.addEventListener("dragleave", () => drop.classList.remove("over"));
-  drop.addEventListener("drop", async (event) => {
-    event.preventDefault();
+  window.addEventListener("drop", (event) => {
     drop.classList.remove("over");
     const file = event.dataTransfer.files[0];
     if (file) {
-      play(await file.arrayBuffer(), file.name);
+      playFile(file);
     }
   });
 
@@ -126,15 +176,6 @@ async function start() {
   if (SAMPLES.includes(requested)) {
     playSample(requested);
   }
-}
-
-async function playSample(name) {
-  const response = await fetch(`samples/${name}.pwv1`);
-  if (!response.ok) {
-    fail(`${name}: ${response.status} ${response.statusText}`);
-    return;
-  }
-  play(await response.arrayBuffer(), name);
 }
 
 start();

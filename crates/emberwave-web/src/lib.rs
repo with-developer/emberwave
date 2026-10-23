@@ -7,8 +7,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use emberwave_core::bitstream::Pwv1File;
 use emberwave_core::color::ColorParams;
@@ -44,6 +43,14 @@ fn surface_format(surface: &wgpu::Surface<'_>, adapter: &wgpu::Adapter) -> wgpu:
         .unwrap_or(wgpu::TextureFormat::Bgra8Unorm)
 }
 
+/// Times from submitting a frame until the browser reported it done, summed
+/// up by the callbacks of the queue until the page asks for their average.
+#[derive(Debug, Default)]
+struct GpuTimes {
+    total_ms: f64,
+    frames: u32,
+}
+
 /// The stream being played.
 struct Stream {
     frames: Vec<Vec<u8>>,
@@ -67,15 +74,21 @@ pub struct Player {
     /// Width and height of the picture, for the blit shader.
     picture: wgpu::Buffer,
     stream: Option<Stream>,
-    /// Milliseconds from submitting the last frame until the GPU had done it,
-    /// as the bits of an `f64`: written by a callback of the queue.
-    gpu_ms: Arc<AtomicU64>,
+    gpu_times: Arc<Mutex<GpuTimes>>,
+    /// The first GPU error the browser reported since the last frame. Error
+    /// scopes cannot be waited for in a browser, so errors arrive here.
+    gpu_error: Arc<Mutex<Option<String>>>,
 }
 
 #[wasm_bindgen]
 impl Player {
     /// Sets up WebGPU for `canvas`. Fails if the browser has no WebGPU.
     pub async fn create(canvas: web_sys::HtmlCanvasElement) -> Result<Player, JsError> {
+        // A panic aborts the module; at least its message reaches the console.
+        std::panic::set_hook(Box::new(|info| {
+            web_sys::console::error_1(&JsValue::from_str(&info.to_string()));
+        }));
+
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
         let instance = wgpu::Instance::new(descriptor);
@@ -95,6 +108,13 @@ impl Player {
             .map_err(js_error)?;
 
         let device = context.device();
+        let gpu_error: Arc<Mutex<Option<String>>> = Arc::default();
+        let record = Arc::clone(&gpu_error);
+        device.on_uncaptured_error(Arc::new(move |error| {
+            if let Ok(mut first) = record.lock() {
+                first.get_or_insert_with(|| error.to_string());
+            }
+        }));
         let format = surface_format(&surface, &adapter);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -135,7 +155,8 @@ impl Player {
             blit,
             picture,
             stream: None,
-            gpu_ms: Arc::default(),
+            gpu_times: Arc::default(),
+            gpu_error,
         })
     }
 
@@ -153,9 +174,23 @@ impl Player {
     /// Loads a PWV1 file and sizes the canvas to its pictures. Returns a line
     /// that describes the stream.
     pub fn load(&mut self, bytes: &[u8]) -> Result<String, JsError> {
+        // The old stream goes first, whether or not the new one loads: its
+        // frames and GPU memory are not needed while the new ones are made.
+        self.stream = None;
+        if let Ok(mut times) = self.gpu_times.lock() {
+            *times = GpuTimes::default();
+        }
+
         let file = Pwv1File::parse(bytes).map_err(js_error)?;
         let header = *file.header();
         let stream = header.stream;
+        let largest = self.context.device().limits().max_texture_dimension_2d;
+        if stream.width > largest || stream.height > largest {
+            return Err(JsError::new(&format!(
+                "the pictures are {}x{}, and this browser draws at most {largest} pixels across",
+                stream.width, stream.height
+            )));
+        }
         let frames = file
             .frames()
             .map(|frame| frame.map(<[u8]>::to_vec))
@@ -227,6 +262,14 @@ impl Player {
     /// Decodes the next frame, the file's frames in turn, and draws it.
     /// Returns the milliseconds the CPU spent recording and submitting it.
     pub fn draw_next(&mut self) -> Result<f64, JsError> {
+        if let Some(error) = self
+            .gpu_error
+            .lock()
+            .ok()
+            .and_then(|mut first| first.take())
+        {
+            return Err(JsError::new(&format!("the GPU reported an error: {error}")));
+        }
         let stream = self
             .stream
             .as_mut()
@@ -300,17 +343,33 @@ impl Player {
         queue.submit([encoder.finish()]);
 
         let submitted = now_ms();
-        let gpu_ms = Arc::clone(&self.gpu_ms);
+        let gpu_times = Arc::clone(&self.gpu_times);
         queue.on_submitted_work_done(move || {
-            gpu_ms.store((now_ms() - submitted).to_bits(), Ordering::Relaxed);
+            if let Ok(mut times) = gpu_times.lock() {
+                times.total_ms += now_ms() - submitted;
+                times.frames += 1;
+            }
         });
         queue.present(target);
         Ok(submitted - start)
     }
 
-    /// Milliseconds from submitting the last frame until the GPU had done
-    /// it: decoding and drawing, as the browser's clock sees it.
-    pub fn last_gpu_ms(&self) -> f64 {
-        f64::from_bits(self.gpu_ms.load(Ordering::Relaxed))
+    /// The average milliseconds from submitting a frame until the browser
+    /// reported the GPU done with it (decoding and drawing, plus the delay of
+    /// the report), over the frames reported since the last call. 0 if none
+    /// was.
+    pub fn take_gpu_ms(&self) -> f64 {
+        match self.gpu_times.lock() {
+            Ok(mut times) => {
+                let average = if times.frames == 0 {
+                    0.0
+                } else {
+                    times.total_ms / f64::from(times.frames)
+                };
+                *times = GpuTimes::default();
+                average
+            }
+            Err(_) => 0.0,
+        }
     }
 }
