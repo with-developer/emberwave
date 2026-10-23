@@ -1,0 +1,6 @@
+/target
+.DS_Store
+
+# Upstream reference builds and generated vectors (see testdata/README.md)
+/testdata/_cache/
+/testdata/generated/
