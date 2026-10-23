@@ -4,6 +4,7 @@ members = [
     "crates/emberwave-core",
     "crates/emberwave-cli",
     "crates/emberwave-ffi",
+    "crates/emberwave-web",
 ]
 
 [workspace.package]
