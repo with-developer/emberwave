@@ -9,6 +9,11 @@
 //                 --height H --chroma 420|444 --frames N --bytes-per-frame B
 //                 [--seed S] [--range full|limited] [--siting center|left]
 //   refgen decode IN.pwv1 OUT.y4m [--bit-depth 8|16]
+//   refgen bench IN.pwv1 [--frames N] [--warmup N] [--warmup-seconds S] [--json]
+//
+// bench times upstream's decoder the way `emberwave-cli bench --output yuv`
+// times emberwave's: planes left in GPU memory, the same warm-up rule, the
+// same statistics and the same output, so the two can be put side by side.
 //
 // PWV1 container layout: bitstream/bitstream.md in the upstream repository,
 // section "Raw disk format specification".
@@ -17,6 +22,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -564,6 +570,244 @@ int run_decode(int argc, char **argv)
 	}
 	return 0;
 }
+
+//////
+// bench
+
+using Clock = std::chrono::steady_clock;
+
+double ms_between(Clock::time_point a, Clock::time_point b)
+{
+	return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+// Nearest-rank percentile of an ascending, non-empty list, as emberwave-cli
+// computes it: the smallest sample that at least `percent` of the samples do
+// not exceed.
+double percentile(const std::vector<double> &sorted, double percent)
+{
+	const size_t rank = size_t(std::ceil(percent / 100.0 * double(sorted.size())));
+	return sorted[std::clamp<size_t>(rank, 1, sorted.size()) - 1];
+}
+
+struct Series
+{
+	const char *name;
+	std::vector<double> samples;
+};
+
+struct Summary
+{
+	double mean, p50, p99, min, max;
+};
+
+Summary summarize(std::vector<double> samples)
+{
+	std::sort(samples.begin(), samples.end());
+	double sum = 0.0;
+	for (double s : samples)
+		sum += s;
+	return { sum / double(samples.size()), percentile(samples, 50.0), percentile(samples, 99.0),
+		     samples.front(), samples.back() };
+}
+
+std::string json_string(const std::string &text)
+{
+	std::string out = "\"";
+	for (unsigned char c : text)
+	{
+		if (c == '"' || c == '\\')
+		{
+			out += '\\';
+			out += char(c);
+		}
+		else if (c < 0x20)
+		{
+			char escaped[8];
+			snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+			out += escaped;
+		}
+		else
+			out += char(c);
+	}
+	return out + "\"";
+}
+
+int run_bench(int argc, char **argv)
+{
+	if (argc < 3)
+		fail("usage: refgen bench IN.pwv1 [--frames N] [--warmup N] [--warmup-seconds S] [--json]");
+	const std::string in_path = argv[2];
+	long frames_to_measure = 0;
+	long warmup_frames = 10;
+	double warmup_seconds = 1.0;
+	bool json = false;
+	for (int i = 3; i < argc; i++)
+	{
+		const std::string arg = argv[i];
+		if (arg == "--frames" && i + 1 < argc)
+			frames_to_measure = atol(argv[++i]);
+		else if (arg == "--warmup" && i + 1 < argc)
+			warmup_frames = atol(argv[++i]);
+		else if (arg == "--warmup-seconds" && i + 1 < argc)
+			warmup_seconds = atof(argv[++i]);
+		else if (arg == "--json")
+			json = true;
+		else
+			fail("unknown option %s", argv[i]);
+	}
+	if (warmup_frames < 0 || !(warmup_seconds >= 0.0 && warmup_seconds <= 3600.0))
+		fail("the warm-up must be at least 0 frames and between 0 and 3600 seconds");
+
+	File in = open_file(in_path, "rb");
+	const Stream stream = read_pwv1_header(in.get());
+	std::vector<std::vector<uint8_t>> frames;
+	for (;;)
+	{
+		uint8_t size_bytes[4];
+		if (fread(size_bytes, 1, 4, in.get()) != 4)
+			break;
+		std::vector<uint8_t> packet(get_u32(size_bytes));
+		if (fread(packet.data(), 1, packet.size(), in.get()) != packet.size())
+			fail("truncated frame %zu", frames.size());
+		frames.push_back(std::move(packet));
+	}
+	if (frames.empty())
+		fail("the file has no frames");
+	if (frames_to_measure <= 0)
+		frames_to_measure = long(frames.size());
+
+	@autoreleasepool
+	{
+		id<MTLDevice> mtl_device = MTLCreateSystemDefaultDevice();
+		if (!mtl_device)
+			fail("no Metal device");
+		id<MTLCommandQueue> queue = [mtl_device newCommandQueue];
+
+		pyrowave_device_create_info device_info = {};
+		device_info.mtl_device = (__bridge void *)mtl_device;
+		pyrowave_device device = nullptr;
+		check(pyrowave_device_create(&device_info, &device), "create device");
+
+		pyrowave_decoder_create_info info = {};
+		info.device = device;
+		info.width = stream.width;
+		info.height = stream.height;
+		info.chroma = stream.chroma_444 ? PYROWAVE_CHROMA_SUBSAMPLING_444 : PYROWAVE_CHROMA_SUBSAMPLING_420;
+		pyrowave_decoder decoder = nullptr;
+		check(pyrowave_decoder_create(&info, &decoder), "create decoder");
+
+		// 8-bit planes that only the GPU touches, like emberwave's packed planes.
+		pyrowave_gpu_buffers buffers = {};
+		id<MTLTexture> textures[3];
+		for (int c = 0; c < 3; c++)
+		{
+			const int w = (c == 0 || stream.chroma_444) ? stream.width : stream.width / 2;
+			const int h = (c == 0 || stream.chroma_444) ? stream.height : stream.height / 2;
+			MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+			                                                                                width:w
+			                                                                               height:h
+			                                                                            mipmapped:NO];
+			desc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+			desc.storageMode = MTLStorageModePrivate;
+			textures[c] = [mtl_device newTextureWithDescriptor:desc];
+			if (!textures[c])
+				fail("cannot create plane texture %d", c);
+			buffers.planes[c] = (__bridge void *)textures[c];
+		}
+
+		// One frame: the packet goes to the parser (the CPU stage), then the GPU
+		// work is encoded, committed and waited for. Clearing first lets the
+		// parser take the file's frames again when they repeat, as emberwave's
+		// decoder does.
+		struct Times
+		{
+			double prepare, wall, gpu;
+		};
+		auto decode = [&](size_t index) -> Times {
+			const std::vector<uint8_t> &packet = frames[index % frames.size()];
+			const Clock::time_point start = Clock::now();
+			pyrowave_decoder_clear(decoder);
+			check(pyrowave_decoder_push_packet(decoder, packet.data(), packet.size()), "push packet");
+			if (!pyrowave_decoder_decode_is_ready(decoder, false))
+				fail("frame %zu is not complete after pushing its packet", index % frames.size());
+			const Clock::time_point pushed = Clock::now();
+
+			Times times = {};
+			@autoreleasepool
+			{
+				id<MTLCommandBuffer> cmd = [queue commandBuffer];
+				check(pyrowave_decoder_decode_gpu_buffer(decoder, (__bridge void *)cmd, &buffers), "decode");
+				[cmd commit];
+				[cmd waitUntilCompleted];
+				const Clock::time_point done = Clock::now();
+				if (cmd.error)
+					fail("command buffer failed: %s", cmd.error.localizedDescription.UTF8String);
+				times = { ms_between(start, pushed), ms_between(pushed, done),
+					      (cmd.GPUEndTime - cmd.GPUStartTime) * 1000.0 };
+			}
+			return times;
+		};
+
+		// Warm up for a number of frames and for a while, like emberwave-cli.
+		size_t warmed = 0;
+		const Clock::time_point warmup_start = Clock::now();
+		while (warmed < size_t(warmup_frames) || ms_between(warmup_start, Clock::now()) < warmup_seconds * 1000.0)
+			decode(warmed++);
+
+		Series total = { "total", {} };
+		Series prepare = { "cpu prepare", {} };
+		Series wall = { "gpu wall", {} };
+		Series gpu = { "gpu (command buffer)", {} };
+		for (long i = 0; i < frames_to_measure; i++)
+		{
+			const Times t = decode(size_t(i));
+			total.samples.push_back(t.prepare + t.wall);
+			prepare.samples.push_back(t.prepare);
+			wall.samples.push_back(t.wall);
+			gpu.samples.push_back(t.gpu);
+		}
+
+		const char *precision = getenv("PYROWAVE_PRECISION");
+		const std::string adapter = mtl_device.name.UTF8String;
+		const std::string description = std::to_string(stream.width) + "x" + std::to_string(stream.height) +
+		                                (stream.chroma_444 ? " 4:4:4" : " 4:2:0") +
+		                                ", decoded by upstream's Metal decoder (PYROWAVE_PRECISION=" +
+		                                (precision ? precision : "default") + ") to planes in GPU memory";
+		const Series *all[] = { &total, &prepare, &wall, &gpu };
+
+		if (json)
+		{
+			printf("{\"input\":%s,\"adapter\":%s,\"backend\":\"Metal\",\"description\":%s,\"frames\":%ld,"
+			       "\"warmup\":%zu,\"readback\":false,\"unit\":\"ms\",\"series\":{",
+			       json_string(in_path).c_str(), json_string(adapter).c_str(), json_string(description).c_str(),
+			       frames_to_measure, warmed);
+			for (size_t i = 0; i < 4; i++)
+			{
+				const Summary s = summarize(all[i]->samples);
+				printf("%s%s:{\"mean\":%.6f,\"p50\":%.6f,\"p99\":%.6f,\"min\":%.6f,\"max\":%.6f}", i ? "," : "",
+				       json_string(all[i]->name).c_str(), s.mean, s.p50, s.p99, s.min, s.max);
+			}
+			printf("}}\n");
+		}
+		else
+		{
+			printf("adapter:  %s (Metal, upstream decoder)\n", adapter.c_str());
+			printf("decoding: %s\n", description.c_str());
+			printf("frames:   %ld measured after %zu warm-up frames\n\n", frames_to_measure, warmed);
+			printf("%-20s%9s%9s%9s%9s%9s   (ms per frame)\n", "", "mean", "p50", "p99", "min", "max");
+			for (const Series *series : all)
+			{
+				const Summary s = summarize(series->samples);
+				printf("%-20s%9.3f%9.3f%9.3f%9.3f%9.3f\n", series->name, s.mean, s.p50, s.p99, s.min, s.max);
+			}
+		}
+
+		pyrowave_decoder_destroy(decoder);
+		pyrowave_device_destroy(device);
+	}
+	return 0;
+}
 } // namespace
 
 int main(int argc, char **argv)
@@ -572,6 +816,8 @@ int main(int argc, char **argv)
 		return run_encode(argc, argv);
 	if (argc >= 2 && std::string(argv[1]) == "decode")
 		return run_decode(argc, argv);
-	fprintf(stderr, "usage: refgen encode|decode ...\n");
+	if (argc >= 2 && std::string(argv[1]) == "bench")
+		return run_bench(argc, argv);
+	fprintf(stderr, "usage: refgen encode|decode|bench ...\n");
 	return 2;
 }
