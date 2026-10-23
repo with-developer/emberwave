@@ -305,9 +305,15 @@ mod tests {
     use super::*;
     use crate::cpu::dequant;
 
-    /// The weighted squared error of an 8x8 block that is not coded at all.
+    /// The weighted squared error of an 8x8 block that is not coded at all,
+    /// added up as the encoder adds: each subblock's values, then the
+    /// subblocks.
     fn uncoded_distortion(coefficients: &[f32; BLOCK8_VALUES], weight: f32) -> f32 {
-        weight * coefficients.iter().map(|c| c * c).sum::<f32>()
+        weight
+            * coefficients
+                .chunks_exact(VALUES_PER_SUBBLOCK)
+                .map(|values| values.iter().map(|c| c * c).sum::<f32>())
+                .sum::<f32>()
     }
 
     fn quant() -> BandQuant {
