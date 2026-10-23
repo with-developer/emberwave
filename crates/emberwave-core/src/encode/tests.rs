@@ -109,9 +109,10 @@ fn encode(
 #[test]
 fn frames_decode_close_to_their_pictures_within_the_budget() {
     for (chroma, width, height, budget, bar) in [
-        // Plenty of bytes: near what 8 bits can tell apart.
-        (ChromaSubsampling::Yuv420, 192, 136, 60_000, 45.0),
-        (ChromaSubsampling::Yuv444, 131, 67, 60_000, 45.0),
+        // Plenty of bytes: near what 8 bits can tell apart (75.6 and 58.3 dB
+        // when written).
+        (ChromaSubsampling::Yuv420, 192, 136, 60_000, 70.0),
+        (ChromaSubsampling::Yuv444, 131, 67, 60_000, 55.0),
         // Tight: the rate control has to drop planes.
         (ChromaSubsampling::Yuv420, 200, 120, 4_000, 30.0),
         (ChromaSubsampling::Yuv444, 160, 96, 3_000, 28.0),
@@ -268,4 +269,60 @@ fn a_flat_picture_costs_almost_nothing() {
     assert!(frame.len() < 300, "{} bytes", frame.len());
     assert_eq!(packets(&frame, HEADER_BYTES).len(), 1 + 3);
     assert_eq!(decode(&layout, &frame), planes);
+}
+
+#[test]
+fn every_budget_holds_down_to_the_byte() {
+    // Budgets that are not whole words included: the frame never passes
+    // them, and it decodes.
+    let planes = chroma_planes(ChromaSubsampling::Yuv420, 64, 64, true);
+    let mut encoder =
+        Encoder::new(64, 64, ChromaSubsampling::Yuv420, Signalling::default()).unwrap();
+    for budget in (8..=260).chain(1501..=1507) {
+        let frame = encoder
+            .encode([&planes[0], &planes[1], &planes[2]], budget)
+            .unwrap();
+        assert!(frame.len() <= budget, "{} > {budget}", frame.len());
+        decode(encoder.layout(), &frame);
+    }
+}
+
+#[test]
+fn packets_take_any_bytes_without_losing_one() {
+    let (_, _, frame) = encode(ChromaSubsampling::Yuv420, 192, 136, true, 8_000);
+    // Cut short, corrupted, and empty: every byte comes out again, in order.
+    let mut damaged = frame.clone();
+    damaged[HEADER_BYTES + 2] ^= 0xff;
+    for bytes in [
+        &frame[..frame.len() - 3],
+        &frame[..5],
+        &[][..],
+        &damaged[..],
+    ] {
+        for max_bytes in [0, 1, 8, 100, 1_400, usize::MAX] {
+            assert_eq!(packets(bytes, max_bytes).concat(), bytes);
+        }
+    }
+}
+
+#[test]
+fn chroma_planes_of_the_wrong_size_are_an_error() {
+    let planes = chroma_planes(ChromaSubsampling::Yuv420, 192, 136, false);
+    let mut encoder =
+        Encoder::new(192, 136, ChromaSubsampling::Yuv420, Signalling::default()).unwrap();
+    for (component, planes) in [
+        (
+            Component::Cb,
+            [&planes[0][..], &planes[1][1..], &planes[2][..]],
+        ),
+        (
+            Component::Cr,
+            [&planes[0][..], &planes[1][..], &planes[0][..]],
+        ),
+    ] {
+        assert!(matches!(
+            encoder.encode(planes, 10_000),
+            Err(EncodeError::PlaneSize { component: c, .. }) if c == component
+        ));
+    }
 }

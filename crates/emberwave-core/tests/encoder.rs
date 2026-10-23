@@ -136,10 +136,14 @@ fn the_streams_show_their_pictures() {
     for vector in vectors() {
         let floor = match vector.name.as_str() {
             // Every plane fits the budget: lossless at 8 bits.
-            "gradient_200x120_420" | "solid_160x96_420" => f64::INFINITY,
+            "gradient_200x120_420" | "solid_160x96_420" | "solid_64x64_420_wrap" => f64::INFINITY,
             "scene_200x120_420" => 38.0,
             "scene_131x67_444" => 33.0,
             "noise_192x136_420_lowrate" => 12.0,
+            // 300 bytes: what is left of the coarsest bands (23.7 dB).
+            "scene_200x120_420_tiny" => 20.0,
+            // Nothing but headers: mid-grey against noise (10.7 dB).
+            "noise_64x64_444_empty" => 9.0,
             other => panic!("no floor for {other}"),
         };
         let (layout, frames) = stream(&vector);

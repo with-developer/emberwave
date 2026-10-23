@@ -6,3 +6,9 @@ gradient_200x120_420 gradient 200 120 420 2 60000
 noise_192x136_420_lowrate noise 192 136 420 2 12000
 scene_131x67_444 scene 131 67 444 2 4000
 solid_160x96_420 solid 160 96 420 1 40000
+# Dropping most planes: blocks drop up to all they may.
+scene_200x120_420_tiny scene 200 120 420 2 300
+# Twelve frames: the sequence number wraps from 7 to 0.
+solid_64x64_420_wrap solid 64 64 420 12 4000
+# Eight bytes: frames of a start of frame header only.
+noise_64x64_444_empty noise 64 64 444 2 8

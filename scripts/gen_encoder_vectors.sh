@@ -26,10 +26,11 @@ trap 'rm -rf "$SCRATCH"' EXIT
 grep -v '^#' "$OUT/vectors.txt" | while read -r name pattern width height chroma frames budget; do
     [ -n "$name" ] || continue
     echo "== $name"
-    # refgen encodes with upstream too; only the pictures are kept.
+    # refgen encodes with upstream too; only the pictures are kept, so it gets
+    # a budget that any picture fits.
     "$REFGEN" encode --out "$SCRATCH/$name.upstream.pwv1" --pattern "$pattern" \
         --width "$width" --height "$height" --chroma "$chroma" --frames "$frames" \
-        --bytes-per-frame "$budget" --source "$OUT/$name.source.y4m"
+        --bytes-per-frame 4000000 --source "$OUT/$name.source.y4m"
     "$CLI" encode "$OUT/$name.source.y4m" --out "$OUT/$name.pwv1" --bytes-per-frame "$budget"
     PYROWAVE_PRECISION=2 "$REFGEN" decode "$OUT/$name.pwv1" "$OUT/$name.ref-fp32.y4m"
 done

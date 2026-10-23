@@ -1,5 +1,6 @@
 //! Malformed input must never panic, and must never leave the assembler in an
-//! inconsistent state.
+//! inconsistent state. Any picture must encode within its budget into a frame
+//! that decodes.
 
 mod common;
 
@@ -8,9 +9,11 @@ use std::sync::LazyLock;
 use common::{read_vector, vector_names};
 use emberwave_core::bitstream::block::BlockStructure;
 use emberwave_core::bitstream::{
-    ChromaSubsampling, FrameAssembler, FrameLayout, Header, MISSING_BLOCK, Pwv1File, Pwv1Header,
+    ChromaSubsampling, Component, FrameAssembler, FrameLayout, Header, MISSING_BLOCK, Pwv1File,
+    Pwv1Header,
 };
 use emberwave_core::cpu;
+use emberwave_core::encode::{Encoder, Signalling};
 use proptest::prelude::*;
 use proptest::sample::Index;
 
@@ -150,6 +153,51 @@ proptest! {
             check_invariants(&assembler);
             let _ = assembler.is_ready(true);
         }
+    }
+
+    #[test]
+    fn any_picture_encodes_within_its_budget_into_a_frame_that_decodes(
+        chroma_444 in any::<bool>(),
+        half_width in 1u32..40,
+        half_height in 1u32..40,
+        style in 0u8..4,
+        seed in any::<u64>(),
+        budget in 8usize..20_000,
+    ) {
+        // Odd sizes for 4:4:4; noise, a checkerboard (all high frequencies),
+        // a flat grey, and extremes.
+        let (chroma, width, height) = if chroma_444 {
+            (ChromaSubsampling::Yuv444, 2 * half_width - 1, 2 * half_height - 1)
+        } else {
+            (ChromaSubsampling::Yuv420, 2 * half_width, 2 * half_height)
+        };
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let mut state = seed | 1;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let planes = Component::ALL.map(|component| {
+            let (w, h) = layout.plane_size(component);
+            (0..w * h)
+                .map(|i| match style {
+                    0 => random() as u8,
+                    1 => if (i % w + i / w) % 2 == 0 { 0 } else { 255 },
+                    2 => seed as u8,
+                    _ => if random() % 2 == 0 { 0 } else { 255 },
+                })
+                .collect::<Vec<u8>>()
+        });
+
+        let mut encoder = Encoder::new(width, height, chroma, Signalling::default()).unwrap();
+        let frame = encoder.encode([&planes[0], &planes[1], &planes[2]], budget).unwrap();
+        prop_assert!(frame.len() <= budget);
+        let mut assembler = FrameAssembler::new(layout);
+        assembler.push_packet(&frame).unwrap();
+        prop_assert!(assembler.is_ready(false));
+        prop_assert!(cpu::decode_frame(&assembler.frame()).is_ok());
     }
 
     #[test]
