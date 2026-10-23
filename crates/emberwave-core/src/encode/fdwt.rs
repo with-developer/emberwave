@@ -102,11 +102,16 @@ pub(crate) fn forward_2d(mut image: Vec<f32>, width: usize, height: usize) -> Le
     }
 }
 
-/// The samples of an 8-bit plane as the transform takes them: scaled to
-/// `[0, 1]`, less the DC shift that the decoder adds back, and padded to
-/// `aligned_width` x `aligned_height` by repeating the last column and the
-/// last row. Repeating the edge keeps the padding from adding detail that
-/// would cost bits.
+/// An 8-bit sample as the transform takes it: scaled to `[0, 1]`, less the DC
+/// shift that the decoder adds back.
+pub(crate) fn sample_level(sample: u8) -> f32 {
+    f32::from(sample) / 255.0 - DC_SHIFT
+}
+
+/// The samples of an 8-bit plane as the transform takes them
+/// ([`sample_level`]), padded to `aligned_width` x `aligned_height` by
+/// repeating the last column and the last row. Repeating the edge keeps the
+/// padding from adding detail that would cost bits.
 pub(crate) fn pad_plane(
     samples: &[u8],
     width: usize,
@@ -117,9 +122,7 @@ pub(crate) fn pad_plane(
     let mut padded = Vec::with_capacity(aligned_width * aligned_height);
     for y in 0..aligned_height {
         let row = &samples[y.min(height - 1) * width..][..width];
-        padded.extend(
-            (0..aligned_width).map(|x| f32::from(row[x.min(width - 1)]) / 255.0 - DC_SHIFT),
-        );
+        padded.extend((0..aligned_width).map(|x| sample_level(row[x.min(width - 1)])));
     }
     padded
 }

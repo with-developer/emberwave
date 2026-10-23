@@ -18,10 +18,10 @@
 //!
 //! A frame decodes with any decoder of bitstream v1, upstream's included.
 
-mod fdwt;
-mod pack;
-mod quant;
-mod rate;
+pub(crate) mod fdwt;
+pub(crate) mod pack;
+pub(crate) mod quant;
+pub(crate) mod rate;
 mod weights;
 
 use thiserror::Error;
@@ -87,13 +87,18 @@ pub enum EncodeError {
     },
 }
 
+/// The wavelet coefficients of a picture: `[component][level][band]`,
+/// row-major at the size of the level's bands; empty where a component has
+/// no such band.
+pub(crate) type Bands = [[[Vec<f32>; 4]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
+
 /// One quantised 32x32 block and what the rate control needs to know of it.
 #[derive(Debug, Clone)]
-struct Block32 {
-    index: u32,
-    quant: BandQuant,
-    blocks8: Blocks8,
-    cost: BlockCost,
+pub(crate) struct Block32 {
+    pub index: u32,
+    pub quant: BandQuant,
+    pub blocks8: Blocks8,
+    pub cost: BlockCost,
 }
 
 /// Encodes the pictures of one stream: one size and chroma format.
@@ -129,19 +134,7 @@ impl Encoder {
     /// The stream as a PWV1 file header describes it: size, chroma format
     /// and signalling, with the per-frame fields zero.
     pub fn stream(&self) -> SequenceHeader {
-        SequenceHeader {
-            width: self.layout.width(),
-            height: self.layout.height(),
-            sequence: 0,
-            total_blocks: 0,
-            code: 0,
-            chroma: self.layout.chroma(),
-            color_primaries: self.signalling.color_primaries,
-            transfer_function: self.signalling.transfer_function,
-            ycbcr_transform: self.signalling.ycbcr_transform,
-            ycbcr_range: self.signalling.ycbcr_range,
-            chroma_siting: self.signalling.chroma_siting,
-        }
+        stream_header(&self.layout, &self.signalling)
     }
 
     /// Encodes one picture into a frame of at most `budget` bytes: a start of
@@ -151,19 +144,8 @@ impl Encoder {
     /// `planes` are the Y, Cb and Cr samples, row-major without padding, at
     /// the sizes of [`FrameLayout::plane_size`].
     pub fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, EncodeError> {
-        for (component, plane) in Component::ALL.into_iter().zip(planes) {
-            let (width, height) = self.layout.plane_size(component);
-            let expected = width as usize * height as usize;
-            if plane.len() != expected {
-                return Err(EncodeError::PlaneSize {
-                    component,
-                    expected,
-                    actual: plane.len(),
-                });
-            }
-        }
-
-        let blocks = self.analyse(planes);
+        check_planes(&self.layout, planes)?;
+        let blocks = self.quantise(&self.transform(planes));
         let costs: Vec<BlockCost> = blocks.iter().map(|block| block.cost.clone()).collect();
         let budget_words = (budget.saturating_sub(HEADER_BYTES) / 4) as u64;
         let drops = (budget >= HEADER_BYTES)
@@ -180,8 +162,7 @@ impl Encoder {
                 }
             })?;
 
-        // The first frame is number 1, as with upstream's encoder.
-        self.sequence = (self.sequence + 1) & 0x7;
+        self.sequence = next_sequence(self.sequence);
         let mut frame = vec![0u8; HEADER_BYTES];
         let mut total_blocks = 0u32;
         for (block, &drop) in blocks.iter().zip(&drops) {
@@ -199,23 +180,19 @@ impl Encoder {
             total_blocks += 1;
         }
 
-        let header = SequenceHeader {
-            sequence: self.sequence,
+        frame[..HEADER_BYTES].copy_from_slice(&start_of_frame(
+            &self.stream(),
+            self.sequence,
             total_blocks,
-            ..self.stream()
-        };
-        let (word0, word1) = header.start_of_frame_words();
-        frame[..4].copy_from_slice(&word0.to_le_bytes());
-        frame[4..8].copy_from_slice(&word1.to_le_bytes());
+        ));
         debug_assert!(frame.len() <= budget);
         Ok(frame)
     }
 
-    /// Transforms and quantises a picture: every block of the frame, in block
-    /// index order, with its costs.
-    fn analyse(&self, planes: [&[u8]; 3]) -> Vec<Block32> {
+    /// The forward transform of a picture whose planes have the right sizes.
+    pub(crate) fn transform(&self, planes: [&[u8]; 3]) -> Bands {
         let layout = &self.layout;
-        let mut bands: [[[Vec<f32>; 4]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS] = Default::default();
+        let mut bands: Bands = Default::default();
         for (component, plane) in Component::ALL.into_iter().zip(planes) {
             let (width, height) = layout.plane_size(component);
             let first = layout.finest_level(component);
@@ -243,7 +220,13 @@ impl Encoder {
             }
             levels[DECOMPOSITION_LEVELS - 1][Band::Ll.index()] = image;
         }
+        bands
+    }
 
+    /// Quantises the coefficients: every block of the frame, in block index
+    /// order, with its costs.
+    pub(crate) fn quantise(&self, bands: &Bands) -> Vec<Block32> {
+        let layout = &self.layout;
         let mut blocks = Vec::with_capacity(layout.block_count() as usize);
         for (component, level, band, band_layout) in layout.bands() {
             let coefficients = &bands[component.index()][level][band.index()];
@@ -282,6 +265,64 @@ impl Encoder {
         }
         blocks
     }
+}
+
+/// The header of a PWV1 file of a stream of `layout` with `signalling`.
+pub(crate) fn stream_header(layout: &FrameLayout, signalling: &Signalling) -> SequenceHeader {
+    SequenceHeader {
+        width: layout.width(),
+        height: layout.height(),
+        sequence: 0,
+        total_blocks: 0,
+        code: 0,
+        chroma: layout.chroma(),
+        color_primaries: signalling.color_primaries,
+        transfer_function: signalling.transfer_function,
+        ycbcr_transform: signalling.ycbcr_transform,
+        ycbcr_range: signalling.ycbcr_range,
+        chroma_siting: signalling.chroma_siting,
+    }
+}
+
+/// The sequence number of the frame after one numbered `sequence`. The first
+/// frame is number 1, as with upstream's encoder.
+pub(crate) fn next_sequence(sequence: u8) -> u8 {
+    (sequence + 1) & 0x7
+}
+
+/// The start of frame header of frame `sequence` of `stream`, which carries
+/// `total_blocks` blocks.
+pub(crate) fn start_of_frame(
+    stream: &SequenceHeader,
+    sequence: u8,
+    total_blocks: u32,
+) -> [u8; HEADER_BYTES] {
+    let header = SequenceHeader {
+        sequence,
+        total_blocks,
+        ..*stream
+    };
+    let (word0, word1) = header.start_of_frame_words();
+    let mut bytes = [0u8; HEADER_BYTES];
+    bytes[..4].copy_from_slice(&word0.to_le_bytes());
+    bytes[4..].copy_from_slice(&word1.to_le_bytes());
+    bytes
+}
+
+/// An error unless `planes` have the sizes of [`FrameLayout::plane_size`].
+pub(crate) fn check_planes(layout: &FrameLayout, planes: [&[u8]; 3]) -> Result<(), EncodeError> {
+    for (component, plane) in Component::ALL.into_iter().zip(planes) {
+        let (width, height) = layout.plane_size(component);
+        let expected = width as usize * height as usize;
+        if plane.len() != expected {
+            return Err(EncodeError::PlaneSize {
+                component,
+                expected,
+                actual: plane.len(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Splits an encoded frame into packets of at most `max_bytes` each, at
