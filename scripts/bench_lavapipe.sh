@@ -32,6 +32,7 @@ docker run --rm \
     -v emberwave-lavapipe-registry:/usr/local/cargo/registry \
     -v emberwave-lavapipe-target:/target \
     -e FRAMES="$FRAMES" \
+    -e BENCH_DATE="$(date +%F)" \
     "$IMAGE" bash -euo pipefail -c '
         apt-get update -qq
         apt-get install -y -qq --no-install-recommends mesa-vulkan-drivers libvulkan1 > /dev/null
@@ -46,7 +47,7 @@ docker run --rm \
         done
         mesa=$(dpkg-query -W -f "\${Version}" mesa-vulkan-drivers)
         printf "{\"date\":\"%s\",\"os\":\"Debian %s\",\"arch\":\"%s\",\"cpus\":%s,\"mesa\":\"%s\"}\n" \
-            "$(date +%F)" "$(cat /etc/debian_version)" "$(uname -m)" "$(nproc)" "$mesa" \
+            "$BENCH_DATE" "$(cat /etc/debian_version)" "$(uname -m)" "$(nproc)" "$mesa" \
             > /out/lavapipe-environment.json
     '
 echo "lavapipe results are in $OUT"
