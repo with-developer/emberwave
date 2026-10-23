@@ -208,9 +208,8 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
 
     // Vertical pass: one invocation per segment of a tile column. Earlier
     // levels store the LL band of the next level; the last level collects its
-    // 8-bit samples for packing. The branch is uniform: one workgroup belongs
-    // to one component. It has to stay uniform, because the barrier below
-    // depends on it; naga does not check that, the browser's compiler does.
+    // 8-bit samples for packing. One workgroup belongs to one component, so
+    // the branch is the same for all its invocations.
     let is_final = comp.is_final != 0u;
     if (tid < 128u) {
         let column = tid % 32u;
@@ -263,8 +262,12 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     // At the last level every invocation writes one word of the tile: four
     // samples of a row, the first in the low byte. Rows of a packed plane are
     // padded to whole words, and the padding samples are zero.
+    //
+    // The barrier is outside the branch on purpose: every level waits, though
+    // only the last needs it. Inside `if (is_final)`, uniform as that is, it
+    // crashed WARP, Direct3D's software rasteriser.
+    workgroupBarrier();
     if (is_final) {
-        workgroupBarrier();
         let row = tid / 8u;
         let word = tid % 8u;
         let y = u32(tile_y) + row;
