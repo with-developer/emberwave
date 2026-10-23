@@ -1,12 +1,15 @@
 //! Rate control: how many bit-planes each 32x32 block drops so that the
 //! frame fits its budget.
 //!
-//! Every block offers steps, each dropping planes up to some number: a step
-//! saves words and adds distortion. Its key orders it by the distortion it
-//! adds per word it saves. The steps of all blocks are applied in key order,
-//! ties by block index, until the frame fits: the cheapest distortion goes
-//! first, frame-wide, in one pass (decision D28). A block's keys never
-//! decrease, so its steps come in the order they build on each other.
+//! A block can be sent at a few sizes. For each, it drops the number of
+//! planes that gives the least distortion there: dropping a plane sometimes
+//! costs no word and still lands the reconstruction nearer. From one size to
+//! the next smaller one is a step, which saves words and adds distortion; its
+//! key orders it by the distortion it adds per word it saves. The steps of
+//! all blocks are applied in key order, ties by block index, until the frame
+//! fits: the cheapest distortion goes first, frame-wide, in one pass
+//! (decision D28). A block's keys never decrease, so its steps come in the
+//! order they build on each other.
 //!
 //! Keys are integers found by exact comparisons, with no division and no
 //! logarithm, so that a GPU, given the same costs, makes the same choices.
@@ -72,27 +75,45 @@ pub(crate) struct Step {
     pub saving: u16,
 }
 
-/// Appends the steps of block `block` in the order they must be applied.
-/// Dropping a plane that saves no word is folded into the next step that
-/// does, and a step's key is at least that of the step before it.
-pub(crate) fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
-    let mut from = 0usize;
-    let mut previous_key = 0u16;
-    for drop in 1..=usize::from(cost.max_drop).min(DROP_STEPS - 1) {
-        let saving = cost.words[from].saturating_sub(cost.words[drop]);
-        if saving == 0 {
-            continue;
+/// The numbers of planes a block may drop that are worth considering: for
+/// each size the block can have, the one with the least distortion (the
+/// fewest planes on a tie). Sizes decrease along the list.
+pub(crate) fn points(cost: &BlockCost) -> Vec<u8> {
+    let mut points: Vec<u8> = Vec::new();
+    for drop in 0..=cost.max_drop.min(DROP_STEPS as u8 - 1) {
+        let (words, distortion) = (
+            cost.words[usize::from(drop)],
+            cost.distortion[usize::from(drop)],
+        );
+        match points.last_mut() {
+            Some(last) if cost.words[usize::from(*last)] == words => {
+                if distortion < cost.distortion[usize::from(*last)] {
+                    *last = drop;
+                }
+            }
+            _ => points.push(drop),
         }
-        let added = cost.distortion[drop] - cost.distortion[from];
+    }
+    points
+}
+
+/// Appends the steps of block `block` in the order they must be applied:
+/// from each of its [`points`] to the next. A step's key is at least that of
+/// the step before it.
+pub(crate) fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
+    let mut previous_key = 0u16;
+    for pair in points(cost).windows(2) {
+        let (from, to) = (usize::from(pair[0]), usize::from(pair[1]));
+        let saving = cost.words[from] - cost.words[to];
+        let added = cost.distortion[to] - cost.distortion[from];
         let key = key(added, saving).max(previous_key);
         out.push(Step {
             key,
             block,
-            drop: drop as u8,
+            drop: pair[1],
             saving,
         });
         previous_key = key;
-        from = drop;
     }
 }
 
@@ -100,7 +121,8 @@ pub(crate) fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
 /// most `budget_words`, or `None` if they do not fit even with every block
 /// dropping all it may.
 pub(crate) fn choose(costs: &[BlockCost], budget_words: u64) -> Option<Vec<u8>> {
-    let mut drops = vec![0u8; costs.len()];
+    // Each block starts at the best drop that costs what dropping none does.
+    let mut drops: Vec<u8> = costs.iter().map(|cost| points(cost)[0]).collect();
     let total: u64 = costs.iter().map(|cost| u64::from(cost.words[0])).sum();
     let Some(need) = total.checked_sub(budget_words).filter(|&need| need > 0) else {
         return Some(drops);
@@ -207,6 +229,20 @@ mod tests {
         assert_eq!((out[0].drop, out[0].saving), (2, 6));
         // Its key counts the distortion of both planes: 9 for 6 words.
         assert_eq!(out[0].key, key(9.0, 6));
+    }
+
+    #[test]
+    fn at_the_same_size_the_least_distortion_wins() {
+        // Dropping one plane costs no word but lands nearer, as can happen
+        // with a dead zone: the block uses it even when everything fits.
+        let c = cost([4, 4, 4, 0], [2.0, 0.1, 13.8, 40.0]);
+        assert_eq!(points(&c), [1, 3]);
+        assert_eq!(choose(std::slice::from_ref(&c), 100), Some(vec![1]));
+        let mut out = Vec::new();
+        steps(0, &c, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].drop, out[0].saving), (3, 4));
+        assert_eq!(out[0].key, key(39.9, 4));
     }
 
     #[test]

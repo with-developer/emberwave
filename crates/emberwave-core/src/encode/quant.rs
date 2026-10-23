@@ -208,9 +208,22 @@ pub(crate) fn analyse_block8(
     let scale_code = (0..MAX_SCALE_CODE)
         .find(|&code| largest < limit * block8_scale(code))
         .unwrap_or(MAX_SCALE_CODE);
+    let scale = block8_scale(scale_code);
     let inverse = INVERSE_SCALES[usize::from(scale_code)];
 
-    let magnitudes = scaled.map(|t| (t * inverse) as u32);
+    // trunc(|t| / scale), exactly: the product with the rounded inverse can
+    // be one off next to a whole number, and `m * scale` is exact, so two
+    // comparisons put it right. A GPU does the same and gets the same.
+    let magnitudes = scaled.map(|t| {
+        let estimate = (t * inverse) as u32;
+        if estimate as f32 * scale > t {
+            estimate - 1
+        } else if (estimate + 1) as f32 * scale <= t {
+            estimate + 1
+        } else {
+            estimate
+        }
+    });
     let largest_magnitude = magnitudes.iter().copied().max().unwrap_or(0);
     if largest_magnitude == 0 {
         return None;
@@ -230,7 +243,7 @@ pub(crate) fn analyse_block8(
     // Multiplications by exact powers of two only, so that a GPU gets the
     // same: GPUs need not divide exactly.
     let to_coefficient = exact_pow2(-quant.exponent);
-    let step = block8_scale(scale_code) * to_coefficient;
+    let step = scale * to_coefficient;
     let mut plane_bytes = [0u16; DROP_STEPS];
     let mut signs = [0u8; DROP_STEPS];
     let mut distortion = [0.0f32; DROP_STEPS];
@@ -365,6 +378,39 @@ mod tests {
                 .iter()
                 .all(|&p| p >= block.base && p <= block.base + 3)
         );
+    }
+
+    #[test]
+    fn magnitudes_are_exact_quotients() {
+        // Values next to a whole multiple of the scale, where a product with
+        // the rounded inverse of the scale can land on the wrong side.
+        let q = quant();
+        let resolution = exact_pow2(q.exponent);
+        for code in 0..=MAX_SCALE_CODE {
+            let scale = block8_scale(code);
+            for m in 1..200u32 {
+                for t in [
+                    m as f32 * scale,
+                    f32::from_bits((m as f32 * scale).to_bits() - 1),
+                ] {
+                    let mut coefficients = [0.0f32; BLOCK8_VALUES];
+                    coefficients[0] = t / resolution;
+                    // Pin the scale code with a large value elsewhere.
+                    coefficients[1] = 2000.0 * scale / resolution;
+                    let Some(block) = analyse_block8(&coefficients, &q) else {
+                        continue;
+                    };
+                    let scale = block8_scale(block.scale_code);
+                    let expected = (t / scale) as u32;
+                    // The quotient itself, computed in f64, decides.
+                    let exact = (f64::from(t) / f64::from(scale)).floor() as u32;
+                    assert_eq!(
+                        block.magnitudes[0], exact,
+                        "t {t} scale {scale} ({expected})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
