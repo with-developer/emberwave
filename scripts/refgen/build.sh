@@ -8,13 +8,21 @@
 UPSTREAM_URL=https://github.com/Themaister/pyrowave.git
 UPSTREAM_REV=79a3232a2199281f33f7a2e2659fc4fac62b022a
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# The repository root, from this file's location. BASH_SOURCE is empty when
+# another shell sources this file; zsh puts the file in $0 instead. A wrong
+# root would clone and build outside the repository, so check it first.
+REFGEN_DIR=$(dirname "${BASH_SOURCE[0]:-$0}")
+ROOT=$(cd "$REFGEN_DIR/../.." && pwd)
+if [ ! -f "$ROOT/scripts/refgen/refgen.mm" ]; then
+    echo "cannot find the repository from $REFGEN_DIR; run the scripts with bash" >&2
+    return 1 2>/dev/null || exit 1
+fi
 CACHE=$ROOT/testdata/_cache
 REFGEN=$CACHE/refgen
 
 if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
     echo "this needs Apple Silicon macOS (upstream Metal port)" >&2
-    exit 1
+    return 1 2>/dev/null || exit 1
 fi
 
 mkdir -p "$CACHE"
