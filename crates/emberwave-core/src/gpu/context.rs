@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::GpuError;
-use super::pipelines::Pipelines;
+use super::pipelines::{EncoderPipelines, Pipelines};
 
 /// Environment variable that restricts the backends considered, for example
 /// `vulkan`, `metal`, `dx12` or a comma separated list. Unset or `auto` means
@@ -91,9 +91,12 @@ pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     timestamps: bool,
-    /// Built on first use, shared by every clone of the context.
+    /// Built on first use, shared by every clone of the context: the
+    /// decoder's and the encoder's, so that neither compiles the other's.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
-    /// Why the device was lost, once it has been; shared with the decoders.
+    encoder_pipelines: Arc<Mutex<Option<Arc<EncoderPipelines>>>>,
+    /// Why the device was lost, once it has been; shared with the decoders
+    /// and the encoders.
     lost: Arc<Mutex<Option<String>>>,
 }
 
@@ -176,6 +179,7 @@ impl GpuContext {
             queue,
             timestamps,
             pipelines: Arc::default(),
+            encoder_pipelines: Arc::default(),
             lost,
         })
     }
@@ -187,7 +191,8 @@ impl GpuContext {
         self.lost.lock().ok().and_then(|lost| lost.clone())
     }
 
-    /// The record of a lost device, shared with the decoders of this context.
+    /// The record of a lost device, shared with the decoders and the encoders
+    /// of this context.
     pub(crate) fn lost_record(&self) -> Arc<Mutex<Option<String>>> {
         Arc::clone(&self.lost)
     }
@@ -213,19 +218,56 @@ impl GpuContext {
         self.timestamps
     }
 
-    /// The compute pipelines, compiled the first time they are asked for.
+    /// The decoder's compute pipelines, compiled the first time they are
+    /// asked for.
     pub(crate) fn pipelines(&self) -> Result<Arc<Pipelines>, GpuError> {
-        let mut cache = self
-            .pipelines
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(pipelines) = cache.as_ref() {
-            return Ok(Arc::clone(pipelines));
-        }
-        let pipelines = Arc::new(Pipelines::new(&self.device)?);
-        *cache = Some(Arc::clone(&pipelines));
-        Ok(pipelines)
+        cached(&self.pipelines, || Pipelines::new(&self.device))
     }
+
+    /// The encoder's compute pipelines, compiled the first time they are
+    /// asked for.
+    pub(crate) fn encoder_pipelines(&self) -> Result<Arc<EncoderPipelines>, GpuError> {
+        cached(&self.encoder_pipelines, || {
+            EncoderPipelines::new(&self.device)
+        })
+    }
+}
+
+/// The value in `cache`, which `build` makes if there is none yet.
+fn cached<T>(
+    cache: &Mutex<Option<Arc<T>>>,
+    build: impl FnOnce() -> Result<T, GpuError>,
+) -> Result<Arc<T>, GpuError> {
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(value) = cache.as_ref() {
+        return Ok(Arc::clone(value));
+    }
+    let value = Arc::new(build()?);
+    *cache = Some(Arc::clone(&value));
+    Ok(value)
+}
+
+/// The context the unit tests share, or `None` if there is no GPU and none is
+/// required: as for the integration tests, `EMBERWAVE_REQUIRE_GPU` turns a
+/// missing adapter into a failure.
+#[cfg(test)]
+pub(crate) fn test_context() -> Option<&'static GpuContext> {
+    static CONTEXT: std::sync::OnceLock<Option<GpuContext>> = std::sync::OnceLock::new();
+    CONTEXT
+        .get_or_init(|| match GpuContext::new(&GpuOptions::default()) {
+            Ok(context) => Some(context),
+            Err(error) => {
+                let required =
+                    std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_some_and(|v| !v.is_empty());
+                assert!(
+                    !required,
+                    "a GPU is required but none is available: {error}"
+                );
+                eprintln!("no GPU available, skipping: {error}");
+                None
+            }
+        })
+        .as_ref()
 }
 
 #[cfg(test)]

@@ -1,8 +1,9 @@
-//! Error type of the GPU decoder.
+//! Error type of the GPU decoder and encoder.
 
 use thiserror::Error;
 
-/// Everything that can go wrong while setting up the GPU or decoding on it.
+/// Everything that can go wrong while setting up the GPU or decoding or
+/// encoding on it.
 #[derive(Debug, Error)]
 pub enum GpuError {
     /// No adapter matched the requested backends.
@@ -53,4 +54,8 @@ pub enum GpuError {
     /// The bitstream is malformed.
     #[error(transparent)]
     Bitstream(#[from] crate::bitstream::Error),
+
+    /// The planes or the budget do not suit the encoder.
+    #[error(transparent)]
+    Encode(#[from] crate::encode::EncodeError),
 }

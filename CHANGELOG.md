@@ -9,10 +9,13 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 - An encoder on the CPU ([#14](https://github.com/with-developer/emberwave/issues/14)): `emberwave_core::encode::Encoder` turns 8-bit pictures into frames within a byte budget, and `emberwave-cli encode` turns a Y4M video into a PWV1 file. Upstream's decoder reads its streams; at the same bytes its PSNR is upstream's encoder's or higher. It makes the same bytes on every system.
 - Writers for the formats the parsers read: `BlockHeader::to_words`, `SequenceHeader::start_of_frame_words` and `stream_words`, and `Pwv1Header::to_bytes`.
 - Test vectors of the encoder in `testdata/encoder/`, with upstream's decode of them, and `scripts/gen_encoder_vectors.sh` to make them. `refgen encode` can write its pictures (`--source`) and encode a Y4M file (`--input`).
+- An encoder on the GPU ([#14](https://github.com/with-developer/emberwave/issues/14)): `gpu::Encoder` runs the CPU encoder's steps as compute shaders, the forward transform, quantisation, rate control and packing, with one upload and one read-back per frame. Its frames are the CPU encoder's, or differ in some blocks where the GPU rounds a coefficient differently, at the same PSNR; on an Apple M3 Max the committed vectors come out byte for byte, and a 4K frame takes about 4 ms. `emberwave-cli encode --gpu` uses it, with `--backend` and `--software` as for decoding.
 
 ### Changed
 
 - `emberwave-cli`'s Y4M reader keeps the range, the chroma siting and the frame rate of the header, reads `C420paldv` as chroma on the left, and reads a file a frame at a time where that is enough.
+- `GpuError` has a new variant, `Encode`, for the GPU encoder's refusals; a `match` over every variant needs an arm for it.
+- `emberwave-cli encode` ends with the mean, median and 99th percentile of the time per frame instead of the mean alone.
 
 ## [0.3.0] - 2026-10-24
 

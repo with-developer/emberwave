@@ -9,11 +9,13 @@ use bytemuck::{Pod, Zeroable};
 use crate::bitstream::consts::{BANDS_PER_LEVEL, DECOMPOSITION_LEVELS, NUM_COMPONENTS};
 use crate::bitstream::{Band, ChromaSiting, ChromaSubsampling, Component, FrameLayout, YcbcrRange};
 use crate::color::{CHROMA_CENTRE, CHROMA_SCALE, ColorParams, INV_255, LUMA_BLACK, LUMA_SCALE};
+use crate::encode::quant::{BandQuant, DROP_STEPS};
 
 use super::GpuError;
 
 /// Largest number of transmitted bands: four at level 4, three at each of the
-/// other levels, for three components. Sizes the band table in `dequant.wgsl`.
+/// other levels, for three components. Sizes the band tables of
+/// `dequant.wgsl` and `quantise.wgsl`.
 pub(crate) const MAX_BANDS: usize =
     NUM_COMPONENTS * (BANDS_PER_LEVEL + (DECOMPOSITION_LEVELS - 1) * (BANDS_PER_LEVEL - 1));
 
@@ -165,48 +167,246 @@ impl DequantParams {
     }
 }
 
-/// Per component part of the inverse transform's uniform block.
+/// One transmitted band in the quantisation table of the encoder.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub(crate) struct CompParams {
-    pub band_offset: [u32; 4],
-    pub dst_offset: u32,
-    pub dst_stride: u32,
-    pub crop_width: u32,
-    pub crop_height: u32,
-    pub is_final: u32,
+pub(crate) struct QuantBand {
+    pub first_block: u32,
+    pub blocks_x: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Float offset of the band in the pyramid.
+    pub offset: u32,
+    /// [`BandQuant::exponent`].
+    pub exponent: u32,
+    /// [`BandQuant::weight`].
+    pub weight: f32,
+    /// [`BandQuant::max_drop`].
+    pub max_drop: u32,
+}
+
+/// Uniform block of `equant.wgsl`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct QuantParams {
+    pub band_count: u32,
+    pub block_count: u32,
+    pub grid_width: u32,
+    pub pad: u32,
+    pub bands: [QuantBand; MAX_BANDS],
+}
+
+impl QuantParams {
+    /// The band table, with the CPU encoder's quantisation of every band.
+    pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout) -> Self {
+        let mut params = Self::zeroed();
+        let mut count = 0;
+        for (component, level, band, info) in layout.bands() {
+            let quant = BandQuant::new(layout.chroma(), component, level, band);
+            params.bands[count] = QuantBand {
+                first_block: info.first_block,
+                blocks_x: info.blocks_x,
+                width: info.width,
+                height: info.height,
+                offset: buffers
+                    .band_offset(component, level, band)
+                    .expect("a transmitted band has pyramid space"),
+                // 7 to 12, positive.
+                exponent: quant.exponent as u32,
+                weight: quant.weight,
+                max_drop: u32::from(quant.max_drop()),
+            };
+            count += 1;
+        }
+        params.band_count = count as u32;
+        params.block_count = layout.block_count();
+        params.grid_width = grid_for(u64::from(layout.block_count())).0;
+        params
+    }
+
+    /// Workgroup grid of the dispatch: one workgroup per block.
+    pub(crate) fn grid(&self) -> (u32, u32) {
+        grid_for(u64::from(self.block_count))
+    }
+}
+
+/// What `equant.wgsl` writes for every block: the CPU encoder's
+/// [`BlockCost`](crate::encode::rate::BlockCost) in 32-bit words.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub(crate) struct CostRecord {
+    pub words: [u32; DROP_STEPS],
+    pub distortion: [f32; DROP_STEPS],
+    pub max_drop: u32,
+}
+
+#[cfg(test)]
+impl CostRecord {
+    /// The record as the CPU encoder's rate control takes it, or `None` if a
+    /// number does not fit its type, which no shader writes.
+    pub(crate) fn to_cost(self) -> Option<crate::encode::rate::BlockCost> {
+        let mut words = [0u16; DROP_STEPS];
+        for (word, &value) in words.iter_mut().zip(&self.words) {
+            *word = u16::try_from(value).ok()?;
+        }
+        Some(crate::encode::rate::BlockCost {
+            words,
+            distortion: self.distortion,
+            max_drop: u8::try_from(self.max_drop).ok()?,
+        })
+    }
+
+    /// The CPU encoder's record in 32-bit words.
+    pub(crate) fn from_cost(cost: &crate::encode::rate::BlockCost) -> Self {
+        Self {
+            words: cost.words.map(u32::from),
+            distortion: cost.distortion,
+            max_drop: u32::from(cost.max_drop),
+        }
+    }
+}
+
+/// Blocks per workgroup of the dispatches of `rate.wgsl` over the blocks.
+pub(crate) const RATE_GROUP_SIZE: u64 = 64;
+
+/// The most words a block takes: a header and 16 8x8 blocks of 3 bytes of
+/// tables, 8 subblocks of at most 18 bit-planes (15 base planes and 3 more)
+/// and 64 sign bits. `pack.wgsl` assembles blocks of up to this size.
+pub(crate) const MAX_BLOCK_WORDS: u64 = (8 + 16 * (3 + 8 * 18 + 8)) / 4;
+
+/// Values a workgroup of `scan.wgsl` sums, and the most chunks of that many
+/// it sums: 2^20 values at most.
+pub(crate) const SCAN_CHUNK: u64 = 1024;
+
+/// Uniform block of `rate.wgsl` and `pack.wgsl`, written for every frame.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct FrameParams {
+    pub block_count: u32,
+    /// Workgroups in x of the dispatches over the blocks, 64 blocks each.
+    pub grid_width: u32,
+    /// Words the blocks may take: the budget less the start of frame header.
+    pub budget_words: u32,
+    pub sequence: u32,
+    /// Words the payload buffer holds.
+    pub capacity_words: u32,
     pub pad: [u32; 3],
 }
 
-/// Uniform block of `idwt.wgsl` for one decomposition level.
+/// Workgroup grid of the dispatches of `rate.wgsl` over the blocks.
+pub(crate) fn rate_grid(layout: &FrameLayout) -> (u32, u32) {
+    grid_for(u64::from(layout.block_count()).div_ceil(RATE_GROUP_SIZE))
+}
+
+/// Number of keys of the rate control, the size of its histogram.
+pub(crate) const RATE_KEYS: u64 = 512;
+
+/// What the CPU reads of `rate.wgsl`'s state, which follows the histogram.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub(crate) struct RateSummary {
+    /// Words of all blocks with nothing dropped.
+    pub total: u32,
+    /// Words of all blocks with all dropped that they may drop.
+    pub minimum: u32,
+    /// Blocks that are sent.
+    pub sent: u32,
+    pub cutoff_key: u32,
+    pub remaining: u32,
+    /// 1 if the frame fits its budget.
+    pub fits: u32,
+}
+
+/// Bytes of `rate.wgsl`'s state: the histogram and the summary.
+pub(crate) const RATE_STATE_BYTES: u64 = RATE_KEYS * 4 + std::mem::size_of::<RateSummary>() as u64;
+
+/// Uniform block of `scan.wgsl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub(crate) struct IdwtParams {
+pub(crate) struct ScanParams {
+    pub count: u32,
+    pub chunk_count: u32,
+    pub grid_width: u32,
+    pub pad: u32,
+}
+
+impl ScanParams {
+    /// The parameters of a scan of `count` values, or an error if they are
+    /// more than two passes of the scan can sum.
+    pub(crate) fn new(count: u32) -> Result<Self, GpuError> {
+        let chunk_count = u64::from(count).div_ceil(SCAN_CHUNK);
+        if chunk_count > SCAN_CHUNK {
+            return Err(GpuError::TooLarge);
+        }
+        Ok(Self {
+            count,
+            chunk_count: chunk_count as u32,
+            grid_width: grid_for(chunk_count).0,
+            pad: 0,
+        })
+    }
+
+    /// Workgroup grid of the dispatches over the chunks.
+    pub(crate) fn grid(&self) -> (u32, u32) {
+        grid_for(u64::from(self.chunk_count))
+    }
+}
+
+/// Per component part of a transform level's uniform block.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct CompParams {
+    /// Float offsets of the LL, HL, LH and HH bands in the pyramid.
+    pub band_offset: [u32; 4],
+    /// Where the level's image is: at the component's finest level the packed
+    /// 8-bit plane, in words, otherwise the LL band of the next finer level,
+    /// in floats.
+    pub image_offset: u32,
+    /// Row length of the image, in the same unit.
+    pub image_stride: u32,
+    /// Size of the plane at the finest level, the size of the image otherwise.
+    pub plane_width: u32,
+    pub plane_height: u32,
+    /// 1 at the component's finest level, whose image is the packed plane.
+    pub is_plane: u32,
+    pub pad: [u32; 3],
+}
+
+/// Uniform block of `idwt.wgsl` and `fdwt.wgsl` for one decomposition level.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct LevelParams {
     pub band_width: u32,
     pub band_height: u32,
-    pub out_width: u32,
-    pub out_height: u32,
+    /// Size of the level's image, twice that of its bands.
+    pub image_width: u32,
+    pub image_height: u32,
     pub comps: [CompParams; NUM_COMPONENTS],
 }
 
-/// One level of the inverse transform: parameters and dispatch size.
+/// One level of the wavelet transform: parameters and dispatch size.
+///
+/// A level works between its four bands and its image, twice their size: the
+/// inverse transform (`idwt.wgsl`) combines the bands into the image and the
+/// forward transform (`fdwt.wgsl`) splits the image into the bands, so both
+/// take the same parameters.
 #[derive(Debug, Clone)]
-pub(crate) struct IdwtLevel {
-    pub params: IdwtParams,
+pub(crate) struct TransformLevel {
+    pub params: LevelParams,
     /// Number of components that have this level: the z size of the dispatch.
     pub components: u32,
 }
 
-impl IdwtLevel {
-    /// Parameters for the inverse transform that consumes the bands of `level`.
+impl TransformLevel {
+    /// Parameters for the transform between the bands of `level` and its image.
     pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout, level: usize) -> Self {
         let (band_width, band_height) = layout.level_size(level);
-        let mut params = IdwtParams {
+        let mut params = LevelParams {
             band_width,
             band_height,
-            out_width: 2 * band_width,
-            out_height: 2 * band_height,
-            ..IdwtParams::zeroed()
+            image_width: 2 * band_width,
+            image_height: 2 * band_height,
+            ..LevelParams::zeroed()
         };
 
         let mut components = 0;
@@ -227,20 +427,20 @@ impl IdwtLevel {
             comp.band_offset = offsets;
             if level == layout.finest_level(component) {
                 let (width, height) = layout.plane_size(component);
-                comp.dst_offset = buffers.packed_offsets[component.index()];
-                comp.dst_stride = buffers.packed_strides[component.index()];
-                comp.crop_width = width;
-                comp.crop_height = height;
-                comp.is_final = 1;
+                comp.image_offset = buffers.packed_offsets[component.index()];
+                comp.image_stride = buffers.packed_strides[component.index()];
+                comp.plane_width = width;
+                comp.plane_height = height;
+                comp.is_plane = 1;
             } else {
                 // The LL band of the next finer level is twice as wide.
-                comp.dst_offset = buffers
+                comp.image_offset = buffers
                     .band_offset(component, level - 1, Band::Ll)
                     .expect("the next finer level exists");
-                comp.dst_stride = 2 * band_width;
-                comp.crop_width = 2 * band_width;
-                comp.crop_height = 2 * band_height;
-                comp.is_final = 0;
+                comp.image_stride = 2 * band_width;
+                comp.plane_width = 2 * band_width;
+                comp.plane_height = 2 * band_height;
+                comp.is_plane = 0;
             }
             components += 1;
         }
@@ -248,11 +448,11 @@ impl IdwtLevel {
         Self { params, components }
     }
 
-    /// Workgroup grid: 32x32 output tiles in x and y, components in z.
+    /// Workgroup grid: 32x32 tiles of the image in x and y, components in z.
     pub(crate) fn grid(&self) -> (u32, u32, u32) {
         (
-            self.params.out_width.div_ceil(32),
-            self.params.out_height.div_ceil(32),
+            self.params.image_width.div_ceil(32),
+            self.params.image_height.div_ceil(32),
             self.components,
         )
     }
@@ -333,9 +533,32 @@ mod tests {
         assert_eq!(size_of::<BandInfo>(), 32);
         assert_eq!(size_of::<DequantParams>(), 16 + 32 * MAX_BANDS);
         assert_eq!(size_of::<CompParams>(), 48);
-        assert_eq!(size_of::<IdwtParams>(), 16 + 3 * 48);
+        assert_eq!(size_of::<LevelParams>(), 16 + 3 * 48);
         assert_eq!(size_of::<YuvParams>(), 64 + 3 * 16);
+        assert_eq!(size_of::<QuantBand>(), 32);
+        assert_eq!(size_of::<QuantParams>(), 16 + 32 * MAX_BANDS);
         assert_eq!(MAX_BANDS, 48);
+        // A storage array element in `equant.wgsl`: 33 words, no padding.
+        assert_eq!(size_of::<CostRecord>(), 4 * 33);
+        assert_eq!(size_of::<FrameParams>(), 32);
+        assert_eq!(size_of::<ScanParams>(), 16);
+        // RateState in `rate.wgsl`.
+        assert_eq!(RATE_STATE_BYTES, 4 * (512 + 6));
+        assert_eq!(MAX_BLOCK_WORDS, 622);
+    }
+
+    #[test]
+    fn the_largest_frame_fits_the_scans_and_32_bit_word_counts() {
+        // 16384x16384 at 4:4:4: three components of 262144 blocks.
+        let layout = FrameLayout::new(16384, 16384, ChromaSubsampling::Yuv444).unwrap();
+        assert_eq!(layout.block_count(), 786_432);
+        let scan = ScanParams::new(layout.block_count()).unwrap();
+        assert_eq!(scan.chunk_count, 768);
+        // The rate control adds up words of every block in 32 bits.
+        assert!(u64::from(layout.block_count()) * MAX_BLOCK_WORDS < u64::from(u32::MAX));
+        // One value more than two passes of the scan sum is refused.
+        assert!(ScanParams::new(1 << 20).is_ok());
+        assert!(ScanParams::new((1 << 20) + 1).is_err());
     }
 
     #[test]
@@ -417,16 +640,16 @@ mod tests {
     }
 
     #[test]
-    fn idwt_levels_chain_into_each_other() {
+    fn transform_levels_chain_into_each_other() {
         let layout = layout_420();
         let buffers = BufferLayout::new(&layout).unwrap();
 
         for level in 1..DECOMPOSITION_LEVELS {
-            let this = IdwtLevel::new(&layout, &buffers, level);
+            let this = TransformLevel::new(&layout, &buffers, level);
             assert_eq!(this.components, 3);
             let (bw, bh) = layout.level_size(level);
             assert_eq!(
-                (this.params.out_width, this.params.out_height),
+                (this.params.image_width, this.params.image_height),
                 (2 * bw, 2 * bh)
             );
 
@@ -434,28 +657,28 @@ mod tests {
                 let comp = this.params.comps[component.index()];
                 if level == layout.finest_level(component) {
                     // 4:2:0 chroma finishes at level 1.
-                    // The last level writes the packed plane, in words.
-                    assert_eq!(comp.is_final, 1);
-                    assert_eq!(comp.dst_offset, buffers.packed_offsets[component.index()]);
-                    assert_eq!(comp.dst_stride, buffers.packed_strides[component.index()]);
+                    // The image of the finest level is the packed plane, in words.
+                    assert_eq!(comp.is_plane, 1);
+                    assert_eq!(comp.image_offset, buffers.packed_offsets[component.index()]);
+                    assert_eq!(comp.image_stride, buffers.packed_strides[component.index()]);
                 } else {
-                    // The destination is the LL band the next level reads.
+                    // The image is the LL band of the next finer level.
                     let next = buffers.band_offset(component, level - 1, Band::Ll).unwrap();
-                    assert_eq!(comp.is_final, 0);
-                    assert_eq!(comp.dst_offset, next);
-                    assert_eq!(comp.dst_stride, 2 * bw);
+                    assert_eq!(comp.is_plane, 0);
+                    assert_eq!(comp.image_offset, next);
+                    assert_eq!(comp.image_stride, 2 * bw);
                 }
             }
         }
 
         // The finest level has luma only in 4:2:0.
-        let finest = IdwtLevel::new(&layout, &buffers, 0);
+        let finest = TransformLevel::new(&layout, &buffers, 0);
         assert_eq!(finest.components, 1);
-        assert_eq!(finest.params.comps[0].is_final, 1);
+        assert_eq!(finest.params.comps[0].is_plane, 1);
         assert_eq!(
             (
-                finest.params.comps[0].crop_width,
-                finest.params.comps[0].crop_height
+                finest.params.comps[0].plane_width,
+                finest.params.comps[0].plane_height
             ),
             (200, 120)
         );
@@ -463,7 +686,7 @@ mod tests {
 
         let layout = FrameLayout::new(131, 67, ChromaSubsampling::Yuv444).unwrap();
         let buffers = BufferLayout::new(&layout).unwrap();
-        assert_eq!(IdwtLevel::new(&layout, &buffers, 0).components, 3);
+        assert_eq!(TransformLevel::new(&layout, &buffers, 0).components, 3);
     }
 
     #[test]
@@ -526,7 +749,7 @@ mod tests {
     }
 
     proptest::proptest! {
-        // DequantParams and IdwtLevel look bands up in the BufferLayout of the
+        // DequantParams, QuantParams and TransformLevel look bands up in the BufferLayout of the
         // same FrameLayout and `expect` to find them. Every picture size the
         // bitstream allows must keep that promise, so building the parameter
         // blocks never panics.
@@ -548,8 +771,14 @@ mod tests {
                 return Ok(());
             };
             DequantParams::new(&layout, &buffers);
+            let quant = QuantParams::new(&layout, &buffers);
+            for band in &quant.bands[..quant.band_count as usize] {
+                proptest::prop_assert!((7..=12).contains(&band.exponent));
+                proptest::prop_assert!(band.max_drop <= 15);
+                proptest::prop_assert!(band.weight > 0.0 && band.weight.is_finite());
+            }
             for level in 0..DECOMPOSITION_LEVELS {
-                IdwtLevel::new(&layout, &buffers, level);
+                TransformLevel::new(&layout, &buffers, level);
             }
             YuvParams::new(&layout, &buffers, &ColorParams::default());
         }

@@ -10,7 +10,7 @@ A portable ([wgpu](https://wgpu.rs)) port of the [PyroWave](https://github.com/T
 
 PyroWave is an intra-only codec built for very fast GPU encode and decode (upstream reports under ~0.1 ms at 1080p and ~0.2 ms at 4K) for local-network game streaming. Its reference implementation is written as Vulkan compute shaders. **emberwave reimplements the decoder in Rust + WGSL on top of wgpu**, so a single code base can target Vulkan, Metal, DX12 and WebGPU.
 
-> **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output, up to 4K (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode). CI runs the tests on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Decoding works, converts to RGB on the GPU and comes with a command line tool, a browser player and a C API. An encoder on the CPU makes streams that upstream's decoder reads, at upstream's PSNR or above for the same bytes; its GPU version is next. A 4K frame decodes in about 1.1 ms on an Apple M3 Max (1.4 ms including the conversion to RGB), 1.4 times the time of upstream's own Metal decoder at FP32 (see [Performance](#performance)). Releases and their changes are in [`CHANGELOG.md`](CHANGELOG.md).
+> **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output, up to 4K (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode). CI runs the tests on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Decoding works, converts to RGB on the GPU and comes with a command line tool, a browser player and a C API. An encoder makes streams that upstream's decoder reads, at upstream's PSNR or above for the same bytes, on the CPU or on the GPU, which encodes a 4K frame in about 4 ms on the same machine. A 4K frame decodes in about 1.1 ms on an Apple M3 Max (1.4 ms including the conversion to RGB), 1.4 times the time of upstream's own Metal decoder at FP32 (see [Performance](#performance)). Releases and their changes are in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Quick start
 
@@ -45,11 +45,12 @@ emberwave-cli bench testdata/gradient_200x120_420.pwv1 --output rgb
 # Compare two Y4M files plane by plane; fails if a plane is below 60 dB PSNR
 emberwave-cli compare out/gradient_200x120_420.y4m testdata/gradient_200x120_420.ref.y4m --min-psnr 60
 
-# Encode a Y4M video (8-bit 4:2:0 or 4:4:4), each frame within 6000 bytes
-emberwave-cli encode testdata/encoder/scene_200x120_420.source.y4m --out scene.pwv1 --bytes-per-frame 6000
+# Encode a Y4M video (8-bit 4:2:0 or 4:4:4), each frame within 6000 bytes;
+# --gpu encodes on the GPU
+emberwave-cli encode testdata/encoder/scene_200x120_420.source.y4m --out scene.pwv1 --bytes-per-frame 6000 --gpu
 ```
 
-The decoder uses whatever GPU the machine offers: Vulkan, Metal or DX12, or a software driver such as Mesa's lavapipe or Windows' WARP. `--backend vulkan|metal|dx12` and `--software` narrow the choice, as does the `EMBERWAVE_BACKEND` environment variable, and the adapter in use is printed. The RGB conversion follows what the file signals (matrix, range, chroma siting); `--matrix bt601|bt709|bt2020` and `--range full|limited` override it. [`ARCHITECTURE.md`](ARCHITECTURE.md#command-line-tool) lists every option and explains how the timings are measured.
+The decoder, and the encoder with `--gpu`, use whatever GPU the machine offers: Vulkan, Metal or DX12, or a software driver such as Mesa's lavapipe or Windows' WARP. `--backend vulkan|metal|dx12` and `--software` narrow the choice, as does the `EMBERWAVE_BACKEND` environment variable, and the adapter in use is printed. The RGB conversion follows what the file signals (matrix, range, chroma siting); `--matrix bt601|bt709|bt2020` and `--range full|limited` override it. [`ARCHITECTURE.md`](ARCHITECTURE.md#command-line-tool) lists every option and explains how the timings are measured.
 
 ### From C
 
@@ -88,13 +89,13 @@ Each milestone is tracked in its own issue.
 - [x] **M4** Benchmarks and documentation ([#5](https://github.com/with-developer/emberwave/issues/5))
 - [x] **M5** Stabilisation and the v0.1.0 release ([#6](https://github.com/with-developer/emberwave/issues/6))
 
-After the release: a [browser player](https://with-developer.github.io/emberwave/) (WebGPU, [#15](https://github.com/with-developer/emberwave/issues/15)) and a C API for clients such as Moonlight's ([#16](https://github.com/with-developer/emberwave/issues/16)); an encoder ([#14](https://github.com/with-developer/emberwave/issues/14)), on the CPU so far, with its GPU version to come.
+After the release: a [browser player](https://with-developer.github.io/emberwave/) (WebGPU, [#15](https://github.com/with-developer/emberwave/issues/15)) and a C API for clients such as Moonlight's ([#16](https://github.com/with-developer/emberwave/issues/16)); an encoder ([#14](https://github.com/with-developer/emberwave/issues/14)), on the CPU and on the GPU.
 
 ## Repository layout
 
 | Path | Purpose |
 |---|---|
-| `crates/emberwave-core` | Bitstream parser, CPU reference decoder, colour conversion and the wgpu/WGSL decoder |
+| `crates/emberwave-core` | Bitstream parser, CPU reference decoder, colour conversion, the wgpu/WGSL decoder, and the encoder on the CPU and the GPU |
 | `crates/emberwave-cli` | `emberwave-cli` command line tool |
 | `crates/emberwave-ffi` | The C API: header, library and a C example |
 | `crates/emberwave-web`, `web/` | The browser player: WebAssembly module and page |
@@ -134,5 +135,5 @@ emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 
 - **릴리스**: v0.1.0이 첫 릴리스, v0.2.0이 속도 개선, v0.3.0이 브라우저 플레이어와 C API 릴리스입니다. Linux(x86_64), macOS(Apple Silicon), Windows(x86_64)용 `emberwave-cli`와 C 라이브러리(`emberwave-ffi`)를 [releases](https://github.com/with-developer/emberwave/releases)에서 받을 수 있습니다. 4K 1000프레임을 반복 디코딩해도 GPU 자원과 프로세스 메모리가 늘지 않는 것을 확인했습니다.
 - **브라우저 플레이어**: [with-developer.github.io/emberwave](https://with-developer.github.io/emberwave/)에서 `.pwv1` 파일을 열면 WebGPU로 페이지 안에서 디코딩해 재생합니다. 파일은 어디에도 올라가지 않습니다.
 - **C API**: `crates/emberwave-ffi`가 C에서 쓰는 헤더(`emberwave.h`)와 공유·정적 라이브러리를 제공합니다. 네트워크로 받은 패킷을 넣고 YUV 평면이나 RGB를 호출자 메모리로 받습니다. 릴리스마다 3개 OS용으로 빌드해 올리고, C 예제가 CI에서 모든 테스트 벡터를 디코딩합니다.
-- **인코더**: `emberwave-cli encode`가 Y4M을 프레임당 바이트 예산 안에서 PWV1로 인코딩합니다(지금은 CPU). 업스트림 디코더가 그대로 읽고, 같은 바이트에서 PSNR이 업스트림 인코더와 같거나 높습니다(장면 영상에서 +0.6~+3.4 dB).
-- **남은 일**: GPU 인코더(#14), 그림을 GPU에서 호출자의 그래픽 API와 공유하는 C API(#27).
+- **인코더**: `emberwave-cli encode`가 Y4M을 프레임당 바이트 예산 안에서 PWV1로 인코딩합니다. 업스트림 디코더가 그대로 읽고, 같은 바이트에서 PSNR이 업스트림 인코더와 같거나 높습니다(장면 영상에서 +0.6~+3.4 dB). `--gpu`를 주면 GPU에서 인코딩하며, Apple M3 Max에서 4K 한 프레임이 업로드와 읽기를 포함해 약 4 ms(CPU의 약 60분의 1)입니다. GPU 인코더의 프레임은 CPU 인코더와 같거나 일부 블록만 다르며(자연 영상에서 보낸 블록의 약 0.5%) PSNR은 같고, Apple M3 Max에서 커밋된 벡터는 모두 바이트 단위로 같습니다.
+- **남은 일**: 인코더 벤치마크와 양자화 최적화(#29), 그림을 GPU에서 호출자의 그래픽 API와 공유하는 C API(#27).

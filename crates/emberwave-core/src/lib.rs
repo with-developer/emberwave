@@ -4,7 +4,9 @@
 //! - [`bitstream`]: the PyroWave v1 bitstream (pure Rust, GPU independent).
 //! - [`cpu`]: a slow reference decoder used as a test oracle.
 //! - [`color`]: YCbCr to RGB conversion, shared by the CPU and GPU paths.
-//! - [`gpu`] (feature `gpu`, on by default): the wgpu/WGSL decoder.
+//! - [`encode`]: an encoder on the CPU, the reference of the GPU's.
+//! - [`gpu`] (feature `gpu`, on by default): the wgpu/WGSL decoder and
+//!   encoder.
 //!
 //! See `ARCHITECTURE.md` for the design.
 

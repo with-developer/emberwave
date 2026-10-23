@@ -8,11 +8,10 @@
 
 mod common;
 
-use std::sync::OnceLock;
-
 use common::{
-    Reference, encoder_dir, encoder_vectors, frames_of, max_abs_diff, psnr, read_reference,
-    read_y4m, testdata_dir, vector_frames, vector_names,
+    Reference, create_context, encoder_dir, encoder_vectors, frames_of, live_resources,
+    max_abs_diff, psnr, read_reference, read_y4m, shared_context, testdata_dir, vector_frames,
+    vector_names,
 };
 use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
 use emberwave_core::bitstream::{
@@ -23,43 +22,10 @@ use emberwave_core::color::{ColorMatrix, ColorParams, yuv_to_rgb8};
 use emberwave_core::cpu;
 use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuError, GpuOptions, TimedOutput};
 
-/// Whether a missing GPU is a failure rather than a reason to skip. An empty
-/// value counts as unset so a CI matrix can leave it blank.
-fn gpu_required() -> bool {
-    std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_some_and(|value| !value.is_empty())
-}
-
-/// Creates a context, or returns `None` if there is no GPU and none is required.
-fn create_context(options: &GpuOptions) -> Option<GpuContext> {
-    match GpuContext::new(options) {
-        Ok(context) => {
-            eprintln!("GPU tests run on {:?}", context.adapter_info());
-            Some(context)
-        }
-        Err(error) => {
-            assert!(
-                !gpu_required(),
-                "a GPU is required but none is available: {error}"
-            );
-            eprintln!("no GPU available, skipping: {error}");
-            None
-        }
-    }
-}
-
-/// The GPU context shared by the tests of this file, or `None` if there is no
-/// GPU and none is required.
-fn context() -> Option<&'static GpuContext> {
-    static CONTEXT: OnceLock<Option<GpuContext>> = OnceLock::new();
-    CONTEXT
-        .get_or_init(|| create_context(&GpuOptions::default()))
-        .as_ref()
-}
-
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
     () => {
-        match context() {
+        match shared_context() {
             Some(context) => context,
             None => return,
         }
@@ -699,16 +665,6 @@ fn timing_a_frame_reports_where_the_time_goes() {
             ),
         }
     }
-}
-
-/// Every count of live GPU objects and memory that wgpu keeps for a context's
-/// device (the tests build wgpu with its `counters` feature), as text: buffers,
-/// textures and their views, bind groups and their layouts, pipelines,
-/// samplers, command encoders, shader modules, query sets, fences, memory.
-/// wgpu 30 keeps the object counts on Vulkan, Metal and DX12; Metal leaves the
-/// memory at zero, and no backend counts memory allocations.
-fn live_resources(context: &GpuContext) -> String {
-    format!("{:?}", context.device().get_internal_counters().hal)
 }
 
 /// Decodes `frame` in the way `round` selects, so that a loop goes through

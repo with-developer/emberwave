@@ -564,6 +564,16 @@ fn encode_refuses_before_it_writes_and_leaves_no_partial_file() {
         ),
         (&empty, vec!["--bytes-per-frame", "100"], "no frames"),
         (&odd, vec!["--bytes-per-frame", "100"], "even"),
+        (
+            &source,
+            vec!["--bytes-per-frame", "100", "--backend", "metal"],
+            "--gpu",
+        ),
+        (
+            &source,
+            vec!["--bytes-per-frame", "100", "--software"],
+            "--gpu",
+        ),
     ] {
         let output = cli()
             .arg("encode")
@@ -586,4 +596,57 @@ fn encode_refuses_before_it_writes_and_leaves_no_partial_file() {
         );
         assert!(!dir.join("out.pwv1.partial").exists(), "{extra:?}");
     }
+}
+
+#[test]
+fn encode_on_the_gpu_makes_streams_like_the_cpus() {
+    // The GPU's frames are the CPU's, or differ in a few blocks (decision
+    // D29); the file around them is the same.
+    let dir = scratch("encode_gpu");
+    let (name, budget) = encoder_vectors()
+        .into_iter()
+        .find(|(name, _)| name == "scene_200x120_420")
+        .unwrap();
+    let out = dir.join("gpu.pwv1");
+    let Some(output) = run_on_gpu(
+        cli()
+            .arg("encode")
+            .arg(testdata(&format!("encoder/{name}.source.y4m")))
+            .arg("--out")
+            .arg(&out)
+            .args(["--bytes-per-frame", &budget, "--gpu"]),
+    ) else {
+        return;
+    };
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("on the GPU"),
+        "{}",
+        stderr(&output)
+    );
+    let written = std::fs::read(&out).unwrap();
+    let committed = std::fs::read(testdata(&format!("encoder/{name}.pwv1"))).unwrap();
+    // The PWV1 header is the same in any case: 24 bytes.
+    assert_eq!(written[..24], committed[..24]);
+
+    // And the stream shows the pictures about as well as the CPU's, whose
+    // worst plane is at 41.9 dB.
+    let output = run_on_gpu(
+        cli()
+            .arg("decode")
+            .arg(&out)
+            .arg("--out-dir")
+            .arg(&dir)
+            .args(["--format", "y4m"]),
+    )
+    .expect("a GPU, since the encode found one");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = cli()
+        .arg("compare")
+        .arg(dir.join("gpu.y4m"))
+        .arg(testdata(&format!("encoder/{name}.source.y4m")))
+        .args(["--min-psnr", "41"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
 }

@@ -17,35 +17,38 @@
 // the float picture never goes to memory. Workgroup z selects the colour
 // component.
 
+// The parameters of a level are shared with fdwt.wgsl, which goes the other
+// way between the same places (gpu/layout.rs, TransformLevel).
 struct CompParams {
     // Offsets of the LL, HL, LH and HH bands in the pyramid, in floats.
     band_offset: vec4<u32>,
-    // Where the output goes: the LL band of the next level in the pyramid
-    // (offset and row length in floats), or at the last level the packed
-    // 8-bit plane (offset and row length in words).
-    dst_offset: u32,
-    dst_stride: u32,
+    // Where the output goes, the level's image: the LL band of the next level
+    // in the pyramid (offset and row length in floats), or at the last level
+    // the packed 8-bit plane (offset and row length in words).
+    image_offset: u32,
+    image_stride: u32,
     // Size of the plane, which the last level crops its output to.
-    crop_width: u32,
-    crop_height: u32,
+    plane_width: u32,
+    plane_height: u32,
     // 1: the last level, which writes the packed plane; 0: an earlier level.
-    is_final: u32,
+    is_plane: u32,
     pad0: u32,
     pad1: u32,
     pad2: u32,
 }
 
-struct IdwtParams {
+struct LevelParams {
     band_width: u32,
     band_height: u32,
-    out_width: u32,
-    out_height: u32,
+    // Size of the output, twice that of the bands.
+    image_width: u32,
+    image_height: u32,
     comps: array<CompParams, 3>,
 }
 
 @group(0) @binding(0) var<storage, read_write> pyramid: array<f32>;
 @group(0) @binding(1) var<storage, read_write> packed: array<u32>;
-@group(0) @binding(2) var<uniform> params: IdwtParams;
+@group(0) @binding(2) var<uniform> params: LevelParams;
 
 // Lifting step constants of the CDF 9/7 filter (ITU-T T.800, F.4.8.2).
 const ALPHA: f32 = -1.586134342059924;
@@ -134,8 +137,8 @@ fn lift(v: ptr<function, array<f32, 16>>) {
 
 // Stores one sample of the next level's LL band, if it lies inside the output.
 fn store_ll(comp: CompParams, x: i32, y: i32, value: f32) {
-    if (x < i32(params.out_width) && y < i32(params.out_height)) {
-        pyramid[comp.dst_offset + u32(y) * comp.dst_stride + u32(x)] = value;
+    if (x < i32(params.image_width) && y < i32(params.image_height)) {
+        pyramid[comp.image_offset + u32(y) * comp.image_stride + u32(x)] = value;
     }
 }
 
@@ -158,8 +161,8 @@ fn level_at(at: u32, x: u32, width: u32) -> u32 {
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let comp = params.comps[wg.z];
-    let out_width = i32(params.out_width);
-    let out_height = i32(params.out_height);
+    let out_width = i32(params.image_width);
+    let out_height = i32(params.image_height);
     let tile_x = i32(wg.x * TILE);
     let tile_y = i32(wg.y * TILE);
 
@@ -216,7 +219,7 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     // levels store the LL band of the next level; the last level collects its
     // 8-bit samples for packing. One workgroup belongs to one component, so
     // the branch is the same for all its invocations.
-    let is_final = comp.is_final != 0u;
+    let is_final = comp.is_plane != 0u;
     if (tid < 128u) {
         let column = tid % 32u;
         let segment = tid / 32u;
@@ -278,11 +281,11 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         let word = tid % 8u;
         let y = u32(tile_y) + row;
         let word_x = u32(tile_x) / 4u + word;
-        if (y < comp.crop_height && word_x < comp.dst_stride) {
+        if (y < comp.plane_height && word_x < comp.image_stride) {
             let x = 4u * word_x;
             let at = row * TILE + 4u * word;
-            let width = comp.crop_width;
-            packed[comp.dst_offset + y * comp.dst_stride + word_x] = level_at(at, x, width) |
+            let width = comp.plane_width;
+            packed[comp.image_offset + y * comp.image_stride + word_x] = level_at(at, x, width) |
                 (level_at(at + 1u, x + 1u, width) << 8u) |
                 (level_at(at + 2u, x + 2u, width) << 16u) |
                 (level_at(at + 3u, x + 3u, width) << 24u);

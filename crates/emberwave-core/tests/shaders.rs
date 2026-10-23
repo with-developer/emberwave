@@ -20,18 +20,19 @@ fn validate(name: &str, source: &str) -> naga::Module {
 
 #[test]
 fn every_shader_validates_without_optional_capabilities() {
-    for (name, source) in [
-        ("dequant", shader_sources::DEQUANT),
-        ("idwt", shader_sources::IDWT),
-        ("yuv2rgb", shader_sources::YUV2RGB),
-    ] {
+    for (name, source, entry_points) in shader_sources::ALL {
         let module = validate(name, source);
 
-        // One compute entry point named `main` each.
-        assert_eq!(module.entry_points.len(), 1, "{name}");
-        let entry = &module.entry_points[0];
-        assert_eq!(entry.name, "main", "{name}");
-        assert_eq!(entry.stage, naga::ShaderStage::Compute, "{name}");
+        // The compute entry points the pipelines are built from, no others.
+        let found: Vec<&str> = module
+            .entry_points
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(found, entry_points, "{name}");
+        for entry in &module.entry_points {
+            assert_eq!(entry.stage, naga::ShaderStage::Compute, "{name}");
+        }
     }
 }
 
@@ -41,14 +42,13 @@ fn workgroup_sizes_and_memory_stay_within_the_portable_limits() {
     const MAX_INVOCATIONS: u32 = 256;
     const MAX_WORKGROUP_BYTES: u32 = 16 * 1024;
 
-    for (name, source) in [
-        ("dequant", shader_sources::DEQUANT),
-        ("idwt", shader_sources::IDWT),
-        ("yuv2rgb", shader_sources::YUV2RGB),
-    ] {
+    for (name, source, _) in shader_sources::ALL {
         let module = validate(name, source);
+        for entry in &module.entry_points {
+            let [x, y, z] = entry.workgroup_size;
+            assert!(x * y * z <= MAX_INVOCATIONS, "{name}: {x}x{y}x{z}");
+        }
         let [x, y, z] = module.entry_points[0].workgroup_size;
-        assert!(x * y * z <= MAX_INVOCATIONS, "{name}: {x}x{y}x{z}");
 
         // Sizes of the workgroup variables, in bytes.
         let layouter = {
@@ -87,11 +87,42 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("block_sign_totals", 64),
     ];
     let idwt: &[Variable] = &[("window", 6400), ("horizontal", 5120)];
-    for (name, source, variables) in [
-        ("dequant", shader_sources::DEQUANT, dequant),
-        ("idwt", shader_sources::IDWT, idwt),
-        ("yuv2rgb", shader_sources::YUV2RGB, &[]),
-    ] {
+    // quantise.wgsl's, in front of equant.wgsl's and pack.wgsl's.
+    let quantise: &[Variable] = &[
+        ("subblock_largest", 512),
+        ("subblock_largest_magnitude", 512),
+    ];
+    let equant: &[Variable] = &[
+        ("absolute", 4096),
+        ("magnitudes", 4096),
+        ("subblock_planes", 512),
+        ("block8_pairs", 64),
+        ("block8_base", 64),
+        ("block8_scale_code", 64),
+        ("pair_sizes", 1024),
+        ("pair_distortion", 1024),
+    ];
+    let pack: &[Variable] = &[
+        ("assembly", 2560),
+        ("subblock_kept", 512),
+        ("subblock_extra", 512),
+        ("subblock_signs", 512),
+        ("block8_sent", 64),
+        ("block8_plane_bytes", 64),
+        ("block8_signs", 64),
+    ];
+    let lists: [(&str, Vec<Variable>); 8] = [
+        ("dequant", dequant.to_vec()),
+        ("idwt", idwt.to_vec()),
+        ("yuv2rgb", Vec::new()),
+        ("fdwt", idwt.to_vec()),
+        ("equant", [quantise, equant].concat()),
+        ("rate", Vec::new()),
+        ("scan", vec![("sums", 1024)]),
+        ("pack", [quantise, pack].concat()),
+    ];
+    for ((name, source, _), (listed, variables)) in shader_sources::ALL.into_iter().zip(lists) {
+        assert_eq!(name, listed, "the lists follow shader_sources::ALL");
         let module = validate(name, source);
         let mut layouter = naga::proc::Layouter::default();
         layouter.update(module.to_ctx()).expect("layout");
