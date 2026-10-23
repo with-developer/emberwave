@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "emberwave-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "emberwave-core",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "emberwave-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "naga",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "emberwave-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "emberwave-core",
 ]
