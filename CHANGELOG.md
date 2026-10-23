@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] - 2026-10-24
+
+emberwave encodes: an encoder on the CPU and on the GPU whose streams upstream's decoder reads, at upstream's PSNR or above for the same bytes. On an Apple M3 Max the GPU encodes a 4K frame in about 4 ms, the CPU in about 240 ms.
 
 ### Added
 
