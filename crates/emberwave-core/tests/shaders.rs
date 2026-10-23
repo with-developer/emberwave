@@ -24,6 +24,7 @@ fn every_shader_validates_without_optional_capabilities() {
         ("dequant", shader_sources::DEQUANT),
         ("idwt", shader_sources::IDWT),
         ("pack", shader_sources::PACK),
+        ("yuv2rgb", shader_sources::YUV2RGB),
     ] {
         let module = validate(name, source);
 
@@ -45,6 +46,7 @@ fn workgroup_sizes_and_memory_stay_within_the_portable_limits() {
         ("dequant", shader_sources::DEQUANT),
         ("idwt", shader_sources::IDWT),
         ("pack", shader_sources::PACK),
+        ("yuv2rgb", shader_sources::YUV2RGB),
     ] {
         let module = validate(name, source);
         let [x, y, z] = module.entry_points[0].workgroup_size;

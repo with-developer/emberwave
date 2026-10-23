@@ -13,8 +13,10 @@ use std::sync::OnceLock;
 use common::{Reference, max_abs_diff, psnr, read_reference, vector_frames, vector_names};
 use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
 use emberwave_core::bitstream::{
-    Band, BlockHeader, ChromaSubsampling, Component, FrameAssembler, FrameLayout,
+    Band, BlockHeader, ChromaSiting, ChromaSubsampling, Component, FrameAssembler, FrameLayout,
+    YcbcrRange,
 };
+use emberwave_core::color::{ColorMatrix, ColorParams, yuv_to_rgb8};
 use emberwave_core::cpu;
 use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuOptions};
 
@@ -509,4 +511,162 @@ fn a_large_payload_grows_the_buffer_and_still_decodes() {
     assert_ne!(first, large);
     assert_eq!(decoder.decode(&empty).unwrap(), first);
     assert_eq!(decoder.decode(&frame).unwrap(), large);
+}
+
+/// How a GPU RGB picture compares with the CPU conversion of the same planes.
+struct RgbComparison {
+    differing: usize,
+    largest: u8,
+    samples: usize,
+}
+
+fn compare_rgb(gpu: &[u8], cpu: &[u8]) -> RgbComparison {
+    assert_eq!(gpu.len(), cpu.len());
+    RgbComparison {
+        differing: gpu.iter().zip(cpu).filter(|(a, b)| a != b).count(),
+        largest: gpu
+            .iter()
+            .zip(cpu)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0),
+        samples: gpu.len(),
+    }
+}
+
+#[test]
+fn rgb_conversion_on_the_gpu_matches_the_cpu() {
+    let context = gpu_or_return!();
+
+    // Every vector (4:2:0 with odd chroma sizes, 4:4:4 with odd sizes) with
+    // every matrix, both ranges and both sitings.
+    let matrices = [ColorMatrix::Bt601, ColorMatrix::Bt709, ColorMatrix::Bt2020];
+    let ranges = [YcbcrRange::Limited, YcbcrRange::Full];
+    let sitings = [ChromaSiting::Center, ChromaSiting::Left];
+
+    let mut worst_fraction = 0.0f64;
+    for name in vector_names() {
+        let (layout, frames) = vector_frames(&name);
+        let mut decoder = decoder_for(context, &layout);
+
+        // The YUV planes the GPU produces are what the conversion starts from.
+        let yuv = decoder.decode(&frames[0]).expect("GPU decode");
+        let planes = [
+            &yuv.planes[0].data,
+            &yuv.planes[1].data,
+            &yuv.planes[2].data,
+        ];
+
+        for matrix in matrices {
+            for range in ranges {
+                for chroma_siting in sitings {
+                    let params = ColorParams {
+                        matrix,
+                        range,
+                        chroma_siting,
+                    };
+                    let rgb = decoder
+                        .decode_rgb(&frames[0], &params)
+                        .expect("GPU RGB decode");
+                    assert_eq!((rgb.width, rgb.height), (layout.width(), layout.height()));
+                    assert_eq!(
+                        rgb.data.len(),
+                        (layout.width() * layout.height() * 3) as usize
+                    );
+
+                    let expected = yuv_to_rgb8(
+                        [planes[0], planes[1], planes[2]],
+                        layout.width(),
+                        layout.height(),
+                        layout.chroma(),
+                        &params,
+                    );
+                    let c = compare_rgb(&rgb.data, &expected);
+                    // The same arithmetic in the same order; the GPU may fuse a
+                    // multiply and an add, which moves a rounding by one.
+                    assert!(
+                        c.largest <= 1,
+                        "{name} {params:?}: largest difference {}",
+                        c.largest
+                    );
+                    let fraction = c.differing as f64 / c.samples as f64;
+                    assert!(
+                        fraction < 0.01,
+                        "{name} {params:?}: {} of {} samples differ",
+                        c.differing,
+                        c.samples
+                    );
+                    worst_fraction = worst_fraction.max(fraction);
+                }
+            }
+        }
+    }
+    println!("largest share of samples that differ from the CPU conversion: {worst_fraction:.5}");
+}
+
+#[test]
+fn rgb_output_changes_with_the_conversion_settings() {
+    let context = gpu_or_return!();
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(context, &layout);
+
+    // The parameters are read for every call: the same frame converted twice
+    // with different settings must differ, and back again must repeat.
+    let a = ColorParams::default();
+    let b = ColorParams {
+        matrix: ColorMatrix::Bt601,
+        range: YcbcrRange::Full,
+        chroma_siting: ChromaSiting::Left,
+    };
+    let first = decoder.decode_rgb(&frames[0], &a).unwrap();
+    let other = decoder.decode_rgb(&frames[0], &b).unwrap();
+    assert_ne!(first, other);
+    assert_eq!(decoder.decode_rgb(&frames[0], &a).unwrap(), first);
+
+    // The YUV path still works after the RGB buffers exist.
+    let yuv = decoder.decode(&frames[0]).unwrap();
+    assert_eq!(yuv.planes[0].data.len(), 200 * 120);
+}
+
+#[test]
+fn timing_a_frame_reports_where_the_time_goes() {
+    // Timestamp queries are optional, so ask for them and accept their absence.
+    let options = GpuOptions {
+        timestamps: true,
+        ..GpuOptions::default()
+    };
+    let Some(context) = create_context(&options) else {
+        return;
+    };
+    let (layout, frames) = vector_frames("noise_192x136_420");
+    let mut decoder = decoder_for(&context, &layout);
+
+    for output in [
+        emberwave_core::gpu::TimedOutput::Yuv,
+        emberwave_core::gpu::TimedOutput::Rgb(ColorParams::default()),
+    ] {
+        let timings = decoder.time_frame(&frames[0], output).unwrap();
+        assert!(timings.gpu_wall > std::time::Duration::ZERO);
+        assert!(timings.prepare > std::time::Duration::ZERO);
+
+        match timings.stages {
+            Some(stages) => {
+                assert!(context.supports_timestamps());
+                // A short stage can be below the timer's resolution and read as
+                // zero, but the whole decode cannot.
+                assert!(stages.total() > std::time::Duration::ZERO);
+                let rgb = matches!(output, emberwave_core::gpu::TimedOutput::Rgb(_));
+                assert_eq!(stages.yuv2rgb.is_some(), rgb);
+                // The GPU cannot take longer than the wall clock around it.
+                assert!(stages.total() <= timings.gpu_wall + timings.prepare);
+            }
+            // A device that offers timestamps has to deliver them: "no stage
+            // times" must not hide a resolve that never landed or a pass whose
+            // end came before its beginning.
+            None => assert!(
+                !context.supports_timestamps(),
+                "the device supports timestamp queries but returned no stage times"
+            ),
+        }
+    }
 }

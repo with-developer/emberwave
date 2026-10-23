@@ -12,7 +12,7 @@ mod layout;
 mod pipelines;
 
 pub use context::{BACKEND_ENV, GpuContext, GpuOptions, parse_backends};
-pub use decoder::{Decoder, Frame, FramePlane};
+pub use decoder::{Decoder, Frame, FramePlane, RgbFrame, StageTimings, TimedOutput, Timings};
 pub use error::GpuError;
 
 /// The WGSL sources of the pipeline stages, for offline validation.
@@ -23,4 +23,6 @@ pub mod shader_sources {
     pub const IDWT: &str = include_str!("shaders/idwt.wgsl");
     /// Float planes to 8-bit samples.
     pub const PACK: &str = include_str!("shaders/pack.wgsl");
+    /// 8-bit YCbCr planes to RGB.
+    pub const YUV2RGB: &str = include_str!("shaders/yuv2rgb.wgsl");
 }

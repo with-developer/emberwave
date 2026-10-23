@@ -3,18 +3,21 @@
 //! The split follows upstream. The CPU assembles packets
 //! ([`FrameAssembler`]); the GPU decodes coefficients and dequantises them
 //! (`dequant.wgsl`), runs the inverse transform level by level (`idwt.wgsl`),
-//! and converts the planes to 8 bits (`pack.wgsl`).
+//! and converts the planes to 8 bits (`pack.wgsl`). On request a last stage
+//! converts YCbCr to RGB (`yuv2rgb.wgsl`).
 
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use wgpu::util::DeviceExt;
 
 use crate::bitstream::consts::DECOMPOSITION_LEVELS;
 use crate::bitstream::{Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout};
+use crate::color::ColorParams;
 
 use super::context::GpuContext;
 use super::error::GpuError;
-use super::layout::{BufferLayout, DequantParams, IdwtLevel, PackParams};
+use super::layout::{BufferLayout, DequantParams, IdwtLevel, PackParams, YuvParams};
 use super::pipelines::{Pipelines, Stage, with_error_scope};
 
 /// Zero words after the payload. The dequantiser may read a little past the
@@ -45,6 +48,90 @@ pub struct Frame {
     pub chroma: ChromaSubsampling,
     /// The planes in bitstream order (Y, Cb, Cr).
     pub planes: [FramePlane; 3],
+}
+
+/// A decoded frame converted to RGB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RgbFrame {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Row-major red, green and blue bytes: `3 * width * height` of them.
+    pub data: Vec<u8>,
+}
+
+/// What [`Decoder::time_frame`] decodes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimedOutput {
+    /// 8-bit Y, Cb and Cr planes in GPU memory.
+    Yuv,
+    /// RGB in GPU memory: the stages above plus the colour conversion.
+    Rgb(ColorParams),
+}
+
+/// GPU time of each stage, measured with timestamp queries.
+///
+/// Only available on devices that support them, and then only at the
+/// granularity of a pass: all five inverse transform levels are one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageTimings {
+    /// Coefficient decoding and dequantisation.
+    pub dequant: Duration,
+    /// The inverse transform, all levels.
+    pub idwt: Duration,
+    /// Conversion of the planes to 8 bits.
+    pub pack: Duration,
+    /// Colour conversion, if it was part of the decode.
+    pub yuv2rgb: Option<Duration>,
+}
+
+impl StageTimings {
+    /// The sum of the stages.
+    pub fn total(&self) -> Duration {
+        self.dequant + self.idwt + self.pack + self.yuv2rgb.unwrap_or_default()
+    }
+}
+
+/// Where the time of one decode went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timings {
+    /// CPU time to assemble the packets and hand the data to the GPU.
+    pub prepare: Duration,
+    /// Wall-clock time from encoding the GPU work until it was done. When the
+    /// picture is read back this includes that.
+    pub gpu_wall: Duration,
+    /// GPU time per stage, if the device can measure it.
+    pub stages: Option<StageTimings>,
+}
+
+/// What a decode reads back to the CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Nothing,
+    Yuv,
+    Rgb,
+}
+
+/// Buffers of the colour conversion, created when it is first used.
+struct ColorResources {
+    rgba: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    params: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    grid: (u32, u32),
+}
+
+/// Number of timestamps: a begin and an end for each of four passes.
+const TIMESTAMP_QUERIES: u32 = 8;
+
+/// What it takes to read timestamps.
+struct TimestampResources {
+    query_set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    /// Nanoseconds per timestamp tick.
+    period_ns: f64,
 }
 
 /// A dispatch of the inverse transform for one decomposition level.
@@ -80,6 +167,9 @@ pub struct Decoder {
 
     pack_bind_group: wgpu::BindGroup,
     pack_grid: (u32, u32, u32),
+
+    color: Option<ColorResources>,
+    timestamps: Option<TimestampResources>,
 }
 
 impl Decoder {
@@ -196,6 +286,27 @@ impl Decoder {
                 entries: &[entry(0, &planes), entry(1, &packed), entry(2, &pack_params)],
             });
 
+            let timestamps = context.supports_timestamps().then(|| TimestampResources {
+                query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("stage timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: TIMESTAMP_QUERIES,
+                }),
+                resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("timestamps"),
+                    size: u64::from(TIMESTAMP_QUERIES) * 8,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                readback: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("timestamp readback"),
+                    size: u64::from(TIMESTAMP_QUERIES) * 8,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                period_ns: f64::from(queue.get_timestamp_period()),
+            });
+
             Self {
                 device: device.clone(),
                 queue: queue.clone(),
@@ -214,6 +325,8 @@ impl Decoder {
                 idwt_stages,
                 pack_bind_group,
                 pack_grid,
+                color: None,
+                timestamps,
             }
         })
     }
@@ -229,15 +342,35 @@ impl Decoder {
     /// Whatever was assembled before is discarded, so the same frame may be
     /// decoded repeatedly.
     pub fn decode(&mut self, frame: &[u8]) -> Result<Frame, GpuError> {
-        self.assembler.clear();
-        self.assembler.push_packet(frame)?;
-        if !self.assembler.is_ready(false) {
-            return Err(GpuError::IncompleteFrame {
-                received: self.assembler.received_blocks(),
-                total: self.assembler.total_blocks(),
-            });
-        }
+        self.assemble_complete(frame)?;
         self.decode_assembled()
+    }
+
+    /// Decodes one complete frame like [`decode`](Self::decode) and converts
+    /// it to RGB on the GPU.
+    pub fn decode_rgb(&mut self, frame: &[u8], color: &ColorParams) -> Result<RgbFrame, GpuError> {
+        self.assemble_complete(frame)?;
+        self.decode_assembled_rgb(color)
+    }
+
+    /// Decodes one complete frame and waits for the GPU without reading the
+    /// picture back, which is what a player does: the picture stays in GPU
+    /// memory. Returns where the time went, for benchmarks.
+    ///
+    /// The per-stage times are `Some` only if the context was created with
+    /// [`GpuOptions::timestamps`](super::GpuOptions::timestamps) and the device
+    /// supports them.
+    pub fn time_frame(&mut self, frame: &[u8], output: TimedOutput) -> Result<Timings, GpuError> {
+        let start = Instant::now();
+        self.assemble_complete(frame)?;
+        let assembled = start.elapsed();
+
+        let color = match output {
+            TimedOutput::Yuv => None,
+            TimedOutput::Rgb(color) => Some(color),
+        };
+        let (_, timings) = self.run_gpu(color.as_ref(), Read::Nothing, true, assembled)?;
+        Ok(timings)
     }
 
     /// Feeds one packet of the frame being received. See
@@ -255,20 +388,73 @@ impl Decoder {
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
     /// calls. Blocks that did not arrive decode as zeros.
     pub fn decode_assembled(&mut self) -> Result<Frame, GpuError> {
+        let (bytes, _) = self.run_gpu(None, Read::Yuv, false, Duration::ZERO)?;
+        Ok(self.unpack(&bytes))
+    }
+
+    /// Like [`decode_assembled`](Self::decode_assembled), converted to RGB.
+    pub fn decode_assembled_rgb(&mut self, color: &ColorParams) -> Result<RgbFrame, GpuError> {
+        let (bytes, _) = self.run_gpu(Some(color), Read::Rgb, false, Duration::ZERO)?;
+        Ok(self.unpack_rgb(&bytes))
+    }
+
+    /// Discards what was assembled and takes `frame` as a complete frame.
+    fn assemble_complete(&mut self, frame: &[u8]) -> Result<(), GpuError> {
+        self.assembler.clear();
+        self.assembler.push_packet(frame)?;
+        if self.assembler.is_ready(false) {
+            Ok(())
+        } else {
+            Err(GpuError::IncompleteFrame {
+                received: self.assembler.received_blocks(),
+                total: self.assembler.total_blocks(),
+            })
+        }
+    }
+
+    /// Runs the GPU stages for the assembled frame and waits for them.
+    ///
+    /// `color` adds the colour conversion. `read` says what is copied back to
+    /// the CPU: the bytes are returned, empty for [`Read::Nothing`].
+    /// `assembled_in` is the CPU time already spent assembling the frame. With
+    /// `timed` the stages are timed, if the device can.
+    fn run_gpu(
+        &mut self,
+        color: Option<&ColorParams>,
+        read: Read,
+        timed: bool,
+        assembled_in: Duration,
+    ) -> Result<(Vec<u8>, Timings), GpuError> {
+        let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         self.upload();
+        if let Some(color) = color {
+            self.prepare_color(color)?;
+        }
+        let prepare = assembled_in + prepare_start.elapsed();
 
-        let frame = with_error_scope(&self.device, || {
+        let queries = self.timestamps.as_ref().filter(|_| timed);
+        let gpu_start = Instant::now();
+        with_error_scope(&self.device, || {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("decode"),
                 });
 
+            // Timestamps go at the boundaries of a pass: queries 2n and 2n + 1 for pass n.
+            let writes = |pass: u32| {
+                queries.map(|q| wgpu::ComputePassTimestampWrites {
+                    query_set: &q.query_set,
+                    beginning_of_pass_write_index: Some(2 * pass),
+                    end_of_pass_write_index: Some(2 * pass + 1),
+                })
+            };
+
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("dequant"),
-                    timestamp_writes: None,
+                    timestamp_writes: writes(0),
                 });
                 pass.set_pipeline(&self.pipelines.dequant.pipeline);
                 pass.set_bind_group(0, &self.dequant_bind_group, &[]);
@@ -278,7 +464,7 @@ impl Decoder {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("idwt"),
-                    timestamp_writes: None,
+                    timestamp_writes: writes(1),
                 });
                 pass.set_pipeline(&self.pipelines.idwt.pipeline);
                 for stage in &self.idwt_stages {
@@ -290,27 +476,192 @@ impl Decoder {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("pack"),
-                    timestamp_writes: None,
+                    timestamp_writes: writes(2),
                 });
                 pass.set_pipeline(&self.pipelines.pack.pipeline);
                 pass.set_bind_group(0, &self.pack_bind_group, &[]);
                 pass.dispatch_workgroups(self.pack_grid.0, self.pack_grid.1, self.pack_grid.2);
             }
 
-            encoder.copy_buffer_to_buffer(
-                &self.packed,
-                0,
-                &self.readback,
-                0,
-                self.buffers.packed_words * 4,
-            );
+            if let (Some(_), Some(resources)) = (color, self.color.as_ref()) {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("yuv2rgb"),
+                    timestamp_writes: writes(3),
+                });
+                pass.set_pipeline(&self.pipelines.yuv2rgb.pipeline);
+                pass.set_bind_group(0, &resources.bind_group, &[]);
+                pass.dispatch_workgroups(resources.grid.0, resources.grid.1, 1);
+            }
+
+            match (read, self.color.as_ref()) {
+                (Read::Yuv, _) => encoder.copy_buffer_to_buffer(
+                    &self.packed,
+                    0,
+                    &self.readback,
+                    0,
+                    self.buffers.packed_words * 4,
+                ),
+                (Read::Rgb, Some(resources)) => encoder.copy_buffer_to_buffer(
+                    &resources.rgba,
+                    0,
+                    &resources.readback,
+                    0,
+                    resources.rgba.size(),
+                ),
+                _ => {}
+            }
+
+            if let Some(q) = queries {
+                encoder.resolve_query_set(&q.query_set, 0..TIMESTAMP_QUERIES, &q.resolve, 0);
+                encoder.copy_buffer_to_buffer(
+                    &q.resolve,
+                    0,
+                    &q.readback,
+                    0,
+                    u64::from(TIMESTAMP_QUERIES) * 8,
+                );
+            }
             self.queue.submit([encoder.finish()]);
-        })
-        .and_then(|()| self.read_back(&self.readback, self.buffers.packed_words * 4))
-        .map(|bytes| self.unpack(&bytes))?;
+        })?;
+
+        let bytes = match (read, self.color.as_ref()) {
+            (Read::Yuv, _) => self.read_back(&self.readback, self.buffers.packed_words * 4)?,
+            (Read::Rgb, Some(resources)) => {
+                self.read_back(&resources.readback, resources.rgba.size())?
+            }
+            _ => {
+                self.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .map_err(|error| GpuError::Readback(error.to_string()))?;
+                Vec::new()
+            }
+        };
+        let gpu_wall = gpu_start.elapsed();
+
+        let stages = match queries {
+            Some(q) => self.read_stage_timings(q, color.is_some())?,
+            None => None,
+        };
 
         self.assembler.mark_frame_decoded();
-        Ok(frame)
+        Ok((
+            bytes,
+            Timings {
+                prepare,
+                gpu_wall,
+                stages,
+            },
+        ))
+    }
+
+    /// Creates the buffers of the colour conversion on first use and writes
+    /// the parameters, which may change from call to call.
+    fn prepare_color(&mut self, color: &ColorParams) -> Result<(), GpuError> {
+        let params = YuvParams::new(self.assembler.layout(), &self.buffers, color);
+
+        if self.color.is_none() {
+            let bytes = u64::from(params.width) * u64::from(params.height) * 4;
+            let limit = buffer_limit(&self.device);
+            if bytes > limit {
+                return Err(GpuError::LimitExceeded {
+                    what: "the RGB image",
+                    needed: bytes,
+                    limit,
+                });
+            }
+
+            let resources = with_error_scope(&self.device, || {
+                let rgba = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rgba"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rgba readback"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("yuv2rgb params"),
+                    size: std::mem::size_of::<YuvParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("yuv2rgb"),
+                    layout: &self.pipelines.yuv2rgb.layout,
+                    entries: &[
+                        entry(0, &self.packed),
+                        entry(1, &rgba),
+                        entry(2, &params_buffer),
+                    ],
+                });
+                ColorResources {
+                    rgba,
+                    readback,
+                    params: params_buffer,
+                    bind_group,
+                    grid: params.grid(),
+                }
+            })?;
+            self.color = Some(resources);
+        }
+
+        if let Some(resources) = &self.color {
+            self.queue
+                .write_buffer(&resources.params, 0, bytemuck::bytes_of(&params));
+        }
+        Ok(())
+    }
+
+    /// Reads the timestamps the last decode wrote and turns them into stage
+    /// times. `None` if the device wrote nothing usable.
+    fn read_stage_timings(
+        &self,
+        queries: &TimestampResources,
+        with_rgb: bool,
+    ) -> Result<Option<StageTimings>, GpuError> {
+        let bytes = self.read_back(&queries.readback, u64::from(TIMESTAMP_QUERIES) * 8)?;
+        let ticks: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect();
+
+        // A device that wrote nothing leaves zeros. A pass shorter than one tick
+        // of the timer is a valid measurement of zero, not a missing one.
+        if ticks.iter().all(|&tick| tick == 0) {
+            return Ok(None);
+        }
+        let stage = |pass: usize| {
+            let (begin, end) = (ticks[2 * pass], ticks[2 * pass + 1]);
+            (end >= begin)
+                .then(|| Duration::from_secs_f64((end - begin) as f64 * queries.period_ns * 1e-9))
+        };
+        Ok(match (stage(0), stage(1), stage(2)) {
+            (Some(dequant), Some(idwt), Some(pack)) => Some(StageTimings {
+                dequant,
+                idwt,
+                pack,
+                yuv2rgb: if with_rgb { stage(3) } else { None },
+            }),
+            _ => None,
+        })
+    }
+
+    /// Turns RGBA words into tight RGB bytes.
+    fn unpack_rgb(&self, rgba: &[u8]) -> RgbFrame {
+        let layout = self.layout();
+        let mut data = Vec::with_capacity(rgba.len() / 4 * 3);
+        for pixel in rgba.chunks_exact(4) {
+            data.extend_from_slice(&pixel[..3]);
+        }
+        RgbFrame {
+            width: layout.width(),
+            height: layout.height(),
+            data,
+        }
     }
 
     /// Reads one band of the wavelet pyramid back, row-major with the width
