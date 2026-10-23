@@ -298,7 +298,7 @@ The gap to the default precision is the reference decoder's own FP16 storage. In
 
 ## GPU pipeline
 
-`gpu::Decoder` decodes frames of one size and chroma format. All GPU memory is allocated when it is created and reused for every frame. The payload buffer is the one exception: it grows when a frame needs more room.
+`gpu::Decoder` decodes frames of one size and chroma format. All GPU memory is allocated when it is created and reused for every frame. The payload buffer is the one exception: it grows when a frame needs more room. The encoder's GPU pipeline, `gpu::Encoder`, is described under [Encoder](#on-the-gpu).
 
 ### Stages
 
@@ -413,10 +413,10 @@ The wall-clock time exceeds the sum of the stages, because submitting work and n
 
 ### Portability
 
-The shaders use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. Two tests hold this to account:
+The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account:
 
-- `tests/shaders.rs` validates the WGSL with naga using an empty capability set, without a GPU, and checks the workgroup sizes and memory.
-- `tests/gpu.rs` creates a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decodes a vector on it.
+- `tests/shaders.rs` validates the WGSL of every shader with naga using an empty capability set, without a GPU, and checks the entry points, the workgroup sizes and memory.
+- `tests/gpu.rs` and `tests/gpu_encoder.rs` create a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decode a vector on it, and encode pictures on it.
 - The rounding rule of the last level is checked on the real backend against the CPU's, on inputs that are exact ties: a unit test of `gpu::decoder` cuts `to_unorm8` out of `idwt.wgsl` and runs it.
 
 What upstream uses and what replaces it:
@@ -430,6 +430,8 @@ What upstream uses and what replaces it:
 | 8-bit UNORM storage images for the output | The last inverse transform level packs four samples per `array<u32>` word |
 | Dozens of dispatches, one per band | One dequantisation dispatch and one per level |
 | Hardware bilinear filtering of the chroma textures (viewer) | Integer taps and weights in the shader |
+| Subgroup operations in the encoder's quantisation and rate control | Workgroup memory, a histogram with 32-bit atomics and prefix sums in workgroup memory |
+| 8-bit stores of the encoder's block bytes | Bytes ORed into words of workgroup memory with atomics, then copied out |
 
 ### Verification
 
@@ -460,9 +462,9 @@ The last two rows come from `scripts/verify_4k.sh`: it encodes two 3840x2160 fra
 | `bench FILE [--output yuv\|rgb] [--readback] [--frames N] [--warmup N] [--warmup-seconds S] [--json]` | Decodes in a loop and prints mean, median, 99th percentile, minimum and maximum of the numbers described under [Timing](#timing); `--json` prints them as JSON. The frames of the file are used in turn when more are asked for than it holds. Warm-up lasts for at least N frames and at least S seconds (10 and 1 by default, see D19). `--readback` copies the picture back and reports the total only |
 | `info FILE [--verbose]` | Prints the PWV1 header, the colour signalling and the frame sizes, without a GPU |
 | `compare A.y4m B.y4m [--min-psnr DB]` | Prints the PSNR and the largest difference per plane of every frame; with `--min-psnr` the exit status tells whether every plane reached it |
-| `encode FILE.y4m --out FILE.pwv1 --bytes-per-frame B [--frames N] [--matrix bt709\|bt2020]` | Encodes an 8-bit 4:2:0 or 4:4:4 Y4M video with the CPU encoder, each frame within B bytes, and prints the size and time of every frame. Range, chroma siting and frame rate come from the Y4M header; `--matrix` names the colours to signal. The file appears only when it is complete, and the video is read a frame at a time |
+| `encode FILE.y4m --out FILE.pwv1 --bytes-per-frame B [--frames N] [--matrix bt709\|bt2020] [--gpu]` | Encodes an 8-bit 4:2:0 or 4:4:4 Y4M video with the CPU encoder, or with `--gpu` the GPU encoder, each frame within B bytes, and prints the size and time of every frame and a summary. The time of a frame is that of the encoder's call: from the picture in memory to the frame in memory, with the transfers to and from a GPU. Range, chroma siting and frame rate come from the Y4M header; `--matrix` names the colours to signal. The file appears only when it is complete, and the video is read a frame at a time |
 
-`decode` and `bench` choose the GPU with `--backend auto|vulkan|metal|dx12` (`auto` honours `EMBERWAVE_BACKEND`, otherwise any backend the machine has) and `--software`, which insists on a software adapter such as lavapipe or WARP. The adapter in use is printed to stderr. `--matrix auto|bt601|bt709|bt2020` and `--range auto|full|limited` set the colour conversion; `auto` takes the PWV1 header's signalling. They belong to the RGB conversion, so `decode --format y4m`, which keeps the planes as decoded, refuses them. Options that cannot work (`--frames 0`, a budget below the 8 bytes of a frame header, a 4:2:0 picture of odd size) are refused before anything is read or written. An error is printed as `error: ...` and ends the program with status 1.
+`decode`, `bench` and `encode --gpu` choose the GPU with `--backend auto|vulkan|metal|dx12` (`auto` honours `EMBERWAVE_BACKEND`, otherwise any backend the machine has) and `--software`, which insists on a software adapter such as lavapipe or WARP. The adapter in use is printed to stderr. `--matrix auto|bt601|bt709|bt2020` and `--range auto|full|limited` set the colour conversion; `auto` takes the PWV1 header's signalling. They belong to the RGB conversion, so `decode --format y4m`, which keeps the planes as decoded, refuses them. Options that cannot work (`--frames 0`, a budget below the 8 bytes of a frame header, a 4:2:0 picture of odd size) are refused before anything is read or written. An error is printed as `error: ...` and ends the program with status 1.
 
 PNG output is 8-bit RGB with fast compression. The Y4M writer takes range, chroma format and chroma siting from the stream: `XCOLORRANGE`, and `C420jpeg` (centred chroma), `C420mpeg2` (chroma on the left luma column) or `C444`. A stream without a frame rate gets 30:1, which Y4M needs, and a warning says so. The Y4M reader of `compare` takes 8-bit 4:2:0 and 4:4:4 only, and a file whose header names a picture size that overflows, or that has no frames, is an error rather than a pass. Percentiles are nearest-rank.
 
@@ -510,7 +512,7 @@ Frames from upstream's Metal encoder signal BT.709, full range and centred chrom
 
 ## Encoder
 
-`emberwave_core::encode` turns 8-bit pictures into frames of bitstream v1 within a byte budget, on the CPU; `emberwave-cli encode` runs it on a Y4M file. It is the reference for a GPU encoder to come (issue #14), as `emberwave_core::cpu` is for the GPU decoder, and like that it is plain sequential Rust. Its frames decode with any decoder of the format: the tests check emberwave's against upstream's, and the vectors in `testdata/encoder/` carry upstream's decode of emberwave's streams.
+`emberwave_core::encode` turns 8-bit pictures into frames of bitstream v1 within a byte budget, on the CPU, and `gpu::Encoder` does the same on the GPU ([On the GPU](#on-the-gpu)); `emberwave-cli encode` runs either on a Y4M file. The CPU encoder is the reference for the GPU's, as `emberwave_core::cpu` is for the GPU decoder, and like that it is plain sequential Rust. Its frames decode with any decoder of the format: the tests check emberwave's against upstream's, and the vectors in `testdata/encoder/` carry upstream's decode of emberwave's streams.
 
 The format fixes the transform and what the decoder does with the numbers; the rest is the encoder's choice:
 
@@ -539,6 +541,32 @@ At the same budget and frame size, decoded by upstream's FP32 decoder (Apple M3 
 | 640x360 noise, 4:2:0 | 60 and 200 kB | 11.90 and 25.79 dB | 11.95 and 25.78 dB |
 
 Noise, which no budget compresses, comes out the same. Without the contrast weighting the encoder would gain another 0 to 6.5 dB of PSNR (decision D28).
+
+### On the GPU
+
+`gpu::Encoder` runs the same steps as compute shaders, so that a picture goes to the GPU once and its frame comes back once. The planes are uploaded, the passes below run in one submission, and the summary of the rate control and the payload come back in one read-back. The CPU writes the start of frame header in front of the payload.
+
+| Stage | Shaders | Dispatches | What it does |
+|---|---|---|---|
+| Forward transform | `fdwt.wgsl` | 5: one per level, finest first; a workgroup per 32x32 tile of the level's image and component | The inverse transform's shape and parameters (`TransformLevel`), the other way round: a 40x40 window of the image, rows and then columns lifted in registers, and the four bands written. At a component's finest level the image is the 8-bit plane, its last column and row repeated up to the aligned size |
+| Quantisation | `quantise.wgsl`, `equant.wgsl` | 1: a workgroup of 128 invocations per block | Scales, magnitudes and bit-planes of `quant.rs`, then the block's size and distortion for 0 to 15 dropped planes, its cost table. Each 8x8 block is measured only up to the drop that leaves nothing of it; beyond, its error is the same sum of the same terms |
+| Rate control | `rate.wgsl`, `scan.wgsl` | 4, and two prefix sums of 3 | Each block's steps, and their saved words added into a histogram of the keys; the key at which the frame fits; what each block's steps of that key save, summed in block order; each block's drop and size, and their sums in block order, which are the blocks' places in the payload |
+| Packing | `quantise.wgsl`, `pack.wgsl` | 1: a workgroup per block | The block quantised again, the chosen planes dropped, its bytes assembled in workgroup memory and written at its place |
+
+Nothing is sorted. The CPU applies the steps of all blocks in key order, ties by block index, until the frame fits. On the GPU every step below the cutoff key is applied and none above it, and the steps of the cutoff key are applied in block order while the frame does not fit yet, which is where the CPU stops. Quantisation and packing share `quantise.wgsl`, compiled in front of each, so that what the rate control measures is what the packing writes.
+
+The GPU cannot repeat the CPU's floating point exactly, so the contract between the two is per stage (decision D29), and the tests feed each stage the CPU's input:
+
+| Stage | Given the CPU's input, the GPU's output is |
+|---|---|
+| Forward transform | Within 1e-5 of the CPU's coefficients, relative (8.3e-7 at most on an Apple M3 Max) |
+| Quantisation | The same sizes; the same distortions up to fused multiply-adds (2.6e-7 of the block's largest at most) |
+| Rate control | The same drops |
+| Packing | The same bytes |
+
+A frame is therefore the CPU encoder's, or one that differs in the few blocks whose coefficients sit on a rounding boundary. On an Apple M3 Max all 25 frames of the committed vectors come out identical; the tests allow differing frames as long as they are as good (within 0.05 dB). The CPU encoder stays the one that makes the same bytes on every system.
+
+On an Apple M3 Max (macOS 27.0.1, Metal through wgpu 30.0.1, 2026-10-24), `emberwave-cli encode --gpu` encodes `refgen`'s scene at 1080p, 1440p and 4K, 4:2:0, at 400, 700 and 1200 kB per frame in a median of 3.1, 3.7 and 3.9 ms per frame over 20 frames, the upload of the planes and the read-back included; the CPU encoder takes 59, 113 and 242 ms. Most of the GPU's time goes to the quantisation. A comparison with upstream's encoder, measured as the decoder's benchmarks are, is issue #29.
 
 ## Decisions
 
@@ -766,3 +794,17 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 - New tooling: `refgen encode --source` writes the pictures it synthesises, and `--input` encodes a Y4M file with upstream's encoder, so that both encoders can be given the same pictures.
 
 **Consequence.** emberwave can make streams, at the PSNR of upstream's encoder or above at equal bytes (see [Encoder](#encoder)); a 640x360 frame takes about 7 ms on one CPU core. Turning off the contrast weighting was tried once: PSNR rose by 0 dB on the gradient, 1.6 to 4.4 dB on the 1280x720 scene, 2.8 dB at 4:4:4 and 6.5 dB on the 1920x1080 scene, as a pure squared-error allocation keeps the fine detail the weighting gives up first. The weighting stays, as upstream's does. Next is the GPU encoder, measured against this one.
+
+### 2026-10-24 — D29: The GPU encoder, and what it shares with the CPU's
+
+**Context.** D28 made the CPU encoder the reference for a GPU encoder, to be compared stage by stage. A GPU cannot repeat the CPU's floating-point results exactly: WGSL has no way to forbid fusing a multiply and an add, and Metal compiles with fast math, so the coefficients of the forward transform can differ from the CPU's in the last place, and so can the sums of squared errors.
+
+**Decision.**
+- `gpu::Encoder` follows the CPU encoder step for step, its operations in the same order. Everything that can be exact is: given the same coefficients, the scales, magnitudes, bit-planes and block sizes come from exact comparisons and are the CPU's; the distortions are the same sums in the same order and differ only where the compiler fuses; given the same cost tables, the rate control chooses the same drops; given the same drops, the packing writes the same bytes. The tests feed each stage the CPU's input and compare ([On the GPU](#on-the-gpu)).
+- A frame is therefore the CPU encoder's or differs in a few blocks. Where frames differ, the tests require the same PSNR within 0.05 dB. Byte-identical streams on every system remain the CPU encoder's promise, not the GPU's.
+- The rate control does not sort. A histogram of the words the steps of each key save, added with 32-bit atomics, which is exact in any order, gives the key at which the frame fits; a prefix sum in block order settles the steps of that key. Prefix sums use workgroup memory (D4), in two passes of 1024-value chunks, enough for the 786,432 blocks of the largest picture.
+- Quantisation and packing share one WGSL file, compiled in front of each, and the packing quantises again rather than read what the quantisation would have had to store, 1024 magnitudes per block. Quantising is exact, so both see the same magnitudes.
+- One upload and one read-back per frame. The read-back takes as many words as the budget allows, with the rate control's summary in front, so that the CPU waits once. The payload buffer grows to the budget in powers of two and stays.
+- `GpuError` gains `Encode`, which carries the CPU encoder's `EncodeError`: the GPU encoder refuses what the CPU encoder refuses, with the same smallest frame size.
+
+**Consequence.** On an Apple M3 Max a 4K frame encodes in a median 3.9 ms, the 12 MB upload and the read-back included, 60 times as fast as on one CPU core, and the committed vectors come out byte for byte as the CPU encoder made them. Most of the GPU time goes to the quantisation. Faster quantisation and a comparison with upstream's encoder are issue #29.
