@@ -10,6 +10,11 @@ publish.workspace = true
 
 [dependencies]
 emberwave-core.workspace = true
+clap.workspace = true
+png.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
