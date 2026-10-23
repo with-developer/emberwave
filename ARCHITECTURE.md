@@ -547,12 +547,12 @@ Noise, which no budget compresses, comes out the same. Without the contrast weig
 
 ### On the GPU
 
-`gpu::Encoder` runs the same steps as compute shaders, so that a picture goes to the GPU once and its frame comes back once. The planes are uploaded, the passes below run in one submission, and the summary of the rate control and the payload come back in one read-back. The CPU writes the start of frame header in front of the payload.
+`gpu::Encoder` runs the same steps as compute shaders, so that a picture goes to the GPU once and its frame comes back once. The CPU writes the planes into an upload buffer the encoder keeps mapped, the passes below run in one submission after the copy of the planes, and the summary of the rate control and the payload come back in one read-back. The CPU writes the start of frame header in front of the payload.
 
 | Stage | Shaders | Dispatches | What it does |
 |---|---|---|---|
 | Forward transform | `fdwt.wgsl` | 5: one per level, finest first; a workgroup per 32x32 tile of the level's image and component | The inverse transform's shape and parameters (`TransformLevel`), the other way round: a 40x40 window of the image, rows and then columns lifted in registers, and the four bands written. At a component's finest level the image is the 8-bit plane, its last column and row repeated up to the aligned size |
-| Quantisation | `quantise.wgsl`, `equant.wgsl` | 1: a workgroup of 128 invocations per block | Scales, magnitudes and bit-planes of `quant.rs`, then the block's size and distortion for 0 to 15 dropped planes, its cost table. Each 8x8 block is measured only up to the drop that leaves nothing of it; beyond, its error is the same sum of the same terms |
+| Quantisation | `quantise.wgsl`, `equant.wgsl` | 1: a workgroup of 128 invocations per block | Scales, magnitudes and bit-planes of `quant.rs`, then the block's size and distortion for 0 to 15 dropped planes, its cost table. Each invocation adds up the squared errors of its own 4x2 subblock in registers, and the subblocks are added up per 8x8 block, in the grouping the CPU adds in. Each 8x8 block is measured only up to the drop that leaves nothing of it; beyond, its error is the same sum of the same terms |
 | Rate control | `rate.wgsl`, `scan.wgsl` | 4, and two prefix sums of 3 | Each block's steps, and their saved words added into a histogram of the keys; the key at which the frame fits; what each block's steps of that key save, summed in block order; each block's drop and size, and their sums in block order, which are the blocks' places in the payload |
 | Packing | `quantise.wgsl`, `pack.wgsl` | 1: a workgroup per block | The block quantised again, the chosen planes dropped, its bytes assembled in workgroup memory and written at its place |
 
@@ -571,7 +571,7 @@ The GPU cannot repeat the CPU's floating point exactly, so the contract between 
 
 A frame is therefore the CPU encoder's, or one that differs in the blocks whose coefficients sit on a rounding boundary. On an Apple M3 Max all 25 frames of the committed vectors come out identical. Of `refgen`'s scene at 1080p, 1440p and 4K about one sent block in 200 differs, mostly at the same size, and the PSNR is the same to a thousandth of a dB; of pictures of flat rectangles, thin strokes or squares, between none and one in 200. The tests allow differing frames as long as they are as good (within 0.05 dB). The CPU encoder stays the one that makes the same bytes on every system.
 
-[`BENCHMARKS.md`](BENCHMARKS.md#encode-next-to-upstream) has the encoder's times next to upstream's, measured as the decoder's are: on an Apple M3 Max a 4K frame takes 3.64 ms from the planes in CPU memory to the frame in CPU memory, against 3.22 ms for upstream's encoder at the same FP32 precision and 242 ms for the CPU encoder. More than half of the GPU passes' time goes to the quantisation.
+[`BENCHMARKS.md`](BENCHMARKS.md#encode-next-to-upstream) has the encoder's times next to upstream's, measured as the decoder's are: on an Apple M3 Max a 4K frame takes 1.88 ms from the planes in CPU memory to the frame in CPU memory, against 3.18 ms for upstream's encoder at the same FP32 precision and 218 ms for the CPU encoder (decision D30).
 
 ## Decisions
 
@@ -814,3 +814,13 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 - `GpuError` gains `Encode`, which carries the CPU encoder's `EncodeError`: the GPU encoder refuses what the CPU encoder refuses, with the same smallest frame size.
 
 **Consequence.** On an Apple M3 Max a 4K frame encodes in a median 3.9 ms, the 12 MB upload and the read-back included, 60 times as fast as on one CPU core, and on that machine the committed vectors come out byte for byte as the CPU encoder made them. Most of the GPU time goes to the quantisation. Faster quantisation and a comparison with upstream's encoder are issue #29.
+
+### 2026-10-24 — D30: The GPU encoder's speed: a mapped upload buffer, sums per subblock
+
+**Context.** Measured as the decoder is (`BENCHMARKS.md`, issue #29), the GPU encoder took 3.64 ms for a 4K frame on an Apple M3 Max and upstream's encoder 3.22 ms at the same FP32 precision. Two things took most of it. The CPU copied the 12 MB of planes into the staging memory that `Queue::write_buffer` allocates anew for every frame, 1.24 ms; into a buffer kept from frame to frame the same copy takes 0.22 ms. And the quantisation, 1.07 ms of 1.88 ms of GPU passes, added the 64 squared errors of each pair of an 8x8 block and a number of dropped planes one after the other, with two loads from workgroup memory per term.
+
+**Decision.**
+- The planes go through an upload buffer the encoder keeps, mapped for writing before each frame, which waits for nothing since every encode waits for its frame, and copied into the planes buffer at the start of the frame's command buffer. It costs a second buffer of the planes' size, 12 MB at 4K.
+- Each invocation of the quantisation adds up the squared errors of its own 4x2 subblock, for every number of dropped planes it needs, in registers; a pair adds up its 8 subblocks. The CPU encoder adds in the same grouping, each subblock's values in order and then the subblocks in order, instead of the 64 values in one run, so that the GPU's distortions remain the CPU's sums in the CPU's order (D29). No choice of the rate control moved: the committed vectors come out byte for byte as before.
+
+**Consequence.** A 4K frame encodes in 1.88 ms instead of 3.64 ms, 0.59 times the time of upstream's encoder at FP32; 1440p in 1.11 ms and 1080p in 0.83 ms, against upstream's 1.53 and 0.92 ms. The CPU's part of a 4K frame is 0.22 ms and the quantisation's 0.59 ms. What remains is a second copy of the planes on the GPU, which an encode from pictures already in GPU memory would avoid (issue #33).
