@@ -2,11 +2,13 @@
 //! low-latency intra-frame wavelet video codec.
 //!
 //! - [`bitstream`]: the PyroWave v1 bitstream (pure Rust, GPU independent).
+//! - [`cpu`]: a slow reference decoder used as a test oracle.
 //!
 //! The wgpu/WGSL decode pipeline arrives in milestone M2. See
 //! `ARCHITECTURE.md` for the plan.
 
 pub mod bitstream;
+pub mod cpu;
 
 /// Version of the `emberwave-core` crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
