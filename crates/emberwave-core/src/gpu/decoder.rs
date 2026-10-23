@@ -397,6 +397,8 @@ impl Decoder {
     /// The RGBA words that [`encode_rgb`](Self::encode_rgb) and
     /// [`decode_rgb`](Self::decode_rgb) write, once one of them has run:
     /// `width * height` words, one per pixel, red in the low byte, alpha 255.
+    /// The buffer belongs to the decoder: dropping the decoder destroys it,
+    /// clones of the handle included.
     pub fn rgba_buffer(&self) -> Option<&wgpu::Buffer> {
         self.color.as_ref().map(|resources| &resources.rgba)
     }
@@ -800,7 +802,8 @@ impl Decoder {
             (payload, bind_group)
         })?;
 
-        self.payload = payload;
+        // Work already submitted keeps the old buffer until it is done.
+        std::mem::replace(&mut self.payload, payload).destroy();
         self.payload_capacity_words = (capacity_bytes / 4) as usize;
         self.dequant_bind_group = bind_group;
         Ok(())
@@ -889,6 +892,29 @@ impl std::fmt::Debug for Decoder {
             .field("layout", self.assembler.layout())
             .field("payload_capacity_words", &self.payload_capacity_words)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Decoder {
+    /// Frees the GPU memory of the large buffers at once. Native wgpu does
+    /// that when a buffer is dropped anyway, but in a browser dropping it only
+    /// lets go of the JavaScript object, and the memory waits for the garbage
+    /// collector: about 140 MiB for a 4K decoder. Work already submitted keeps
+    /// its buffers until it is done.
+    fn drop(&mut self) {
+        let mut buffers = vec![
+            &self.payload,
+            &self.block_offsets,
+            &self.pyramid,
+            &self.packed,
+            &self.readback,
+        ];
+        if let Some(color) = &self.color {
+            buffers.extend([&color.rgba, &color.readback]);
+        }
+        for buffer in buffers {
+            buffer.destroy();
+        }
     }
 }
 
