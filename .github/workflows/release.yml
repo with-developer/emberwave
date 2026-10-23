@@ -1,0 +1,110 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds emberwave-cli for Linux, macOS and Windows and
+# publishes a GitHub release with the archives, their checksums and the
+# CHANGELOG.md section of that version as the notes.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: The tag names the crate version and a commit on main
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $version in Cargo.toml" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tag $GITHUB_REF_NAME is not on main" >&2
+            exit 1
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - name: Build
+        run: cargo build --release --locked -p emberwave-cli
+      - name: Package
+        shell: bash
+        run: |
+          name="emberwave-cli-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          exe=emberwave-cli
+          if [ "$RUNNER_OS" = Windows ]; then exe=emberwave-cli.exe; fi
+          mkdir "$name"
+          cp "target/release/$exe" README.md LICENSE CHANGELOG.md "$name/"
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z a -bso0 "$name.zip" "$name"
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: emberwave-cli-*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The notes are the CHANGELOG.md section headed "## [X.Y.Z]".
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="[$version]" '/^## /{p = index($0, v) > 0; next} p' CHANGELOG.md > notes.md
+          test -s notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+            --title "emberwave $GITHUB_REF_NAME" --notes-file notes.md
