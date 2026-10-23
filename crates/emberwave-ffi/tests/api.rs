@@ -458,6 +458,33 @@ fn a_bad_target_is_refused_before_the_frame_is_used() {
 }
 
 #[test]
+fn a_picture_size_the_format_cannot_have_is_an_invalid_argument() {
+    let Some(context) = context() else {
+        return;
+    };
+    // Zero, too large, and odd for 4:2:0.
+    for (width, height, chroma) in [
+        (0, 0, EMBERWAVE_CHROMA_420),
+        (16385, 64, EMBERWAVE_CHROMA_444),
+        (191, 100, EMBERWAVE_CHROMA_420),
+    ] {
+        let mut decoder = ptr::null_mut();
+        // SAFETY: a live context and a pointer to store the decoder.
+        let status =
+            unsafe { emberwave_decoder_create(context, width, height, chroma, &mut decoder) };
+        assert_eq!(status, EmberwaveStatus::InvalidArgument, "{width}x{height}");
+        assert!(decoder.is_null());
+        assert!(
+            last_error().contains("invalid dimensions"),
+            "{}",
+            last_error()
+        );
+    }
+    // SAFETY: a live context, destroyed once.
+    unsafe { emberwave_context_destroy(context) };
+}
+
+#[test]
 fn packets_of_another_stream_are_refused_and_clear_starts_over() {
     let Some(context) = context() else {
         return;

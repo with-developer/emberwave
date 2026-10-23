@@ -320,10 +320,16 @@ impl Decoder {
         })
     }
 
+    /// Why the device of this decoder was lost, if it was. See
+    /// [`GpuContext::lost`].
+    pub fn lost(&self) -> Option<String> {
+        self.lost.lock().ok().and_then(|lost| lost.clone())
+    }
+
     /// An error if the device has been lost, so that nothing is decoded on it
     /// and no stale result is returned.
     fn check_device(&self) -> Result<(), GpuError> {
-        match self.lost.lock().ok().and_then(|lost| lost.clone()) {
+        match self.lost() {
             Some(reason) => Err(GpuError::DeviceLost(reason)),
             None => Ok(()),
         }

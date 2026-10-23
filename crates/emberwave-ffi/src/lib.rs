@@ -21,7 +21,8 @@ use std::ffi::{CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use emberwave_core::bitstream::{
-    ChromaSiting, ChromaSubsampling, Component, Header, Pwv1Header, SequenceHeader, YcbcrRange,
+    ChromaSiting, ChromaSubsampling, Component, Error as BitstreamError, Header, Pwv1Header,
+    SequenceHeader, YcbcrRange,
 };
 use emberwave_core::color::{ColorMatrix, ColorParams};
 use emberwave_core::gpu::{Decoder, GpuContext, GpuError, GpuOptions};
@@ -200,8 +201,8 @@ impl From<GpuError> for Failure {
     }
 }
 
-impl From<emberwave_core::bitstream::Error> for Failure {
-    fn from(error: emberwave_core::bitstream::Error) -> Self {
+impl From<BitstreamError> for Failure {
+    fn from(error: BitstreamError) -> Self {
         Self(EmberwaveStatus::Bitstream, error.to_string())
     }
 }
@@ -210,20 +211,33 @@ impl From<emberwave_core::bitstream::Error> for Failure {
 /// [`emberwave_last_error`] and turns a panic into
 /// [`EmberwaveStatus::Internal`].
 fn run(body: impl FnOnce() -> Result<(), Failure>) -> EmberwaveStatus {
+    run_or_lost(body, || None)
+}
+
+/// Like [`run`], but a panic is reported as a lost device if `lost` says the
+/// device is lost. wgpu panics when the device fails while it waits for the
+/// GPU (decision D22), after it has recorded the loss.
+fn run_or_lost(
+    body: impl FnOnce() -> Result<(), Failure>,
+    lost: impl FnOnce() -> Option<String>,
+) -> EmberwaveStatus {
     let Failure(status, message) = match catch_unwind(AssertUnwindSafe(body)) {
         Ok(Ok(())) => return EmberwaveStatus::Ok,
         Ok(Err(failure)) => failure,
-        Err(panic) => {
-            let detail = panic
-                .downcast_ref::<&str>()
-                .map(|text| (*text).to_owned())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_default();
-            Failure(
-                EmberwaveStatus::Internal,
-                format!("internal error: {detail}"),
-            )
-        }
+        Err(panic) => match lost() {
+            Some(reason) => GpuError::DeviceLost(reason).into(),
+            None => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                Failure(
+                    EmberwaveStatus::Internal,
+                    format!("internal error: {detail}"),
+                )
+            }
+        },
     };
     // C strings end at the first NUL, so a message is cut there.
     let bytes: Vec<u8> = message
@@ -290,6 +304,16 @@ unsafe fn live_mut<'a>(
 ) -> Result<&'a mut EmberwaveDecoder, Failure> {
     // SAFETY: as the caller promises.
     unsafe { decoder.as_mut() }.ok_or_else(|| Failure::argument("decoder is NULL"))
+}
+
+/// Why the device of the decoder `decoder` points to was lost, if it was.
+///
+/// # Safety
+///
+/// `decoder` is `NULL` or a live decoder.
+unsafe fn lost(decoder: *const EmberwaveDecoder) -> Option<String> {
+    // SAFETY: as the caller promises.
+    unsafe { decoder.as_ref() }.and_then(|decoder| decoder.decoder.lost())
 }
 
 fn chroma_code(chroma: ChromaSubsampling) -> u32 {
@@ -607,7 +631,15 @@ pub unsafe extern "C" fn emberwave_decoder_create(
             EMBERWAVE_CHROMA_444 => ChromaSubsampling::Yuv444,
             other => return Err(Failure::argument(format!("unknown chroma format {other}"))),
         };
-        let created = Decoder::new(&context.context, width, height, chroma)?;
+        let created = Decoder::new(&context.context, width, height, chroma).map_err(|error| {
+            match error {
+                // The caller's numbers, not a stream's.
+                GpuError::Bitstream(BitstreamError::InvalidDimensions { .. }) => {
+                    Failure::argument(error.to_string())
+                }
+                other => other.into(),
+            }
+        })?;
         let boxed = Box::new(EmberwaveDecoder { decoder: created });
         // SAFETY: checked by the first output() above.
         unsafe { decoder.write(Box::into_raw(boxed)) };
@@ -737,29 +769,33 @@ pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
     cb: EmberwavePlane,
     cr: EmberwavePlane,
 ) -> EmberwaveStatus {
-    run(|| {
-        // SAFETY: as the caller promises.
-        let decoder = unsafe { live_mut(decoder) }?;
-        let targets = [
-            (y, Component::Y, "y"),
-            (cb, Component::Cb, "cb"),
-            (cr, Component::Cr, "cr"),
-        ];
-        // Checked before decoding, so that a bad argument does not use up the
-        // frame.
-        let layout = decoder.decoder.layout();
-        for (target, component, name) in &targets {
-            let (width, height) = layout.plane_size(*component);
-            check_target(target, name, width as usize, height as usize)?;
-        }
-        let frame = decoder.decoder.decode_assembled()?;
-        for (plane, (target, _, _)) in frame.planes.iter().zip(&targets) {
-            // SAFETY: checked above for the plane's size, and the caller
-            // promises the memory.
-            unsafe { copy_rows(&plane.data, plane.width as usize, target) };
-        }
-        Ok(())
-    })
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            let targets = [
+                (y, Component::Y, "y"),
+                (cb, Component::Cb, "cb"),
+                (cr, Component::Cr, "cr"),
+            ];
+            // Checked before decoding, so that a bad argument does not use up the
+            // frame.
+            let layout = decoder.decoder.layout();
+            for (target, component, name) in &targets {
+                let (width, height) = layout.plane_size(*component);
+                check_target(target, name, width as usize, height as usize)?;
+            }
+            let frame = decoder.decoder.decode_assembled()?;
+            for (plane, (target, _, _)) in frame.planes.iter().zip(&targets) {
+                // SAFETY: checked above for the plane's size, and the caller
+                // promises the memory.
+                unsafe { copy_rows(&plane.data, plane.width as usize, target) };
+            }
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
 }
 
 /// Decodes the frame received so far, converts it to RGB on the GPU and writes
@@ -782,26 +818,30 @@ pub unsafe extern "C" fn emberwave_decoder_decode_rgb(
     color: *const EmberwaveColor,
     rgb: EmberwavePlane,
 ) -> EmberwaveStatus {
-    run(|| {
-        // SAFETY: as the caller promises.
-        let decoder = unsafe { live_mut(decoder) }?;
-        // SAFETY: as the caller promises.
-        let params = match unsafe { color.as_ref() } {
-            Some(color) => color_params(color)?,
-            None => decoder
-                .decoder
-                .start_of_frame()
-                .map(ColorParams::from_stream)
-                .unwrap_or_default(),
-        };
-        let layout = decoder.decoder.layout();
-        let row_bytes = 3 * layout.width() as usize;
-        check_target(&rgb, "rgb", row_bytes, layout.height() as usize)?;
-        let frame = decoder.decoder.decode_assembled_rgb(&params)?;
-        // SAFETY: checked above, and the caller promises the memory.
-        unsafe { copy_rows(&frame.data, row_bytes, &rgb) };
-        Ok(())
-    })
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            // SAFETY: as the caller promises.
+            let params = match unsafe { color.as_ref() } {
+                Some(color) => color_params(color)?,
+                None => decoder
+                    .decoder
+                    .start_of_frame()
+                    .map(ColorParams::from_stream)
+                    .unwrap_or_default(),
+            };
+            let layout = decoder.decoder.layout();
+            let row_bytes = 3 * layout.width() as usize;
+            check_target(&rgb, "rgb", row_bytes, layout.height() as usize)?;
+            let frame = decoder.decoder.decode_assembled_rgb(&params)?;
+            // SAFETY: checked above, and the caller promises the memory.
+            unsafe { copy_rows(&frame.data, row_bytes, &rgb) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
 }
 
 #[cfg(test)]
@@ -816,6 +856,75 @@ mod tests {
         assert_send::<EmberwaveContext>();
         assert_sync::<EmberwaveContext>();
         assert_send::<EmberwaveDecoder>();
+    }
+
+    #[test]
+    fn a_panic_on_a_lost_device_is_reported_as_the_loss() {
+        let mut context = std::ptr::null_mut();
+        // SAFETY: NULL options and a pointer to store the context.
+        if unsafe { emberwave_context_create(std::ptr::null(), &mut context) }
+            != EmberwaveStatus::Ok
+        {
+            assert!(
+                std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+                "no GPU"
+            );
+            return;
+        }
+        let mut decoder = std::ptr::null_mut();
+        // SAFETY: a live context, and pointers to store results; the device
+        // is destroyed as wgpu does when a GPU goes away.
+        unsafe {
+            let status =
+                emberwave_decoder_create(context, 64, 64, EMBERWAVE_CHROMA_420, &mut decoder);
+            assert_eq!(status, EmberwaveStatus::Ok);
+            assert_eq!(lost(decoder), None);
+            (*context).context.device().destroy();
+        }
+
+        // Decoding finds the device lost.
+        let mut y = vec![0u8; 64 * 64];
+        let mut cb = vec![0u8; 32 * 32];
+        let mut cr = vec![0u8; 32 * 32];
+        let plane = |bytes: &mut Vec<u8>, stride| EmberwavePlane {
+            data: bytes.as_mut_ptr(),
+            stride,
+        };
+        // SAFETY: a live decoder, and planes as large as their strides say.
+        let status = unsafe {
+            emberwave_decoder_decode_yuv(
+                decoder,
+                plane(&mut y, 64),
+                plane(&mut cb, 32),
+                plane(&mut cr, 32),
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::DeviceLost);
+        // SAFETY: a live decoder.
+        assert!(unsafe { lost(decoder) }.is_some());
+
+        // What wgpu does when the device fails while it is waited for.
+        let status = run_or_lost(
+            || panic!("the device failed while it was waited for"),
+            // SAFETY: a live decoder.
+            || unsafe { lost(decoder) },
+        );
+        assert_eq!(status, EmberwaveStatus::DeviceLost);
+        // SAFETY: a static C string.
+        let message = unsafe { std::ffi::CStr::from_ptr(emberwave_last_error()) };
+        assert!(message.to_string_lossy().contains("lost"), "{message:?}");
+
+        // A panic with a working device stays an internal error.
+        assert_eq!(
+            run_or_lost(|| panic!("a bug"), || None),
+            EmberwaveStatus::Internal
+        );
+
+        // SAFETY: both live, destroyed once.
+        unsafe {
+            emberwave_decoder_destroy(decoder);
+            emberwave_context_destroy(context);
+        }
     }
 
     #[test]
