@@ -48,6 +48,7 @@ Environment variables:
 - **Portable GPU code.** The shaders use only what wgpu guarantees on Vulkan, Metal, DX12 and WebGPU: no subgroup operations, no `f16`, no 8-bit or 16-bit storage, no push constants, at most 256 invocations and 16 KiB of workgroup memory per workgroup. `tests/shaders.rs` enforces it.
 - **Every shader starts with a comment** naming the stage of the upstream algorithm it implements.
 - **Constant indices for local arrays in WGSL.** An array local to an invocation that is indexed by a loop variable can end up in memory instead of registers; that made the inverse transform 4.5 times slower (decision D24). Write such code out, and measure with `scripts/bench.sh` before and after.
+- **Write workgroup memory before reading it.** The pipelines do not zero workgroup memory (decision D25), so a shader that reads an element no invocation of its workgroup has written gets whatever an earlier workgroup left there. Every workgroup variable is written in full, followed by a barrier, before it is read. The GPU tests compare every level with the CPU exactly, which catches a slip in practice, but only if the stale values differ from the right ones.
 - **No code from upstream.** Understand upstream's algorithm and write it again; only the algorithm and the bitstream format are shared. Bitstream constants get names, with a comment saying where upstream defines them.
 - **No `unsafe`.** The workspace forbids it.
 - **Public items have doc comments.**

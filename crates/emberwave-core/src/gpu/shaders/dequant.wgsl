@@ -44,6 +44,8 @@ const MISSING_BLOCK: u32 = 0xffffffffu;
 // Side of a coded block and of the 8x8 blocks inside it.
 const BLOCK_SIZE: u32 = 32u;
 
+// Workgroup memory is not zeroed for this pipeline (decision D25): each
+// variable is written in full before the barrier that precedes its reads.
 var<workgroup> shared_offset: u32;
 var<workgroup> control_words: array<u32, 16>;
 var<workgroup> qscales: array<u32, 16>;

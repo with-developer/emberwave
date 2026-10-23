@@ -64,6 +64,10 @@ const APRON: i32 = 4;
 // Shifts the DC level back (bitstream.md, "Inverse DC shift").
 const DC_SHIFT: f32 = 0.5;
 
+// Workgroup memory is not zeroed for this pipeline (decision D25): every
+// element is written before it is read. The load fills all of `window`, the
+// horizontal pass all of `horizontal`, and at the last level the vertical
+// pass rewrites the 32x32 corner of `window` that the packing reads.
 var<workgroup> window: array<f32, 1600>;
 var<workgroup> horizontal: array<f32, 1280>;
 
