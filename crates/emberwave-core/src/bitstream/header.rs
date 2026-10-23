@@ -195,6 +195,13 @@ impl Header {
     }
 }
 
+/// The sequence number (bits 28 to 30 of word 0) of a header of either kind,
+/// without interpreting anything else. `None` if fewer than 4 bytes are given.
+pub(crate) fn peek_sequence(bytes: &[u8]) -> Option<u8> {
+    let first = bytes.first_chunk::<4>()?;
+    Some(((u32::from_le_bytes(*first) >> 28) & 0x7) as u8)
+}
+
 /// Reads the two little-endian words of a header.
 pub(crate) fn read_words(bytes: &[u8]) -> Result<(u32, u32), Error> {
     match bytes.first_chunk::<HEADER_BYTES>() {

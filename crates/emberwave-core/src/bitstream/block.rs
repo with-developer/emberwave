@@ -103,9 +103,47 @@ impl BlockStructure {
             return Err(Error::BlockTooSmall { words: words.len() });
         }
 
-        let header = BlockHeader::from_words(words[0], words[1]);
         let bytes = BlockBytes::new(words);
-        let size = bytes.len();
+        Self::parse_with(
+            BlockHeader::from_words(words[0], words[1]),
+            bytes.len(),
+            |offset| bytes.u8(offset),
+        )
+    }
+
+    /// Like [`parse`](Self::parse) for a block that is still a slice of
+    /// little-endian bytes, for example straight out of a packet. Trailing
+    /// bytes that do not make a whole word are ignored.
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let words = bytes.len() / 4;
+        if words < HEADER_WORDS {
+            return Err(Error::BlockTooSmall { words });
+        }
+
+        let word = |i: usize| {
+            u32::from_le_bytes([
+                bytes[4 * i],
+                bytes[4 * i + 1],
+                bytes[4 * i + 2],
+                bytes[4 * i + 3],
+            ])
+        };
+        Self::parse_with(
+            BlockHeader::from_words(word(0), word(1)),
+            words * 4,
+            |offset| bytes.get(offset).copied().unwrap_or(0),
+        )
+    }
+
+    /// The parsing itself, over any way of reading a byte of the block.
+    fn parse_with(
+        header: BlockHeader,
+        size: usize,
+        byte_at: impl Fn(usize) -> u8,
+    ) -> Result<Self, Error> {
+        let half_at = |offset: usize| {
+            u16::from_le_bytes([byte_at(offset), byte_at(offset.saturating_add(1))])
+        };
 
         let active = header.ballot.count_ones() as usize;
         let tables_end = HEADER_BYTES + active * (CONTROL_WORD_BYTES + QSCALE_BYTES);
@@ -125,8 +163,8 @@ impl BlockStructure {
                 continue;
             }
 
-            let control_word = bytes.u16(HEADER_BYTES + index * CONTROL_WORD_BYTES);
-            let qscale = bytes.u8(qscale_base + index * QSCALE_BYTES);
+            let control_word = half_at(HEADER_BYTES + index * CONTROL_WORD_BYTES);
+            let qscale = byte_at(qscale_base + index * QSCALE_BYTES);
             let base_planes = qscale & QSCALE_PLANES_MASK;
 
             let extra_planes: usize = (0..SUBBLOCKS_PER_BLOCK8)
@@ -290,6 +328,41 @@ mod tests {
         assert_eq!(s.active_count(), 0);
         assert_eq!(s.sign_offset(), 8);
         assert!((0..16).all(|r| s.block8(r).is_none()));
+    }
+
+    #[test]
+    fn words_and_bytes_parse_alike() {
+        let mut tables = Vec::new();
+        tables.extend_from_slice(&0b0110u16.to_le_bytes());
+        tables.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        tables.push(0x32);
+        tables.push(0x50);
+        let words = block(0b101, &tables, 15);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        assert_eq!(
+            BlockStructure::parse(&words),
+            BlockStructure::parse_bytes(&bytes)
+        );
+        // Trailing bytes that are not a whole word are ignored.
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(
+            BlockStructure::parse(&words),
+            BlockStructure::parse_bytes(&longer)
+        );
+
+        // Errors agree too.
+        let short = block(0xFFFF, &[], 3);
+        let short_bytes: Vec<u8> = short.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(
+            BlockStructure::parse(&short),
+            BlockStructure::parse_bytes(&short_bytes)
+        );
+        assert_eq!(
+            BlockStructure::parse_bytes(&[0; 7]),
+            Err(Error::BlockTooSmall { words: 1 })
+        );
     }
 
     #[test]

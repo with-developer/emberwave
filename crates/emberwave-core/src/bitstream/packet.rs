@@ -5,15 +5,18 @@
 //! dequantisation stage consumes: a table with the position of every 32x32
 //! block in the payload, and the payload words themselves. The behaviour
 //! follows upstream's `Decoder::push_packet` (sequence handling, first copy of
-//! a duplicate block wins) except that a block that fails validation leaves
-//! the assembler untouched.
+//! a duplicate block wins) with one deliberate difference: upstream starts the
+//! new frame as soon as a header of a newer frame arrives and validates it
+//! afterwards, so a corrupt packet can discard the frame being assembled.
+//! Here a header or block is validated first, and one that is rejected changes
+//! nothing.
 
 use super::block::BlockStructure;
 use super::consts::{
     DECOMPOSITION_LEVELS, HEADER_BYTES, SEQUENCE_COUNT_MASK, SEQUENCE_MAX_FORWARD_DISTANCE,
 };
 use super::error::Error;
-use super::header::{Header, SequenceHeader};
+use super::header::{Header, SequenceHeader, peek_sequence};
 use super::layout::{Band, Component, FrameLayout};
 
 /// Value in the block offset table for a block that has not been received.
@@ -117,11 +120,31 @@ impl FrameAssembler {
     ///
     /// Packets of an older frame are ignored. A packet of a newer frame
     /// discards what was collected so far. Blocks that were already received
-    /// are ignored. On error the offending block is not added; blocks of the
-    /// same packet that came before it are kept.
+    /// are ignored.
+    ///
+    /// A header or block that is rejected changes nothing, even if it belongs
+    /// to a newer frame; blocks of the same packet that came before it are
+    /// kept.
     pub fn push_packet(&mut self, mut data: &[u8]) -> Result<(), Error> {
         while data.len() >= HEADER_BYTES {
-            match Header::parse(data)? {
+            let header = match Header::parse(data) {
+                Ok(header) => header,
+                // Like any other header of an old frame, one whose kind this
+                // decoder does not know is ignored together with the rest of
+                // the packet.
+                Err(Error::UnknownExtendedCode(code)) => {
+                    let stale = peek_sequence(data)
+                        .is_some_and(|sequence| self.freshness(sequence) == Freshness::Stale);
+                    return if stale {
+                        Ok(())
+                    } else {
+                        Err(Error::UnknownExtendedCode(code))
+                    };
+                }
+                Err(error) => return Err(error),
+            };
+
+            match header {
                 Header::StartOfFrame(header) => {
                     if header.chroma != self.layout.chroma() {
                         return Err(Error::ChromaMismatch {
@@ -174,6 +197,10 @@ impl FrameAssembler {
                             count,
                         });
                     }
+
+                    // Validate before anything is changed, so a rejected block
+                    // never discards the frame being assembled.
+                    BlockStructure::parse_bytes(&data[..size])?;
 
                     if freshness == Freshness::Newer {
                         self.restart(header.sequence);
@@ -269,9 +296,9 @@ impl FrameAssembler {
         self.last_sequence = Some(sequence);
     }
 
-    /// Appends the block unless its index was seen before.
+    /// Appends a block that has been validated, unless its index was seen before.
     fn insert_block(&mut self, block_index: u32, block: &[u8]) -> Result<(), Error> {
-        let Some(slot) = self.block_offsets.get(block_index as usize) else {
+        let Some(slot) = self.block_offsets.get_mut(block_index as usize) else {
             return Ok(());
         };
         if *slot != MISSING_BLOCK {
@@ -284,13 +311,7 @@ impl FrameAssembler {
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
         );
-
-        if let Err(error) = BlockStructure::parse(&self.payload[offset as usize..]) {
-            self.payload.truncate(offset as usize);
-            return Err(error);
-        }
-
-        self.block_offsets[block_index as usize] = offset;
+        *slot = offset;
         self.received_blocks += 1;
         Ok(())
     }
@@ -544,6 +565,77 @@ mod tests {
         assert_eq!(a.received_blocks(), 2);
         assert_eq!(a.frame().payload().len(), 4);
         assert!(a.frame().block(1).is_none());
+    }
+
+    #[test]
+    fn a_rejected_block_of_a_newer_frame_leaves_the_frame_in_place() {
+        let mut a = assembler();
+        a.push_packet(&[start_of_frame(1, 2), block(0, 1, 0), block(5, 1, 0)].concat())
+            .unwrap();
+        assert!(a.is_ready(false));
+
+        // Sequence 2 is newer, but the block promises data it does not have.
+        let mut hollow = block(1, 2, 0);
+        hollow[0] = 0xFF;
+        hollow[1] = 0xFF;
+        assert!(matches!(
+            a.push_packet(&hollow),
+            Err(Error::BlockContentOverrun { .. })
+        ));
+        // Sequence 3, index out of range.
+        assert!(matches!(
+            a.push_packet(&block(66, 3, 0)),
+            Err(Error::BlockIndexOutOfRange { .. })
+        ));
+        // Sequence 4, smaller than its header.
+        let mut tiny = block(1, 4, 0);
+        tiny[2] = 1;
+        tiny[3] = 0x40;
+        assert!(matches!(
+            a.push_packet(&tiny),
+            Err(Error::BlockTooSmall { .. })
+        ));
+        // A start of frame of a newer frame with the wrong size.
+        let mut wrong = start_of_frame(2, 9);
+        wrong[0] = 0;
+        assert!(matches!(
+            a.push_packet(&wrong),
+            Err(Error::DimensionMismatch { .. })
+        ));
+
+        // The first frame survived all of that.
+        assert_eq!((a.sequence(), a.received_blocks()), (Some(1), 2));
+        assert!(a.is_ready(false));
+        assert!(a.frame().block(0).is_some() && a.frame().block(5).is_some());
+    }
+
+    #[test]
+    fn an_old_header_of_an_unknown_kind_is_ignored_but_a_current_one_is_an_error() {
+        let mut a = assembler();
+        a.push_packet(&[block(0, 3, 0)].concat()).unwrap();
+
+        // Extended header with code 2 and sequence 3 + 5 = 0 (mod 8): stale,
+        // so it is dropped together with the rest of the packet.
+        let unknown = |sequence: u8| {
+            let word0 = (u32::from(sequence) << 28) | (1 << 31);
+            let word1 = 2u32 << 24;
+            [word0.to_le_bytes(), word1.to_le_bytes()].concat()
+        };
+        assert_eq!(
+            a.push_packet(&[unknown(0), block(7, 3, 0)].concat()),
+            Ok(())
+        );
+        assert_eq!(a.received_blocks(), 1);
+
+        // The same kind of header for the current or a newer frame is an error
+        // and changes nothing.
+        for sequence in [3, 4] {
+            assert_eq!(
+                a.push_packet(&unknown(sequence)),
+                Err(Error::UnknownExtendedCode(2))
+            );
+        }
+        assert_eq!((a.sequence(), a.received_blocks()), (Some(3), 1));
     }
 
     #[test]
