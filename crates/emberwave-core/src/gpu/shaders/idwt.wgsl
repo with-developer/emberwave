@@ -12,16 +12,23 @@
 // 32x32 tile of the output: it loads the 40x40 interleaved neighbourhood
 // (4 samples of extension on each side, one per lifting step), filters
 // horizontally and then vertically in workgroup memory, and stores the tile.
-// Workgroup z selects the colour component.
+// At the last level of a component the tile is stored as 8-bit samples,
+// packed four to a word, which is what upstream's UNORM storage images hold;
+// the float picture never goes to memory. Workgroup z selects the colour
+// component.
 
 struct CompParams {
     // Offsets of the LL, HL, LH and HH bands in the pyramid, in floats.
     band_offset: vec4<u32>,
+    // Where the output goes: the LL band of the next level in the pyramid
+    // (offset and row length in floats), or at the last level the packed
+    // 8-bit plane (offset and row length in words).
     dst_offset: u32,
     dst_stride: u32,
+    // Size of the plane, which the last level crops its output to.
     crop_width: u32,
     crop_height: u32,
-    // 1: write the DC-shifted, clamped final plane; 0: write the LL band of the next level.
+    // 1: the last level, which writes the packed plane; 0: an earlier level.
     is_final: u32,
     pad0: u32,
     pad1: u32,
@@ -37,7 +44,7 @@ struct IdwtParams {
 }
 
 @group(0) @binding(0) var<storage, read_write> pyramid: array<f32>;
-@group(0) @binding(1) var<storage, read_write> planes: array<f32>;
+@group(0) @binding(1) var<storage, read_write> packed: array<u32>;
 @group(0) @binding(2) var<uniform> params: IdwtParams;
 
 // Lifting step constants of the CDF 9/7 filter (ITU-T T.800, F.4.8.2).
@@ -121,19 +128,25 @@ fn lift(v: ptr<function, array<f32, 16>>) {
     (*v)[11] = (*v)[11] - ALPHA * ((*v)[10] + (*v)[12]);
 }
 
-// Stores one output sample, if it lies inside the output.
-fn store(comp: CompParams, x: i32, y: i32, value: f32) {
-    if (x >= i32(params.out_width) || y >= i32(params.out_height)) {
-        return;
-    }
-    if (comp.is_final != 0u) {
-        if (u32(x) < comp.crop_width && u32(y) < comp.crop_height) {
-            planes[comp.dst_offset + u32(y) * comp.dst_stride + u32(x)] =
-                clamp(value + DC_SHIFT, 0.0, 1.0);
-        }
-    } else {
+// Stores one sample of the next level's LL band, if it lies inside the output.
+fn store_ll(comp: CompParams, x: i32, y: i32, value: f32) {
+    if (x < i32(params.out_width) && y < i32(params.out_height)) {
         pyramid[comp.dst_offset + u32(y) * comp.dst_stride + u32(x)] = value;
     }
+}
+
+// A final sample as an 8-bit level: the DC shift is added by the caller, the
+// result clamped to [0, 1] and rounded like a UNORM store. WGSL's round()
+// rounds ties to even on every backend. Kept as a float so that it can wait in
+// the window array; it is a whole number from 0 to 255.
+fn to_unorm8(v: f32) -> f32 {
+    return round(clamp(v, 0.0, 1.0) * 255.0);
+}
+
+// The 8-bit level of tile sample `at` collected in the window array, or 0 for
+// a padding sample past the right edge of the plane.
+fn level_at(at: u32, x: u32, width: u32) -> u32 {
+    return select(0u, u32(window[at]), x < width);
 }
 
 @compute @workgroup_size(256)
@@ -193,7 +206,11 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     }
     workgroupBarrier();
 
-    // Vertical pass: one invocation per segment of a tile column.
+    // Vertical pass: one invocation per segment of a tile column. Earlier
+    // levels store the LL band of the next level; the last level collects its
+    // 8-bit samples for packing. The branch is uniform: one workgroup belongs
+    // to one component.
+    let is_final = comp.is_final != 0u;
     if (tid < 128u) {
         let column = tid % 32u;
         let segment = tid / 32u;
@@ -217,15 +234,48 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         v[15] = horizontal[base + 15u * TILE];
         lift(&v);
 
-        let x = tile_x + i32(column);
-        let y = tile_y + i32(8u * segment);
-        store(comp, x, y + 0, v[4]);
-        store(comp, x, y + 1, v[5]);
-        store(comp, x, y + 2, v[6]);
-        store(comp, x, y + 3, v[7]);
-        store(comp, x, y + 4, v[8]);
-        store(comp, x, y + 5, v[9]);
-        store(comp, x, y + 6, v[10]);
-        store(comp, x, y + 7, v[11]);
+        if (is_final) {
+            // The window array is free now: the horizontal pass is done.
+            let at = 8u * segment * TILE + column;
+            window[at + 0u * TILE] = to_unorm8(v[4] + DC_SHIFT);
+            window[at + 1u * TILE] = to_unorm8(v[5] + DC_SHIFT);
+            window[at + 2u * TILE] = to_unorm8(v[6] + DC_SHIFT);
+            window[at + 3u * TILE] = to_unorm8(v[7] + DC_SHIFT);
+            window[at + 4u * TILE] = to_unorm8(v[8] + DC_SHIFT);
+            window[at + 5u * TILE] = to_unorm8(v[9] + DC_SHIFT);
+            window[at + 6u * TILE] = to_unorm8(v[10] + DC_SHIFT);
+            window[at + 7u * TILE] = to_unorm8(v[11] + DC_SHIFT);
+        } else {
+            let x = tile_x + i32(column);
+            let y = tile_y + i32(8u * segment);
+            store_ll(comp, x, y + 0, v[4]);
+            store_ll(comp, x, y + 1, v[5]);
+            store_ll(comp, x, y + 2, v[6]);
+            store_ll(comp, x, y + 3, v[7]);
+            store_ll(comp, x, y + 4, v[8]);
+            store_ll(comp, x, y + 5, v[9]);
+            store_ll(comp, x, y + 6, v[10]);
+            store_ll(comp, x, y + 7, v[11]);
+        }
+    }
+
+    // At the last level every invocation writes one word of the tile: four
+    // samples of a row, the first in the low byte. Rows of a packed plane are
+    // padded to whole words, and the padding samples are zero.
+    if (is_final) {
+        workgroupBarrier();
+        let row = tid / 8u;
+        let word = tid % 8u;
+        let y = u32(tile_y) + row;
+        let word_x = u32(tile_x) / 4u + word;
+        if (y < comp.crop_height && word_x < comp.dst_stride) {
+            let x = 4u * word_x;
+            let at = row * TILE + 4u * word;
+            let width = comp.crop_width;
+            packed[comp.dst_offset + y * comp.dst_stride + word_x] = level_at(at, x, width) |
+                (level_at(at + 1u, x + 1u, width) << 8u) |
+                (level_at(at + 2u, x + 2u, width) << 16u) |
+                (level_at(at + 3u, x + 3u, width) << 24u);
+        }
     }
 }

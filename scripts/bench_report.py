@@ -164,7 +164,6 @@ def benchmarks_block(results, env):
                         "gpu (timestamps)",
                         "dequant",
                         "idwt",
-                        "pack",
                         "yuv2rgb",
                     )
                 ]
@@ -181,7 +180,6 @@ def benchmarks_block(results, env):
                 "GPU passes",
                 "dequant",
                 "idwt",
-                "pack",
                 "yuv2rgb",
             ],
             rows,

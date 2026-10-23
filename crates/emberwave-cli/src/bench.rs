@@ -154,10 +154,6 @@ pub fn run(args: &Args) -> Result<()> {
         name: "idwt",
         samples: Vec::new(),
     };
-    let mut pack = Series {
-        name: "pack",
-        samples: Vec::new(),
-    };
     let mut yuv2rgb = Series {
         name: "yuv2rgb",
         samples: Vec::new(),
@@ -180,7 +176,6 @@ pub fn run(args: &Args) -> Result<()> {
         if let Some(stages) = timings.stages {
             dequant.samples.push(ms(stages.dequant));
             idwt.samples.push(ms(stages.idwt));
-            pack.samples.push(ms(stages.pack));
             if let Some(duration) = stages.yuv2rgb {
                 yuv2rgb.samples.push(ms(duration));
             }
@@ -189,7 +184,7 @@ pub fn run(args: &Args) -> Result<()> {
     }
 
     let series: Vec<&Series> = [
-        &total, &prepare, &gpu_wall, &gpu_sum, &dequant, &idwt, &pack, &yuv2rgb,
+        &total, &prepare, &gpu_wall, &gpu_sum, &dequant, &idwt, &yuv2rgb,
     ]
     .into_iter()
     .filter(|s| !s.samples.is_empty())

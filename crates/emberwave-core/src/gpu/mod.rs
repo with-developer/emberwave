@@ -21,8 +21,6 @@ pub mod shader_sources {
     pub const DEQUANT: &str = include_str!("shaders/dequant.wgsl");
     /// Inverse wavelet transform of one level.
     pub const IDWT: &str = include_str!("shaders/idwt.wgsl");
-    /// Float planes to 8-bit samples.
-    pub const PACK: &str = include_str!("shaders/pack.wgsl");
     /// 8-bit YCbCr planes to RGB.
     pub const YUV2RGB: &str = include_str!("shaders/yuv2rgb.wgsl");
 }
