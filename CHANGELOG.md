@@ -2,14 +2,16 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-24
+
+emberwave outside Rust: a player in the browser, published at https://with-developer.github.io/emberwave/, and a C API with prebuilt libraries for Linux, macOS and Windows.
 
 ### Added
 
 - A browser player ([#15](https://github.com/with-developer/emberwave/issues/15)): `crates/emberwave-web` and the page in `web/`, published to GitHub Pages, decode `.pwv1` files with WebGPU in the page and draw them on a canvas.
 - `Decoder::encode_rgb` records a decode into the caller's command encoder without waiting, and `Decoder::rgba_buffer` gives the picture; `GpuContext::from_adapter` creates a context on an adapter the caller chose. Together they let a player keep the picture on the GPU, and they are what the browser player uses.
 - A C API ([#16](https://github.com/with-developer/emberwave/issues/16)): `crates/emberwave-ffi` with the header `include/emberwave.h`, made by cbindgen. Contexts and decoders, packets pushed as they arrive, and the decoded planes or RGB written into the caller's memory; status codes with a message per thread, and panics caught at the boundary. Each release ships the header with a shared and a static library for Linux, macOS and Windows, and a C example decodes every test vector in CI on all three.
-- `Decoder::clear` and `Decoder::start_of_frame`, which the C API needed.
+- `Decoder::clear`, `Decoder::start_of_frame` and `Decoder::lost`, which the C API needed.
 
 ### Changed
 
