@@ -69,3 +69,45 @@ fn workgroup_sizes_and_memory_stay_within_the_portable_limits() {
         println!("{name}: workgroup {x}x{y}x{z}, {total} bytes of workgroup memory");
     }
 }
+
+#[test]
+fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
+    // The pipelines do not zero workgroup memory (ARCHITECTURE.md, decision
+    // D25). That is only right while every workgroup variable is written
+    // before it is read, which was checked for exactly these variables and
+    // sizes. A shader that gains, loses or resizes one fails here: check its
+    // writes and reads again, then update the list.
+    type Variable = (&'static str, u32); // name, size in bytes
+    let dequant: &[Variable] = &[
+        ("shared_offset", 4),
+        ("control_words", 64),
+        ("qscales", 64),
+        ("plane_costs", 64),
+        ("sign_counts", 512),
+        ("block_sign_totals", 64),
+    ];
+    let idwt: &[Variable] = &[("window", 6400), ("horizontal", 5120)];
+    for (name, source, variables) in [
+        ("dequant", shader_sources::DEQUANT, dequant),
+        ("idwt", shader_sources::IDWT, idwt),
+        ("yuv2rgb", shader_sources::YUV2RGB, &[]),
+    ] {
+        let module = validate(name, source);
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).expect("layout");
+        let found: Vec<(String, u32)> = module
+            .global_variables
+            .iter()
+            .filter(|(_, variable)| variable.space == naga::AddressSpace::WorkGroup)
+            .map(|(_, variable)| {
+                let name = variable.name.clone().unwrap_or_default();
+                (name, layouter[variable.ty].size)
+            })
+            .collect();
+        let variables: Vec<(String, u32)> = variables
+            .iter()
+            .map(|&(name, size)| (name.to_owned(), size))
+            .collect();
+        assert_eq!(found, variables, "{name}");
+    }
+}

@@ -44,6 +44,8 @@ const MISSING_BLOCK: u32 = 0xffffffffu;
 // Side of a coded block and of the 8x8 blocks inside it.
 const BLOCK_SIZE: u32 = 32u;
 
+// Workgroup memory is not zeroed for this pipeline (decision D25): each
+// variable is written in full before the barrier that precedes its reads.
 var<workgroup> shared_offset: u32;
 var<workgroup> control_words: array<u32, 16>;
 var<workgroup> qscales: array<u32, 16>;
@@ -115,8 +117,8 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     let origin_y = (relative / band.blocks_x) * BLOCK_SIZE;
 
     // The offset is loaded by one invocation and shared through
-    // workgroupUniformLoad, which makes it uniform: the early return below
-    // then leaves the later barriers legal.
+    // workgroupUniformLoad, which makes it uniform: the branch on a missing
+    // block below may then contain barriers.
     if (tid == 0u) {
         shared_offset = block_offsets[block_index];
     }

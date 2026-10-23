@@ -2,9 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [0.2.0] - 2026-10-23
+## [0.2.0] - 2026-10-24
 
-Faster decoding: on an Apple M3 Max a 4K frame decodes to planes in 1.38 ms instead of 4.28 ms (1.63 instead of 4.53 ms with the conversion to RGB), 1.8 times the time of upstream's own Metal decoder at FP32 ([#11](https://github.com/with-developer/emberwave/issues/11)). The decoded pictures are the same up to rounding ties: in the test vectors 5 of 464,790 samples now differ by one level, as the compiler fuses a multiply and an add differently in the rewritten transform.
+Faster decoding: on an Apple M3 Max a 4K frame decodes to planes in 1.11 ms instead of 4.28 ms (1.37 instead of 4.53 ms with the conversion to RGB), 1.4 times the time of upstream's own Metal decoder at FP32 ([#11](https://github.com/with-developer/emberwave/issues/11), [#12](https://github.com/with-developer/emberwave/issues/12)). The decoded pictures are the same up to rounding ties: in the test vectors 5 of 464,790 samples now differ by one level, as the compiler fuses a multiply and an add differently in the rewritten transform.
 
 ### Changed
 
@@ -12,6 +12,7 @@ Faster decoding: on an Apple M3 Max a 4K frame decodes to planes in 1.38 ms inst
 - The dequantiser finds the band of a block by binary search. With the change above it is 2.6 times faster.
 - The last level of the inverse transform writes the 8-bit planes itself. The separate packing pass and the float planes (47.5 MiB at 4K) are gone.
 - The frame assembler validates blocks without building their full structure, 2.8 times faster.
+- Workgroup memory is no longer zeroed before every workgroup, which the shaders never needed: the inverse transform is another 1.7 times faster. On WARP, Direct3D's software rasteriser, the first frame no longer takes a minute and a half.
 - Software rendering on lavapipe is about a third faster too (4K: 46 ms instead of 69 ms).
 
 ### Removed

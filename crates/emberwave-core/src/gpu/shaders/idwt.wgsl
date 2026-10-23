@@ -64,6 +64,10 @@ const APRON: i32 = 4;
 // Shifts the DC level back (bitstream.md, "Inverse DC shift").
 const DC_SHIFT: f32 = 0.5;
 
+// Workgroup memory is not zeroed for this pipeline (decision D25): every
+// element is written before it is read. The load fills all of `window`, the
+// horizontal pass all of `horizontal`, and at the last level the vertical
+// pass rewrites the 32x32 corner of `window` that the packing reads.
 var<workgroup> window: array<f32, 1600>;
 var<workgroup> horizontal: array<f32, 1280>;
 
@@ -144,7 +148,9 @@ fn to_unorm8(v: f32) -> f32 {
 }
 
 // The 8-bit level of tile sample `at` collected in the window array, or 0 for
-// a padding sample past the right edge of the plane.
+// a padding sample past the right edge of the plane. `select` evaluates both
+// arms, so the window is read for padding samples too: the vertical pass has
+// to write the whole tile, not only the part inside the plane.
 fn level_at(at: u32, x: u32, width: u32) -> u32 {
     return select(0u, u32(window[at]), x < width);
 }

@@ -113,7 +113,15 @@ fn create_stage(
         layout: Some(&pipeline_layout),
         module: &module,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        // The shaders write every workgroup variable before they read it, so
+        // the zeroing WebGPU requires is wasted work. naga does it with one
+        // invocation per workgroup, which made the inverse transform take 0.64
+        // instead of 0.38 ms at 4K (ARCHITECTURE.md, decision D25). Browsers
+        // zero the memory regardless.
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
         cache: None,
     });
     Stage { pipeline, layout }
