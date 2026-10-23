@@ -2,6 +2,18 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- An encoder on the CPU ([#14](https://github.com/with-developer/emberwave/issues/14)): `emberwave_core::encode::Encoder` turns 8-bit pictures into frames within a byte budget, and `emberwave-cli encode` turns a Y4M video into a PWV1 file. Upstream's decoder reads its streams; at the same bytes its PSNR is upstream's encoder's or higher. It makes the same bytes on every system.
+- Writers for the formats the parsers read: `BlockHeader::to_words`, `SequenceHeader::start_of_frame_words` and `stream_words`, and `Pwv1Header::to_bytes`.
+- Test vectors of the encoder in `testdata/encoder/`, with upstream's decode of them, and `scripts/gen_encoder_vectors.sh` to make them. `refgen encode` can write its pictures (`--source`) and encode a Y4M file (`--input`).
+
+### Changed
+
+- `emberwave-cli`'s Y4M reader keeps the range, the chroma siting and the frame rate of the header.
+
 ## [0.3.0] - 2026-10-24
 
 emberwave outside Rust: a player in the browser, published at https://with-developer.github.io/emberwave/, and a C API with prebuilt libraries for Linux, macOS and Windows.
