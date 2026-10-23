@@ -61,4 +61,13 @@ Each vector comes as:
 
 Tests decode a vector and compare plane by plane: at least 60 dB PSNR against `ref.y4m` and at least 80 dB against `ref-fp32.y4m`. See `ARCHITECTURE.md`, decision D9. Set `EMBERWAVE_REFERENCE_DIR` to compare against decodes made elsewhere, for example by the upstream Vulkan decoder.
 
-The upstream encoder does not write byte-for-byte reproducible bitstreams (the unused bits of a block's last sign byte are leftover GPU memory), so regenerating changes the committed `.pwv1` files. Regenerate only when adding a vector or changing its parameters. Large vectors for benchmarking are generated into `testdata/generated/` by a script added in M4 and are never committed.
+The upstream encoder does not write byte-for-byte reproducible bitstreams (the unused bits of a block's last sign byte are leftover GPU memory), so regenerating changes the committed `.pwv1` files. Regenerate only when adding a vector or changing its parameters.
+
+## Large streams
+
+Streams of real size are never committed. Two scripts generate them into `testdata/generated/`, which git ignores. The picture is a synthetic scene that `refgen` feeds to the upstream encoder: colour bars, a gradient, a moving shaded disc, a fine diagonal grid and a little film grain. Like `gen_testdata.sh` they need Apple Silicon macOS.
+
+| Script | What it does |
+|---|---|
+| `scripts/verify_4k.sh [frames]` | The 4K acceptance check. Encodes a 4K scene, decodes it with the upstream decoder at both precisions and with `emberwave-cli` (to PNG and to Y4M), and requires 60 dB against the default precision and 80 dB against the FP32 decode. See `ARCHITECTURE.md`, decision D20 |
+| `scripts/gen_bench_data.sh` | 60-frame scene streams at 1080p, 1440p and 4K for the benchmarks, and with `--noise` a 4K stream of white noise |

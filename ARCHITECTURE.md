@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (M2).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu` and the wgpu/WGSL decoder in `emberwave_core::gpu`. Colour conversion and the CLI come in M3. The decision log at the end is kept up to date.
+> **Status (M3).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. `emberwave-cli` decodes files with them. Benchmarks come in M4. The decision log at the end is kept up to date.
 
 ## Overview
 
@@ -16,7 +16,10 @@ bytes ──► [CPU] packet parser ──► block table + payload words
                          [GPU] inverse DWT, level by level (5 levels)
                                        │
                                        ▼
-                         [GPU] Y / Cb / Cr planes ──► (M3) YUV → RGB
+                         [GPU] Y / Cb / Cr planes, packed to 8 bits
+                                       │
+                                       ▼
+                         [GPU] YUV → RGB (optional)
 ```
 
 Steps that upstream runs on the CPU stay on the CPU, and steps that upstream runs on the GPU stay on the GPU. Parity with the reference comes before any optimisation.
@@ -25,6 +28,7 @@ Steps that upstream runs on the CPU stay on the CPU, and steps that upstream run
 |---|---|
 | `bitstream` | Pure Rust, GPU independent: headers, block layout, packet assembly, PWV1 files. Never panics on malformed input. This is the CPU stage. |
 | `cpu` | Dequantisation and inverse DWT as plain sequential Rust, following `bitstream.md` literally. A test oracle and the yardstick for shader stages, not a product feature. |
+| `color` | The YCbCr to RGB conversion: matrices, range handling and chroma siting, with a CPU implementation that the shader is tested against. |
 | `gpu` | wgpu pipelines and WGSL shaders for the GPU stages (cargo feature `gpu`, on by default). |
 
 ## Bitstream format
@@ -300,15 +304,16 @@ The gap to the default precision is the reference decoder's own FP16 storage. In
 
 ### Stages
 
-A frame takes seven dispatches in three compute passes, whatever its size:
+A frame takes seven dispatches in three compute passes, whatever its size, and an eighth dispatch in a fourth pass when it is converted to RGB:
 
 | Stage | Shader | Dispatch | Reads | Writes |
 |---|---|---|---|---|
 | Dequantisation | `dequant.wgsl` | 1: one workgroup of 128 invocations per block index | payload, block offsets | the pyramid |
 | Inverse DWT | `idwt.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or the float planes |
 | Packing | `pack.wgsl` | 1: one invocation per output word | float planes | packed 8-bit planes |
+| Colour conversion (optional) | `yuv2rgb.wgsl` | 1: one invocation per pixel | packed planes | RGBA words |
 
-The packed planes are copied to a mappable buffer and returned as a `Frame`.
+The packed planes are copied to a mappable buffer and returned as a `Frame`. When the frame is converted to RGB, the RGBA words are copied instead, as an `RgbFrame`, and the packed planes stay in GPU memory.
 
 ### Memory
 
@@ -320,8 +325,10 @@ The packed planes are copied to a mappable buffer and returned as a `Frame`.
 | float planes (`array<f32>`) | the finished planes, in `[0, 1]` | 47.5 MiB |
 | packed planes (`array<u32>`) | 8-bit planes, four pixels per word, rows padded to words | 11.9 MiB |
 | readback (`MAP_READ`) | copy of the packed planes for the CPU | 11.9 MiB |
+| RGBA words (`array<u32>`) | one word per pixel, created on the first RGB decode | 31.6 MiB |
+| RGB readback (`MAP_READ`) | copy of the RGBA words, likewise | 31.6 MiB |
 
-The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 to 0 have room where the inverse transform of the level above writes them. Every band is rewritten for every frame, with zeros for blocks that were not received, so nothing needs clearing. The sizes of the pyramid and the planes are checked against the device limits when the decoder is created. The payload buffer is checked the same way every time it grows: a frame whose payload does not fit gives `GpuError::LimitExceeded` instead of an allocation that fails. With the WebGPU default of 128 MiB that can only happen for a stream of maximal blocks (a 4K frame of them is about 200 MiB); real frames are a few MiB.
+The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 to 0 have room where the inverse transform of the level above writes them. Every band is rewritten for every frame, with zeros for blocks that were not received, so nothing needs clearing. The sizes of the pyramid and the planes are checked against the device limits when the decoder is created, and that of the RGBA buffer when it is created. The payload buffer is checked the same way every time it grows: a frame whose payload does not fit gives `GpuError::LimitExceeded` instead of an allocation that fails. With the WebGPU default of 128 MiB that can only happen for a stream of maximal blocks (a 4K frame of them is about 200 MiB); real frames are a few MiB.
 
 Per-dispatch parameters (band table, tile sizes, buffer offsets) depend only on the picture size, so they are computed once and live in small uniform buffers.
 
@@ -350,6 +357,60 @@ Total workgroup memory is 11520 bytes. Tiles that stick out of the image (the co
 
 Float planes become 8-bit samples with `round(v * 255)`. WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words; the CPU side cuts the padding off.
 
+### Colour conversion
+
+The bitstream ends at the Y, Cb and Cr planes; turning them into RGB is left to the application. Upstream does it in its viewer (`shaders/yuv2rgb.frag`), not in the codec. emberwave offers the step as an option of the decoder (`Decoder::decode_rgb`): one more pass over the packed planes, so what gets converted is the 8-bit picture.
+
+Per pixel, with `y`, `cb` and `cr` the 8-bit samples times 1/255:
+
+```
+cb -= 128/255;  cr -= 128/255
+if limited range:
+    y  = clamp((y - 16/255) * 255/219, 0, 1)
+    cb = clamp(cb * 255/224, -0.5, 0.5)            (cr the same)
+R = y + R_Cr * cr
+G = y - G_Cb * cb - G_Cr * cr
+B = y + B_Cb * cb
+output = round_ties_even(clamp(v, 0, 1) * 255)
+```
+
+The four factors come from the luma weights `Kr` and `Kb` of the standard, with `Kg = 1 - Kr - Kb`: `R_Cr = 2 (1 - Kr)`, `B_Cb = 2 (1 - Kb)`, `G_Cb = 2 Kb (1 - Kb) / Kg` and `G_Cr = 2 Kr (1 - Kr) / Kg`. They are computed in `f64` and rounded to `f32` once.
+
+| Matrix | `Kr` | `Kb` | `R_Cr` | `G_Cb` | `G_Cr` | `B_Cb` |
+|---|---|---|---|---|---|---|
+| BT.601 | 0.299 | 0.114 | 1.402 | 0.344136 | 0.714136 | 1.772 |
+| BT.709 | 0.2126 | 0.0722 | 1.5748 | 0.187324 | 0.468124 | 1.8556 |
+| BT.2020 (non-constant luminance) | 0.2627 | 0.0593 | 1.4746 | 0.164553 | 0.571353 | 1.8814 |
+
+A stream names BT.709 or BT.2020. BT.601 is there for the caller to choose, and it matters because of what upstream's viewer does (decision D17).
+
+4:2:0 chroma is upsampled bilinearly at the position the siting gives. Horizontally, centre siting puts a chroma sample between two luma columns, so luma column `p` sits at chroma coordinate `p/2 - 1/4`; left siting puts it on the even column, at `p/2`. Vertically chroma is always centred, as in upstream's viewer, which shifts only the horizontal coordinate. Every weight is then a multiple of 1/4:
+
+| Luma position `p` | Centre: first sample, weight of the next | Left |
+|---|---|---|
+| even | `p/2 - 1`, 3/4 | `p/2`, 0 |
+| odd | `p/2`, 1/4 | `p/2`, 2/4 |
+
+(`p/2` is an integer division.) Indices outside the plane are clamped to the edge sample. The four taps are summed in integers with weights that add up to 16 and the sum is scaled by 1/16, so the interpolation is exact. Filtering a texture in hardware would round the weights to a fixed-point format of the GPU's choosing.
+
+`color::yuv_to_rgb8` is the CPU implementation and evaluates the same expressions in the same order. The shader's output equals it to within one 8-bit step. A GPU compiler may fuse a multiply and an add, which moves a rounding in rare cases: at most 0.003 % of the samples differ on the test vectors.
+
+What the stage leaves alone: the result is the encoded, non-linear R'G'B' of the stream. A stream that signals PQ or BT.2020 primaries is reported by `info`, but no tone mapping, transfer function or gamut conversion is applied; that belongs to the display pipeline the picture is handed to.
+
+### Timing
+
+`Decoder::time_frame` decodes a frame and waits for the GPU without reading the picture back, which is what a player does: the picture stays in GPU memory. It returns where the time went:
+
+| Field | Meaning |
+|---|---|
+| `prepare` | CPU time to assemble the frame, upload the payload and the block table and, for RGB, write the conversion parameters |
+| `gpu_wall` | Wall-clock time from creating the command encoder until the GPU is idle again: encoding, submission, execution and the wait. With a readback it includes that |
+| `stages` | GPU time per pass, from timestamp queries: dequantisation, the inverse transform (all five levels together), packing and, for RGB, the colour conversion |
+
+Timestamps are written at the beginning and the end of each compute pass and resolved into a small buffer that is read after the frame. That needs only `Features::TIMESTAMP_QUERY`, which the browser offers too. Writes between dispatches (`TIMESTAMP_QUERY_INSIDE_PASSES`) are not available on Apple GPUs, so a pass is the finest granularity, which is why the five levels of the inverse transform are timed together. Where the feature is missing `stages` is `None` and the tools print the CPU and wall-clock numbers only.
+
+The wall-clock time exceeds the sum of the stages, because submitting work and noticing that it has finished take time of their own. For the 192x136 test vector, decoded to RGB on an Apple M3 Max (Metal, wgpu 30.0.1, 2026-10-23), the stages add up to about 0.15 ms and `gpu_wall` is about 0.42 ms, with 0.04 ms of `prepare` on top. Both are reported: the first says how long the GPU works, the second how long the application waits for its picture.
+
 ### Portability
 
 The shaders use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. Two tests hold this to account:
@@ -368,6 +429,7 @@ What upstream uses and what replaces it:
 | FP16 storage images, `PYROWAVE_PRECISION` modes | FP32 buffers |
 | 8-bit UNORM storage images for the output | A packing pass into `array<u32>` |
 | Dozens of dispatches, one per band | One dequantisation dispatch and one per level |
+| Hardware bilinear filtering of the chroma textures (viewer) | Integer taps and weights in the shader |
 
 ### Verification
 
@@ -380,8 +442,28 @@ Run on 2026-10-23 with the committed vectors on an Apple M3 Max (Metal):
 | LL bands after each inverse level, GPU against CPU | Largest difference 8.0e-7 (the tolerance is 1e-5) |
 | Decoded planes against the default-precision reference | Worst 64.83 dB (needs 60), largest difference 1 LSB |
 | Decoded planes against the FP32 reference | Worst 86.28 dB (needs 80), most planes bit-identical |
+| RGB output, GPU against the CPU conversion: all vectors, three matrices, both ranges, both sitings | Largest difference 1; at most 0.003 % of the samples differ |
+| 4K stream decoded by `emberwave-cli`, planes against the default-precision reference | Worst 65.64 dB (needs 60), largest difference 1 LSB |
+| The same stream against the FP32 reference | Worst 96.31 dB (needs 80), largest difference 1 LSB |
 
 The GPU numbers equal the CPU decoder's, which is the point: the GPU pipeline adds no error of its own beyond float rounding.
+
+The last two rows come from `scripts/verify_4k.sh`: it encodes two 3840x2160 frames of a synthetic scene (1.2 MB each) with the upstream encoder, decodes them with the upstream decoder at both precisions and with `emberwave-cli` to PNG and Y4M, and fails unless the bars of D9 are met.
+
+## Command line tool
+
+`emberwave-cli` (`crates/emberwave-cli`) is a thin front end: the decoder, the colour conversion and the timing API are the library's, and the tool adds file formats and reporting.
+
+| Command | What it does |
+|---|---|
+| `decode FILE --out-dir DIR [--format png\|y4m] [--frames N]` | Decodes the frames of a PWV1 file and writes `STEM_000000.png`, ... or one `STEM.y4m` with the unconverted planes. Prints the time of every frame and a summary |
+| `bench FILE [--output yuv\|rgb] [--readback] [--frames N] [--warmup N] [--warmup-seconds S] [--json]` | Decodes in a loop and prints mean, median, 99th percentile, minimum and maximum of the numbers described under [Timing](#timing); `--json` prints them as JSON. The frames of the file are used in turn when more are asked for than it holds. Warm-up lasts for at least N frames and at least S seconds (10 and 1 by default, see D19). `--readback` copies the picture back and reports the total only |
+| `info FILE [--verbose]` | Prints the PWV1 header, the colour signalling and the frame sizes, without a GPU |
+| `compare A.y4m B.y4m [--min-psnr DB]` | Prints the PSNR and the largest difference per plane of every frame; with `--min-psnr` the exit status tells whether every plane reached it |
+
+`decode` and `bench` choose the GPU with `--backend auto|vulkan|metal|dx12` (`auto` honours `EMBERWAVE_BACKEND`, otherwise any backend the machine has) and `--software`, which insists on a software adapter such as lavapipe or WARP. The adapter in use is printed to stderr. `--matrix auto|bt601|bt709|bt2020` and `--range auto|full|limited` set the colour conversion; `auto` takes the PWV1 header's signalling. They belong to the RGB conversion, so `decode --format y4m`, which keeps the planes as decoded, refuses them. Options that cannot work (`--frames 0`) are refused before anything is read or written. An error is printed as `error: ...` and ends the program with status 1.
+
+PNG output is 8-bit RGB with fast compression. The Y4M writer takes range, chroma format and chroma siting from the stream: `XCOLORRANGE`, and `C420jpeg` (centred chroma), `C420mpeg2` (chroma on the left luma column) or `C444`. A stream without a frame rate gets 30:1, which Y4M needs, and a warning says so. The Y4M reader of `compare` takes 8-bit 4:2:0 and 4:4:4 only, and a file whose header names a picture size that overflows, or that has no frames, is an error rather than a pass. Percentiles are nearest-rank.
 
 ## Decisions
 
@@ -480,3 +562,33 @@ Short-form ADRs, newest last. Each entry is dated.
 New crates: `wgpu`; `pollster` to block on wgpu's futures in the synchronous API; `bytemuck` (with `derive`) to hand `u32` and parameter structs to buffers without `unsafe`, which the workspace forbids; `naga` as a dev-dependency for the offline shader validation, at the version wgpu uses.
 
 The GPU tests skip when there is no adapter, unless `EMBERWAVE_REQUIRE_GPU` is set; CI sets it on Linux, where it installs lavapipe, a software Vulkan driver.
+
+### 2026-10-23 — D17: Colour conversion uses the standard matrices, not upstream's viewer's
+
+**Context.** The stream signals `ycbcr_transform` (BT.709 or BT.2020 non-constant luminance), `ycbcr_range` and `chroma_siting`, and `bitstream.md` leaves their definitions "to the respective specifications". Upstream's only conversion is the viewer's `shaders/yuv2rgb.frag`. Its matrix `yuv2rgb_bt709` is BT.709 (1.5748, 1.8556), but `yuv2rgb_bt2020` holds the BT.601 coefficients: 1.402 and 1.772, and green factors written as `0.202008 / 0.587` and `0.419198 / 0.587`, where 0.587 is BT.601's `Kg`. The factors of BT.2020 are 1.4746 and 1.8814. Nothing else in upstream converts to or from BT.2020 (checked by searching the pinned revision).
+
+**Decision.** `ColorMatrix::Bt2020` is BT.2020 as the standard defines it, derived from `Kr = 0.2627` and `Kb = 0.0593`, so a stream that signals BT.2020 is converted the way the signalling and `bitstream.md` say, not the way the viewer does it. BT.601 is available as a choice (`--matrix bt601`), and it is exactly what the viewer's "BT.2020" branch computes, so upstream's picture can be reproduced on request. The conversion works on the 8-bit planes with integer chroma weights, and applies no tone mapping or transfer function.
+
+**Consequence.** On BT.2020 streams the RGB differs from upstream's viewer; the viewer's matrix is mislabelled, which is a matter for upstream. Streams that signal BT.709 agree up to the viewer's texture filtering. The matrices are unit-tested against the published coefficients.
+
+### 2026-10-23 — D18: The command line tool and its dependencies
+
+**Decision.** One binary with the subcommands `decode`, `bench`, `info` and `compare` (see [Command line tool](#command-line-tool)). `decode` has no default output location: `--out-dir` is required, so the tool never chooses where to write. `compare` is part of the tool, so the acceptance check needs no external program and works on every OS.
+
+New crates: `clap` with `derive`, for argument parsing, help texts and errors that stay in step with the code; `png`, for PNG output, with its default features; `serde_json` as a dev-dependency only, so that the end-to-end tests can check that `bench --json` is valid JSON. The JSON is written by hand because its shape is small and flat, which keeps a serialisation framework out of the binary. The Y4M reader and writer and the statistics are small enough to live in the tool.
+
+### 2026-10-23 — D19: What the timings mean
+
+**Context.** Two things make a single number misleading. A GPU finishes a small frame long before the application finds out: for the 192x136 vector the pass timestamps add up to 0.15 ms and the wall clock shows 0.42 ms. And the first moments of a run are slow: with a warm-up of ten frames, the same 200x120 vector measured 0.52 ms of GPU time over 30 counted frames, 0.21 ms over 300 and 0.15 ms over 1500. That looks like the GPU raising its clock under load; the cause was not isolated.
+
+**Decision.** `bench` reports the CPU time to prepare, the wall-clock time until a finished frame is in GPU memory (`gpu wall`), their sum (`total`) and, where the device can, per-pass GPU times from timestamps. `total` is the number to quote for a frame, since it is what an application waits for; the pass times show where it goes. Reading the picture back is optional (`--readback`) because a player keeps it on the GPU. Mean, median, 99th percentile, minimum and maximum are all printed: for a stream a late frame matters more than the average.
+
+Warm-up is both a number of frames and a time: at least 10 frames and at least one second (`--warmup`, `--warmup-seconds`) are decoded and not counted. With that, the 192x136 vector gave 0.148 to 0.149 ms of GPU time in four runs of 300 or 30 counted frames, and `gpu wall` agreed within 5 %.
+
+**Consequence.** Numbers are only quoted together with the environment (the adapter, the backend, the date and the wgpu version), as `CLAUDE.md` demands. A slow software renderer spends its ten frames on warm-up before it counts anything, so `--warmup` can be lowered there.
+
+### 2026-10-23 — D20: The 4K acceptance check generates its stream
+
+**Context.** The definition of done asks for a 4K stream decoded by the CLI and matched to the reference at the PSNR criterion. A 4K frame needs a source picture, and a committed 4K stream is megabytes.
+
+**Decision.** `scripts/verify_4k.sh` creates the stream when it runs. The input picture is a synthetic scene (colour bars, a gradient, a moving shaded disc, a fine diagonal grid and a little film grain, defined in `scripts/refgen/refgen.mm`), encoded by upstream's own encoder, so the bitstream is still the original encoder's output and only the picture is ours. The same scene feeds the benchmark streams in M4. Generated files go to `testdata/generated/`, which git ignores. Like the vectors, the script needs Apple Silicon macOS, because the reference decoder is upstream's Metal one (D1).
