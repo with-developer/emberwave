@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/emberwave-core",
+    "crates/emberwave-cli",
+    "crates/emberwave-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/with-developer/emberwave"
+rust-version = "1.85"
+# Releases are GitHub Releases only; keep cargo from publishing by accident.
+publish = false
+
+[workspace.dependencies]
+emberwave-core = { path = "crates/emberwave-core", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
