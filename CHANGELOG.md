@@ -12,7 +12,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Changed
 
-- `emberwave-cli`'s Y4M reader keeps the range, the chroma siting and the frame rate of the header.
+- `emberwave-cli`'s Y4M reader keeps the range, the chroma siting and the frame rate of the header, reads `C420paldv` as chroma on the left, and reads a file a frame at a time where that is enough.
 
 ## [0.3.0] - 2026-10-24
 
