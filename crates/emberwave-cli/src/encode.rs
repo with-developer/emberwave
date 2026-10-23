@@ -1,5 +1,5 @@
 //! `emberwave-cli encode`: encode a Y4M file to a PWV1 file, each frame within
-//! a byte budget.
+//! a byte budget, on the CPU or with `--gpu` on the GPU.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -9,11 +9,13 @@ use std::time::Instant;
 use clap::ValueEnum;
 use emberwave_core::bitstream::consts::HEADER_BYTES;
 use emberwave_core::bitstream::{
-    ChromaSubsampling, ColorPrimaries, Pwv1Header, TransferFunction, YcbcrTransform,
+    ChromaSubsampling, ColorPrimaries, Pwv1Header, SequenceHeader, TransferFunction, YcbcrTransform,
 };
-use emberwave_core::encode::{Encoder, Signalling};
+use emberwave_core::encode::{self, Signalling};
+use emberwave_core::gpu;
 
-use crate::{Result, chroma_name, siting_name, y4m};
+use crate::stats::Summary;
+use crate::{Backend, GpuArgs, Result, chroma_name, siting_name, y4m};
 
 /// The Y'CbCr matrix to signal, which a Y4M file does not say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -46,6 +48,37 @@ pub struct Args {
     /// Y4M header
     #[arg(long, value_enum, default_value_t = SignalledMatrix::Bt709)]
     matrix: SignalledMatrix,
+
+    /// Encode on the GPU. The CPU encoder makes the same bytes on every
+    /// system; the GPU's frames are the CPU's or differ in a few blocks
+    #[arg(long)]
+    gpu: bool,
+
+    /// With --gpu: which GPU
+    #[command(flatten)]
+    gpu_args: GpuArgs,
+}
+
+/// The CPU or the GPU encoder.
+enum Encoder {
+    Cpu(Box<encode::Encoder>),
+    Gpu(Box<gpu::Encoder>),
+}
+
+impl Encoder {
+    fn stream(&self) -> SequenceHeader {
+        match self {
+            Self::Cpu(encoder) => encoder.stream(),
+            Self::Gpu(encoder) => encoder.stream(),
+        }
+    }
+
+    fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>> {
+        Ok(match self {
+            Self::Cpu(encoder) => encoder.encode(planes, budget)?,
+            Self::Gpu(encoder) => encoder.encode(planes, budget)?,
+        })
+    }
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -59,6 +92,9 @@ pub fn run(args: &Args) -> Result<()> {
     }
     if args.frames == Some(0) {
         return Err("--frames 0 leaves nothing to encode".into());
+    }
+    if !args.gpu && (args.gpu_args.backend != Backend::Auto || args.gpu_args.software) {
+        return Err("--backend and --software choose the GPU of --gpu".into());
     }
     let mut video = y4m::open(&args.input)?;
     let header = *video.header();
@@ -91,15 +127,32 @@ pub fn run(args: &Args) -> Result<()> {
     };
     let width = u32::try_from(header.width)?;
     let height = u32::try_from(header.height)?;
-    let mut encoder = Encoder::new(width, height, header.chroma, signalling)?;
+    let mut encoder = if args.gpu {
+        let context = args.gpu_args.create_context(false)?;
+        Encoder::Gpu(Box::new(gpu::Encoder::new(
+            &context,
+            width,
+            height,
+            header.chroma,
+            signalling,
+        )?))
+    } else {
+        Encoder::Cpu(Box::new(encode::Encoder::new(
+            width,
+            height,
+            header.chroma,
+            signalling,
+        )?))
+    };
     eprintln!(
-        "{}x{} {}, {} chroma siting, {:?} range; {} bytes per frame at most",
+        "{}x{} {}, {} chroma siting, {:?} range; {} bytes per frame at most, on the {}",
         width,
         height,
         chroma_name(header.chroma),
         siting_name(header.siting),
         header.range,
-        args.bytes_per_frame
+        args.bytes_per_frame,
+        if args.gpu { "GPU" } else { "CPU" }
     );
 
     // A PWV1 header has no frame rate when either number is zero.
@@ -119,11 +172,11 @@ pub fn run(args: &Args) -> Result<()> {
     // The file appears under its name only once it is complete; a failure
     // leaves whatever was there before.
     let partial = partial_path(&args.out);
-    let result = (|| -> Result<(usize, usize, f64)> {
+    let result = (|| -> Result<(usize, usize, Vec<f64>)> {
         let mut out = BufWriter::new(File::create(&partial)?);
         out.write_all(&file_header.to_bytes())?;
         let limit = args.frames.unwrap_or(usize::MAX);
-        let (mut count, mut bytes, mut seconds) = (0usize, 0usize, 0.0f64);
+        let (mut count, mut bytes, mut times) = (0usize, 0usize, Vec::new());
         while count < limit {
             let Some([y, cb, cr]) = video.next_frame()? else {
                 break;
@@ -140,7 +193,7 @@ pub fn run(args: &Args) -> Result<()> {
             );
             count += 1;
             bytes += frame.len();
-            seconds += elapsed;
+            times.push(elapsed * 1e3);
         }
         if count == 0 {
             return Err("the Y4M file has no frames".into());
@@ -148,9 +201,9 @@ pub fn run(args: &Args) -> Result<()> {
         out.into_inner()
             .map_err(|error| error.into_error())?
             .sync_all()?;
-        Ok((count, bytes, seconds))
+        Ok((count, bytes, times))
     })();
-    let (count, bytes, seconds) = match result {
+    let (count, bytes, times) = match result {
         Ok(totals) => totals,
         Err(error) => {
             let _ = std::fs::remove_file(&partial);
@@ -159,11 +212,16 @@ pub fn run(args: &Args) -> Result<()> {
     };
     std::fs::rename(&partial, &args.out)?;
 
+    // The time of a frame is that of the encoder's call: the picture in
+    // memory to the frame in memory, the transfers to and from a GPU included.
+    let summary = Summary::of(&times).ok_or("no frames")?;
     println!(
-        "encoded {count} frames to {}: {} bytes per frame and {:.1} ms on average",
+        "encoded {count} frames to {}: {} bytes per frame; mean {:.3} ms, p50 {:.3} ms, p99 {:.3} ms per frame",
         args.out.display(),
         bytes / count,
-        seconds / count as f64 * 1e3
+        summary.mean,
+        summary.p50,
+        summary.p99
     );
     Ok(())
 }
