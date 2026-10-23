@@ -99,11 +99,8 @@ impl Decoder {
         // Compiled once per context, however many decoders are created.
         let pipelines = context.pipelines()?;
 
-        let limits = device.limits();
         let check = |what: &'static str, bytes: u64| {
-            let limit = limits
-                .max_storage_buffer_binding_size
-                .min(limits.max_buffer_size);
+            let limit = buffer_limit(&device);
             if bytes > limit {
                 Err(GpuError::LimitExceeded {
                     what,
@@ -258,7 +255,7 @@ impl Decoder {
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
     /// calls. Blocks that did not arrive decode as zeros.
     pub fn decode_assembled(&mut self) -> Result<Frame, GpuError> {
-        self.ensure_payload_capacity();
+        self.ensure_payload_capacity()?;
         self.upload();
 
         let frame = with_error_scope(&self.device, || {
@@ -359,29 +356,46 @@ impl Decoder {
     }
 
     /// Grows the payload buffer if the assembled frame does not fit.
-    fn ensure_payload_capacity(&mut self) {
-        let needed = self.assembler.frame().payload().len() + PAYLOAD_PADDING_WORDS;
-        if needed <= self.payload_capacity_words {
-            return;
+    ///
+    /// A frame whose payload is larger than the device can bind is an error,
+    /// not a crash. This can only happen with a huge stream: a 4K frame whose
+    /// every block is as large as the format allows is about 200 MiB, and the
+    /// WebGPU default limit is 128 MiB.
+    fn ensure_payload_capacity(&mut self) -> Result<(), GpuError> {
+        let needed_words = self.assembler.frame().payload().len() + PAYLOAD_PADDING_WORDS;
+        if needed_words <= self.payload_capacity_words {
+            return Ok(());
         }
 
-        // Double, so a stream of slowly growing frames does not reallocate each time.
-        let capacity = needed.next_power_of_two().max(MIN_PAYLOAD_WORDS);
-        self.payload = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("payload"),
-            size: capacity as u64 * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.payload_capacity_words = capacity;
-        self.dequant_bind_group = dequant_bind_group(
-            &self.device,
-            &self.pipelines.dequant,
-            &self.payload,
-            &self.block_offsets,
-            &self.pyramid,
-            &self.dequant_params,
-        );
+        let limit_bytes = buffer_limit(&self.device);
+        let capacity_bytes =
+            payload_capacity_bytes(needed_words, limit_bytes).ok_or(GpuError::LimitExceeded {
+                what: "the payload of this frame",
+                needed: needed_words as u64 * 4,
+                limit: limit_bytes & !3,
+            })?;
+        let (payload, bind_group) = with_error_scope(&self.device, || {
+            let payload = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("payload"),
+                size: capacity_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = dequant_bind_group(
+                &self.device,
+                &self.pipelines.dequant,
+                &payload,
+                &self.block_offsets,
+                &self.pyramid,
+                &self.dequant_params,
+            );
+            (payload, bind_group)
+        })?;
+
+        self.payload = payload;
+        self.payload_capacity_words = (capacity_bytes / 4) as usize;
+        self.dequant_bind_group = bind_group;
+        Ok(())
     }
 
     /// Uploads the block table and the payload of the assembled frame.
@@ -465,6 +479,30 @@ impl std::fmt::Debug for Decoder {
     }
 }
 
+/// The size in bytes of a payload buffer that holds `needed_words` words on a
+/// device whose buffers can be at most `limit_bytes` large, or `None` if even
+/// the exact size is too much.
+///
+/// The size is rounded up to a power of two, so that a stream of slowly
+/// growing frames does not reallocate every time, but never beyond the limit.
+fn payload_capacity_bytes(needed_words: usize, limit_bytes: u64) -> Option<u64> {
+    let limit = limit_bytes & !3;
+    let needed = needed_words as u64 * 4;
+    if needed > limit {
+        return None;
+    }
+    let rounded = needed_words.next_power_of_two().max(MIN_PAYLOAD_WORDS) as u64 * 4;
+    Some(rounded.min(limit))
+}
+
+/// The most bytes one buffer can have and still be bound as a storage buffer.
+fn buffer_limit(device: &wgpu::Device) -> u64 {
+    let limits = device.limits();
+    limits
+        .max_storage_buffer_binding_size
+        .min(limits.max_buffer_size)
+}
+
 fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
@@ -498,4 +536,155 @@ fn dequant_bind_group(
             entry(3, params),
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::GpuOptions;
+
+    /// A context, or `None` if there is no GPU and none is required.
+    fn context() -> Option<GpuContext> {
+        match GpuContext::new(&GpuOptions::default()) {
+            Ok(context) => Some(context),
+            Err(error) => {
+                let required =
+                    std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_some_and(|v| !v.is_empty());
+                assert!(
+                    !required,
+                    "a GPU is required but none is available: {error}"
+                );
+                eprintln!("no GPU available, skipping: {error}");
+                None
+            }
+        }
+    }
+
+    /// Runs the packing stage on `values` as the first samples of the luma
+    /// plane of a 256x4 picture and returns the bytes it produces for them.
+    fn pack(context: &GpuContext, values: &[f32]) -> Vec<u8> {
+        let layout = FrameLayout::new(256, 4, ChromaSubsampling::Yuv444).unwrap();
+        let buffers = BufferLayout::new(&layout).unwrap();
+        let pipelines = context.pipelines().unwrap();
+        let device = context.device();
+
+        let mut planes = vec![0.0f32; buffers.plane_floats as usize];
+        planes[..values.len()].copy_from_slice(values);
+        let planes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("planes"),
+            contents: bytemuck::cast_slice(&planes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let packed_bytes = buffers.packed_words * 4;
+        let packed = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("packed"),
+            size: packed_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: packed_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let params = PackParams::new(&layout, &buffers);
+        let params_buffer = uniform_buffer(device, "pack params", &params);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pack"),
+            layout: &pipelines.pack.layout,
+            entries: &[
+                entry(0, &planes_buffer),
+                entry(1, &packed),
+                entry(2, &params_buffer),
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&pipelines.pack.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let (x, y, z) = params.grid();
+            pass.dispatch_workgroups(x, y, z);
+        }
+        encoder.copy_buffer_to_buffer(&packed, 0, &readback, 0, packed_bytes);
+        context.queue().submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.expect("map"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = slice.get_mapped_range().expect("range");
+        data[..values.len()].to_vec()
+    }
+
+    #[test]
+    fn the_payload_buffer_grows_by_doubling_but_never_past_the_limit() {
+        const MIB: u64 = 1024 * 1024;
+
+        // Small frames get the minimum, then powers of two.
+        assert_eq!(
+            payload_capacity_bytes(10, 128 * MIB),
+            Some(MIN_PAYLOAD_WORDS as u64 * 4)
+        );
+        assert_eq!(payload_capacity_bytes(20_000, 128 * MIB), Some(32_768 * 4));
+
+        // A payload that fits the limit but whose power of two does not gets
+        // exactly its size.
+        let needed_words = (70 * MIB / 4) as usize;
+        assert_eq!(
+            payload_capacity_bytes(needed_words, 100 * MIB),
+            Some(100 * MIB)
+        );
+        // A limit that is not a multiple of four is rounded down to whole words.
+        assert_eq!(
+            payload_capacity_bytes(needed_words, 100 * MIB + 3),
+            Some(100 * MIB)
+        );
+
+        // About 200 MiB, a 4K frame of blocks of the largest size the format
+        // allows, does not fit the WebGPU default of 128 MiB but fits a larger limit.
+        let huge_words = (12_429u64 * 4095) as usize;
+        assert_eq!(payload_capacity_bytes(huge_words, 128 * MIB), None);
+        assert_eq!(
+            payload_capacity_bytes(huge_words, 4095 * MIB),
+            Some(256 * MIB)
+        );
+
+        // Exactly the limit fits, one word more does not.
+        let words = (128 * MIB / 4) as usize;
+        assert_eq!(payload_capacity_bytes(words, 128 * MIB), Some(128 * MIB));
+        assert_eq!(payload_capacity_bytes(words + 1, 128 * MIB), None);
+    }
+
+    #[test]
+    fn packing_rounds_ties_to_even_like_the_cpu() {
+        let Some(context) = context() else {
+            return;
+        };
+
+        // (k + 0.5) / 255 for k in 0..255: scaled back by 255 it lands on k + 0.5
+        // whenever the float arithmetic allows, which is a tie. Then values
+        // outside [0, 1], which are clamped.
+        let mut values: Vec<f32> = (0..255).map(|k| (k as f32 + 0.5) / 255.0).collect();
+        values.extend([1.5, -0.25, 1.0, 0.0, f32::MIN_POSITIVE, 0.999_999]);
+
+        let expected: Vec<u8> = values
+            .iter()
+            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8)
+            .collect();
+        let ties = values
+            .iter()
+            .take(255)
+            .enumerate()
+            .filter(|(k, v)| **v * 255.0 == *k as f32 + 0.5)
+            .count();
+        // Round-half-up would get half of the ties wrong, so there must be plenty.
+        assert!(ties >= 40, "only {ties} exact ties");
+
+        assert_eq!(pack(&context, &values), expected);
+    }
 }
