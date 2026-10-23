@@ -38,7 +38,7 @@ for stream in $STREAMS; do
 done
 
 cargo build --release -p emberwave-cli --manifest-path "$ROOT/Cargo.toml"
-CLI=$ROOT/target/release/emberwave-cli
+CLI=${CARGO_TARGET_DIR:-$ROOT/target}/release/emberwave-cli
 if [ "$UPSTREAM" = 1 ]; then
     # shellcheck source=refgen/build.sh
     source "$ROOT/scripts/refgen/build.sh"
