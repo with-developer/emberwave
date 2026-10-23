@@ -1,12 +1,15 @@
 name: Release
 
-# Pushing a tag vX.Y.Z builds emberwave-cli for Linux, macOS and Windows and
-# publishes a GitHub release with the archives, their checksums and the
-# CHANGELOG.md section of that version as the notes.
+# Pushing a tag vX.Y.Z builds emberwave-cli and the C library (emberwave-ffi)
+# for Linux, macOS and Windows and publishes a GitHub release with the
+# archives, their checksums and the CHANGELOG.md section of that version as
+# the notes. Run by hand (workflow_dispatch), it builds and packages the same
+# archives without publishing anything: a rehearsal before tagging.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,6 +20,7 @@ env:
 jobs:
   check:
     name: check the tag
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -39,6 +43,8 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     needs: check
+    # A rehearsal has no tag to check, and then the check is skipped.
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -62,28 +68,56 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
       - name: Build
-        run: cargo build --release --locked -p emberwave-cli
+        run: cargo build --release --locked -p emberwave-cli -p emberwave-ffi
+      # The static library is built on its own, so that everyday builds make
+      # only the shared one. rustc prints the system libraries a program
+      # linking it statically needs.
+      - name: Build the static C library
+        shell: bash
+        run: |
+          cargo rustc --release --locked -p emberwave-ffi --lib --crate-type staticlib \
+            -- --print native-static-libs 2>&1 | tee staticlib.log
+          sed -n 's/.*native-static-libs: //p' staticlib.log | tail -n 1 > native-static-libs.txt
+          test -s native-static-libs.txt
       - name: Package
         shell: bash
         run: |
+          pack() {
+            if [ "${{ matrix.archive }}" = zip ]; then
+              7z a -bso0 "$1.zip" "$1"
+            else
+              tar czf "$1.tar.gz" "$1"
+            fi
+          }
+
           name="emberwave-cli-${GITHUB_REF_NAME}-${{ matrix.target }}"
           exe=emberwave-cli
           if [ "$RUNNER_OS" = Windows ]; then exe=emberwave-cli.exe; fi
           mkdir "$name"
           cp "target/release/$exe" README.md LICENSE CHANGELOG.md "$name/"
-          if [ "${{ matrix.archive }}" = zip ]; then
-            7z a -bso0 "$name.zip" "$name"
-          else
-            tar czf "$name.tar.gz" "$name"
-          fi
+          pack "$name"
+
+          name="emberwave-ffi-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$name/include" "$name/lib"
+          cp crates/emberwave-ffi/include/emberwave.h "$name/include/"
+          case "$RUNNER_OS" in
+            Linux) libs="libemberwave_ffi.so libemberwave_ffi.a" ;;
+            macOS) libs="libemberwave_ffi.dylib libemberwave_ffi.a" ;;
+            Windows) libs="emberwave_ffi.dll emberwave_ffi.dll.lib emberwave_ffi.lib" ;;
+          esac
+          for lib in $libs; do cp "target/release/$lib" "$name/lib/"; done
+          cp native-static-libs.txt "$name/lib/"
+          cp crates/emberwave-ffi/README.md LICENSE CHANGELOG.md "$name/"
+          pack "$name"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
-          path: emberwave-cli-*.${{ matrix.archive }}
+          path: emberwave-*.${{ matrix.archive }}
           if-no-files-found: error
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
