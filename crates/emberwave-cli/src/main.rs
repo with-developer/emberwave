@@ -1,7 +1,8 @@
 //! Command line front end of emberwave: decode PyroWave (`.pwv1`) files with
-//! wgpu, measure the decode time, and inspect files.
+//! wgpu, encode them, measure the decode and encode times, and inspect files.
 
 mod bench;
+mod bench_encode;
 mod compare;
 mod decode;
 mod encode;
@@ -38,6 +39,8 @@ enum Command {
     Encode(encode::Args),
     /// Measure decode time per frame
     Bench(bench::Args),
+    /// Measure encode time per frame
+    BenchEncode(bench_encode::Args),
     /// Print the header and frame statistics of a file
     Info(info::Args),
     /// Compare two Y4M files plane by plane (PSNR)
@@ -173,6 +176,7 @@ fn main() -> ExitCode {
         Command::Decode(args) => decode::run(&args),
         Command::Encode(args) => encode::run(&args),
         Command::Bench(args) => bench::run(&args),
+        Command::BenchEncode(args) => bench_encode::run(&args),
         Command::Info(args) => info::run(&args),
         Command::Compare(args) => compare::run(&args),
     };

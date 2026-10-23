@@ -650,3 +650,81 @@ fn encode_on_the_gpu_makes_streams_like_the_cpus() {
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
 }
+
+#[test]
+fn bench_encode_reports_per_frame_times_on_the_cpu_and_the_gpu() {
+    // Two frames, taken in turn: five measured frames go round them twice.
+    let source = testdata("encoder/scene_200x120_420.source.y4m");
+    let args = [
+        "--bytes-per-frame",
+        "6000",
+        "--frames",
+        "5",
+        "--warmup",
+        "1",
+        "--warmup-seconds",
+        "0",
+    ];
+    let output = cli()
+        .arg("bench-encode")
+        .arg(&source)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.lines()
+            .any(|line| line == "frames:   5 measured after 1 warm-up frames"),
+        "{text}"
+    );
+    assert!(text.contains("encoded on the CPU"), "{text}");
+
+    let Some(output) = run_on_gpu(
+        cli()
+            .arg("bench-encode")
+            .arg(&source)
+            .args(args)
+            .args(["--gpu", "--json"]),
+    ) else {
+        return;
+    };
+    assert!(output.status.success(), "{}", stderr(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(json["frames"], 5);
+    assert_eq!(json["warmup"], 1);
+    assert_eq!(json["bytes_per_frame"], 6000);
+    assert_eq!(json["unit"], "ms");
+    for series in ["total", "cpu prepare", "gpu wall"] {
+        let numbers = &json["series"][series];
+        for key in ["mean", "p50", "p99", "min", "max"] {
+            assert!(
+                numbers[key].as_f64().is_some_and(|v| v > 0.0),
+                "{series} {key}: {numbers}"
+            );
+        }
+    }
+
+    // One pass over the video by default.
+    let output = cli()
+        .arg("bench-encode")
+        .arg(&source)
+        .args([
+            "--bytes-per-frame",
+            "6000",
+            "--warmup",
+            "0",
+            "--warmup-seconds",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output)
+            .lines()
+            .any(|line| line == "frames:   2 measured after 0 warm-up frames"),
+        "{}",
+        stdout(&output)
+    );
+}

@@ -58,7 +58,7 @@ pub struct Args {
 }
 
 /// Parses a number of seconds: finite, and between 0 and an hour.
-fn parse_seconds(text: &str) -> std::result::Result<f64, String> {
+pub(crate) fn parse_seconds(text: &str) -> std::result::Result<f64, String> {
     let seconds: f64 = text.parse().map_err(|error| format!("{error}"))?;
     if (0.0..=3600.0).contains(&seconds) {
         Ok(seconds)
@@ -68,13 +68,85 @@ fn parse_seconds(text: &str) -> std::result::Result<f64, String> {
 }
 
 /// A named series of timings in milliseconds.
-struct Series {
-    name: &'static str,
-    samples: Vec<f64>,
+pub(crate) struct Series {
+    pub name: &'static str,
+    pub samples: Vec<f64>,
 }
 
-fn ms(duration: Duration) -> f64 {
+impl Series {
+    pub(crate) fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            samples: Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+/// Runs `step` with 0, 1, 2 and so on for at least `frames` frames and at
+/// least `seconds` seconds, and returns how many it ran: a GPU that has been
+/// idle clocks down, and runs the first moments of a load noticeably slower.
+pub(crate) fn warm_up(
+    frames: usize,
+    seconds: f64,
+    mut step: impl FnMut(usize) -> Result<()>,
+) -> Result<usize> {
+    let time = Duration::from_secs_f64(seconds);
+    let start = Instant::now();
+    let mut done = 0;
+    while done < frames || start.elapsed() < time {
+        step(done)?;
+        done += 1;
+    }
+    Ok(done)
+}
+
+/// Prints mean, median, 99th percentile, minimum and maximum of each series.
+pub(crate) fn print_table(series: &[&Series]) {
+    println!(
+        "{:<20}{:>9}{:>9}{:>9}{:>9}{:>9}   (ms per frame)",
+        "", "mean", "p50", "p99", "min", "max"
+    );
+    for s in series {
+        if let Some(summary) = Summary::of(&s.samples) {
+            println!(
+                "{:<20}{:>9.3}{:>9.3}{:>9.3}{:>9.3}{:>9.3}",
+                s.name, summary.mean, summary.p50, summary.p99, summary.min, summary.max
+            );
+        }
+    }
+}
+
+/// A JSON object of `fields`, whose values are JSON already, then the unit
+/// and the summary of each series. Built by hand: the shape is small and flat.
+pub(crate) fn json_object(fields: &[(&str, String)], series: &[&Series]) -> String {
+    let mut out = String::from("{");
+    for (name, value) in fields {
+        let _ = write!(out, "{}:{value},", quote(name));
+    }
+    out.push_str("\"unit\":\"ms\",\"series\":{");
+    for (i, s) in series.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if let Some(summary) = Summary::of(&s.samples) {
+            let _ = write!(
+                out,
+                "{}:{{\"mean\":{:.6},\"p50\":{:.6},\"p99\":{:.6},\"min\":{:.6},\"max\":{:.6}}}",
+                quote(s.name),
+                summary.mean,
+                summary.p50,
+                summary.p99,
+                summary.min,
+                summary.max
+            );
+        }
+    }
+    out.push_str("}}");
+    out
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -124,44 +196,15 @@ pub fn run(args: &Args) -> Result<()> {
         }
     };
 
-    // Warm up for a number of frames and for a while: a GPU that has been idle
-    // clocks down, and runs the first moments of a load noticeably slower.
-    let warmup_time = Duration::from_secs_f64(args.warmup_seconds);
-    let warmup_start = Instant::now();
-    let mut warmup = 0;
-    while warmup < args.warmup || warmup_start.elapsed() < warmup_time {
-        decode(warmup)?;
-        warmup += 1;
-    }
+    let warmup = warm_up(args.warmup, args.warmup_seconds, |i| decode(i).map(drop))?;
 
-    let mut total = Series {
-        name: "total",
-        samples: Vec::new(),
-    };
-    let mut prepare = Series {
-        name: "cpu prepare",
-        samples: Vec::new(),
-    };
-    let mut gpu_wall = Series {
-        name: "gpu wall",
-        samples: Vec::new(),
-    };
-    let mut dequant = Series {
-        name: "dequant",
-        samples: Vec::new(),
-    };
-    let mut idwt = Series {
-        name: "idwt",
-        samples: Vec::new(),
-    };
-    let mut yuv2rgb = Series {
-        name: "yuv2rgb",
-        samples: Vec::new(),
-    };
-    let mut gpu_sum = Series {
-        name: "gpu (timestamps)",
-        samples: Vec::new(),
-    };
+    let mut total = Series::new("total");
+    let mut prepare = Series::new("cpu prepare");
+    let mut gpu_wall = Series::new("gpu wall");
+    let mut dequant = Series::new("dequant");
+    let mut idwt = Series::new("idwt");
+    let mut yuv2rgb = Series::new("yuv2rgb");
+    let mut gpu_sum = Series::new("gpu (timestamps)");
 
     for i in 0..count {
         let timings = decode(i)?;
@@ -223,24 +266,13 @@ pub fn run(args: &Args) -> Result<()> {
         println!("decoding: {description}");
         println!("frames:   {count} measured after {warmup} warm-up frames");
         println!();
-        println!(
-            "{:<20}{:>9}{:>9}{:>9}{:>9}{:>9}   (ms per frame)",
-            "", "mean", "p50", "p99", "min", "max"
-        );
-        for s in series {
-            if let Some(summary) = Summary::of(&s.samples) {
-                println!(
-                    "{:<20}{:>9.3}{:>9.3}{:>9.3}{:>9.3}{:>9.3}",
-                    s.name, summary.mean, summary.p50, summary.p99, summary.min, summary.max
-                );
-            }
-        }
+        print_table(&series);
     }
     Ok(())
 }
 
-/// The result as JSON. Built by hand: the shape is small and flat. `frames` is
-/// the number of measured frames and of warm-up frames that were decoded.
+/// The result as JSON. `frames` is the number of measured frames and of
+/// warm-up frames that were decoded.
 fn json(
     args: &Args,
     adapter: &str,
@@ -249,41 +281,22 @@ fn json(
     (frames, warmup): (usize, usize),
     series: &[&Series],
 ) -> String {
-    let mut out = String::new();
-    let _ = write!(
-        out,
-        "{{\"input\":{},\"adapter\":{},\"backend\":{},\"description\":{},\"frames\":{},\"warmup\":{},\"readback\":{},\"unit\":\"ms\",\"series\":{{",
-        quote(&args.input.display().to_string()),
-        quote(adapter),
-        quote(backend),
-        quote(description),
-        frames,
-        warmup,
-        args.readback,
-    );
-    for (i, s) in series.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        if let Some(summary) = Summary::of(&s.samples) {
-            let _ = write!(
-                out,
-                "{}:{{\"mean\":{:.6},\"p50\":{:.6},\"p99\":{:.6},\"min\":{:.6},\"max\":{:.6}}}",
-                quote(s.name),
-                summary.mean,
-                summary.p50,
-                summary.p99,
-                summary.min,
-                summary.max
-            );
-        }
-    }
-    out.push_str("}}");
-    out
+    json_object(
+        &[
+            ("input", quote(&args.input.display().to_string())),
+            ("adapter", quote(adapter)),
+            ("backend", quote(backend)),
+            ("description", quote(description)),
+            ("frames", frames.to_string()),
+            ("warmup", warmup.to_string()),
+            ("readback", args.readback.to_string()),
+        ],
+        series,
+    )
 }
 
 /// A JSON string literal.
-fn quote(text: &str) -> String {
+pub(crate) fn quote(text: &str) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
         match c {
