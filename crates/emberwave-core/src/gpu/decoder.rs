@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
 use crate::bitstream::consts::DECOMPOSITION_LEVELS;
-use crate::bitstream::{Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout};
+use crate::bitstream::{
+    Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout, SequenceHeader,
+};
 use crate::color::ColorParams;
 
 use super::context::GpuContext;
@@ -318,10 +320,16 @@ impl Decoder {
         })
     }
 
+    /// Why the device of this decoder was lost, if it was. See
+    /// [`GpuContext::lost`].
+    pub fn lost(&self) -> Option<String> {
+        self.lost.lock().ok().and_then(|lost| lost.clone())
+    }
+
     /// An error if the device has been lost, so that nothing is decoded on it
     /// and no stale result is returned.
     fn check_device(&self) -> Result<(), GpuError> {
-        match self.lost.lock().ok().and_then(|lost| lost.clone()) {
+        match self.lost() {
             Some(reason) => Err(GpuError::DeviceLost(reason)),
             None => Ok(()),
         }
@@ -413,6 +421,19 @@ impl Decoder {
     /// [`FrameAssembler::is_ready`].
     pub fn is_ready(&self, allow_partial_frame: bool) -> bool {
         self.assembler.is_ready(allow_partial_frame)
+    }
+
+    /// Discards what was received, and forgets the order of the frames: the
+    /// next packet starts a frame, whatever its sequence number. See
+    /// [`FrameAssembler::clear`].
+    pub fn clear(&mut self) {
+        self.assembler.clear();
+    }
+
+    /// The start of frame header of the frame being received, once it has
+    /// arrived: among other things, the colour signalling of the picture.
+    pub fn start_of_frame(&self) -> Option<&SequenceHeader> {
+        self.assembler.start_of_frame()
     }
 
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)

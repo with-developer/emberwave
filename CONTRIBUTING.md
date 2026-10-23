@@ -26,6 +26,8 @@ cargo test --workspace
 | Shaders | `crates/emberwave-core/tests/shaders.rs` | The WGSL validates with naga without any optional capability, and the workgroup variables are the reviewed ones, without a GPU |
 | GPU | `crates/emberwave-core/tests/gpu.rs` | The GPU decoder against the CPU decoder and against upstream, on a real adapter |
 | CLI | `crates/emberwave-cli/tests/cli.rs` | The `emberwave-cli` binary end to end |
+| C API | `crates/emberwave-ffi/tests/api.rs`, `tests/header.rs` | The C functions called through raw pointers against the Rust decoder; the committed header against cbindgen's output |
+| C example | `scripts/check_c_example.sh` | The C example, built with CMake against the shared library, decodes every vector (CI runs it after the tests) |
 
 Environment variables:
 
@@ -33,6 +35,8 @@ Environment variables:
 - `EMBERWAVE_BACKEND=vulkan|metal|dx12` picks the backend, for the tests and for the CLI.
 - `EMBERWAVE_REFERENCE_DIR=DIR` compares against reference decodes made elsewhere, for example by upstream's Vulkan decoder.
 - `PROPTEST_CASES=100000` runs a deeper robustness pass than the default 256 cases.
+
+After a change to the C API, `EMBERWAVE_BLESS=1 cargo test -p emberwave-ffi --test header` writes `crates/emberwave-ffi/include/emberwave.h` anew; commit it with the change. `scripts/check_c_example.sh` needs CMake and a C compiler, and `cargo build -p emberwave-ffi -p emberwave-cli` first.
 
 `scripts/build_web.sh` builds the browser player into `web/` (it needs `rustup target add wasm32-unknown-unknown` and `cargo install wasm-bindgen-cli` at the version of the `wasm-bindgen` crate in `Cargo.lock`); serve `web/` with any static file server, for example `python3 -m http.server -d web 8000`, and open it in a browser with WebGPU. `scripts/verify_4k.sh` is the 4K acceptance check, and [`BENCHMARKS.md`](BENCHMARKS.md) explains the benchmark scripts. Two leak checks run on request, both on the 4K stream of `scripts/gen_bench_data.sh`: `cargo test --release -p emberwave-core --test gpu -- --ignored` counts the GPU resources over 1000 frames, and `scripts/soak.sh` watches the memory of `emberwave-cli` over as many.
 

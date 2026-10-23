@@ -7,3 +7,7 @@
 # Shaders keep LF on every checkout: a test cuts a function out of idwt.wgsl
 # by its text, and the shaders are compiled from these files as they are.
 *.wgsl text eol=lf
+
+# The C header is generated, and tests/header.rs compares it with cbindgen's
+# output byte for byte.
+*.h text eol=lf
