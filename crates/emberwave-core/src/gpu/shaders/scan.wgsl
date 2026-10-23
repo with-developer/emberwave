@@ -67,10 +67,13 @@ fn total_at(index: u32) -> u32 {
 
 @compute @workgroup_size(256)
 fn scan_chunks(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) tid: u32) {
-    let chunk = wg.y * params.grid_width + wg.x;
-    if (chunk >= params.chunk_count) {
-        return;
-    }
+    // Workgroups past the last chunk, which a grid of the chunk count never
+    // has, sum the last chunk again and write nothing, rather than return:
+    // a return in front of the barriers of `exclusive_scan` crashed WARP,
+    // Direct3D's software adapter, though no workgroup took it.
+    let workgroup = wg.y * params.grid_width + wg.x;
+    let chunk = min(workgroup, params.chunk_count - 1u);
+    let count = select(0u, params.count, workgroup < params.chunk_count);
     let base = chunk * CHUNK + tid * 4u;
     let v0 = value_at(base);
     let v1 = value_at(base + 1u);
@@ -78,19 +81,19 @@ fn scan_chunks(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
     let v3 = value_at(base + 3u);
     let sum = v0 + v1 + v2 + v3;
     let before = exclusive_scan(tid, sum);
-    if (base < params.count) {
+    if (base < count) {
         values[base] = before;
     }
-    if (base + 1u < params.count) {
+    if (base + 1u < count) {
         values[base + 1u] = before + v0;
     }
-    if (base + 2u < params.count) {
+    if (base + 2u < count) {
         values[base + 2u] = before + v0 + v1;
     }
-    if (base + 3u < params.count) {
+    if (base + 3u < count) {
         values[base + 3u] = before + v0 + v1 + v2;
     }
-    if (tid == GROUP_SIZE - 1u) {
+    if (count != 0u && tid == GROUP_SIZE - 1u) {
         chunk_totals[chunk] = before + sum;
     }
 }

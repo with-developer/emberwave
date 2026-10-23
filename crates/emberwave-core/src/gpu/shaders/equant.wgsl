@@ -104,10 +104,12 @@ fn measure(block8: u32, drop: u32, to_coefficient: f32, weight: f32) {
 
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
-    let block_index = wg.y * params.grid_width + wg.x;
-    if (block_index >= params.block_count) {
-        return;
-    }
+    // A grid of more than 65535 workgroups has some past the last block.
+    // They quantise the last block again and write nothing, rather than
+    // return: a return in front of the barriers below crashed WARP,
+    // Direct3D's software adapter, though no workgroup took it.
+    let workgroup = wg.y * params.grid_width + wg.x;
+    let block_index = min(workgroup, params.block_count - 1u);
     let band = find_band(block_index);
 
     // Phase 1. |c * 2^b| * 2^-b is |c| exactly, as the CPU computes it.
@@ -165,7 +167,7 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     // planes dropped for the size, all coded ones for the distortion. With
     // more planes dropped than were measured, the last pair measured holds
     // the error, and the block is not coded.
-    if (tid < DROP_STEPS) {
+    if (workgroup < params.block_count && tid < DROP_STEPS) {
         let drop = tid;
         var coded_count = 0u;
         var plane_bytes = 0u;

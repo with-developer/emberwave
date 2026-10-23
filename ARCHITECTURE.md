@@ -553,6 +553,8 @@ Noise, which no budget compresses, comes out the same. Without the contrast weig
 | Rate control | `rate.wgsl`, `scan.wgsl` | 4, and two prefix sums of 3 | Each block's steps, and their saved words added into a histogram of the keys; the key at which the frame fits; what each block's steps of that key save, summed in block order; each block's drop and size, and their sums in block order, which are the blocks' places in the payload |
 | Packing | `quantise.wgsl`, `pack.wgsl` | 1: a workgroup per block | The block quantised again, the chosen planes dropped, its bytes assembled in workgroup memory and written at its place |
 
+A workgroup past the last block, which a grid of more than 65,535 workgroups has, quantises the last block again and writes nothing, rather than return at the top. A return in front of the barriers of `equant.wgsl` and of `scan_chunks` in `scan.wgsl` crashed WARP, Direct3D's software adapter, in CI, though no workgroup took it; shader variants, each run in a process of its own on WARP, pinned the crash on the return. `pack.wgsl` and the decoder's `dequant.wgsl` return early in the same way and run on WARP.
+
 Nothing is sorted. The CPU applies the steps of all blocks in key order, ties by block index, until the frame fits. On the GPU every step below the cutoff key is applied and none above it, and the steps of the cutoff key are applied in block order while the frame does not fit yet, which is where the CPU stops. Quantisation and packing share `quantise.wgsl`, compiled in front of each, so that what the rate control measures is what the packing writes.
 
 The GPU cannot repeat the CPU's floating point exactly, so the contract between the two is per stage (decision D29), and the tests feed each stage the CPU's input:

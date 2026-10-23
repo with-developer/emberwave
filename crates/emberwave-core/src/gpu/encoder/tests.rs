@@ -6,7 +6,7 @@ use crate::cpu::decode_frame;
 use crate::encode::rate::{self, BlockCost};
 use crate::encode::{Bands, Encoder as CpuEncoder};
 use crate::gpu::context::test_context;
-use crate::gpu::resources::read_back;
+use crate::gpu::resources::{entry, read_back, uniform_buffer};
 
 use ChromaSubsampling::{Yuv420, Yuv444};
 
@@ -529,4 +529,106 @@ fn frames_are_the_cpu_encoders_or_as_good() {
     println!("{identical} of {frames} frames identical; worst loss {worst:.4} dB");
     assert_eq!(frames, SHAPES.len() * 4);
     assert!(worst < 0.05, "the GPU's frames are {worst:.3} dB worse");
+}
+
+#[test]
+fn prefix_sums_are_exclusive_across_chunks() {
+    let Some(context) = test_context() else {
+        return;
+    };
+    // 1995 blocks: a full chunk of 1024 values and a partial one.
+    let gpu = Encoder::new(context, 1056, 544, Yuv444, Signalling::default()).unwrap();
+    let count = gpu.layout().block_count() as usize;
+    assert_eq!(gpu.scan_params.chunk_count, 2);
+    let values: Vec<u32> = (0..count as u32).map(|i| (i * 7919) % 1000).collect();
+    gpu.queue
+        .write_buffer(&gpu.tie_savings, 0, bytemuck::cast_slice(&values));
+    gpu.run(|this, encoder| this.encode_scan(encoder, &this.scan_ties));
+
+    let scanned = gpu.read_words(&gpu.tie_savings, 0, count as u64);
+    let mut sum = 0u32;
+    for (i, (&value, &prefix)) in values.iter().zip(&scanned).enumerate() {
+        assert_eq!(prefix, sum, "value {i}");
+        sum += value;
+    }
+    let total = gpu.read_words(&gpu.chunk_totals, 2 * 4, 1)[0];
+    assert_eq!(total, sum, "the sum of everything");
+}
+
+#[test]
+fn workgroups_past_the_end_change_nothing() {
+    // A grid of more than 65535 workgroups has some past the end, which
+    // must neither return early (a return before a barrier crashed WARP)
+    // nor write. A narrower grid than the encoder's makes some here.
+    let Some(context) = test_context() else {
+        return;
+    };
+    let mut gpu = Encoder::new(context, 1056, 544, Yuv444, Signalling::default()).unwrap();
+    let blocks = gpu.layout().block_count();
+    let planes = picture(gpu.layout(), 21);
+    gpu.upload_planes(as_slices(&planes)).unwrap();
+    gpu.run_stages(true);
+    let device = &gpu.device;
+    let expected = gpu.read_costs();
+
+    // 1995 blocks in rows of 1000: five workgroups past the last block.
+    let mut params = QuantParams::new(&gpu.layout, &gpu.buffers);
+    params.grid_width = 1000;
+    let params = uniform_buffer(device, "test params", &params);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("test equant"),
+        layout: &gpu.pipelines.equant.layout,
+        entries: &[
+            entry(0, &gpu.pyramid),
+            entry(1, &gpu.costs),
+            entry(2, &params),
+        ],
+    });
+    gpu.queue.write_buffer(
+        &gpu.costs,
+        0,
+        &vec![0xA5; expected.len() * std::mem::size_of::<CostRecord>()],
+    );
+    gpu.run(|this, encoder| {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&this.pipelines.equant.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(1000, blocks.div_ceil(1000), 1);
+    });
+    assert!(gpu.read_costs() == expected, "the cost tables");
+
+    // Two chunks of the prefix sums, and three workgroups past them.
+    let values: Vec<u32> = (0..blocks).map(|i| i % 97).collect();
+    gpu.queue
+        .write_buffer(&gpu.tie_savings, 0, bytemuck::cast_slice(&values));
+    let mut scan = gpu.scan_params;
+    scan.grid_width = scan.chunk_count + 3;
+    let scan_params = uniform_buffer(device, "test scan params", &scan);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("test scan"),
+        layout: &gpu.pipelines.scan.chunks.layout,
+        entries: &[
+            entry(0, &gpu.tie_savings),
+            entry(1, &gpu.chunk_totals),
+            entry(2, &scan_params),
+        ],
+    });
+    gpu.run(|this, encoder| {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_pipeline(&this.pipelines.scan.chunks.pipeline);
+        pass.dispatch_workgroups(scan.grid_width, 1, 1);
+        pass.set_pipeline(&this.pipelines.scan.totals.pipeline);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&this.pipelines.scan.add.pipeline);
+        pass.dispatch_workgroups(scan.grid_width, 1, 1);
+    });
+    let scanned = gpu.read_words(&gpu.tie_savings, 0, u64::from(blocks));
+    let mut sum = 0;
+    for (i, (&value, &prefix)) in values.iter().zip(&scanned).enumerate() {
+        assert_eq!(prefix, sum, "value {i}");
+        sum += value;
+    }
+    let total = gpu.read_words(&gpu.chunk_totals, u64::from(scan.chunk_count) * 4, 1)[0];
+    assert_eq!(total, sum);
 }
