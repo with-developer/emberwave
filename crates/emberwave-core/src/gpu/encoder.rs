@@ -171,13 +171,19 @@ impl Encoder {
         chroma: ChromaSubsampling,
         signalling: Signalling,
     ) -> Result<Self, GpuError> {
+        // A lost device stays lost: nothing is made on it.
+        if let Some(reason) = context.lost() {
+            return Err(GpuError::DeviceLost(reason));
+        }
         let layout = FrameLayout::new(width, height, chroma)?;
         let buffers = BufferLayout::new(&layout)?;
         let scan_params = ScanParams::new(layout.block_count())?;
         let device = context.device().clone();
         let queue = context.queue().clone();
         // Compiled once per context, however many encoders are created.
-        let pipelines = context.encoder_pipelines()?;
+        let pipelines = context
+            .encoder_pipelines()
+            .map_err(|error| context.explain(error))?;
 
         let blocks = u64::from(layout.block_count());
         let cost_bytes = blocks * std::mem::size_of::<CostRecord>() as u64;
@@ -221,8 +227,8 @@ impl Encoder {
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             );
             let quant_params_data = QuantParams::new(&layout, &buffers);
-            let quant_params = uniform_buffer(&device, "equant params", &quant_params_data);
-            let scan_params_buffer = uniform_buffer(&device, "scan params", &scan_params);
+            let quant_params = uniform_buffer(&device, &queue, "equant params", &quant_params_data);
+            let scan_params_buffer = uniform_buffer(&device, &queue, "scan params", &scan_params);
             let payload_capacity_words = MIN_PAYLOAD_WORDS;
             let (payload, readback) = payload_buffers(&device, payload_capacity_words);
 
@@ -231,7 +237,7 @@ impl Encoder {
             let fdwt_stages = (0..DECOMPOSITION_LEVELS)
                 .map(|level| {
                     let stage = TransformLevel::new(&layout, &buffers, level);
-                    let params = uniform_buffer(&device, "fdwt params", &stage.params);
+                    let params = uniform_buffer(&device, &queue, "fdwt params", &stage.params);
                     FdwtStage {
                         bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("fdwt"),
@@ -334,6 +340,7 @@ impl Encoder {
                 lost: context.lost_record(),
             }
         })
+        .map_err(|error| context.explain(error))
     }
 
     /// The block layout of the frames.

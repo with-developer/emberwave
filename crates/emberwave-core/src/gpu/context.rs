@@ -191,6 +191,27 @@ impl GpuContext {
         self.lost.lock().ok().and_then(|lost| lost.clone())
     }
 
+    /// The error of a call that failed on this context's device: the loss of
+    /// the device, if it was lost, and `error` otherwise.
+    ///
+    /// A device that the driver lost has called back already. A destroyed
+    /// one calls back only when it is polled with no work left on it, so
+    /// this polls once, without waiting, while no loss is recorded, and not
+    /// once one is: wgpu panics when a poll finds the driver lost the device
+    /// (decision D22).
+    pub(crate) fn explain(&self, error: GpuError) -> GpuError {
+        if matches!(error, GpuError::DeviceLost(_)) {
+            return error;
+        }
+        if self.lost().is_none() {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+        }
+        match self.lost() {
+            Some(reason) => GpuError::DeviceLost(reason),
+            None => error,
+        }
+    }
+
     /// The record of a lost device, shared with the decoders and the encoders
     /// of this context.
     pub(crate) fn lost_record(&self) -> Arc<Mutex<Option<String>>> {

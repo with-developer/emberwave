@@ -341,3 +341,52 @@ fn timing_an_encode_reports_where_the_time_goes() {
         }
     }
 }
+
+#[test]
+fn nothing_is_made_on_a_lost_device() {
+    // Making a decoder or an encoder on a lost device used to panic in wgpu
+    // (issue #35). Each on a context of its own: the first constructor that
+    // fails on a destroyed device records the loss, and a later one would
+    // stop at the record before making anything. Before as well as after
+    // the context compiled its pipelines, whose failure is then the first.
+    for compiled in [false, true] {
+        let lost = || {
+            let context = create_context(&GpuOptions::default())?;
+            if compiled {
+                Decoder::new(&context, 64, 64, ChromaSubsampling::Yuv420).expect("a decoder");
+                Encoder::new(
+                    &context,
+                    64,
+                    64,
+                    ChromaSubsampling::Yuv420,
+                    Signalling::default(),
+                )
+                .expect("an encoder");
+            }
+            context.device().destroy();
+            Some(context)
+        };
+        let Some(context) = lost() else {
+            return;
+        };
+        let decoder = Decoder::new(&context, 64, 64, ChromaSubsampling::Yuv420);
+        assert!(
+            matches!(decoder, Err(GpuError::DeviceLost(_))),
+            "compiled {compiled}: {:?}",
+            decoder.map(drop)
+        );
+        let context = lost().expect("a GPU, as before");
+        let encoder = Encoder::new(
+            &context,
+            64,
+            64,
+            ChromaSubsampling::Yuv420,
+            Signalling::default(),
+        );
+        assert!(
+            matches!(encoder, Err(GpuError::DeviceLost(_))),
+            "compiled {compiled}: {:?}",
+            encoder.map(drop)
+        );
+    }
+}

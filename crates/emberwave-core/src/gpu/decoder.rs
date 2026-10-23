@@ -176,12 +176,18 @@ impl Decoder {
         height: u32,
         chroma: ChromaSubsampling,
     ) -> Result<Self, GpuError> {
+        // A lost device stays lost: nothing is made on it.
+        if let Some(reason) = context.lost() {
+            return Err(GpuError::DeviceLost(reason));
+        }
         let layout = FrameLayout::new(width, height, chroma)?;
         let buffers = BufferLayout::new(&layout)?;
         let device = context.device().clone();
         let queue = context.queue().clone();
         // Compiled once per context, however many decoders are created.
-        let pipelines = context.pipelines()?;
+        let pipelines = context
+            .pipelines()
+            .map_err(|error| context.explain(error))?;
 
         check_size(&device, "the wavelet pyramid", buffers.pyramid_floats * 4)?;
         check_size(&device, "the packed planes", buffers.packed_words * 4)?;
@@ -222,7 +228,8 @@ impl Decoder {
 
             let dequant_params_data = DequantParams::new(&layout, &buffers);
             let dequant_grid = dequant_params_data.grid();
-            let dequant_params = uniform_buffer(&device, "dequant params", &dequant_params_data);
+            let dequant_params =
+                uniform_buffer(&device, &queue, "dequant params", &dequant_params_data);
             let dequant_bind_group = dequant_bind_group(
                 &device,
                 &pipelines.dequant,
@@ -238,7 +245,7 @@ impl Decoder {
                 .rev()
                 .map(|level| {
                     let stage = TransformLevel::new(&layout, &buffers, level);
-                    let params = uniform_buffer(&device, "idwt params", &stage.params);
+                    let params = uniform_buffer(&device, &queue, "idwt params", &stage.params);
                     IdwtStage {
                         bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("idwt"),
@@ -275,6 +282,7 @@ impl Decoder {
                 lost: context.lost_record(),
             }
         })
+        .map_err(|error| context.explain(error))
     }
 
     /// Why the device of this decoder was lost, if it was. See
