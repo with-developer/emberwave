@@ -65,12 +65,13 @@ if [ "$SOURCES" = 0 ]; then
 fi
 
 # source NAME WIDTH HEIGHT: the scene's first 20 pictures, as the encoder
-# benchmarks take them. refgen encodes them too; that stream is thrown away.
+# benchmarks take them. refgen encodes them too, into /dev/null. The file
+# appears under its name only once it is complete.
 source_pictures() {
     echo "== $1.y4m ($2x$3, 20 frames)"
-    "$REFGEN" encode --out "$OUT/$1.discard.pwv1" --pattern scene --width "$2" --height "$3" \
-        --chroma 420 --frames 20 --bytes-per-frame 4000000 --source "$OUT/$1.y4m" > /dev/null 2>&1
-    rm -f "$OUT/$1.discard.pwv1"
+    "$REFGEN" encode --out /dev/null --pattern scene --width "$2" --height "$3" \
+        --chroma 420 --frames 20 --bytes-per-frame 4000000 --source "$OUT/$1.y4m.partial" > /dev/null
+    mv "$OUT/$1.y4m.partial" "$OUT/$1.y4m"
 }
 
 if [ "$SOURCES" = 1 ]; then
@@ -79,6 +80,7 @@ if [ "$SOURCES" = 1 ]; then
             1080p) source_pictures scene_1080p_420 1920 1080 ;;
             1440p) source_pictures scene_1440p_420 2560 1440 ;;
             4k) source_pictures scene_4k_420 3840 2160 ;;
+            *) echo "unknown size $size (use 1080p, 1440p or 4k)" >&2; exit 2 ;;
         esac
     done
 fi

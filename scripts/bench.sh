@@ -56,32 +56,49 @@ if [ "$UPSTREAM" = 1 ]; then
     source "$ROOT/scripts/refgen/build.sh"
 fi
 
+# measure FILE COMMAND...: runs the command and keeps its JSON in FILE, which
+# only appears when the command succeeded. The report reads only results
+# newer than this run's environment.json, so none of an earlier run's slips
+# in next to this run's.
+measure() {
+    local file=$1
+    shift
+    "$@" > "$file.partial"
+    mv "$file.partial" "$file"
+}
+
 python3 "$ROOT/scripts/bench_report.py" environment "$OUT/environment.json"
 for stream in $STREAMS; do
     input=$GENERATED/$stream.pwv1
     echo "== $stream"
-    "$CLI" bench "$input" --frames "$FRAMES" --output yuv --json > "$OUT/$stream.yuv.json"
-    "$CLI" bench "$input" --frames "$FRAMES" --output rgb --json > "$OUT/$stream.rgb.json"
-    "$CLI" bench "$input" --frames "$FRAMES" --output rgb --readback --json > "$OUT/$stream.rgb-readback.json"
+    measure "$OUT/$stream.yuv.json" "$CLI" bench "$input" --frames "$FRAMES" --output yuv --json
+    measure "$OUT/$stream.rgb.json" "$CLI" bench "$input" --frames "$FRAMES" --output rgb --json
+    measure "$OUT/$stream.rgb-readback.json" \
+        "$CLI" bench "$input" --frames "$FRAMES" --output rgb --readback --json
     if [ "$UPSTREAM" = 1 ]; then
-        "$REFGEN" bench "$input" --frames "$FRAMES" --json > "$OUT/$stream.upstream.json"
-        PYROWAVE_PRECISION=2 "$REFGEN" bench "$input" --frames "$FRAMES" --json \
-            > "$OUT/$stream.upstream-fp32.json"
+        measure "$OUT/$stream.upstream.json" "$REFGEN" bench "$input" --frames "$FRAMES" --json
+        PYROWAVE_PRECISION=2 measure "$OUT/$stream.upstream-fp32.json" \
+            "$REFGEN" bench "$input" --frames "$FRAMES" --json
     fi
 done
 
+# The CPU encoder takes a quarter of a second for a 4K frame: a tenth of the
+# frames, one at least.
+CPU_FRAMES=$(( FRAMES >= 10 ? FRAMES / 10 : 1 ))
 for entry in $ENCODE; do
     source=${entry%%:*}
     budget=${entry##*:}
     input=$GENERATED/$source.y4m
     echo "== $source, encoded"
-    "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --gpu --frames "$FRAMES" --json \
-        > "$OUT/$source.encode-gpu.json"
-    "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --frames $((FRAMES / 10)) --json \
-        > "$OUT/$source.encode-cpu.json"
+    measure "$OUT/$source.encode-gpu.json" \
+        "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --gpu --frames "$FRAMES" --json
+    measure "$OUT/$source.encode-cpu.json" \
+        "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --frames "$CPU_FRAMES" --json
     if [ "$UPSTREAM" = 1 ]; then
-        "$REFGEN" bench-encode "$input" --bytes-per-frame "$budget" --frames "$FRAMES" --json \
-            > "$OUT/$source.encode-upstream.json"
+        measure "$OUT/$source.encode-upstream.json" \
+            "$REFGEN" bench-encode "$input" --bytes-per-frame "$budget" --frames "$FRAMES" --json
+        PYROWAVE_PRECISION=2 measure "$OUT/$source.encode-upstream-fp32.json" \
+            "$REFGEN" bench-encode "$input" --bytes-per-frame "$budget" --frames "$FRAMES" --json
     fi
 done
 

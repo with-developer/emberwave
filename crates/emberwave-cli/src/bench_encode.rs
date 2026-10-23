@@ -1,9 +1,10 @@
 //! `emberwave-cli bench-encode`: measure the encode time per frame.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use emberwave_core::bitstream::ChromaSubsampling;
+use emberwave_core::bitstream::consts::HEADER_BYTES;
 use emberwave_core::encode::{self, Signalling};
 use emberwave_core::gpu;
 
@@ -12,8 +13,8 @@ use crate::{Backend, GpuArgs, Result, chroma_name, y4m};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// The Y4M video to encode, 8-bit 4:2:0 or 4:4:4; its frames are encoded
-    /// in turn, as often as needed
+    /// The Y4M video to encode, 8-bit 4:2:0 or 4:4:4; its frames are read
+    /// into memory first and then encoded in turn, as often as needed
     input: PathBuf,
 
     /// The most bytes a frame may take, its start of frame header included
@@ -44,35 +45,6 @@ pub struct Args {
     /// With --gpu: which GPU
     #[command(flatten)]
     gpu_args: GpuArgs,
-}
-
-/// The frames of a Y4M file in turn, from the start again after the last,
-/// read as they are needed so that a long video does not fill the memory.
-struct Frames {
-    path: PathBuf,
-    reader: y4m::Reader<std::io::BufReader<std::fs::File>>,
-}
-
-impl Frames {
-    /// The number of frames of the video at `path`.
-    fn count(path: &Path) -> Result<usize> {
-        let mut reader = y4m::open(path)?;
-        let mut count = 0;
-        while reader.next_frame()?.is_some() {
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    fn next(&mut self) -> Result<[Vec<u8>; 3]> {
-        if let Some(frame) = self.reader.next_frame()? {
-            return Ok(frame);
-        }
-        self.reader = y4m::open(&self.path)?;
-        self.reader
-            .next_frame()?
-            .ok_or_else(|| "the Y4M file has no frames".into())
-    }
 }
 
 /// The CPU or the GPU encoder.
@@ -158,7 +130,14 @@ pub fn run(args: &Args) -> Result<()> {
     if !args.gpu && (args.gpu_args.backend != Backend::Auto || args.gpu_args.software) {
         return Err("--backend and --software choose the GPU of --gpu".into());
     }
-    let reader = y4m::open(&args.input)?;
+    if args.bytes_per_frame < HEADER_BYTES {
+        return Err(format!(
+            "--bytes-per-frame {} is less than the {HEADER_BYTES} bytes of a frame header",
+            args.bytes_per_frame
+        )
+        .into());
+    }
+    let mut reader = y4m::open(&args.input)?;
     let header = *reader.header();
     if header.chroma == ChromaSubsampling::Yuv420 && (header.width | header.height) % 2 != 0 {
         return Err(format!(
@@ -168,10 +147,16 @@ pub fn run(args: &Args) -> Result<()> {
         .into());
     }
     let (width, height) = (u32::try_from(header.width)?, u32::try_from(header.height)?);
-    let mut frames = Frames {
-        path: args.input.clone(),
-        reader,
-    };
+    // In memory first, as `bench` has its file, so that the encodes follow
+    // each other as they would in a stream, with no reading in between: a
+    // GPU that waits for the CPU slows down, and not every GPU alike.
+    let mut frames = Vec::new();
+    while let Some(frame) = reader.next_frame()? {
+        frames.push(frame);
+    }
+    if frames.is_empty() {
+        return Err("the Y4M file has no frames".into());
+    }
 
     let (mut encoder, adapter, backend) = if args.gpu {
         let context = args.gpu_args.create_context(true)?;
@@ -198,32 +183,19 @@ pub fn run(args: &Args) -> Result<()> {
     };
 
     // One pass over the video unless --frames says otherwise.
-    let count = match args.frames {
-        Some(count) => count,
-        None => Frames::count(&args.input)?,
+    let count = args.frames.unwrap_or(frames.len());
+    let planes = |i: usize| {
+        let frame = &frames[i % frames.len()];
+        [&frame[0][..], &frame[1][..], &frame[2][..]]
     };
-    if count == 0 {
-        return Err("the Y4M file has no frames".into());
-    }
 
-    // Only the encoder's call is timed, not the reading of the video.
     let mut measurement = Measurement::new();
-    let warmup = warm_up(args.warmup, args.warmup_seconds, |_| {
-        let planes = frames.next()?;
-        measurement.encode(
-            &mut encoder,
-            [&planes[0], &planes[1], &planes[2]],
-            args.bytes_per_frame,
-        )
+    let warmup = warm_up(args.warmup, args.warmup_seconds, |i| {
+        measurement.encode(&mut encoder, planes(i), args.bytes_per_frame)
     })?;
     let mut measurement = Measurement::new();
-    for _ in 0..count {
-        let planes = frames.next()?;
-        measurement.encode(
-            &mut encoder,
-            [&planes[0], &planes[1], &planes[2]],
-            args.bytes_per_frame,
-        )?;
+    for i in 0..count {
+        measurement.encode(&mut encoder, planes(i), args.bytes_per_frame)?;
     }
 
     let description = format!(

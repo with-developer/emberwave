@@ -26,7 +26,7 @@
 // same statistics and the same output, so the two can be put side by side.
 // bench-encode times upstream's encoder the way `emberwave-cli bench-encode`
 // times emberwave's: from the planes in CPU memory to the frame's packet in
-// CPU memory, the video's frames in turn.
+// CPU memory, the video's frames, read into memory first, in turn.
 //
 // PWV1 container layout: bitstream/bitstream.md in the upstream repository,
 // section "Raw disk format specification".
@@ -980,28 +980,23 @@ int run_bench_encode(int argc, char **argv)
 	if (warmup_frames < 0 || !(warmup_seconds >= 0.0 && warmup_seconds <= 3600.0))
 		fail("the warm-up must be at least 0 frames and between 0 and 3600 seconds");
 
-	// One pass over the video unless --frames says otherwise.
+	// In memory first, as emberwave-cli bench-encode has them, so that the
+	// encodes follow each other with no reading in between.
 	Y4mReader input = open_y4m(in_path);
 	const Stream stream = input.stream;
-	if (frames_to_measure <= 0)
+	std::vector<Picture> frames;
+	for (;;)
 	{
 		Picture pic;
-		while (read_y4m_frame(input, pic))
-			frames_to_measure++;
-		if (frames_to_measure == 0)
-			fail("the Y4M file has no frames");
-		input = open_y4m(in_path);
-	}
-
-	// The frames in turn, from the start again after the last; reading them
-	// is not timed.
-	auto next_frame = [&](Picture &pic) {
-		if (read_y4m_frame(input, pic))
-			return;
-		input = open_y4m(in_path);
 		if (!read_y4m_frame(input, pic))
-			fail("the Y4M file has no frames");
-	};
+			break;
+		frames.push_back(std::move(pic));
+	}
+	if (frames.empty())
+		fail("the Y4M file has no frames");
+	// One pass over the video unless --frames says otherwise.
+	if (frames_to_measure <= 0)
+		frames_to_measure = long(frames.size());
 
 	pyrowave_device device = nullptr;
 	check(pyrowave_create_default_device(&device), "create device");
@@ -1016,9 +1011,8 @@ int run_bench_encode(int argc, char **argv)
 
 	// One frame: the planes go to the encoder, which submits its GPU work;
 	// counting the packets waits for it; packetizing copies the frame out.
-	Picture pic;
-	auto encode = [&]() -> double {
-		next_frame(pic);
+	auto encode = [&](size_t index) -> double {
+		Picture &pic = frames[index % frames.size()];
 		pyrowave_cpu_buffer buffer = {};
 		for (int c = 0; c < 3; c++)
 		{
@@ -1050,19 +1044,21 @@ int run_bench_encode(int argc, char **argv)
 	const Clock::time_point warmup_start = Clock::now();
 	while (warmed < size_t(warmup_frames) || ms_between(warmup_start, Clock::now()) < warmup_seconds * 1000.0)
 	{
-		encode();
+		encode(warmed);
 		warmed++;
 	}
 
 	Series total = { "total", {} };
 	for (long i = 0; i < frames_to_measure; i++)
-		total.samples.push_back(encode());
+		total.samples.push_back(encode(size_t(i)));
 
 	const std::string adapter = [MTLCreateSystemDefaultDevice() name].UTF8String;
+	const char *precision = getenv("PYROWAVE_PRECISION");
 	const std::string description = std::to_string(stream.width) + "x" + std::to_string(stream.height) +
 	                                (stream.chroma_444 ? " 4:4:4" : " 4:2:0") + ", " +
 	                                std::to_string(bytes_per_frame) +
-	                                " bytes per frame, encoded by upstream's Metal encoder from planes in CPU memory";
+	                                " bytes per frame, encoded by upstream's Metal encoder (PYROWAVE_PRECISION=" +
+	                                (precision ? precision : "default") + ") from planes in CPU memory";
 	const Summary s = summarize(total.samples);
 	if (json)
 	{
