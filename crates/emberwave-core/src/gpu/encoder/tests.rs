@@ -97,9 +97,9 @@ impl Encoder {
     fn run_stages(&self, transform: bool) {
         self.run(|this, encoder| {
             if transform {
-                this.encode_transform(encoder);
+                this.encode_transform(encoder, None);
             }
-            this.encode_quantisation(encoder);
+            this.encode_quantisation(encoder, None);
         });
     }
 
@@ -355,7 +355,7 @@ fn the_rate_control_chooses_the_cpus_drops() {
             gpu.write_frame_params(budget_words, 1);
             gpu.run(|this, encoder| {
                 encoder.clear_buffer(&this.rate_state, 0, None);
-                this.encode_rate_control(encoder);
+                this.encode_rate_control(encoder, None);
             });
             let summary: RateSummary = bytemuck::pod_read_unaligned(&gpu.read_buffer(
                 &gpu.rate_state,
@@ -442,7 +442,7 @@ fn packing_the_cpus_choices_gives_the_cpus_bytes() {
                 .write_buffer(&gpu.block_words, 0, bytemuck::cast_slice(&offsets));
             // The CPU encoder's first frame is number 1.
             gpu.write_frame_params(u32::MAX, 1);
-            gpu.run(|this, encoder| this.encode_packing(encoder));
+            gpu.run(|this, encoder| this.encode_packing(encoder, None));
 
             let payload: Vec<u8> = gpu.read_buffer(&gpu.payload, 0, payload_words * 4);
             assert_eq!(frame.len(), HEADER_BYTES + payload.len());
@@ -543,7 +543,7 @@ fn prefix_sums_are_exclusive_across_chunks() {
     let values: Vec<u32> = (0..count as u32).map(|i| (i * 7919) % 1000).collect();
     gpu.queue
         .write_buffer(&gpu.tie_savings, 0, bytemuck::cast_slice(&values));
-    gpu.run(|this, encoder| this.encode_scan(encoder, &this.scan_ties));
+    gpu.run(|this, encoder| this.encode_scan(encoder, &this.scan_ties, None));
 
     let scanned = gpu.read_words(&gpu.tie_savings, 0, count as u64);
     let mut sum = 0u32;

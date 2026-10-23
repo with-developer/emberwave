@@ -15,7 +15,7 @@ mod resources;
 
 pub use context::{BACKEND_ENV, GpuContext, GpuOptions, parse_backends};
 pub use decoder::{Decoder, Frame, FramePlane, RgbFrame, StageTimings, TimedOutput, Timings};
-pub use encoder::Encoder;
+pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder};
 pub use error::GpuError;
 
 /// The WGSL sources of the pipeline stages, for offline validation.

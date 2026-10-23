@@ -297,3 +297,47 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
     assert!(matches!(result, Err(GpuError::DeviceLost(_))), "{result:?}");
     assert!(encoder.lost().is_some());
 }
+
+#[test]
+fn timing_an_encode_reports_where_the_time_goes() {
+    // Timestamp queries are optional, so ask for them and accept their absence.
+    let options = GpuOptions {
+        timestamps: true,
+        ..GpuOptions::default()
+    };
+    let Some(context) = create_context(&options) else {
+        return;
+    };
+    let vector = vectors()
+        .into_iter()
+        .find(|v| v.name == "scene_200x120_420")
+        .unwrap();
+    let mut timed = encoder_for(&context, &vector.layout);
+    let mut plain = encoder_for(&context, &vector.layout);
+    for source in &vector.source.frames {
+        let (frame, timings) = timed.encode_timed(planes(source), vector.budget).unwrap();
+        // Timing changes nothing in the frame.
+        assert!(frame == plain.encode(planes(source), vector.budget).unwrap());
+        assert!(timings.gpu_wall > std::time::Duration::ZERO);
+        assert!(timings.prepare > std::time::Duration::ZERO);
+        match timings.stages {
+            Some(stages) => {
+                assert!(context.supports_timestamps());
+                // A short stage can be below the timer's resolution and read
+                // as zero, but the whole encode cannot, nor the stages of
+                // several dispatches: quantisation runs a workgroup per block
+                // and rate control four passes and two prefix sums.
+                assert!(stages.total() > std::time::Duration::ZERO);
+                assert!(stages.quantisation > std::time::Duration::ZERO);
+                assert!(stages.rate_control > std::time::Duration::ZERO);
+                // The GPU cannot take longer than the wall clock around it.
+                assert!(stages.total() <= timings.gpu_wall + timings.prepare);
+            }
+            // A device that offers timestamps has to deliver them.
+            None => assert!(
+                !context.supports_timestamps(),
+                "the device supports timestamp queries but returned no stage times"
+            ),
+        }
+    }
+}

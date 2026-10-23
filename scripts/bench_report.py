@@ -5,7 +5,8 @@
         Records the machine the benchmark runs on.
     bench_report.py write RESULTS_DIR BENCHMARKS.md README.md
         Rewrites the generated blocks of both files from the JSON results that
-        `emberwave-cli bench --json` and `refgen bench --json` wrote.
+        `emberwave-cli bench --json`, `emberwave-cli bench-encode --json`,
+        `refgen bench --json` and `refgen bench-encode --json` wrote.
 
 Only the Python standard library is used.
 """
@@ -30,6 +31,13 @@ STREAMS = [
 
 # Frames per stream, as gen_bench_data.sh writes them.
 STREAM_FRAMES = 60
+
+# The pictures of the encoder benchmarks, gen_bench_data.sh --sources.
+ENCODE_SOURCES = [
+    ("scene_1080p_420", "1080p scene"),
+    ("scene_1440p_420", "1440p scene"),
+    ("scene_4k_420", "4K scene"),
+]
 
 
 def run(*command):
@@ -84,9 +92,25 @@ def environment():
     return env
 
 
+# Results older than this run's environment.json are an earlier run's: when
+# bench.sh times less this time, they must not reach the report. Set by
+# main(); lavapipe's results, which have an environment of their own, are
+# read whatever their age.
+RUN_START = None
+
+
 def load(directory, name):
     path = directory / f"{name}.json"
-    return json.loads(path.read_text()) if path.exists() else None
+    if not path.exists():
+        return None
+    if (
+        RUN_START is not None
+        and "lavapipe" not in name
+        and name != "environment"
+        and path.stat().st_mtime < RUN_START
+    ):
+        return None
+    return json.loads(path.read_text())
 
 
 def value(result, series, key="mean"):
@@ -253,7 +277,87 @@ def benchmarks_block(results, env):
         )
         parts.append(table(["Stream", "mean", "p50", "p99", "frames"], rows))
 
+    parts += encode_parts(results)
     return "\n\n".join(parts) + "\n"
+
+
+def encode_parts(results):
+    """The tables of the encoder benchmarks, if there are results."""
+    rows = []
+    for stem, label in ENCODE_SOURCES:
+        gpu = load(results, f"{stem}.encode-gpu")
+        if not gpu:
+            continue
+        cpu = load(results, f"{stem}.encode-cpu")
+        row = [label, f"{gpu['bytes_per_frame'] // 1000} kB"]
+        row += [ms(value(gpu, "total")), ms(value(gpu, "total", "p99"))]
+        for name in ("encode-upstream", "encode-upstream-fp32"):
+            theirs = load(results, f"{stem}.{name}")
+            row += [ms(value(theirs, "total")), ms(value(theirs, "total", "p99"))]
+        row.append(ms(value(cpu, "total")))
+        rows.append(row)
+    if not rows:
+        return []
+    parts = [
+        "### Encode, next to upstream\n\n"
+        "From the picture's planes in CPU memory to the frame in CPU memory, the upload and the "
+        "read-back included, which is what `Encoder::encode` does and what upstream's encoder "
+        "does with `pyrowave_encoder_encode_cpu` and `pyrowave_encoder_packetize`, timed by "
+        "`refgen bench-encode`. The pictures are 20 frames of the scene, read into memory first "
+        "and taken in turn. Upstream's encoder keeps its wavelet pyramid in FP16 by default and "
+        "in FP32 with `PYROWAVE_PRECISION=2`, as emberwave's does. The CPU encoder is timed over "
+        "a tenth of the frames.",
+        table(
+            [
+                "Picture",
+                "budget",
+                "emberwave GPU mean",
+                "p99",
+                "upstream FP16 mean",
+                "p99",
+                "upstream FP32 mean",
+                "p99",
+                "emberwave CPU mean",
+            ],
+            rows,
+        ),
+        "Where the GPU encoder's time goes, the pass times from GPU timestamps:",
+    ]
+    rows = []
+    for stem, label in ENCODE_SOURCES:
+        gpu = load(results, f"{stem}.encode-gpu")
+        if gpu:
+            rows.append(
+                [label]
+                + [
+                    ms(value(gpu, s))
+                    for s in (
+                        "cpu prepare",
+                        "gpu wall",
+                        "gpu (timestamps)",
+                        "transform",
+                        "quantisation",
+                        "rate control",
+                        "packing",
+                    )
+                ]
+            )
+    parts.append(
+        table(
+            [
+                "Picture",
+                "CPU prepare",
+                "GPU wall",
+                "GPU passes",
+                "transform",
+                "quantisation",
+                "rate control",
+                "packing",
+            ],
+            rows,
+        )
+    )
+    return parts
 
 
 def readme_block(results, env):
@@ -278,6 +382,19 @@ def readme_block(results, env):
             f"{ms(value(ours, 'total'))} ms (planes only). "
             "[`BENCHMARKS.md`](BENCHMARKS.md) has the method and all the numbers.\n"
         )
+    encoded = load(results, "scene_4k_420.encode-gpu")
+    upstream = load(results, "scene_4k_420.encode-upstream-fp32")
+    if encoded:
+        text += (
+            f"\nEncoding a 4K frame within 1.2 MB takes {ms(value(encoded, 'total'))} ms on the GPU, "
+            "from the planes in CPU memory to the frame in CPU memory"
+            + (
+                f", and {ms(value(upstream, 'total'))} ms with upstream's encoder at FP32."
+                if upstream
+                else "."
+            )
+            + "\n"
+        )
     return text
 
 
@@ -293,10 +410,12 @@ def main(argv):
     if len(argv) == 3 and argv[1] == "environment":
         pathlib.Path(argv[2]).write_text(json.dumps(environment(), indent=2) + "\n")
     elif len(argv) == 5 and argv[1] == "write":
+        global RUN_START
         results = pathlib.Path(argv[2])
         env = load(results, "environment")
         if env is None:
             raise SystemExit(f"{results}/environment.json is missing; run scripts/bench.sh")
+        RUN_START = (results / "environment.json").stat().st_mtime
         replace_block(pathlib.Path(argv[3]), "bench", benchmarks_block(results, env))
         replace_block(pathlib.Path(argv[4]), "bench-summary", readme_block(results, env))
     else:
