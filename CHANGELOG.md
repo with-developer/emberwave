@@ -10,7 +10,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Changed
 
-- The GPU encoder is faster (decision D30): on an Apple M3 Max a 4K frame encodes in 1.88 ms instead of 3.64 ms, against 3.18 ms for upstream's encoder at the same precision. The planes go through an upload buffer the encoder keeps mapped, which costs 12 MB more GPU memory at 4K, and the quantisation adds each subblock's errors in registers. The CPU encoder adds its errors in the same grouping; its streams are the same as before.
+- The GPU encoder is faster (decision D30): on an Apple M3 Max a 4K frame encodes in about 1.9 ms instead of about 3.5 ms, against 3.4 ms for upstream's encoder at the same precision. The planes go through an upload buffer the encoder keeps from frame to frame, 12 MB of GPU memory at 4K that the old path allocated anew for every frame, and the quantisation adds each subblock's errors in registers. The CPU encoder adds its errors in the same grouping; its streams are the same as before.
 
 ### Fixed
 

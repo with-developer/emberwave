@@ -570,13 +570,17 @@ impl Encoder {
                     let _ = sender.send(result);
                 });
         })?;
+        // Only a lost device fails here, which the caller reports as such.
+        let failed = |error: &dyn std::fmt::Display| {
+            GpuError::Device(format!("mapping the upload buffer failed: {error}"))
+        };
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|error| GpuError::Readback(error.to_string()))?;
+            .map_err(|error| failed(&error))?;
         receiver
             .recv()
-            .map_err(|error| GpuError::Readback(error.to_string()))?
-            .map_err(|error| GpuError::Readback(error.to_string()))?;
+            .map_err(|error| failed(&error))?
+            .map_err(|error| failed(&error))?;
         self.upload_mapped = true;
         Ok(())
     }

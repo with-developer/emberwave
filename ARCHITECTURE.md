@@ -547,7 +547,7 @@ Noise, which no budget compresses, comes out the same. Without the contrast weig
 
 ### On the GPU
 
-`gpu::Encoder` runs the same steps as compute shaders, so that a picture goes to the GPU once and its frame comes back once. The CPU writes the planes into an upload buffer the encoder keeps mapped, the passes below run in one submission after the copy of the planes, and the summary of the rate control and the payload come back in one read-back. The CPU writes the start of frame header in front of the payload.
+`gpu::Encoder` runs the same steps as compute shaders, so that a picture goes to the GPU once and its frame comes back once. The CPU writes the planes into an upload buffer the encoder keeps from frame to frame and maps again before each, the passes below run in one submission after the copy of the planes, and the summary of the rate control and the payload come back in one read-back. The CPU writes the start of frame header in front of the payload.
 
 | Stage | Shaders | Dispatches | What it does |
 |---|---|---|---|
@@ -565,13 +565,13 @@ The GPU cannot repeat the CPU's floating point exactly, so the contract between 
 | Stage | Given the CPU's input, the GPU's output is |
 |---|---|
 | Forward transform | Within 1e-5 of the CPU's coefficients, relative for coefficients above 1 and absolute below (8.3e-7 at most on an Apple M3 Max) |
-| Quantisation | The same sizes; the same distortions up to fused multiply-adds, within 1e-5 of each (3.6e-7 at most) |
+| Quantisation | The same sizes; the same distortions up to fused multiply-adds, within 1e-5 of each (2.5e-7 at most) |
 | Rate control | The same drops |
 | Packing | The same bytes |
 
 A frame is therefore the CPU encoder's, or one that differs in the blocks whose coefficients sit on a rounding boundary. On an Apple M3 Max all 25 frames of the committed vectors come out identical. Of `refgen`'s scene at 1080p, 1440p and 4K about one sent block in 200 differs, mostly at the same size, and the PSNR is the same to a thousandth of a dB; of pictures of flat rectangles, thin strokes or squares, between none and one in 200. The tests allow differing frames as long as they are as good (within 0.05 dB). The CPU encoder stays the one that makes the same bytes on every system.
 
-[`BENCHMARKS.md`](BENCHMARKS.md#encode-next-to-upstream) has the encoder's times next to upstream's, measured as the decoder's are: on an Apple M3 Max a 4K frame takes 1.88 ms from the planes in CPU memory to the frame in CPU memory, against 3.18 ms for upstream's encoder at the same FP32 precision and 218 ms for the CPU encoder (decision D30).
+[`BENCHMARKS.md`](BENCHMARKS.md#encode-next-to-upstream) has the encoder's times next to upstream's, measured as the decoder's are: on an Apple M3 Max a 4K frame takes 1.91 ms from the planes in CPU memory to the frame in CPU memory, against 3.39 ms for upstream's encoder at the same FP32 precision and 218 ms for the CPU encoder (decision D30).
 
 ## Decisions
 
@@ -817,10 +817,10 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 
 ### 2026-10-24 — D30: The GPU encoder's speed: a mapped upload buffer, sums per subblock
 
-**Context.** Measured as the decoder is (`BENCHMARKS.md`, issue #29), the GPU encoder took 3.64 ms for a 4K frame on an Apple M3 Max and upstream's encoder 3.22 ms at the same FP32 precision. Two things took most of it. The CPU copied the 12 MB of planes into the staging memory that `Queue::write_buffer` allocates anew for every frame, 1.24 ms; into a buffer kept from frame to frame the same copy takes 0.22 ms. And the quantisation, 1.07 ms of 1.88 ms of GPU passes, added the 64 squared errors of each pair of an 8x8 block and a number of dropped planes one after the other, with two loads from workgroup memory per term.
+**Context.** Measured as the decoder is (`BENCHMARKS.md`, issue #29), the GPU encoder took 3.37 to 3.66 ms for a 4K frame on an Apple M3 Max (three rounds of 600 frames) and upstream's encoder about 3.2 to 3.4 ms at the same FP32 precision. Two things took most of it. The CPU copied the 12 MB of planes into the staging memory that `Queue::write_buffer` allocates anew for every frame, 1.25 to 1.28 ms; into a buffer kept from frame to frame the same copy takes 0.22 ms. And the quantisation, 0.91 to 1.04 ms of 1.61 to 1.82 ms of GPU passes, added the 64 squared errors of each pair of an 8x8 block and a number of dropped planes one after the other, with two loads from workgroup memory per term.
 
 **Decision.**
-- The planes go through an upload buffer the encoder keeps, mapped for writing before each frame, which waits for nothing since every encode waits for its frame, and copied into the planes buffer at the start of the frame's command buffer. It costs a second buffer of the planes' size, 12 MB at 4K.
+- The planes go through an upload buffer the encoder keeps, mapped for writing before each frame, which waits for nothing since every encode waits for its frame, and copied into the planes buffer at the start of the frame's command buffer. It keeps a second buffer of the planes' size, 12 MB at 4K, allocated between frames; the old path allocated as much for every frame, and the peak memory of a 4K encode did not rise.
 - Each invocation of the quantisation adds up the squared errors of its own 4x2 subblock, for every number of dropped planes it needs, in registers; a pair adds up its 8 subblocks. The CPU encoder adds in the same grouping, each subblock's values in order and then the subblocks in order, instead of the 64 values in one run, so that the GPU's distortions remain the CPU's sums in the CPU's order (D29). No choice of the rate control moved: the committed vectors come out byte for byte as before.
 
-**Consequence.** A 4K frame encodes in 1.88 ms instead of 3.64 ms, 0.59 times the time of upstream's encoder at FP32; 1440p in 1.11 ms and 1080p in 0.83 ms, against upstream's 1.53 and 0.92 ms. The CPU's part of a 4K frame is 0.22 ms and the quantisation's 0.59 ms. What remains is a second copy of the planes on the GPU, which an encode from pictures already in GPU memory would avoid (issue #33).
+**Consequence.** Measured alternately with the build before, a 4K frame encodes in 1.88 to 1.95 ms instead of 3.37 to 3.66 ms; the CPU's part is 0.22 to 0.23 ms and the quantisation's 0.59 to 0.61 ms. In the benchmarks that is 0.56 times the time of upstream's encoder at FP32 at 4K, and 1.12 and 0.82 ms at 1440p and 1080p against upstream's 1.53 and 0.93 ms. What remains is a second copy of the planes on the GPU, which an encode from pictures already in GPU memory would avoid (issue #33).
