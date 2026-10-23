@@ -8,10 +8,13 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 - A browser player ([#15](https://github.com/with-developer/emberwave/issues/15)): `crates/emberwave-web` and the page in `web/`, published to GitHub Pages, decode `.pwv1` files with WebGPU in the page and draw them on a canvas.
 - `Decoder::encode_rgb` records a decode into the caller's command encoder without waiting, and `Decoder::rgba_buffer` gives the picture; `GpuContext::from_adapter` creates a context on an adapter the caller chose. Together they let a player keep the picture on the GPU, and they are what the browser player uses.
+- A C API ([#16](https://github.com/with-developer/emberwave/issues/16)): `crates/emberwave-ffi` with the header `include/emberwave.h`, made by cbindgen. Contexts and decoders, packets pushed as they arrive, and the decoded planes or RGB written into the caller's memory; status codes with a message per thread, and panics caught at the boundary. Each release ships the header with a shared and a static library for Linux, macOS and Windows, and a C example decodes every test vector in CI on all three.
+- `Decoder::clear` and `Decoder::start_of_frame`, which the C API needed.
 
 ### Changed
 
 - `GpuContext::new`, which blocks, is not part of the WebAssembly build; use `GpuContext::new_async` or `GpuContext::from_adapter` there.
+- A `Decoder` destroys its GPU buffers when it is dropped. Native wgpu freed them then anyway; in a browser they waited for the garbage collector. A clone of the buffer from `Decoder::rgba_buffer` does not keep it alive.
 
 ## [0.2.0] - 2026-10-24
 

@@ -479,6 +479,34 @@ Nothing in a browser may block, so the player uses only the parts of the decoder
 
 The page paces frames by the stream's frame rate, keeping the remainder of each interval, so 25 frames per second play as 25 on a 60 Hz display. It shows the frames per second, the CPU time to record and submit a frame, and the time from submitting a frame until the browser reports the GPU done with it (`onSubmittedWorkDone`): decoding and drawing, plus the delay of the report, averaged over the frames reported each second. In headless Chrome 155 on an Apple M3 Max (2026-10-24) the 1080p benchmark stream took about 0.6 ms of CPU and 2.2 ms from submission to done, the 4K one about 1.2 and 3.8 ms, both playing at their 30 frames per second.
 
+## C API
+
+`crates/emberwave-ffi` is the decoder for C programs. It builds a shared library (and, for releases, a static one) with the functions of `include/emberwave.h`, which cbindgen generates from `src/lib.rs`; `tests/header.rs` fails when the committed header falls behind the source. [`crates/emberwave-ffi/README.md`](crates/emberwave-ffi/README.md) is the guide for C programmers. The objects are those of the Rust API:
+
+| C | Rust | Role |
+|---|---|---|
+| `EmberwaveContext` | `GpuContext` | A GPU device and the compiled shaders, shared by its decoders |
+| `EmberwaveDecoder` | `Decoder` | Assembles the packets of one stream and decodes its frames |
+
+A decoder holds the device it was made on, so it may outlive its context. The functions:
+
+| Function | What it does |
+|---|---|
+| `emberwave_probe_pwv1`, `emberwave_probe_packet` | Picture size, chroma format and colour signalling from a PWV1 file header or from a packet that starts with a start of frame header |
+| `emberwave_context_create`, `_destroy`, `_adapter` | Choose a GPU (backends, software only) and name it |
+| `emberwave_decoder_create`, `_destroy`, `_info` | One decoder per picture size and chroma format; the sizes of its planes |
+| `emberwave_decoder_push_packet`, `_is_ready`, `_clear` | Feed packets as they arrive; ask whether the frame, or enough of it, is there |
+| `emberwave_decoder_decode_yuv`, `_decode_rgb` | Decode and copy the planes, or RGB, into the caller's memory, row by row with the caller's strides |
+| `emberwave_version`, `emberwave_last_error` | The version, and the message of the last failure on the calling thread |
+
+Every function returns a status, or a value that cannot fail. A Rust panic is caught at the boundary and becomes `EMBERWAVE_STATUS_INTERNAL`, because unwinding into C is not allowed. Arguments are checked before the frame is used: a `NULL` pointer, a stride shorter than a row or an unknown constant is `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and the frame can still be decoded with correct ones. What the caller passes in is a plain integer, never a Rust enum, so no value from C can be an invalid one.
+
+`unsafe` code lives in this crate only. It has its own lint table instead of the workspace's `forbid`: every unsafe operation sits in an `unsafe` block of its own with a comment saying why it is sound, and every public function documents what the caller must guarantee.
+
+The C API copies the picture to the CPU, which costs more than decoding it: a 4K frame to RGB takes 7.5 ms with the copy and 1.4 ms without (`BENCHMARKS.md`). Handing the picture to the caller's graphics API on the GPU would need the Vulkan, Metal or Direct3D 12 object behind a wgpu buffer and a way for each API to import it; that is left for later.
+
+Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
+
 ## Decisions
 
 Short-form ADRs, newest last. Each entry is dated.
@@ -676,3 +704,19 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 
 **Consequence.** Any browser with WebGPU can play a stream without uploading it anywhere. `GpuContext::new` is not part of the browser build.
 
+### 2026-10-24 — D27: The C API
+
+**Context.** `CLAUDE.md` asks for a C FFI, `emberwave-ffi` with a header made by cbindgen, for Moonlight-style clients (issue #16): creating and destroying a decoder, pushing packets, asking whether a frame is ready, and getting the decoded frame as YUV planes or RGB in the caller's buffers, with documented error codes and thread rules, `unsafe` only in that crate (D5), and a C example that decodes the test vectors in CI on all three systems.
+
+**Decision.**
+- The objects follow the Rust API and upstream's own C API for Metal: a context per GPU, which compiles the shaders once, and decoders on it, one per stream. See [C API](#c-api).
+- Values that come in from C are integers with `#define`d names (chroma format, backends, colours, flags), and the status is the only enum, which only goes out. A C caller cannot hand Rust an invalid enum value.
+- Errors are a status plus a message for the calling thread (`emberwave_last_error`), the way `errno` and `dlerror` work, so that a failed `*_create`, which has no object yet, can still say why.
+- Pictures are copied into the caller's memory with the caller's strides; nothing the caller has to free comes out of the library.
+- The header is generated by cbindgen inside a test and committed, so that C programmers read it without Rust tools and CI notices when it is stale. cbindgen is a dev-dependency only (it brings `toml` and a few crates of its own); `EMBERWAVE_BLESS=1` rewrites the header.
+- The shared library carries a name that lets it move with the program: `@rpath/libemberwave_ffi.dylib` on macOS, the SONAME `libemberwave_ffi.so` on Linux (`build.rs`).
+- Everyday builds make the shared library only; releases also build the static one with `cargo rustc --crate-type staticlib` and ship the list of system libraries it needs.
+- CI builds `examples/c` with CMake against the shared library on Linux (lavapipe), macOS (Metal) and Windows (WARP), and decodes every test vector with it to at least 80 dB against upstream's FP32 decode (`scripts/check_c_example.sh`). `tests/api.rs` calls the functions through raw pointers, as C does, and compares with the Rust decoder.
+- The release workflow can be started by hand to rehearse: it then builds and packages everything, the C library included, and publishes nothing.
+
+**Consequence.** C and C++ programs can decode PyroWave on all three systems with a prebuilt library. The picture goes through the CPU; sharing it with the caller's graphics API on the GPU is a separate piece of work.
