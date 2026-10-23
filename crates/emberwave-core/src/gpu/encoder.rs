@@ -13,7 +13,7 @@
 //! last place of a coefficient, so a frame is the CPU encoder's frame or
 //! one that differs in a few of its blocks (decision D29).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES};
@@ -108,6 +108,13 @@ pub struct Encoder {
 
     /// The 8-bit planes, rows padded to whole words, as the decoder's.
     planes: wgpu::Buffer,
+    /// Where the CPU writes the planes for the GPU to copy into `planes`.
+    /// Kept from frame to frame, so that a frame's planes go into memory
+    /// that is there already; `Queue::write_buffer` allocates new memory for
+    /// every frame, and the first writes to it cost more than the copy.
+    upload: wgpu::Buffer,
+    /// Whether `upload` is mapped for writing.
+    upload_mapped: bool,
     /// [`sample_level`] of every 8-bit value, for `fdwt.wgsl`.
     sample_levels: wgpu::Buffer,
     pyramid: wgpu::Buffer,
@@ -187,6 +194,12 @@ impl Encoder {
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST;
             let planes = storage("planes", buffers.packed_words * 4, usage);
+            let upload = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("planes upload"),
+                size: (buffers.packed_words * 4).max(16),
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
             let levels: Vec<f32> = (0..=u8::MAX).map(sample_level).collect();
             let sample_levels = storage("sample levels", levels.len() as u64 * 4, usage);
             queue.write_buffer(&sample_levels, 0, bytemuck::cast_slice(&levels));
@@ -290,6 +303,8 @@ impl Encoder {
                 sequence: 0,
                 pipelines: Arc::clone(&pipelines),
                 planes,
+                upload,
+                upload_mapped: true,
                 sample_levels,
                 pyramid,
                 costs,
@@ -418,6 +433,7 @@ impl Encoder {
                     label: Some("encode"),
                 });
             encoder.clear_buffer(&self.rate_state, 0, None);
+            self.encode_upload(&mut encoder);
             self.encode_transform(&mut encoder, queries);
             self.encode_quantisation(&mut encoder, queries);
             self.encode_rate_control(&mut encoder, queries);
@@ -539,20 +555,44 @@ impl Encoder {
         Ok(())
     }
 
-    /// Writes the planes into the planes buffer, rows padded to whole words,
+    /// Maps the upload buffer for writing, unless it is. The GPU is done with
+    /// it: every encode waits for its frame.
+    fn map_upload(&mut self) -> Result<(), GpuError> {
+        if self.upload_mapped {
+            return Ok(());
+        }
+        let (sender, receiver) = mpsc::channel();
+        with_error_scope(&self.device, || {
+            self.upload
+                .slice(..)
+                .map_async(wgpu::MapMode::Write, move |result| {
+                    // The receiver is only gone if this function returned.
+                    let _ = sender.send(result);
+                });
+        })?;
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| GpuError::Readback(error.to_string()))?;
+        receiver
+            .recv()
+            .map_err(|error| GpuError::Readback(error.to_string()))?
+            .map_err(|error| GpuError::Readback(error.to_string()))?;
+        self.upload_mapped = true;
+        Ok(())
+    }
+
+    /// Writes the planes into the upload buffer, rows padded to whole words,
     /// or returns an error if they do not have the sizes of the pictures.
-    /// They go straight into wgpu's staging memory: one copy, not two.
+    /// [`encode_upload`](Self::encode_upload) records the copy to the GPU.
     fn upload_planes(&mut self, planes: [&[u8]; 3]) -> Result<(), GpuError> {
         check_planes(&self.layout, planes)?;
-        // Never zero: a picture has a sample at least.
-        let Some(size) = wgpu::BufferSize::new(self.buffers.packed_words * 4) else {
-            return Ok(());
-        };
-        with_error_scope(&self.device, || {
-            // None only with a validation error, which the scope reports.
-            let Some(mut view) = self.queue.write_buffer_with(&self.planes, 0, size) else {
-                return;
-            };
+        self.map_upload()?;
+        let mut view = self
+            .upload
+            .slice(..)
+            .get_mapped_range_mut()
+            .map_err(|error| GpuError::Device(error.to_string()))?;
+        {
             for (component, plane) in Component::ALL.into_iter().zip(planes) {
                 let i = component.index();
                 let width = self.layout.plane_size(component).0 as usize;
@@ -569,7 +609,22 @@ impl Encoder {
                     view.slice(at + width..at + stride).fill(0);
                 }
             }
-        })
+        }
+        drop(view);
+        with_error_scope(&self.device, || self.upload.unmap())?;
+        self.upload_mapped = false;
+        Ok(())
+    }
+
+    /// Records the copy of the uploaded planes into the planes buffer.
+    fn encode_upload(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_buffer_to_buffer(
+            &self.upload,
+            0,
+            &self.planes,
+            0,
+            self.buffers.packed_words * 4,
+        );
     }
 
     /// Records the forward transform of the uploaded planes; with `queries`,
@@ -770,6 +825,7 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         for buffer in [
             &self.planes,
+            &self.upload,
             &self.sample_levels,
             &self.pyramid,
             &self.costs,

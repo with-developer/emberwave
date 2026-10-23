@@ -97,6 +97,7 @@ impl Encoder {
     fn run_stages(&self, transform: bool) {
         self.run(|this, encoder| {
             if transform {
+                this.encode_upload(encoder);
                 this.encode_transform(encoder, None);
             }
             this.encode_quantisation(encoder, None);
