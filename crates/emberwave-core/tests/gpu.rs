@@ -1,0 +1,466 @@
+//! Tests of the GPU decoder against the CPU oracle and the original decoder.
+//!
+//! They need a GPU or a software Vulkan driver (lavapipe). Without one they
+//! skip, unless `EMBERWAVE_REQUIRE_GPU` is set, which turns a missing adapter
+//! into a failure; CI sets it on the job that installs lavapipe.
+
+#![cfg(feature = "gpu")]
+
+mod common;
+
+use std::sync::OnceLock;
+
+use common::{Reference, max_abs_diff, psnr, read_reference, vector_frames, vector_names};
+use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
+use emberwave_core::bitstream::{Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout};
+use emberwave_core::cpu;
+use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuOptions};
+
+/// Whether a missing GPU is a failure rather than a reason to skip. An empty
+/// value counts as unset so a CI matrix can leave it blank.
+fn gpu_required() -> bool {
+    std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_some_and(|value| !value.is_empty())
+}
+
+/// Creates a context, or returns `None` if there is no GPU and none is required.
+fn create_context(options: &GpuOptions) -> Option<GpuContext> {
+    match GpuContext::new(options) {
+        Ok(context) => {
+            eprintln!("GPU tests run on {:?}", context.adapter_info());
+            Some(context)
+        }
+        Err(error) => {
+            assert!(
+                !gpu_required(),
+                "a GPU is required but none is available: {error}"
+            );
+            eprintln!("no GPU available, skipping: {error}");
+            None
+        }
+    }
+}
+
+/// The GPU context shared by the tests of this file, or `None` if there is no
+/// GPU and none is required.
+fn context() -> Option<&'static GpuContext> {
+    static CONTEXT: OnceLock<Option<GpuContext>> = OnceLock::new();
+    CONTEXT
+        .get_or_init(|| create_context(&GpuOptions::default()))
+        .as_ref()
+}
+
+/// Skips the current test when there is no GPU.
+macro_rules! gpu_or_return {
+    () => {
+        match context() {
+            Some(context) => context,
+            None => return,
+        }
+    };
+}
+
+fn assembled(layout: &FrameLayout, frame: &[u8]) -> FrameAssembler {
+    let mut assembler = FrameAssembler::new(layout.clone());
+    assembler.push_packet(frame).expect("packet parses");
+    assembler
+}
+
+fn decoder_for(context: &GpuContext, layout: &FrameLayout) -> Decoder {
+    Decoder::new(context, layout.width(), layout.height(), layout.chroma()).expect("decoder")
+}
+
+/// Compares the planes of a GPU frame with a reference frame, plane by plane.
+fn assert_matches_reference(
+    name: &str,
+    index: usize,
+    frame: &Frame,
+    reference: &[Vec<u8>; 3],
+    which: Reference,
+    worst: &mut f64,
+) {
+    for (plane_index, (plane, expected)) in frame.planes.iter().zip(reference).enumerate() {
+        let db = psnr(expected, &plane.data);
+        println!(
+            "{which:?} {name:28} frame {index} plane {plane_index}: PSNR {db:8.2} dB, max |diff| {}",
+            max_abs_diff(expected, &plane.data)
+        );
+        *worst = worst.min(db);
+    }
+}
+
+#[test]
+fn dequantised_coefficients_are_bit_identical_to_the_cpu() {
+    let context = gpu_or_return!();
+    let mut compared = 0usize;
+
+    for name in vector_names() {
+        let (layout, frames) = vector_frames(&name);
+        let mut decoder = decoder_for(context, &layout);
+
+        for (index, frame) in frames.iter().enumerate() {
+            decoder.decode(frame).expect("GPU decode");
+            let assembler = assembled(&layout, frame);
+            let bands = cpu::dequant::dequantize(&assembler.frame()).expect("CPU dequantisation");
+
+            for (component, level, band, info) in layout.bands() {
+                let expected = bands.plane(component, level, band).expect("CPU band");
+                let actual = decoder
+                    .read_band(component, level, band)
+                    .expect("read back")
+                    .expect("GPU band");
+                assert_eq!(actual.len(), (info.width * info.height) as usize);
+
+                for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "{name} frame {index} {component:?} level {level} {band:?} sample {i}: {a} vs {e}"
+                    );
+                }
+                compared += actual.len();
+            }
+        }
+    }
+    assert!(compared > 10_000, "only {compared} coefficients compared");
+}
+
+#[test]
+fn inverse_transform_matches_the_cpu_level_by_level() {
+    let context = gpu_or_return!();
+    // The GPU and the CPU evaluate the same expressions, but the GPU compiler
+    // is free to fuse a multiply and an add, which moves a result by one unit
+    // in the last place. Five levels of lifting stay far below this.
+    const TOLERANCE: f32 = 1e-5;
+    let mut worst = 0.0f32;
+
+    for name in vector_names() {
+        let (layout, frames) = vector_frames(&name);
+        let mut decoder = decoder_for(context, &layout);
+
+        for (index, frame) in frames.iter().enumerate() {
+            decoder.decode(frame).expect("GPU decode");
+            let assembler = assembled(&layout, frame);
+            let (_, ll) = cpu::decode_frame_with_ll(&assembler.frame()).expect("CPU decode");
+
+            for component in Component::ALL {
+                // Level 4 comes straight from the bitstream; the others are
+                // produced by the inverse transform of the level above.
+                for level in (layout.finest_level(component)..DECOMPOSITION_LEVELS).rev() {
+                    let expected = ll.get(component, level).expect("CPU LL band");
+                    let actual = decoder
+                        .read_band(component, level, Band::Ll)
+                        .expect("read back")
+                        .expect("GPU LL band");
+                    assert_eq!(actual.len(), expected.len());
+
+                    let diff = actual
+                        .iter()
+                        .zip(expected)
+                        .map(|(a, e)| (a - e).abs())
+                        .fold(0.0f32, f32::max);
+                    worst = worst.max(diff);
+                    assert!(
+                        diff <= TOLERANCE,
+                        "{name} frame {index} {component:?} level {level}: max difference {diff}"
+                    );
+                }
+            }
+        }
+    }
+    println!("largest difference to the CPU in any LL band: {worst:e}");
+}
+
+#[test]
+fn gpu_decode_matches_the_reference_decoder() {
+    let context = gpu_or_return!();
+
+    for which in Reference::ALL {
+        let mut worst = f64::INFINITY;
+        for name in vector_names() {
+            let reference = read_reference(&name, which);
+            let (layout, frames) = vector_frames(&name);
+            let mut decoder = decoder_for(context, &layout);
+
+            for (index, frame) in frames.iter().enumerate() {
+                let decoded = decoder.decode(frame).expect("GPU decode");
+                assert_eq!(decoded.chroma, layout.chroma());
+                assert_matches_reference(
+                    &name,
+                    index,
+                    &decoded,
+                    &reference.frames[index],
+                    which,
+                    &mut worst,
+                );
+            }
+        }
+        println!(
+            "{which:?}: worst PSNR {worst:.2} dB (needs {})",
+            which.min_psnr()
+        );
+        assert!(
+            worst >= which.min_psnr(),
+            "GPU decode disagrees with the {which:?} reference: {worst:.2} dB"
+        );
+    }
+}
+
+#[test]
+fn a_decoder_can_be_reused_and_gives_the_same_frame_every_time() {
+    let context = gpu_or_return!();
+
+    // Frames of different content through one decoder, then the first again:
+    // nothing may be left over from an earlier frame.
+    let (layout, frames) = vector_frames("noise_192x136_420");
+    let mut decoder = decoder_for(context, &layout);
+    let first = decoder.decode(&frames[0]).unwrap();
+    for frame in &frames[1..] {
+        decoder.decode(frame).unwrap();
+    }
+    assert_eq!(decoder.decode(&frames[0]).unwrap(), first);
+    assert_eq!(decoder.decode(&frames[0]).unwrap(), first);
+}
+
+#[test]
+fn an_empty_frame_decodes_to_mid_grey() {
+    let context = gpu_or_return!();
+    let layout = FrameLayout::new(160, 96, ChromaSubsampling::Yuv420).unwrap();
+    let mut decoder = decoder_for(context, &layout);
+
+    // Only a start of frame header announcing no blocks. Every coefficient is
+    // zero, so every sample is exactly 0.5, which is 127.5 in 8 bits: a tie,
+    // and ties go to the even neighbour.
+    let word0 = 159u32 | (95 << 14) | (1 << 28) | (1 << 31);
+    let header = [word0.to_le_bytes(), 0u32.to_le_bytes()].concat();
+    let frame = decoder.decode(&header).unwrap();
+
+    assert_eq!(frame.planes[0].data.len(), 160 * 96);
+    assert_eq!(frame.planes[1].data.len(), 80 * 48);
+    for plane in &frame.planes {
+        assert!(plane.data.iter().all(|&v| v == 128), "mid grey expected");
+    }
+
+    let assembler = assembled(&layout, &header);
+    let cpu_frame = cpu::decode_frame(&assembler.frame()).unwrap();
+    assert_eq!(cpu_frame.planes[0].to_unorm8(), frame.planes[0].data);
+}
+
+#[test]
+fn an_incomplete_frame_is_an_error_until_it_is_allowed_to_be_partial() {
+    let context = gpu_or_return!();
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(context, &layout);
+
+    // Cut the frame short: some blocks are missing.
+    let cut = &frames[0][..frames[0].len() / 2];
+    // The cut lands inside a block, so drop the partial one by parsing block
+    // headers until the cut.
+    let mut end = 8; // start of frame header
+    while end + 8 <= cut.len() {
+        let words = usize::from(u16::from_le_bytes([cut[end + 2], cut[end + 3]]) & 0xfff);
+        if end + words * 4 > cut.len() {
+            break;
+        }
+        end += words * 4;
+    }
+
+    let error = decoder.decode(&cut[..end]).unwrap_err();
+    assert!(
+        matches!(error, emberwave_core::gpu::GpuError::IncompleteFrame { .. }),
+        "{error}"
+    );
+
+    // As a partial frame it decodes, with the missing blocks as zeros.
+    decoder.push_packet(&cut[..end]).unwrap();
+    assert!(!decoder.is_ready(false));
+    let frame = decoder.decode_assembled().unwrap();
+    assert_eq!(frame.planes[0].data.len(), 200 * 120);
+}
+
+#[test]
+fn a_device_limited_to_webgpu_guarantees_decodes_the_same() {
+    // The portable subset: default limits and no optional features. If the
+    // shaders needed anything beyond it, creating the pipelines or running
+    // them would fail here.
+    let options = GpuOptions {
+        strict_webgpu: true,
+        ..GpuOptions::default()
+    };
+    let Some(context) = create_context(&options) else {
+        return;
+    };
+
+    let (layout, frames) = vector_frames("noise_131x67_444");
+    let reference = read_reference("noise_131x67_444", Reference::Fp32);
+    let mut decoder = decoder_for(&context, &layout);
+    let mut worst = f64::INFINITY;
+    for (index, frame) in frames.iter().enumerate() {
+        let decoded = decoder.decode(frame).unwrap();
+        assert_matches_reference(
+            "noise_131x67_444",
+            index,
+            &decoded,
+            &reference.frames[index],
+            Reference::Fp32,
+            &mut worst,
+        );
+    }
+    assert!(worst >= Reference::Fp32.min_psnr(), "{worst:.2} dB");
+}
+
+/// A small xorshift generator, so synthetic frames are reproducible.
+struct Rng(u32);
+
+impl Rng {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0
+    }
+}
+
+/// A valid block with random content: random ballot, tables, bit-planes and
+/// signs. Not something an encoder would write, but structurally sound, so
+/// the CPU and GPU decoders have to agree on it.
+fn synthetic_block(rng: &mut Rng, block_index: u32, quant_code: u8, sequence: u8) -> Vec<u8> {
+    let ballot: u16 = match rng.next() % 8 {
+        0 => 0,
+        1 => 0xFFFF,
+        _ => rng.next() as u16,
+    };
+    let active = ballot.count_ones() as usize;
+
+    let mut controls = Vec::new();
+    let mut qscales = Vec::new();
+    let mut planes = Vec::new();
+    for _ in 0..active {
+        let base_planes = (rng.next() % 6) as u8;
+        // Some blocks have an all-zero control word, which decodes to nothing.
+        let control: u16 = if rng.next().is_multiple_of(6) {
+            0
+        } else {
+            rng.next() as u16
+        };
+        let scale_code = (rng.next() % 16) as u8;
+        controls.extend_from_slice(&control.to_le_bytes());
+        qscales.push((scale_code << 4) | base_planes);
+
+        let extra: usize = (0..8).map(|s| usize::from((control >> (2 * s)) & 3)).sum();
+        for _ in 0..extra + 8 * usize::from(base_planes) {
+            // Plenty of zero bytes keep the coefficients sparse.
+            planes.push(if rng.next().is_multiple_of(3) {
+                0
+            } else {
+                rng.next() as u8
+            });
+        }
+    }
+
+    // More sign bytes than any block can use: the decoders only read what the
+    // magnitudes call for.
+    let signs: Vec<u8> = (0..active * 8).map(|_| rng.next() as u8).collect();
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&controls);
+    body.extend_from_slice(&qscales);
+    body.extend_from_slice(&planes);
+    body.extend_from_slice(&signs);
+    while (8 + body.len()) % 4 != 0 {
+        body.push(0);
+    }
+
+    let words = (8 + body.len()) / 4;
+    assert!(words < 4096, "block does not fit the 12-bit size field");
+    let word0 = u32::from(ballot) | ((words as u32) << 16) | (u32::from(sequence) << 28);
+    let word1 = u32::from(quant_code) | (block_index << 8);
+    [word0.to_le_bytes().as_slice(), &word1.to_le_bytes(), &body].concat()
+}
+
+/// A whole synthetic frame: every block index gets a block (some are left out),
+/// and the quantiser code cycles through all 256 values.
+fn synthetic_frame(layout: &FrameLayout, seed: u32) -> Vec<u8> {
+    let mut rng = Rng(seed);
+    let mut blocks = Vec::new();
+    let mut included = 0u32;
+    for block_index in 0..layout.block_count() {
+        if rng.next().is_multiple_of(10) {
+            continue; // missing block
+        }
+        let quant_code = (block_index % 256) as u8;
+        blocks.extend(synthetic_block(&mut rng, block_index, quant_code, 1));
+        included += 1;
+    }
+
+    let word0 = (layout.width() - 1) | ((layout.height() - 1) << 14) | (1 << 28) | (1 << 31);
+    let chroma_bit = u32::from(layout.chroma() == ChromaSubsampling::Yuv444) << 26;
+    let word1 = included | chroma_bit;
+    [
+        word0.to_le_bytes().as_slice(),
+        &word1.to_le_bytes(),
+        &blocks,
+    ]
+    .concat()
+}
+
+#[test]
+fn synthetic_frames_dequantise_identically_on_gpu_and_cpu() {
+    let context = gpu_or_return!();
+
+    // 512x288 has 285 blocks, so every quantiser code from 0 to 255 occurs.
+    for (width, height, chroma, seed) in [
+        (512, 288, ChromaSubsampling::Yuv420, 0x1234_5678),
+        (512, 288, ChromaSubsampling::Yuv420, 0x9E37_79B9),
+        (130, 66, ChromaSubsampling::Yuv444, 0x0BAD_CAFE),
+    ] {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let frame = synthetic_frame(&layout, seed);
+        let mut decoder = decoder_for(context, &layout);
+        decoder.decode(&frame).expect("GPU decode");
+
+        let assembler = assembled(&layout, &frame);
+        let bands = cpu::dequant::dequantize(&assembler.frame()).expect("CPU dequantisation");
+        let mut nonzero = 0usize;
+        for (component, level, band, _) in layout.bands() {
+            let expected = bands.plane(component, level, band).unwrap();
+            let actual = decoder.read_band(component, level, band).unwrap().unwrap();
+            for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    e.to_bits(),
+                    "{width}x{height} seed {seed:#x} {component:?} level {level} {band:?} sample {i}"
+                );
+                nonzero += usize::from(*e != 0.0);
+            }
+        }
+        assert!(
+            nonzero > 1000,
+            "the synthetic frame is too empty ({nonzero})"
+        );
+    }
+}
+
+#[test]
+fn a_large_payload_grows_the_buffer_and_still_decodes() {
+    let context = gpu_or_return!();
+    let layout = FrameLayout::new(512, 288, ChromaSubsampling::Yuv420).unwrap();
+    let frame = synthetic_frame(&layout, 0x5EED_0001);
+    assert!(
+        frame.len() > 64 * 1024,
+        "needs more than the initial buffer: {}",
+        frame.len()
+    );
+
+    let mut decoder = decoder_for(context, &layout);
+    // An empty frame first, then the large one, then the empty one again: the
+    // payload buffer grows for the second and nothing may linger afterwards.
+    // Correctness of the large frame itself is covered by the bit-exact
+    // comparison of synthetic frames above, which are this large too.
+    let word0 = 511u32 | (287 << 14) | (1 << 28) | (1 << 31);
+    let empty = [word0.to_le_bytes(), 0u32.to_le_bytes()].concat();
+    let first = decoder.decode(&empty).unwrap();
+    let large = decoder.decode(&frame).unwrap();
+    assert_ne!(first, large);
+    assert_eq!(decoder.decode(&empty).unwrap(), first);
+    assert_eq!(decoder.decode(&frame).unwrap(), large);
+}

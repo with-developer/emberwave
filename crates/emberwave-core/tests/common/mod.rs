@@ -37,6 +37,22 @@ pub fn read_vector(name: &str) -> Vec<u8> {
     std::fs::read(testdata_dir().join(format!("{name}.pwv1"))).expect("vector file")
 }
 
+/// The layout of a vector and the bytes of each of its frames.
+pub fn vector_frames(name: &str) -> (emberwave_core::bitstream::FrameLayout, Vec<Vec<u8>>) {
+    use emberwave_core::bitstream::{FrameLayout, Pwv1File};
+
+    let bytes = read_vector(name);
+    let file = Pwv1File::parse(&bytes).expect("PWV1 header");
+    let stream = file.header().stream;
+    let layout = FrameLayout::new(stream.width, stream.height, stream.chroma).expect("layout");
+    let frames: Vec<Vec<u8>> = file
+        .frames()
+        .map(|frame| frame.expect("frame data").to_vec())
+        .collect();
+    assert!(!frames.is_empty(), "{name} has no frames");
+    (layout, frames)
+}
+
 /// A decoded Y4M file with 8-bit planar frames.
 pub struct Y4m {
     pub width: usize,
