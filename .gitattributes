@@ -1,0 +1,5 @@
+# Test vectors are binary. A constant-colour Y4M has no NUL bytes, so git's
+# heuristic would call it text and a Windows checkout with core.autocrlf would
+# rewrite its line endings and corrupt it.
+*.pwv1 binary
+*.y4m binary

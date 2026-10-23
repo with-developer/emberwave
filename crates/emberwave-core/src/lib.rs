@@ -1,8 +1,14 @@
 //! Core library of emberwave, a portable (wgpu) port of the PyroWave
 //! low-latency intra-frame wavelet video codec.
 //!
-//! The crate will hold the bitstream parser (pure Rust, GPU independent) and
-//! the wgpu/WGSL decode pipeline. See `ARCHITECTURE.md` for the plan.
+//! - [`bitstream`]: the PyroWave v1 bitstream (pure Rust, GPU independent).
+//! - [`cpu`]: a slow reference decoder used as a test oracle.
+//!
+//! The wgpu/WGSL decode pipeline arrives in milestone M2. See
+//! `ARCHITECTURE.md` for the plan.
+
+pub mod bitstream;
+pub mod cpu;
 
 /// Version of the `emberwave-core` crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
