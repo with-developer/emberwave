@@ -14,6 +14,7 @@
 //! one that differs in a few of its blocks (decision D29).
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES};
 use crate::bitstream::{ChromaSubsampling, Component, FrameLayout, SequenceHeader};
@@ -29,13 +30,59 @@ use super::layout::{
     RATE_STATE_BYTES, RateSummary, ScanParams, TransformLevel, rate_grid,
 };
 use super::pipelines::{EncoderPipelines, with_error_scope};
-use super::resources::{buffer, buffer_limit, check_size, entry, read_back, uniform_buffer};
+use super::resources::{
+    StageQueries, buffer, buffer_limit, check_size, entry, read_back, uniform_buffer,
+};
 
 /// A dispatch of the forward transform for one decomposition level.
 struct FdwtStage {
     bind_group: wgpu::BindGroup,
     grid: (u32, u32, u32),
 }
+
+/// GPU time of each stage of an encode, measured with timestamp queries at
+/// the boundaries of its compute passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeStageTimings {
+    /// The forward transform, all levels.
+    pub transform: Duration,
+    /// Quantisation and the cost tables.
+    pub quantisation: Duration,
+    /// The rate control, its prefix sums included.
+    pub rate_control: Duration,
+    /// The packing of the blocks.
+    pub packing: Duration,
+}
+
+impl EncodeStageTimings {
+    /// The sum of the stages.
+    pub fn total(&self) -> Duration {
+        self.transform + self.quantisation + self.rate_control + self.packing
+    }
+}
+
+/// Where the time of one encode went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeTimings {
+    /// CPU time to check the planes and put them where wgpu uploads them
+    /// from, and to prepare the GPU work.
+    pub prepare: Duration,
+    /// Wall-clock time from submitting the GPU work until the frame was back
+    /// in CPU memory: the upload, the stages and the read-back.
+    pub gpu_wall: Duration,
+    /// GPU time per stage, if the context was created with
+    /// [`GpuOptions::timestamps`](super::GpuOptions::timestamps) and the
+    /// device supports them.
+    pub stages: Option<EncodeStageTimings>,
+}
+
+/// The stages that are timed, in order: transform, quantisation, rate
+/// control and packing.
+const TIMED_STAGES: u32 = 4;
+const TRANSFORM: u32 = 0;
+const QUANTISATION: u32 = 1;
+const RATE_CONTROL: u32 = 2;
+const PACKING: u32 = 3;
 
 /// The payload buffer never holds fewer words than this.
 const MIN_PAYLOAD_WORDS: u64 = 16 * 1024;
@@ -97,6 +144,8 @@ pub struct Encoder {
     scan_words: wgpu::BindGroup,
     scan_params: ScanParams,
     pack_bind_group: wgpu::BindGroup,
+
+    timestamps: Option<StageQueries>,
 
     /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
     lost: Arc<Mutex<Option<String>>>,
@@ -264,6 +313,9 @@ impl Encoder {
                 scan_words,
                 scan_params,
                 pack_bind_group,
+                timestamps: context
+                    .supports_timestamps()
+                    .then(|| StageQueries::new(&device, &queue, TIMED_STAGES)),
                 lost: context.lost_record(),
             }
         })
@@ -295,17 +347,45 @@ impl Encoder {
     /// the budget is [`GpuError::Encode`]. It waits for the GPU, so it cannot
     /// run in a browser, where nothing may block.
     pub fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(planes, budget, false)
+            .map(|(frame, _)| frame)
+    }
+
+    /// Encodes like [`encode`](Self::encode) and says where the time went,
+    /// for benchmarks. The per-stage times are `Some` only if the context was
+    /// created with [`GpuOptions::timestamps`](super::GpuOptions::timestamps)
+    /// and the device supports them.
+    pub fn encode_timed(
+        &mut self,
+        planes: [&[u8]; 3],
+        budget: usize,
+    ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
+        self.run_encode(planes, budget, true)
+    }
+
+    fn run_encode(
+        &mut self,
+        planes: [&[u8]; 3],
+        budget: usize,
+        timed: bool,
+    ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
         self.check_device()?;
-        let outcome = self.encode_on_device(planes, budget);
+        let outcome = self.encode_on_device(planes, budget, timed);
         // As in the decoder: a failure on a device that was lost meanwhile
         // is the loss, and whatever came back is not to be trusted.
         self.check_device()?;
         outcome
     }
 
-    /// The work of [`encode`](Self::encode), without the checks for a lost
-    /// device.
-    fn encode_on_device(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, GpuError> {
+    /// The work of [`run_encode`](Self::run_encode), without the checks for
+    /// a lost device.
+    fn encode_on_device(
+        &mut self,
+        planes: [&[u8]; 3],
+        budget: usize,
+        timed: bool,
+    ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
+        let prepare_start = Instant::now();
         self.upload_planes(planes)?;
         // No frame takes more than every block at its largest, which fits
         // 32 bits; neither need the budget.
@@ -326,17 +406,26 @@ impl Encoder {
         with_error_scope(&self.device, || {
             self.queue
                 .write_buffer(&self.frame_params, 0, bytemuck::bytes_of(&params));
+        })?;
+        let prepare = prepare_start.elapsed();
+
+        let queries = self.timestamps.as_ref().filter(|_| timed);
+        let gpu_start = Instant::now();
+        with_error_scope(&self.device, || {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("encode"),
                 });
             encoder.clear_buffer(&self.rate_state, 0, None);
-            self.encode_transform(&mut encoder);
-            self.encode_quantisation(&mut encoder);
-            self.encode_rate_control(&mut encoder);
-            self.encode_packing(&mut encoder);
+            self.encode_transform(&mut encoder, queries);
+            self.encode_quantisation(&mut encoder, queries);
+            self.encode_rate_control(&mut encoder, queries);
+            self.encode_packing(&mut encoder, queries);
             self.encode_read_back(&mut encoder, capacity_words);
+            if let Some(q) = queries {
+                q.encode_resolve(&mut encoder);
+            }
             self.queue.submit([encoder.finish()]);
         })?;
         let data = read_back(
@@ -344,6 +433,18 @@ impl Encoder {
             &self.readback,
             SUMMARY_BYTES + capacity_words * 4,
         )?;
+        let gpu_wall = gpu_start.elapsed();
+        let stages = match queries {
+            Some(q) => q.read(&self.device)?.and_then(|stages| {
+                Some(EncodeStageTimings {
+                    transform: stages[TRANSFORM as usize]?,
+                    quantisation: stages[QUANTISATION as usize]?,
+                    rate_control: stages[RATE_CONTROL as usize]?,
+                    packing: stages[PACKING as usize]?,
+                })
+            }),
+            None => None,
+        };
 
         let summary: RateSummary =
             bytemuck::pod_read_unaligned(&data[..std::mem::size_of::<RateSummary>()]);
@@ -383,7 +484,14 @@ impl Encoder {
         frame.extend_from_slice(&start_of_frame(&self.stream(), sequence, summary.sent));
         frame.extend_from_slice(payload);
         debug_assert!(frame.len() <= budget);
-        Ok(frame)
+        Ok((
+            frame,
+            EncodeTimings {
+                prepare,
+                gpu_wall,
+                stages,
+            },
+        ))
     }
 
     /// An error if the device has been lost, so that nothing is encoded on it
@@ -467,11 +575,12 @@ impl Encoder {
         })
     }
 
-    /// Records the forward transform of the uploaded planes.
-    fn encode_transform(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// Records the forward transform of the uploaded planes; with `queries`,
+    /// timed.
+    fn encode_transform(&self, encoder: &mut wgpu::CommandEncoder, queries: Option<&StageQueries>) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("fdwt"),
-            timestamp_writes: None,
+            timestamp_writes: queries.map(|q| q.writes(Some(TRANSFORM), Some(TRANSFORM))),
         });
         pass.set_pipeline(&self.pipelines.fdwt.pipeline);
         for stage in &self.fdwt_stages {
@@ -482,10 +591,14 @@ impl Encoder {
 
     /// Records the quantisation of the coefficients in the pyramid, which
     /// fills the cost tables.
-    fn encode_quantisation(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn encode_quantisation(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queries: Option<&StageQueries>,
+    ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("equant"),
-            timestamp_writes: None,
+            timestamp_writes: queries.map(|q| q.writes(Some(QUANTISATION), Some(QUANTISATION))),
         });
         pass.set_pipeline(&self.pipelines.equant.pipeline);
         pass.set_bind_group(0, &self.quant_bind_group, &[]);
@@ -494,13 +607,18 @@ impl Encoder {
 
     /// Records the rate control, which needs its state cleared: the drops
     /// and, in `block_words`, where each block goes in the payload.
-    fn encode_rate_control(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn encode_rate_control(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queries: Option<&StageQueries>,
+    ) {
         let rate = &self.pipelines.rate;
         let (x, y) = self.rate_grid;
         {
+            // The stage begins with this pass and ends with the last scan.
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("rate"),
-                timestamp_writes: None,
+                timestamp_writes: queries.map(|q| q.writes(Some(RATE_CONTROL), None)),
             });
             pass.set_bind_group(0, &self.rate_bind_group, &[]);
             pass.set_pipeline(&rate.analyse.pipeline);
@@ -510,7 +628,7 @@ impl Encoder {
             pass.set_pipeline(&rate.ties.pipeline);
             pass.dispatch_workgroups(x, y, 1);
         }
-        self.encode_scan(encoder, &self.scan_ties);
+        self.encode_scan(encoder, &self.scan_ties, None);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("rate"),
@@ -520,16 +638,25 @@ impl Encoder {
             pass.set_pipeline(&rate.choose.pipeline);
             pass.dispatch_workgroups(x, y, 1);
         }
-        self.encode_scan(encoder, &self.scan_words);
+        self.encode_scan(
+            encoder,
+            &self.scan_words,
+            queries.map(|q| q.writes(None, Some(RATE_CONTROL))),
+        );
     }
 
     /// Records the exclusive prefix sum of the values `bind_group` binds.
-    fn encode_scan(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup) {
+    fn encode_scan(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
         let scan = &self.pipelines.scan;
         let (x, y) = self.scan_params.grid();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("scan"),
-            timestamp_writes: None,
+            timestamp_writes,
         });
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_pipeline(&scan.chunks.pipeline);
@@ -541,10 +668,10 @@ impl Encoder {
     }
 
     /// Records the packing of the blocks into the payload.
-    fn encode_packing(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn encode_packing(&self, encoder: &mut wgpu::CommandEncoder, queries: Option<&StageQueries>) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("pack"),
-            timestamp_writes: None,
+            timestamp_writes: queries.map(|q| q.writes(Some(PACKING), Some(PACKING))),
         });
         pass.set_pipeline(&self.pipelines.pack.pipeline);
         pass.set_bind_group(0, &self.pack_bind_group, &[]);
