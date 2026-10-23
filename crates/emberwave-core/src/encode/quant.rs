@@ -262,16 +262,24 @@ pub(crate) fn analyse_block8(
         }
 
         let drop_scale = exact_pow2(i32::from(drop)) * step;
+        // Each 4x2 subblock's values in order, then the subblocks in order:
+        // the grouping in which the GPU's invocations add them up.
         let error: f32 = magnitudes
-            .iter()
-            .zip(&scaled)
-            .map(|(&m, &t)| {
-                let reconstructed = match kept(m) {
-                    0 => 0.0,
-                    k => (k as f32 + DEADZONE_OFFSET) * drop_scale,
-                };
-                let difference = t * to_coefficient - reconstructed;
-                difference * difference
+            .chunks_exact(VALUES_PER_SUBBLOCK)
+            .zip(scaled.chunks_exact(VALUES_PER_SUBBLOCK))
+            .map(|(magnitudes, scaled)| {
+                magnitudes
+                    .iter()
+                    .zip(scaled)
+                    .map(|(&m, &t)| {
+                        let reconstructed = match kept(m) {
+                            0 => 0.0,
+                            k => (k as f32 + DEADZONE_OFFSET) * drop_scale,
+                        };
+                        let difference = t * to_coefficient - reconstructed;
+                        difference * difference
+                    })
+                    .sum::<f32>()
             })
             .sum();
         distortion[usize::from(drop)] = quant.weight * error;
@@ -297,9 +305,15 @@ mod tests {
     use super::*;
     use crate::cpu::dequant;
 
-    /// The weighted squared error of an 8x8 block that is not coded at all.
+    /// The weighted squared error of an 8x8 block that is not coded at all,
+    /// added up as the encoder adds: each subblock's values, then the
+    /// subblocks.
     fn uncoded_distortion(coefficients: &[f32; BLOCK8_VALUES], weight: f32) -> f32 {
-        weight * coefficients.iter().map(|c| c * c).sum::<f32>()
+        weight
+            * coefficients
+                .chunks_exact(VALUES_PER_SUBBLOCK)
+                .map(|values| values.iter().map(|c| c * c).sum::<f32>())
+                .sum::<f32>()
     }
 
     fn quant() -> BandQuant {

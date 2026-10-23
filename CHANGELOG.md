@@ -6,7 +6,11 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Added
 
-- Encoder benchmarks ([#29](https://github.com/with-developer/emberwave/issues/29)): `emberwave-cli bench-encode` times an encoder on the frames of a Y4M video, in the way `bench` times the decoder, and `Encoder::encode_timed` returns `EncodeTimings` with the GPU time of each stage. `refgen bench-encode` times upstream's encoder the same way, at both of its precisions, and `scripts/bench.sh` puts them in `BENCHMARKS.md`, with the pictures from `scripts/gen_bench_data.sh --sources`. On an Apple M3 Max a 4K frame encodes in 3.64 ms, against 3.22 ms for upstream's encoder at FP32.
+- Encoder benchmarks ([#29](https://github.com/with-developer/emberwave/issues/29)): `emberwave-cli bench-encode` times an encoder on the frames of a Y4M video, in the way `bench` times the decoder, and `Encoder::encode_timed` returns `EncodeTimings` with the GPU time of each stage. `refgen bench-encode` times upstream's encoder the same way, at both of its precisions, and `scripts/bench.sh` puts them in `BENCHMARKS.md`, with the pictures from `scripts/gen_bench_data.sh --sources`.
+
+### Changed
+
+- The GPU encoder is faster (decision D30): on an Apple M3 Max a 4K frame encodes in about 1.9 ms instead of about 3.5 ms, against 3.4 ms for upstream's encoder at the same precision. The planes go through an upload buffer the encoder keeps from frame to frame, 12 MB of GPU memory at 4K that the old path allocated anew for every frame, and the quantisation adds each subblock's errors in registers. The CPU encoder adds its errors in the same grouping; its streams are the same as before.
 
 ### Fixed
 
