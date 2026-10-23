@@ -23,6 +23,10 @@ pub struct GpuOptions {
     /// default limits and no optional features. Used by tests to show that the
     /// shaders are portable.
     pub strict_webgpu: bool,
+    /// Ask for GPU timestamp queries if the adapter has them, so that
+    /// [`Decoder::time_frame`](super::Decoder::time_frame) can report the time
+    /// of each stage. Ignored with `strict_webgpu`.
+    pub timestamps: bool,
 }
 
 impl GpuOptions {
@@ -33,6 +37,7 @@ impl GpuOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             strict_webgpu: false,
+            timestamps: false,
         }
     }
 
@@ -85,6 +90,7 @@ pub struct GpuContext {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    timestamps: bool,
     /// Built on first use, shared by every clone of the context.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
 }
@@ -122,10 +128,19 @@ impl GpuContext {
             limits.max_buffer_size = supported.max_buffer_size;
         }
 
+        let timestamps = options.timestamps
+            && !options.strict_webgpu
+            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = if timestamps {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("emberwave"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: limits,
                 ..Default::default()
             })
@@ -135,6 +150,7 @@ impl GpuContext {
             adapter,
             device,
             queue,
+            timestamps,
             pipelines: Arc::default(),
         })
     }
@@ -152,6 +168,12 @@ impl GpuContext {
     /// The wgpu queue.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// Whether the device can time the GPU stages (`timestamps` was asked for
+    /// and the adapter supports it).
+    pub fn supports_timestamps(&self) -> bool {
+        self.timestamps
     }
 
     /// The compute pipelines, compiled the first time they are asked for.

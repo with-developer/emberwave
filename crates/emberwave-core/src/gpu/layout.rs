@@ -7,7 +7,8 @@
 use bytemuck::{Pod, Zeroable};
 
 use crate::bitstream::consts::{BANDS_PER_LEVEL, DECOMPOSITION_LEVELS, NUM_COMPONENTS};
-use crate::bitstream::{Band, Component, FrameLayout};
+use crate::bitstream::{Band, ChromaSiting, ChromaSubsampling, Component, FrameLayout, YcbcrRange};
+use crate::color::{CHROMA_CENTRE, CHROMA_SCALE, ColorParams, INV_255, LUMA_BLACK, LUMA_SCALE};
 
 use super::GpuError;
 
@@ -18,6 +19,9 @@ pub(crate) const MAX_BANDS: usize =
 
 /// Invocations per workgroup of `pack.wgsl`.
 const PACK_GROUP_SIZE: u64 = 256;
+
+/// Invocations per workgroup of `yuv2rgb.wgsl`.
+const YUV_GROUP_SIZE: u64 = 256;
 
 /// Largest workgroup grid dimension that every backend supports.
 pub(crate) const MAX_GRID_DIMENSION: u32 = 65_535;
@@ -323,6 +327,64 @@ impl PackParams {
     }
 }
 
+/// Uniform block of `yuv2rgb.wgsl`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct YuvParams {
+    pub width: u32,
+    pub height: u32,
+    pub chroma_420: u32,
+    pub siting_left: u32,
+    pub y_offset: u32,
+    pub y_stride: u32,
+    pub cb_offset: u32,
+    pub cb_stride: u32,
+    pub cr_offset: u32,
+    pub cr_stride: u32,
+    pub chroma_width: u32,
+    pub chroma_height: u32,
+    pub limited: u32,
+    pub grid_width: u32,
+    pub pad: [u32; 2],
+    pub coefficients: [f32; 4],
+    pub levels: [f32; 4],
+    pub scale: [f32; 4],
+}
+
+impl YuvParams {
+    pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout, color: &ColorParams) -> Self {
+        let (chroma_width, chroma_height) = layout.plane_size(Component::Cb);
+        let mut params = Self {
+            width: layout.width(),
+            height: layout.height(),
+            chroma_420: u32::from(layout.chroma() == ChromaSubsampling::Yuv420),
+            siting_left: u32::from(color.chroma_siting == ChromaSiting::Left),
+            y_offset: buffers.packed_offsets[Component::Y.index()],
+            y_stride: buffers.packed_strides[Component::Y.index()],
+            cb_offset: buffers.packed_offsets[Component::Cb.index()],
+            cb_stride: buffers.packed_strides[Component::Cb.index()],
+            cr_offset: buffers.packed_offsets[Component::Cr.index()],
+            cr_stride: buffers.packed_strides[Component::Cr.index()],
+            chroma_width,
+            chroma_height,
+            limited: u32::from(color.range == YcbcrRange::Limited),
+            grid_width: 0,
+            pad: [0; 2],
+            coefficients: color.matrix.coefficients(),
+            levels: [LUMA_BLACK, LUMA_SCALE, CHROMA_SCALE, CHROMA_CENTRE],
+            scale: [INV_255, 0.0, 0.0, 0.0],
+        };
+        params.grid_width = params.grid().0;
+        params
+    }
+
+    /// Workgroup grid: one invocation per pixel.
+    pub(crate) fn grid(&self) -> (u32, u32) {
+        let pixels = u64::from(self.width) * u64::from(self.height);
+        grid_for(pixels.div_ceil(YUV_GROUP_SIZE))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
@@ -343,6 +405,7 @@ mod tests {
         assert_eq!(size_of::<IdwtParams>(), 16 + 3 * 48);
         assert_eq!(size_of::<PackComp>(), 32);
         assert_eq!(size_of::<PackParams>(), 16 + 3 * 32);
+        assert_eq!(size_of::<YuvParams>(), 64 + 3 * 16);
         assert_eq!(MAX_BANDS, 48);
     }
 
@@ -486,6 +549,51 @@ mod tests {
             assert!(x <= MAX_GRID_DIMENSION && y <= MAX_GRID_DIMENSION);
             assert!(u64::from(x) * u64::from(y) >= count);
         }
+    }
+
+    #[test]
+    fn yuv_params_describe_the_packed_planes_and_the_conversion() {
+        use crate::bitstream::{ChromaSiting, YcbcrRange};
+        use crate::color::ColorMatrix;
+
+        let layout = layout_420(); // 200x120, chroma 100x60
+        let buffers = BufferLayout::new(&layout).unwrap();
+        let color = ColorParams {
+            matrix: ColorMatrix::Bt2020,
+            range: YcbcrRange::Full,
+            chroma_siting: ChromaSiting::Left,
+        };
+        let p = YuvParams::new(&layout, &buffers, &color);
+
+        assert_eq!((p.width, p.height, p.chroma_420), (200, 120, 1));
+        assert_eq!((p.siting_left, p.limited), (1, 0));
+        assert_eq!((p.chroma_width, p.chroma_height), (100, 60));
+        // The packed planes follow each other, rows padded to words.
+        assert_eq!((p.y_offset, p.y_stride), (0, 50));
+        assert_eq!((p.cb_offset, p.cb_stride), (50 * 120, 25));
+        assert_eq!((p.cr_offset, p.cr_stride), (50 * 120 + 25 * 60, 25));
+        assert_eq!(p.coefficients, ColorMatrix::Bt2020.coefficients());
+        assert_eq!(p.scale[0], 1.0 / 255.0);
+
+        // 24000 pixels is 94 workgroups of 256.
+        assert_eq!(p.grid(), (94, 1));
+        assert_eq!(p.grid_width, 94);
+
+        // A picture of more than 65535 workgroups wraps into the second dimension.
+        let big = FrameLayout::new(8192, 4320, ChromaSubsampling::Yuv420).unwrap();
+        let big_buffers = BufferLayout::new(&big).unwrap();
+        let p = YuvParams::new(&big, &big_buffers, &ColorParams::default());
+        assert_eq!(p.grid(), (65_535, 3));
+        assert_eq!(p.grid_width, 65_535);
+        assert!(u64::from(p.grid().0) * u64::from(p.grid().1) * 256 >= 8192 * 4320);
+
+        let planar = FrameLayout::new(131, 67, ChromaSubsampling::Yuv444).unwrap();
+        let planar_buffers = BufferLayout::new(&planar).unwrap();
+        let p = YuvParams::new(&planar, &planar_buffers, &ColorParams::default());
+        assert_eq!(
+            (p.chroma_420, p.chroma_width, p.chroma_height),
+            (0, 131, 67)
+        );
     }
 
     #[test]

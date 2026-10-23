@@ -18,36 +18,12 @@
 # or its parameters change; tests run against the committed bytes.
 set -euo pipefail
 
-UPSTREAM_URL=https://github.com/Themaister/pyrowave.git
-UPSTREAM_REV=79a3232a2199281f33f7a2e2659fc4fac62b022a
-
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-CACHE=$ROOT/testdata/_cache
+# shellcheck source=refgen/build.sh
+source "$ROOT/scripts/refgen/build.sh"
+
 OUT=${1:-$ROOT/testdata}
-
-if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
-    echo "gen_testdata.sh needs Apple Silicon macOS (upstream Metal port)" >&2
-    exit 1
-fi
-
-mkdir -p "$CACHE" "$OUT"
-
-if [ ! -d "$CACHE/pyrowave/.git" ]; then
-    git clone --quiet "$UPSTREAM_URL" "$CACHE/pyrowave"
-fi
-git -C "$CACHE/pyrowave" checkout --quiet "$UPSTREAM_REV"
-
-BUILD=$CACHE/build/pyrowave-metal
-cmake -S "$CACHE/pyrowave/metal" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release > /dev/null
-cmake --build "$BUILD" -j > /dev/null
-
-REFGEN=$CACHE/refgen
-xcrun clang++ -std=c++17 -O2 -fobjc-arc \
-    -I"$CACHE/pyrowave/metal" \
-    "$ROOT/scripts/refgen/refgen.mm" \
-    -L"$BUILD" -lpyrowave-metal -Wl,-rpath,"$BUILD" \
-    -framework Metal -framework Foundation \
-    -o "$REFGEN"
+mkdir -p "$OUT"
 
 # gen NAME encode-options...: encode a vector, then decode it with the reference.
 gen() {

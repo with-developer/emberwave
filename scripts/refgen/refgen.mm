@@ -5,7 +5,7 @@
 // synthesises input pictures, writes the PWV1 container and reads the decoded
 // planes back. It is test tooling and not part of the emberwave library.
 //
-//   refgen encode --out F.pwv1 --pattern solid|gradient|noise --width W
+//   refgen encode --out F.pwv1 --pattern solid|gradient|noise|scene --width W
 //                 --height H --chroma 420|444 --frames N --bytes-per-frame B
 //                 [--seed S] [--range full|limited] [--siting center|left]
 //   refgen decode IN.pwv1 OUT.y4m [--bit-depth 8|16]
@@ -17,6 +17,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -146,6 +147,63 @@ Stream read_pwv1_header(FILE *f)
 //////
 // Picture synthesis. Everything is deterministic so a vector can be reproduced.
 
+// A deterministic "scene" for pictures people can look at: colour bars on top,
+// a sky-to-ground gradient, a shaded disc that moves from frame to frame, a
+// fine diagonal grid for high-frequency detail, and a little film grain.
+struct Rgb
+{
+	float r, g, b;
+};
+
+float hash01(uint32_t x, uint32_t y, uint32_t frame, uint32_t seed)
+{
+	uint32_t h = x * 374761393u + y * 668265263u + frame * 2246822519u + seed * 3266489917u;
+	h = (h ^ (h >> 13)) * 1274126177u;
+	h ^= h >> 16;
+	return float(h & 0xffffffu) / 16777216.0f;
+}
+
+Rgb scene_pixel(int x, int y, int w, int h, int frame, uint32_t seed)
+{
+	const float u = (float(x) + 0.5f) / float(w);
+	const float v = (float(y) + 0.5f) / float(h);
+	Rgb c;
+
+	if (v < 0.12f)
+	{
+		static const float bars[8][3] = {
+			{ 1, 1, 1 }, { 1, 1, 0 }, { 0, 1, 1 }, { 0, 1, 0 }, { 1, 0, 1 }, { 1, 0, 0 }, { 0, 0, 1 }, { 0, 0, 0 },
+		};
+		const int i = std::min(7, int(u * 8.0f));
+		c = { bars[i][0], bars[i][1], bars[i][2] };
+	}
+	else
+	{
+		const float t = (v - 0.12f) / 0.88f;
+		c = { 0.15f + 0.65f * t, 0.35f + 0.25f * t, 0.85f - 0.55f * t };
+
+		// The disc, anti-aliased over about a pixel.
+		const float aspect = float(w) / float(h);
+		const float cx = 0.30f + 0.40f * (0.5f + 0.5f * sinf(0.15f * float(frame)));
+		const float cy = 0.56f;
+		const float radius = 0.22f;
+		const float dx = (u - cx) * aspect;
+		const float dy = v - cy;
+		const float coverage = std::clamp(0.5f + (radius - sqrtf(dx * dx + dy * dy)) * float(h), 0.0f, 1.0f);
+		const float shade = std::clamp(0.5f + dx / (2.0f * radius), 0.0f, 1.0f);
+		const Rgb disc = { 0.95f, 0.80f - 0.50f * shade, 0.20f + 0.60f * shade };
+		c = { c.r + (disc.r - c.r) * coverage, c.g + (disc.g - c.g) * coverage, c.b + (disc.b - c.b) * coverage };
+
+		// Fine diagonal grid in the lower left.
+		if (u < 0.35f && v > 0.70f && ((x + y) % 16 < 2 || (x - y + 65536) % 16 < 2))
+			c = { 0.05f, 0.05f, 0.05f };
+	}
+
+	const float grain = (hash01(uint32_t(x), uint32_t(y), uint32_t(frame), seed) - 0.5f) * 0.02f;
+	return { std::clamp(c.r + grain, 0.0f, 1.0f), std::clamp(c.g + grain, 0.0f, 1.0f),
+		     std::clamp(c.b + grain, 0.0f, 1.0f) };
+}
+
 struct Picture
 {
 	std::vector<uint8_t> plane[3];
@@ -200,6 +258,36 @@ Picture synthesize(const std::string &pattern, int frame, int width, int height,
 						v = 192 - (x * 128) / dx;
 					p.plane[c][size_t(y) * size_t(p.w[c]) + size_t(x)] = uint8_t(std::min(255, v));
 				}
+			}
+		}
+	}
+	else if (pattern == "scene")
+	{
+		// BT.709, video range. Chroma of 4:2:0 is the mean of its 2x2 pixels.
+		const int cw = p.w[1], ch = p.h[1];
+		const int step = chroma_444 ? 1 : 2;
+		for (int cy = 0; cy < ch; cy++)
+		{
+			for (int cx = 0; cx < cw; cx++)
+			{
+				float cb_sum = 0.0f, cr_sum = 0.0f;
+				for (int dy = 0; dy < step; dy++)
+				{
+					for (int dx = 0; dx < step; dx++)
+					{
+						const int x = cx * step + dx, y = cy * step + dy;
+						const Rgb c = scene_pixel(x, y, width, height, frame, seed);
+						const float luma = 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+						cb_sum += (c.b - luma) / 1.8556f;
+						cr_sum += (c.r - luma) / 1.5748f;
+						p.plane[0][size_t(y) * size_t(width) + size_t(x)] =
+						    uint8_t(std::clamp(std::lround(16.0f + 219.0f * luma), 16l, 235l));
+					}
+				}
+				const float n = float(step * step);
+				const size_t i = size_t(cy) * size_t(cw) + size_t(cx);
+				p.plane[1][i] = uint8_t(std::clamp(std::lround(128.0f + 224.0f * cb_sum / n), 16l, 240l));
+				p.plane[2][i] = uint8_t(std::clamp(std::lround(128.0f + 224.0f * cr_sum / n), 16l, 240l));
 			}
 		}
 	}
