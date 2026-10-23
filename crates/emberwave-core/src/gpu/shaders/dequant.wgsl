@@ -93,12 +93,21 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         return;
     }
 
-    // Find the band this block belongs to. The loop bounds are uniform.
+    // Find the band this block belongs to: the last band whose first block is
+    // not after it. Bands are in block order, so a binary search over the at
+    // most 48 entries takes six steps. Every invocation of the workgroup does
+    // the same steps, so the loop is uniform.
     var band_slot = 0u;
-    for (var i = 1u; i < params.band_count; i = i + 1u) {
-        if (block_index >= params.bands[i].first_block) {
-            band_slot = i;
+    var step = 32u;
+    loop {
+        let probe = band_slot + step;
+        if (probe < params.band_count && block_index >= params.bands[probe].first_block) {
+            band_slot = probe;
         }
+        if (step == 1u) {
+            break;
+        }
+        step = step >> 1u;
     }
     let band = params.bands[band_slot];
     let relative = block_index - band.first_block;
