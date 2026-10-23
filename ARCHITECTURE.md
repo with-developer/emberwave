@@ -319,8 +319,9 @@ The packed planes are copied to a mappable buffer and returned as a `Frame`.
 | pyramid (`array<f32>`) | the four bands of every level of every component, back to back | 63.6 MiB |
 | float planes (`array<f32>`) | the finished planes, in `[0, 1]` | 47.5 MiB |
 | packed planes (`array<u32>`) | 8-bit planes, four pixels per word, rows padded to words | 11.9 MiB |
+| readback (`MAP_READ`) | copy of the packed planes for the CPU | 11.9 MiB |
 
-The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 to 0 have room where the inverse transform of the level above writes them. Every band is rewritten for every frame, with zeros for blocks that were not received, so nothing needs clearing. The sizes are checked against the device limits when the decoder is created.
+The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 to 0 have room where the inverse transform of the level above writes them. Every band is rewritten for every frame, with zeros for blocks that were not received, so nothing needs clearing. The sizes of the pyramid and the planes are checked against the device limits when the decoder is created. The payload buffer is checked the same way every time it grows: a frame whose payload does not fit gives `GpuError::LimitExceeded` instead of an allocation that fails. With the WebGPU default of 128 MiB that can only happen for a stream of maximal blocks (a 4K frame of them is about 200 MiB); real frames are a few MiB.
 
 Per-dispatch parameters (band table, tile sizes, buffer offsets) depend only on the picture size, so they are computed once and live in small uniform buffers.
 
@@ -355,6 +356,7 @@ The shaders use only what WebGPU guarantees: no subgroup operations, no 8-bit or
 
 - `tests/shaders.rs` validates the WGSL with naga using an empty capability set, without a GPU, and checks the workgroup sizes and memory.
 - `tests/gpu.rs` creates a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decodes a vector on it.
+- The rounding rule of the packing stage is checked on the real backend against the CPU's, on inputs that are exact ties (`gpu::decoder` unit test).
 
 What upstream uses and what replaces it:
 
