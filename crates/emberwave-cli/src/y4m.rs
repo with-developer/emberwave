@@ -91,6 +91,12 @@ pub struct Video {
     pub width: usize,
     pub height: usize,
     pub chroma: ChromaSubsampling,
+    /// Where 4:2:0 chroma sits: left for `C420mpeg2`, otherwise the centre.
+    pub siting: ChromaSiting,
+    /// `XCOLORRANGE=FULL`, or video range otherwise.
+    pub range: YcbcrRange,
+    /// Numerator and denominator of the `F` field, or 0/0 without one.
+    pub frame_rate: (u32, u32),
     /// Per frame: the Y, Cb and Cr planes.
     pub frames: Vec<[Vec<u8>; 3]>,
 }
@@ -113,6 +119,8 @@ fn parse(data: &[u8]) -> Result<Video> {
     }
 
     let (mut width, mut height, mut chroma) = (0usize, 0usize, ChromaSubsampling::Yuv420);
+    let (mut siting, mut range, mut frame_rate) =
+        (ChromaSiting::Center, YcbcrRange::Limited, (0, 0));
     for token in header.split_whitespace().skip(1) {
         // The first character names the field; a token that does not start
         // with a one-byte character is none of the fields we know.
@@ -122,7 +130,19 @@ fn parse(data: &[u8]) -> Result<Video> {
         match tag {
             "W" => width = value.parse()?,
             "H" => height = value.parse()?,
+            "F" => {
+                frame_rate = value
+                    .split_once(':')
+                    .and_then(|(num, den)| Some((num.parse().ok()?, den.parse().ok()?)))
+                    .ok_or_else(|| format!("unreadable frame rate F{value}"))?;
+            }
+            "X" if value == "COLORRANGE=FULL" => range = YcbcrRange::Full,
             "C" => {
+                siting = if value == "420mpeg2" {
+                    ChromaSiting::Left
+                } else {
+                    ChromaSiting::Center
+                };
                 chroma = match value {
                     "420" | "420jpeg" | "420mpeg2" | "420paldv" => ChromaSubsampling::Yuv420,
                     "444" => ChromaSubsampling::Yuv444,
@@ -186,6 +206,9 @@ fn parse(data: &[u8]) -> Result<Video> {
         width,
         height,
         chroma,
+        siting,
+        range,
+        frame_rate,
         frames,
     })
 }
@@ -259,6 +282,18 @@ mod tests {
         assert_eq!(video.frames[1][0], [8, 9, 10, 11]);
         assert_eq!(video.frames[1][1], [12, 13]);
         assert_eq!(video.frames[1][2], [14, 15]);
+        // What the header signals comes back too.
+        assert_eq!(video.siting, ChromaSiting::Left);
+        assert_eq!(video.range, YcbcrRange::Limited);
+        assert_eq!(video.frame_rate, stream.frame_rate);
+
+        let full = StreamInfo {
+            range: YcbcrRange::Full,
+            ..stream
+        };
+        let video = parse(&file(&full.header_line(), 1)).unwrap();
+        assert_eq!(video.range, YcbcrRange::Full);
+        assert!(parse(b"YUV4MPEG2 W4 H1 F30 C444\n").is_err());
     }
 
     #[test]
