@@ -17,20 +17,36 @@ fn the_header_is_up_to_date() {
         .expect("cbindgen reads src/lib.rs");
     let mut generated = Vec::new();
     bindings.write(&mut generated);
-    let generated = String::from_utf8(generated).expect("the header is UTF-8");
+    // A Windows checkout gives text files CRLF line ends, and cbindgen copies
+    // those of cbindgen.toml into the header comment. The header is LF.
+    let generated = String::from_utf8(generated)
+        .expect("the header is UTF-8")
+        .replace('\r', "");
 
     let path = crate_dir.join("include/emberwave.h");
     if std::env::var_os("EMBERWAVE_BLESS").is_some() {
         std::fs::write(&path, &generated).expect("include/emberwave.h is writable");
         return;
     }
-    // A Windows checkout may have turned the line ends into CRLF.
     let committed = std::fs::read_to_string(&path)
         .expect("include/emberwave.h exists")
-        .replace("\r\n", "\n");
-    assert!(
-        committed == generated,
-        "include/emberwave.h is out of date: run \
-         EMBERWAVE_BLESS=1 cargo test -p emberwave-ffi --test header"
-    );
+        .replace('\r', "");
+    if committed != generated {
+        // The first line that differs, to show what changed.
+        let committed: Vec<&str> = committed.split('\n').collect();
+        let generated: Vec<&str> = generated.split('\n').collect();
+        let line = committed
+            .iter()
+            .zip(&generated)
+            .position(|(a, b)| a != b)
+            .unwrap_or(committed.len().min(generated.len()));
+        panic!(
+            "include/emberwave.h is out of date: run \
+             EMBERWAVE_BLESS=1 cargo test -p emberwave-ffi --test header\n\
+             line {}:\n  committed: {:?}\n  generated: {:?}",
+            line + 1,
+            committed.get(line),
+            generated.get(line),
+        );
+    }
 }
