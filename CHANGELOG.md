@@ -6,7 +6,11 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Added
 
-- Encoder benchmarks ([#29](https://github.com/with-developer/emberwave/issues/29)): `emberwave-cli bench-encode` times an encoder on the frames of a Y4M video, in the way `bench` times the decoder, and `Encoder::encode_timed` returns `EncodeTimings` with the GPU time of each stage. `refgen bench-encode` times upstream's encoder the same way, and `scripts/bench.sh` puts both in `BENCHMARKS.md`, with the pictures from `scripts/gen_bench_data.sh --sources`.
+- Encoder benchmarks ([#29](https://github.com/with-developer/emberwave/issues/29)): `emberwave-cli bench-encode` times an encoder on the frames of a Y4M video, in the way `bench` times the decoder, and `Encoder::encode_timed` returns `EncodeTimings` with the GPU time of each stage. `refgen bench-encode` times upstream's encoder the same way, at both of its precisions, and `scripts/bench.sh` puts them in `BENCHMARKS.md`, with the pictures from `scripts/gen_bench_data.sh --sources`. On an Apple M3 Max a 4K frame encodes in 3.64 ms, against 3.22 ms for upstream's encoder at FP32.
+
+### Fixed
+
+- `Decoder::time_frame` sometimes reported the previous frame's time for its last stages, or none at all, on Metal: the timestamps were resolved in the frame's command buffer, before the GPU had written them. They are now resolved once the frame is done, in a submission of their own, which `gpu_wall` does not include.
 
 ## [0.4.0] - 2026-10-24
 
