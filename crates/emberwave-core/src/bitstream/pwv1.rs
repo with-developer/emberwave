@@ -29,8 +29,9 @@ const VERSION_OFFSET: usize = 21;
 /// The header of a PWV1 file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pwv1Header {
-    /// Picture size, chroma format and colour signalling. `sequence`,
-    /// `total_blocks` and `code` are reserved here and carry no meaning.
+    /// Picture size, chroma format and colour signalling, in the layout of a
+    /// start of frame header. `extended`, `sequence`, `total_blocks` and
+    /// `code` are reserved here and carry no meaning.
     pub stream: SequenceHeader,
     /// Frame rate numerator. 0 with a denominator of 0 means the frames are
     /// unrelated images.

@@ -56,7 +56,7 @@ The PWV1 file is the on-disk form:
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 4 | `magic` | the bytes `PWV1` |
-| 4 | 8 | `stream` | a start of frame header: picture size, chroma format, colour signalling. `sequence`, `total_blocks` and `code` are reserved and zero here |
+| 4 | 8 | `stream` | the same 8 bytes as a start of frame header, carrying picture size, chroma format and colour signalling. `extended`, `sequence`, `total_blocks` and `code` are reserved and zero here |
 | 12 | 4 | `frame_rate_num` | 0 together with a zero denominator means unrelated images |
 | 16 | 4 | `frame_rate_den` | |
 | 20 | 1 | `reference_bit_depth` | 0 (arbitrary), 8, 10 or 16 |
@@ -266,6 +266,7 @@ Decoding is not bit-exact between implementations: the transform is floating poi
 - A packet is read header by header. A start of frame header sets `total_blocks`; a block header followed by `payload_words * 4` bytes is a block.
 - The sequence number decides which frame a header belongs to. With `d = (new - last) mod 8`: `d = 0` is the current frame, `1 <= d <= 3` starts a newer frame and discards what was collected, `4 <= d <= 7` is an older frame; it is ignored and the rest of the packet is dropped. The first packet always starts a frame.
 - The first copy of a block wins; later copies of the same `block_index` are ignored.
+- A header or block is validated before anything changes, and one that is rejected changes nothing, even if it belongs to a newer frame. Upstream does it the other way round: it starts the new frame as soon as a non-stale header arrives and validates afterwards, so a corrupt packet can discard the frame being assembled.
 - The output is a table with the word offset of every block (`u32::MAX` for blocks that were not received) and the received blocks concatenated, headers included. This is exactly what the GPU dequantisation stage consumes.
 - A frame is ready when `received >= total_blocks`. A frame that lost packets may be decoded anyway if the coarsest bands are complete and more than 90 percent of the blocks arrived; the thresholds are parameters.
 
@@ -273,12 +274,14 @@ Decoding is not bit-exact between implementations: the transform is floating poi
 
 | Topic | Upstream | emberwave |
 |---|---|---|
+| Order of restart and validation | A non-stale header starts the new frame first and is validated afterwards, so a rejected header or block of a newer frame has already discarded the old frame | Validated first; a rejected header or block changes nothing, and an old frame stays available until a valid packet of a newer one arrives |
 | Block internals | Not validated on the CPU. The GPU reads whatever the header declares | Tables and bit-planes must fit in `payload_words`, otherwise the block is rejected and the assembler is left unchanged. A sign area that is too short is detected while decoding |
 | Colour signalling in the frame | The encoder leaves colour and range bits of the in-frame start of frame header at zero (checked on real vectors: range reads "full" for a limited-range stream) | Colour information is taken from the PWV1 header, which the file writers fill in |
 | Odd 4:2:0 sizes | Required to be even, but not checked | Rejected |
 | `quant_code >= 200` | The integer shift `1 << (20 + e)` is undefined | The scale formula is extended to smaller values |
 | Reproducibility | The encoder's output is not byte-for-byte reproducible: the unused bits of a block's last sign byte are leftover GPU memory | Tests use committed bitstreams and compare decoded pictures, never bitstreams |
-| A duplicate block with `payload_words` below 2 | Silently skipped, because the check comes after the duplicate test | Rejected like any other block |
+| A duplicate block that is malformed | Silently skipped, because the checks come after the duplicate test | Validated like any other block, so it is rejected |
+| An old header of an unknown kind | Ignored with the rest of the packet | The same; a current or newer one is an error |
 
 ### Verification
 
@@ -355,7 +358,7 @@ Short-form ADRs, newest last. Each entry is dated.
 
 **Context.** Upstream's CPU parser checks the packet bounds, the block index and `payload_words >= 2`, and leaves the inside of a block to the GPU, which then reads wherever the header points.
 
-**Decision.** `FrameAssembler` also checks that a block's tables and bit-planes fit in its declared size, and a block that fails is rejected without changing the assembler. The sign area depends on the decoded magnitudes, so its size is checked while decoding. Behaviour on streams from a real encoder is identical to upstream's.
+**Decision.** `FrameAssembler` also checks that a block's tables and bit-planes fit in its declared size, and a header or block that fails any check is rejected without changing the assembler, which includes the restart that a header of a newer frame would otherwise cause. Upstream restarts first and validates afterwards. The sign area depends on the decoded magnitudes, so its size is checked while decoding. Behaviour on streams from a real encoder is identical to upstream's.
 
 **Consequence.** Malformed input produces errors, never reads outside a block, and never leaves the assembler inconsistent. Property tests check that.
 
