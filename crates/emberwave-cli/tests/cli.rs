@@ -388,7 +388,8 @@ fn decode_to_png_converts_the_decoded_planes_correctly() {
         height as u32,
         ChromaSubsampling::Yuv420,
         &params,
-    );
+    )
+    .expect("the Y4M planes match its size");
     assert_eq!(pixels.len(), expected.len());
 
     let differing = pixels.iter().zip(&expected).filter(|(a, b)| a != b).count();

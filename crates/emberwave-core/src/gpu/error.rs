@@ -32,6 +32,11 @@ pub enum GpuError {
     #[error("the GPU reported an error: {0}")]
     Device(String),
 
+    /// The device was lost: a driver reset, a GPU that went away, or a
+    /// destroyed device. Its context and decoders cannot be used any more.
+    #[error("the GPU device was lost ({0}); create a new context")]
+    DeviceLost(String),
+
     /// Waiting for the result or mapping it failed.
     #[error("reading the result back failed: {0}")]
     Readback(String),

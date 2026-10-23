@@ -6,7 +6,7 @@
 //! and converts the planes to 8 bits (`pack.wgsl`). On request a last stage
 //! converts YCbCr to RGB (`yuv2rgb.wgsl`).
 
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use wgpu::util::DeviceExt;
@@ -170,6 +170,9 @@ pub struct Decoder {
 
     color: Option<ColorResources>,
     timestamps: Option<TimestampResources>,
+
+    /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
+    lost: Arc<Mutex<Option<String>>>,
 }
 
 impl Decoder {
@@ -327,8 +330,18 @@ impl Decoder {
                 pack_grid,
                 color: None,
                 timestamps,
+                lost: context.lost_record(),
             }
         })
+    }
+
+    /// An error if the device has been lost, so that nothing is decoded on it
+    /// and no stale result is returned.
+    fn check_device(&self) -> Result<(), GpuError> {
+        match self.lost.lock().ok().and_then(|lost| lost.clone()) {
+            Some(reason) => Err(GpuError::DeviceLost(reason)),
+            None => Ok(()),
+        }
     }
 
     /// The block layout of the frames this decoder decodes.
@@ -425,9 +438,29 @@ impl Decoder {
         timed: bool,
         assembled_in: Duration,
     ) -> Result<(Vec<u8>, Timings), GpuError> {
+        self.check_device()?;
+        let outcome = self.run_gpu_on_device(color, read, timed, assembled_in);
+        // The device can be lost while the frame is on it, and wgpu tells
+        // during the wait. Whatever failed then is the loss, and whatever came
+        // back is not to be trusted.
+        self.check_device()?;
+        outcome
+    }
+
+    /// The work of [`run_gpu`](Self::run_gpu), without the checks for a lost
+    /// device.
+    fn run_gpu_on_device(
+        &mut self,
+        color: Option<&ColorParams>,
+        read: Read,
+        timed: bool,
+        assembled_in: Duration,
+    ) -> Result<(Vec<u8>, Timings), GpuError> {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
-        self.upload();
+        // In an error scope like all GPU work, so that a failed copy comes back
+        // as an error instead of reaching wgpu's default handler, which panics.
+        with_error_scope(&self.device, || self.upload())?;
         if let Some(color) = color {
             self.prepare_color(color)?;
         }
@@ -610,8 +643,10 @@ impl Decoder {
         }
 
         if let Some(resources) = &self.color {
-            self.queue
-                .write_buffer(&resources.params, 0, bytemuck::bytes_of(&params));
+            with_error_scope(&self.device, || {
+                self.queue
+                    .write_buffer(&resources.params, 0, bytemuck::bytes_of(&params));
+            })?;
         }
         Ok(())
     }
@@ -684,21 +719,27 @@ impl Decoder {
         let (width, height) = self.layout().level_size(level);
         let bytes = u64::from(width) * u64::from(height) * 4;
 
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("band readback"),
-            size: bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        self.check_device()?;
+        let copied = with_error_scope(&self.device, || {
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("band readback"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
-        encoder.copy_buffer_to_buffer(&self.pyramid, u64::from(offset) * 4, &staging, 0, bytes);
-        self.queue.submit([encoder.finish()]);
-
-        let data = self.read_back(&staging, bytes)?;
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("band readback"),
+                });
+            encoder.copy_buffer_to_buffer(&self.pyramid, u64::from(offset) * 4, &staging, 0, bytes);
+            self.queue.submit([encoder.finish()]);
+            staging
+        })
+        .and_then(|staging| self.read_back(&staging, bytes));
+        // As in run_gpu: a failure on a device that was lost meanwhile is the loss.
+        self.check_device()?;
+        let data = copied?;
         Ok(Some(
             data.chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -770,27 +811,32 @@ impl Decoder {
 
     /// Waits for the GPU and copies a mappable buffer's first `bytes` bytes out.
     fn read_back(&self, buffer: &wgpu::Buffer, bytes: u64) -> Result<Vec<u8>, GpuError> {
-        let slice = buffer.slice(..bytes);
-        let (sender, receiver) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            // The receiver is only gone if this function already returned.
-            let _ = sender.send(result);
-        });
+        // Mapping and unmapping report errors through the error scopes like
+        // the other calls. Waiting cannot: wgpu treats a device error while
+        // polling as fatal (decision D22).
+        with_error_scope(&self.device, || {
+            let slice = buffer.slice(..bytes);
+            let (sender, receiver) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                // The receiver is only gone if this function already returned.
+                let _ = sender.send(result);
+            });
 
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|error| GpuError::Readback(error.to_string()))?;
-        receiver
-            .recv()
-            .map_err(|error| GpuError::Readback(error.to_string()))?
-            .map_err(|error| GpuError::Readback(error.to_string()))?;
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|error| GpuError::Readback(error.to_string()))?;
+            receiver
+                .recv()
+                .map_err(|error| GpuError::Readback(error.to_string()))?
+                .map_err(|error| GpuError::Readback(error.to_string()))?;
 
-        let data = slice
-            .get_mapped_range()
-            .map_err(|error| GpuError::Readback(error.to_string()))?
-            .to_vec();
-        buffer.unmap();
-        Ok(data)
+            let data = slice
+                .get_mapped_range()
+                .map_err(|error| GpuError::Readback(error.to_string()))?
+                .to_vec();
+            buffer.unmap();
+            Ok(data)
+        })?
     }
 
     /// Cuts the packed planes (rows padded to whole words) into tight planes.

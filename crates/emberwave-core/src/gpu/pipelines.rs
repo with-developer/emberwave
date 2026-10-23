@@ -138,13 +138,17 @@ pub(crate) fn with_error_scope<T>(
     body: impl FnOnce() -> T,
 ) -> Result<T, GpuError> {
     let memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    // Internal errors are what a driver's failure to compile a shader or to
+    // build a pipeline becomes.
+    let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
     let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let value = body();
     // Scopes are popped innermost first.
     let validation = pollster::block_on(validation_scope.pop());
+    let internal = pollster::block_on(internal_scope.pop());
     let memory = pollster::block_on(memory_scope.pop());
 
-    match validation.or(memory) {
+    match validation.or(internal).or(memory) {
         Some(error) => Err(GpuError::Device(error.to_string())),
         None => Ok(value),
     }

@@ -607,4 +607,35 @@ mod tests {
         assert_eq!((x, y), (24, 1));
         assert_eq!(params.grid_width, 24);
     }
+
+    proptest::proptest! {
+        // DequantParams and IdwtLevel look bands up in the BufferLayout of the
+        // same FrameLayout and `expect` to find them. Every picture size the
+        // bitstream allows must keep that promise, so building the parameter
+        // blocks never panics.
+        #[test]
+        fn every_valid_picture_size_builds_its_parameter_blocks(
+            width in 1u32..=16384,
+            height in 1u32..=16384,
+            planar in proptest::bool::ANY,
+        ) {
+            let (width, height, chroma) = if planar {
+                (width, height, ChromaSubsampling::Yuv444)
+            } else {
+                // 4:2:0 needs even sizes; 16384 is even.
+                (width.next_multiple_of(2), height.next_multiple_of(2), ChromaSubsampling::Yuv420)
+            };
+            let layout = FrameLayout::new(width, height, chroma).unwrap();
+            // A picture too large for 32-bit offsets is an error, not a panic.
+            let Ok(buffers) = BufferLayout::new(&layout) else {
+                return Ok(());
+            };
+            DequantParams::new(&layout, &buffers);
+            for level in 0..DECOMPOSITION_LEVELS {
+                IdwtLevel::new(&layout, &buffers, level);
+            }
+            PackParams::new(&layout, &buffers);
+            YuvParams::new(&layout, &buffers, &ColorParams::default());
+        }
+    }
 }

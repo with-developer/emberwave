@@ -132,6 +132,21 @@ pub fn chroma_taps(p: u32, siting: AxisSiting) -> (i32, u32) {
     }
 }
 
+/// Why [`yuv_to_rgb8`] refused its input.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ColorError {
+    /// A plane holds fewer samples than the picture size needs.
+    #[error("plane {plane} has {actual} samples, but the picture needs {needed}")]
+    PlaneTooSmall {
+        /// 0 for Y, 1 for Cb, 2 for Cr.
+        plane: usize,
+        /// Samples the picture size needs.
+        needed: u64,
+        /// Samples the plane has.
+        actual: usize,
+    },
+}
+
 /// Siting along one axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisSiting {
@@ -148,22 +163,40 @@ pub enum AxisSiting {
 /// sizes, but any picture converts). Vertical chroma siting is always
 /// centred, the horizontal siting follows `params`.
 ///
-/// # Panics
+/// # Errors
 ///
-/// If a plane is smaller than its dimensions say.
+/// [`ColorError::PlaneTooSmall`] if a plane is smaller than the picture size
+/// says. Larger planes are fine; the samples past the picture are ignored.
 pub fn yuv_to_rgb8(
     planes: [&[u8]; 3],
     width: u32,
     height: u32,
     chroma: ChromaSubsampling,
     params: &ColorParams,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, ColorError> {
     let [luma, cb, cr] = planes;
     let (width_u, height_u) = (width as usize, height as usize);
     let (chroma_width, chroma_height) = match chroma {
         ChromaSubsampling::Yuv444 => (width_u, height_u),
         ChromaSubsampling::Yuv420 => (width_u.div_ceil(2), height_u.div_ceil(2)),
     };
+
+    // Checked once here, in 64 bits, so that the indexing below cannot fail.
+    let luma_samples = u64::from(width) * u64::from(height);
+    let chroma_samples = chroma_width as u64 * chroma_height as u64;
+    for (plane, (data, needed)) in planes
+        .iter()
+        .zip([luma_samples, chroma_samples, chroma_samples])
+        .enumerate()
+    {
+        if (data.len() as u64) < needed {
+            return Err(ColorError::PlaneTooSmall {
+                plane,
+                needed,
+                actual: data.len(),
+            });
+        }
+    }
     let [r_cr, g_cb, g_cr, b_cb] = params.matrix.coefficients();
     let limited = params.range == YcbcrRange::Limited;
     let horizontal = match params.chroma_siting {
@@ -221,12 +254,90 @@ pub fn yuv_to_rgb8(
             }
         }
     }
-    rgb
+    Ok(rgb)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `yuv_to_rgb8` for planes that match the picture size.
+    fn convert(
+        planes: [&[u8]; 3],
+        width: u32,
+        height: u32,
+        chroma: ChromaSubsampling,
+        params: &ColorParams,
+    ) -> Vec<u8> {
+        yuv_to_rgb8(planes, width, height, chroma, params).expect("the planes match the size")
+    }
+
+    #[test]
+    fn planes_smaller_than_the_picture_are_an_error() {
+        let params = ColorParams::default();
+        // 4x2 in 4:2:0 needs 8 luma samples and 2 of each chroma.
+        let (luma, chroma) = (vec![0u8; 8], vec![128u8; 2]);
+        assert!(
+            yuv_to_rgb8(
+                [&luma, &chroma, &chroma],
+                4,
+                2,
+                ChromaSubsampling::Yuv420,
+                &params
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            yuv_to_rgb8(
+                [&luma[..7], &chroma, &chroma],
+                4,
+                2,
+                ChromaSubsampling::Yuv420,
+                &params
+            ),
+            Err(ColorError::PlaneTooSmall {
+                plane: 0,
+                needed: 8,
+                actual: 7
+            })
+        );
+        assert_eq!(
+            yuv_to_rgb8(
+                [&luma, &chroma, &chroma[..1]],
+                4,
+                2,
+                ChromaSubsampling::Yuv420,
+                &params
+            ),
+            Err(ColorError::PlaneTooSmall {
+                plane: 2,
+                needed: 2,
+                actual: 1
+            })
+        );
+        // 4:4:4 needs full-size chroma planes.
+        assert!(matches!(
+            yuv_to_rgb8(
+                [&luma, &chroma, &chroma],
+                4,
+                2,
+                ChromaSubsampling::Yuv444,
+                &params
+            ),
+            Err(ColorError::PlaneTooSmall { plane: 1, .. })
+        ));
+        // The largest picture the format allows is checked without overflow.
+        assert!(
+            yuv_to_rgb8(
+                [&[], &[], &[]],
+                u32::MAX,
+                u32::MAX,
+                ChromaSubsampling::Yuv420,
+                &params
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn coefficients_match_the_published_matrices() {
@@ -305,7 +416,7 @@ mod tests {
                     // A flat 4:4:4 picture of one colour, 4x4 pixels.
                     let [y, cb, cr] = forward(colour, matrix, limited);
                     let planes = [vec![y; 16], vec![cb; 16], vec![cr; 16]];
-                    let rgb = yuv_to_rgb8(
+                    let rgb = convert(
                         [&planes[0], &planes[1], &planes[2]],
                         4,
                         4,
@@ -329,7 +440,7 @@ mod tests {
     fn video_black_and_white_map_to_full_range_black_and_white() {
         let params = ColorParams::default();
         let planes = [vec![16u8, 235], vec![128u8; 2], vec![128u8; 2]];
-        let rgb = yuv_to_rgb8(
+        let rgb = convert(
             [&planes[0], &planes[1], &planes[2]],
             2,
             1,
@@ -353,7 +464,7 @@ mod tests {
         //   B = 1 + 1.8556 * 0.5                      = 1.928  -> 255
         let params = ColorParams::default();
         let planes = [vec![0u8, 255], vec![0u8, 255], vec![255u8, 0]];
-        let rgb = yuv_to_rgb8(
+        let rgb = convert(
             [&planes[0], &planes[1], &planes[2]],
             2,
             1,
@@ -375,7 +486,7 @@ mod tests {
             let luma = vec![120u8; w * h];
             let cb = vec![90u8; (w / 2) * (h / 2)];
             let cr = vec![200u8; (w / 2) * (h / 2)];
-            let rgb = yuv_to_rgb8(
+            let rgb = convert(
                 [&luma, &cb, &cr],
                 w as u32,
                 h as u32,
@@ -383,7 +494,7 @@ mod tests {
                 &params,
             );
 
-            let flat = yuv_to_rgb8(
+            let flat = convert(
                 [&luma, &vec![90u8; w * h], &vec![200u8; w * h]],
                 w as u32,
                 h as u32,
@@ -412,7 +523,7 @@ mod tests {
                     chroma_siting: siting,
                     ..full_range
                 };
-                let rgb = yuv_to_rgb8(
+                let rgb = convert(
                     [&luma, &chroma, &chroma],
                     w as u32,
                     h as u32,
@@ -437,7 +548,7 @@ mod tests {
         let luma = [128u8; 8];
         let cb = [0u8, 255];
         let cr = [128u8; 2];
-        let rgb = yuv_to_rgb8([&luma, &cb, &cr], 4, 2, ChromaSubsampling::Yuv420, &params);
+        let rgb = convert([&luma, &cb, &cr], 4, 2, ChromaSubsampling::Yuv420, &params);
 
         // Blue grows with Cb: it must rise monotonically along the row.
         let blue: Vec<u8> = (0..4).map(|x| rgb[x * 3 + 2]).collect();

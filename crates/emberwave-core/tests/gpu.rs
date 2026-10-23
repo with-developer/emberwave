@@ -18,7 +18,7 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams, yuv_to_rgb8};
 use emberwave_core::cpu;
-use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuOptions};
+use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuError, GpuOptions, TimedOutput};
 
 /// Whether a missing GPU is a failure rather than a reason to skip. An empty
 /// value counts as unset so a CI matrix can leave it blank.
@@ -580,7 +580,8 @@ fn rgb_conversion_on_the_gpu_matches_the_cpu() {
                         layout.height(),
                         layout.chroma(),
                         &params,
-                    );
+                    )
+                    .expect("the decoder's planes match its layout");
                     let c = compare_rgb(&rgb.data, &expected);
                     // The same arithmetic in the same order; the GPU may fuse a
                     // multiply and an add, which moves a rounding by one.
@@ -669,4 +670,36 @@ fn timing_a_frame_reports_where_the_time_goes() {
             ),
         }
     }
+}
+
+#[test]
+fn a_lost_device_is_an_error_rather_than_a_stale_result() {
+    // A context of its own, since destroying the device loses it for good.
+    let Some(context) = create_context(&GpuOptions::default()) else {
+        return;
+    };
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(&context, &layout);
+    decoder
+        .decode(&frames[0])
+        .expect("decode on a working device");
+    assert_eq!(context.lost(), None);
+
+    context.device().destroy();
+    let color = ColorParams::default();
+    let results = [
+        decoder.decode(&frames[0]).map(drop),
+        decoder.decode_rgb(&frames[0], &color).map(drop),
+        decoder.time_frame(&frames[0], TimedOutput::Yuv).map(drop),
+        decoder
+            .time_frame(&frames[0], TimedOutput::Rgb(color))
+            .map(drop),
+    ];
+    for result in &results {
+        assert!(
+            matches!(result, Err(GpuError::DeviceLost(_))),
+            "{results:?}"
+        );
+    }
+    assert!(context.lost().is_some());
 }
