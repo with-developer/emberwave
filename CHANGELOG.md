@@ -2,6 +2,17 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- A browser player ([#15](https://github.com/with-developer/emberwave/issues/15)): `crates/emberwave-web` and the page in `web/`, published to GitHub Pages, decode `.pwv1` files with WebGPU in the page and draw them on a canvas.
+- `Decoder::encode_rgb` records a decode into the caller's command encoder without waiting, and `Decoder::rgba_buffer` gives the picture; `GpuContext::from_adapter` creates a context on an adapter the caller chose. Together they let a player keep the picture on the GPU, and they are what the browser player uses.
+
+### Changed
+
+- `GpuContext::new`, which blocks, is not part of the WebAssembly build; use `GpuContext::new_async` or `GpuContext::from_adapter` there.
+
 ## [0.2.0] - 2026-10-24
 
 Faster decoding: on an Apple M3 Max a 4K frame decodes to planes in 1.11 ms instead of 4.28 ms (1.37 instead of 4.53 ms with the conversion to RGB), 1.4 times the time of upstream's own Metal decoder at FP32 ([#11](https://github.com/with-developer/emberwave/issues/11), [#12](https://github.com/with-developer/emberwave/issues/12)). The decoded pictures are the same up to rounding ties: in the test vectors 5 of 464,790 samples now differ by one level, as the compiler fuses a multiply and an add differently in the rewritten transform.

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>emberwave player</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+  body { margin: 0 auto; padding: 16px; max-width: 1100px; }
+  h1 { margin-block: 0 4px; }
+  canvas { display: block; width: 100%; height: auto; background: #000; }
+  #drop { border: 2px dashed #8888; border-radius: 8px; padding: 12px; margin-block: 12px; }
+  #drop.over { border-color: #4a8; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { font: inherit; }
+  #stats { font-variant-numeric: tabular-nums; }
+  .error { color: #d33; }
+</style>
+</head>
+<body>
+<h1>emberwave</h1>
+<p>Plays <a href="https://github.com/Themaister/pyrowave">PyroWave</a> streams (<code>.pwv1</code>), decoded with WebGPU in this page by <a href="https://github.com/with-developer/emberwave">emberwave</a>. Nothing is uploaded.</p>
+<div id="drop">
+  <div class="row">
+    <label>Open a file <input type="file" id="file" accept=".pwv1"></label>
+    <span>or drop one here, or play a sample:</span>
+    <span id="samples" class="row"></span>
+  </div>
+</div>
+<canvas id="screen" width="320" height="180"></canvas>
+<p id="info">Starting…</p>
+<p id="stats"></p>
+<script type="module" src="main.js"></script>
+</body>
+</html>

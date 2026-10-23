@@ -98,7 +98,9 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
-    /// Creates a context, blocking until the device is ready.
+    /// Creates a context, blocking until the device is ready. Not in a
+    /// browser, where nothing may block: use [`new_async`](Self::new_async).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(options: &GpuOptions) -> Result<Self, GpuError> {
         pollster::block_on(Self::new_async(options))
     }
@@ -120,7 +122,16 @@ impl GpuContext {
                 ..Default::default()
             })
             .await?;
+        Self::from_adapter(adapter, options).await
+    }
 
+    /// Creates a context on an adapter the caller has chosen, for example one
+    /// that can draw to the caller's window or canvas. The options say which
+    /// features to ask for; the backend and adapter options are not used.
+    pub async fn from_adapter(
+        adapter: wgpu::Adapter,
+        options: &GpuOptions,
+    ) -> Result<Self, GpuError> {
         // The portable default limits, except that buffers may be as large as
         // the adapter allows: large frames need large buffers.
         let mut limits = wgpu::Limits::default();

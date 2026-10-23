@@ -465,6 +465,20 @@ The last two rows come from `scripts/verify_4k.sh`: it encodes two 3840x2160 fra
 
 PNG output is 8-bit RGB with fast compression. The Y4M writer takes range, chroma format and chroma siting from the stream: `XCOLORRANGE`, and `C420jpeg` (centred chroma), `C420mpeg2` (chroma on the left luma column) or `C444`. A stream without a frame rate gets 30:1, which Y4M needs, and a warning says so. The Y4M reader of `compare` takes 8-bit 4:2:0 and 4:4:4 only, and a file whose header names a picture size that overflows, or that has no frames, is an error rather than a pass. Percentiles are nearest-rank.
 
+## Browser player
+
+`crates/emberwave-web` builds the decoder for the browser (WebAssembly and WebGPU), and `web/` is a page that plays `.pwv1` files with it: a file opened or dropped on the page, or one of the test vectors. `scripts/build_web.sh` builds the module into `web/pkg/` and copies the vectors to `web/samples/`, and `.github/workflows/pages.yml` publishes `web/` to GitHub Pages on every push to `main`.
+
+Nothing in a browser may block, so the player uses only the parts of the decoder that do not wait:
+
+- `GpuContext::from_adapter` creates the device on an adapter that can draw on the canvas. `GpuContext::new`, which blocks, does not exist in the browser build.
+- `Decoder::encode_rgb` records the decode and the colour conversion into the player's command encoder and returns. A render pass in the same encoder copies the RGBA words to the canvas (`blit.wgsl`: one triangle over the canvas, which has the size of the picture, so a fragment reads one word). One submission per frame, and the picture never leaves the GPU.
+- Error scopes cannot be waited for, so in the browser build `with_error_scope` just runs its work. The player catches what the browser reports instead (`on_uncaptured_error`) and shows the first error on the page with the next frame. Pictures wider or taller than the browser can draw (`max_texture_dimension_2d`, 8192 by default) are refused when the file is loaded.
+- The methods that read a frame back or time it wait for the GPU, and are not for the browser.
+- In a browser, dropping a wgpu buffer only lets go of the JavaScript object, and the GPU memory waits for the garbage collector. `Decoder` therefore destroys its large buffers when it is dropped, and the player drops the old stream before it loads the next file: about 140 MiB for a 4K stream.
+
+The page paces frames by the stream's frame rate, keeping the remainder of each interval, so 25 frames per second play as 25 on a 60 Hz display. It shows the frames per second, the CPU time to record and submit a frame, and the time from submitting a frame until the browser reports the GPU done with it (`onSubmittedWorkDone`): decoding and drawing, plus the delay of the report, averaged over the frames reported each second. In headless Chrome 155 on an Apple M3 Max (2026-10-24) the 1080p benchmark stream took about 0.6 ms of CPU and 2.2 ms from submission to done, the 4K one about 1.2 and 3.8 ms, both playing at their 30 frames per second.
+
 ## Decisions
 
 Short-form ADRs, newest last. Each entry is dated.
@@ -648,3 +662,17 @@ Warm-up is both a number of frames and a time: at least 10 frames and at least o
 Two alternatives were rejected. Zeroing in WGSL with all invocations would bring back part of the cost and still hide a missed write, since zero is the right value for missing coefficients and for padding. Zeroing only in debug builds would test something other than what ships. The browser build cannot opt out, as browsers always zero workgroup memory, so there a mistake would read zeros where the native build reads stale values.
 
 **Consequence.** On an Apple M3 Max, measured alternately with and without zeroing (three rounds of 600 frames of the 4K stream), the inverse transform takes 0.39 ms instead of 0.65 ms and the GPU passes 0.55 ms instead of 0.82 ms. A frame decoded to planes takes 1.12 ms instead of 1.40 ms, and 1.39 ms instead of 1.63 ms with the conversion to RGB. On WARP the pipelines are created in 0.4 s, the first dispatch is no slower than the next, and the Windows CI job takes 1.5 minutes instead of 14. lavapipe, which zeroes in the driver, stays within the noise of its ten-frame runs: 44 ms for a 4K frame, 46 ms before. A shader that reads workgroup memory before writing it gets what an earlier workgroup left there. The GPU tests compare every level with the CPU exactly and catch that, unless the stale values happen to be the right ones.
+
+### 2026-10-24 — D26: The browser player
+
+**Context.** `CLAUDE.md` lists a WebGPU demo among the things to do after the release: a wasm build and a static page on GitHub Pages that plays a dropped file (issue #15). The decoder's API waited for the GPU everywhere: creating a context, popping error scopes, reading a picture back, timing it. A browser does not allow any of that.
+
+**Decision.**
+- A crate `emberwave-web`, made with wasm-bindgen. It has content only for `wasm32` targets, so the workspace builds everywhere and native builds pull in no browser crates. New crates for it: `wasm-bindgen`, `wasm-bindgen-futures` and `web-sys`, at the versions wgpu 30 itself requires.
+- The decoder gains a path that does not wait. `Decoder::encode_rgb` records into the caller's encoder, as upstream's `decode_gpu_buffer` does, `Decoder::rgba_buffer` gives the result, and `GpuContext::from_adapter` lets the caller pick an adapter that can draw on its surface. Native players can use the same path.
+- The picture reaches the canvas through a render pass that reads the RGBA storage buffer, with the canvas at the size of the picture: no texture copy, no readback.
+- The page is plain HTML and JavaScript, without a bundler or framework.
+- CI checks the browser build with `cargo clippy --target wasm32-unknown-unknown`. The page itself was checked by script in headless Chrome with WebGPU (a sample and the 1080p and 4K benchmark streams played, and the screenshots showed the right pictures); that check needs a GPU and is not part of CI.
+
+**Consequence.** Any browser with WebGPU can play a stream without uploading it anywhere. `GpuContext::new` is not part of the browser build.
+

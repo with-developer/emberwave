@@ -4,3 +4,7 @@
 # Upstream reference builds and generated vectors (see testdata/README.md)
 /testdata/_cache/
 /testdata/generated/
+
+# The browser build (scripts/build_web.sh)
+/web/pkg/
+/web/samples/
