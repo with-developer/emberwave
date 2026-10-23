@@ -91,3 +91,8 @@ jobs:
       - name: Report the GPU adapter
         run: cargo test -p emberwave-core --test gpu inverse_transform -- --nocapture
       - run: cargo test --workspace
+      # The C example, built with CMake against the shared library that the
+      # build above made, decodes every test vector.
+      - name: Run the C example
+        shell: bash
+        run: scripts/check_c_example.sh target/debug
