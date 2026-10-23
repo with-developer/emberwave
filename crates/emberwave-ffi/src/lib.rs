@@ -54,7 +54,7 @@ pub enum EmberwaveStatus {
 }
 
 /// 4:2:0: the chroma planes have half the width and height of the luma plane,
-/// rounded up.
+/// whose width and height are even.
 pub const EMBERWAVE_CHROMA_420: u32 = 0;
 /// 4:4:4: the chroma planes have the size of the luma plane.
 pub const EMBERWAVE_CHROMA_444: u32 = 1;
@@ -88,7 +88,7 @@ pub const EMBERWAVE_SITING_CENTER: u32 = 0;
 /// 4:2:0 chroma sits on the left one of the two luma samples it covers.
 pub const EMBERWAVE_SITING_LEFT: u32 = 1;
 
-/// How [`emberwave_context_create`] chooses the GPU.
+/// How `emberwave_context_create` chooses the GPU.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveContextOptions {
@@ -150,7 +150,7 @@ pub struct EmberwavePlane {
     pub stride: usize,
 }
 
-/// The colour conversion of [`emberwave_decoder_decode_rgb`].
+/// The colour conversion of `emberwave_decoder_decode_rgb`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveColor {
@@ -478,7 +478,7 @@ pub extern "C" fn emberwave_last_error() -> *const c_char {
 /// Describes the stream of a PWV1 file from its header, the first 24 bytes:
 /// picture size, chroma format, colour signalling and frame rate. Frames
 /// follow the header, each a little-endian 32-bit size and that many bytes to
-/// give to [`emberwave_decoder_push_packet`].
+/// give to `emberwave_decoder_push_packet`.
 ///
 /// # Safety
 ///
@@ -534,9 +534,10 @@ pub unsafe extern "C" fn emberwave_probe_packet(
 }
 
 /// Creates a context on a GPU that `options` allow, or with `NULL` options on
-/// any (the environment variable `EMBERWAVE_BACKEND` can then narrow the
-/// choice, as for the command line tool). A discrete GPU is preferred to an
-/// integrated one.
+/// any. With `NULL` options the environment variable `EMBERWAVE_BACKEND` can
+/// narrow the choice, as for the command line tool: `vulkan`, `metal`, `dx12`,
+/// a comma separated list of them, or `auto`; a value that names no backend is
+/// ignored. A discrete GPU is preferred to an integrated one.
 ///
 /// # Safety
 ///
@@ -574,7 +575,7 @@ pub unsafe extern "C" fn emberwave_context_create(
 ///
 /// # Safety
 ///
-/// `context` is `NULL`, or a context from [`emberwave_context_create`] that
+/// `context` is `NULL`, or a context from `emberwave_context_create` that
 /// has not been destroyed and that no other thread is using.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_context_destroy(context: *mut EmberwaveContext) {
@@ -604,8 +605,10 @@ pub unsafe extern "C" fn emberwave_context_adapter(
 }
 
 /// Creates a decoder on `context` for pictures of `width` x `height` pixels
-/// in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. All the GPU
-/// memory it needs for decoding is allocated here.
+/// in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. Width and
+/// height are from 1 to 16384, and even for 4:2:0; other sizes give
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`. All the GPU memory the decoder needs is
+/// allocated here.
 ///
 /// # Safety
 ///
@@ -651,7 +654,7 @@ pub unsafe extern "C" fn emberwave_decoder_create(
 ///
 /// # Safety
 ///
-/// `decoder` is `NULL`, or a decoder from [`emberwave_decoder_create`] that
+/// `decoder` is `NULL`, or a decoder from `emberwave_decoder_create` that
 /// has not been destroyed and that no other thread is using.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_decoder_destroy(decoder: *mut EmberwaveDecoder) {
@@ -753,14 +756,14 @@ pub unsafe extern "C" fn emberwave_decoder_clear(decoder: *mut EmberwaveDecoder)
 
 /// Decodes the frame received so far and writes its Y, Cb and Cr planes, 8
 /// bits per sample in the range the stream uses. Blocks that did not arrive
-/// decode as zeros, so call it when [`emberwave_decoder_is_ready`] says so.
+/// decode as zeros, so call it when `emberwave_decoder_is_ready` says so.
 /// Waits for the GPU.
 ///
 /// # Safety
 ///
 /// `decoder` is a live decoder that no other thread is using. Each plane's
 /// `data` points to `stride * (height - 1) + width` bytes that may be
-/// written, with the sizes of [`emberwave_decoder_info`], and the planes do
+/// written, with the sizes of `emberwave_decoder_info`, and the planes do
 /// not overlap.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_decoder_decode_yuv(

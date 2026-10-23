@@ -141,11 +141,11 @@ int main(int argc, char **argv)
     } else {
         chroma_tag = "C420jpeg";
     }
-    fprintf(out, "YUV4MPEG2 W%u H%u F%u:%u Ip A1:1 %s\n", (unsigned)frame.width,
+    fprintf(out, "YUV4MPEG2 W%u H%u F%u:%u Ip A1:1 XCOLORRANGE=%s %s\n", (unsigned)frame.width,
             (unsigned)frame.height,
             (unsigned)(stream.frame_rate_num && stream.frame_rate_den ? stream.frame_rate_num : 30),
             (unsigned)(stream.frame_rate_num && stream.frame_rate_den ? stream.frame_rate_den : 1),
-            chroma_tag);
+            stream.range == EMBERWAVE_RANGE_FULL ? "FULL" : "LIMITED", chroma_tag);
 
     offset = 24; /* past the file header */
     while (offset + 4 <= size) {
@@ -175,6 +175,10 @@ int main(int argc, char **argv)
         fputs("FRAME\n", out);
         fwrite(planes, 1, luma_bytes + 2 * chroma_bytes, out);
         frames++;
+    }
+    if (offset != size) {
+        fprintf(stderr, "the file ends inside the size of frame %u\n", frames);
+        return 1;
     }
     printf("decoded %u frames of %ux%u\n", frames, (unsigned)frame.width, (unsigned)frame.height);
 

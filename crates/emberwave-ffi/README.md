@@ -21,7 +21,35 @@ cargo rustc --release -p emberwave-ffi --lib --crate-type staticlib \
     -- --print native-static-libs              # the static library, and what it needs
 ```
 
-The shared library finds its way: its name on macOS is `@rpath/libemberwave_ffi.dylib`, and on Linux `libemberwave_ffi.so`, so a program looks for it in its run path. On Windows, keep the DLL next to the program.
+## Linking
+
+The commands below assume an archive unpacked into `emberwave/` and a program `app.c`.
+
+The shared library names itself `@rpath/libemberwave_ffi.dylib` on macOS and `libemberwave_ffi.so` on Linux, so a program looks for it on its run path. These commands set the run path to a `lib` directory next to the program and put the library there:
+
+```sh
+# macOS
+cc app.c -I emberwave/include -L emberwave/lib -lemberwave_ffi -Wl,-rpath,@executable_path/lib
+# Linux
+cc app.c -I emberwave/include -L emberwave/lib -lemberwave_ffi -Wl,-rpath,'$ORIGIN/lib'
+# both
+mkdir -p lib && cp emberwave/lib/libemberwave_ffi.* lib/
+```
+
+On Windows, link the import library and keep the DLL next to the program (from a Visual Studio developer prompt):
+
+```bat
+cl app.c /I emberwave\include emberwave\lib\emberwave_ffi.dll.lib
+copy emberwave\lib\emberwave_ffi.dll .
+```
+
+To link the static library instead, name its file, as `-lemberwave_ffi` would pick the shared one, and add the system libraries it needs:
+
+```sh
+cc app.c -I emberwave/include emberwave/lib/libemberwave_ffi.a $(cat emberwave/lib/native-static-libs.txt)
+```
+
+On Windows that is `emberwave\lib\emberwave_ffi.lib` with the libraries named in `emberwave\lib\native-static-libs.txt`.
 
 ## Use
 
@@ -44,13 +72,13 @@ emberwave_decoder_destroy(decoder);
 emberwave_context_destroy(context);
 ```
 
-[`examples/c/decode.c`](examples/c/decode.c) is a complete program: it decodes a PWV1 file to a Y4M file. Its [`CMakeLists.txt`](examples/c/CMakeLists.txt) shows how to link the shared library:
+[`examples/c/decode.c`](https://github.com/with-developer/emberwave/blob/main/crates/emberwave-ffi/examples/c/decode.c) in the repository is a complete program: it decodes a PWV1 file to a Y4M file. Its [`CMakeLists.txt`](https://github.com/with-developer/emberwave/blob/main/crates/emberwave-ffi/examples/c/CMakeLists.txt) links it to the shared library of a cargo build, from the root of the repository:
 
 ```sh
 cargo build -p emberwave-ffi
-cmake -S crates/emberwave-ffi/examples/c -B build -DEMBERWAVE_LIB_DIR=target/debug
-cmake --build build
-build/emberwave_decode testdata/noise_192x136_420.pwv1 out.y4m
+cmake -S crates/emberwave-ffi/examples/c -B target/c-example -DEMBERWAVE_LIB_DIR=target/debug
+cmake --build target/c-example
+target/c-example/emberwave_decode testdata/noise_192x136_420.pwv1 out.y4m
 ```
 
 `scripts/check_c_example.sh` does that for every test vector and compares the output with upstream's decoder; CI runs it on Linux, macOS and Windows.

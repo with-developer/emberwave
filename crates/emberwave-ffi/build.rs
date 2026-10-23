@@ -6,6 +6,9 @@
 //! (run path, `LD_LIBRARY_PATH`, system directories) on Linux.
 
 fn main() {
+    // Without this, a change to any file of the package would run the script
+    // again and rebuild the crate.
+    println!("cargo::rerun-if-changed=build.rs");
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("macos") => {
             println!(

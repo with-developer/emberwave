@@ -24,7 +24,7 @@
 #include <stdint.h>
 
 // 4:2:0: the chroma planes have half the width and height of the luma plane,
-// rounded up.
+// whose width and height are even.
 #define EMBERWAVE_CHROMA_420 0
 
 // 4:4:4: the chroma planes have the size of the luma plane.
@@ -119,7 +119,7 @@ typedef struct EmberwaveStreamInfo {
   uint32_t frame_rate_den;
 } EmberwaveStreamInfo;
 
-// How [`emberwave_context_create`] chooses the GPU.
+// How `emberwave_context_create` chooses the GPU.
 typedef struct EmberwaveContextOptions {
   // `EMBERWAVE_BACKEND_*` values combined with `|`, or
   // `EMBERWAVE_BACKEND_ANY`.
@@ -151,7 +151,7 @@ typedef struct EmberwavePlane {
   size_t stride;
 } EmberwavePlane;
 
-// The colour conversion of [`emberwave_decoder_decode_rgb`].
+// The colour conversion of `emberwave_decoder_decode_rgb`.
 typedef struct EmberwaveColor {
   // An `EMBERWAVE_MATRIX_*` value.
   uint32_t matrix;
@@ -176,7 +176,7 @@ const char *emberwave_last_error(void);
 // Describes the stream of a PWV1 file from its header, the first 24 bytes:
 // picture size, chroma format, colour signalling and frame rate. Frames
 // follow the header, each a little-endian 32-bit size and that many bytes to
-// give to [`emberwave_decoder_push_packet`].
+// give to `emberwave_decoder_push_packet`.
 //
 // # Safety
 //
@@ -200,9 +200,10 @@ enum EmberwaveStatus emberwave_probe_packet(const uint8_t *data,
                                             struct EmberwaveStreamInfo *info);
 
 // Creates a context on a GPU that `options` allow, or with `NULL` options on
-// any (the environment variable `EMBERWAVE_BACKEND` can then narrow the
-// choice, as for the command line tool). A discrete GPU is preferred to an
-// integrated one.
+// any. With `NULL` options the environment variable `EMBERWAVE_BACKEND` can
+// narrow the choice, as for the command line tool: `vulkan`, `metal`, `dx12`,
+// a comma separated list of them, or `auto`; a value that names no backend is
+// ignored. A discrete GPU is preferred to an integrated one.
 //
 // # Safety
 //
@@ -217,7 +218,7 @@ enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptio
 //
 // # Safety
 //
-// `context` is `NULL`, or a context from [`emberwave_context_create`] that
+// `context` is `NULL`, or a context from `emberwave_context_create` that
 // has not been destroyed and that no other thread is using.
 void emberwave_context_destroy(struct EmberwaveContext *context);
 
@@ -231,8 +232,10 @@ void emberwave_context_destroy(struct EmberwaveContext *context);
 const char *emberwave_context_adapter(const struct EmberwaveContext *context);
 
 // Creates a decoder on `context` for pictures of `width` x `height` pixels
-// in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. All the GPU
-// memory it needs for decoding is allocated here.
+// in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. Width and
+// height are from 1 to 16384, and even for 4:2:0; other sizes give
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`. All the GPU memory the decoder needs is
+// allocated here.
 //
 // # Safety
 //
@@ -248,7 +251,7 @@ enum EmberwaveStatus emberwave_decoder_create(const struct EmberwaveContext *con
 //
 // # Safety
 //
-// `decoder` is `NULL`, or a decoder from [`emberwave_decoder_create`] that
+// `decoder` is `NULL`, or a decoder from `emberwave_decoder_create` that
 // has not been destroyed and that no other thread is using.
 void emberwave_decoder_destroy(struct EmberwaveDecoder *decoder);
 
@@ -295,14 +298,14 @@ void emberwave_decoder_clear(struct EmberwaveDecoder *decoder);
 
 // Decodes the frame received so far and writes its Y, Cb and Cr planes, 8
 // bits per sample in the range the stream uses. Blocks that did not arrive
-// decode as zeros, so call it when [`emberwave_decoder_is_ready`] says so.
+// decode as zeros, so call it when `emberwave_decoder_is_ready` says so.
 // Waits for the GPU.
 //
 // # Safety
 //
 // `decoder` is a live decoder that no other thread is using. Each plane's
 // `data` points to `stride * (height - 1) + width` bytes that may be
-// written, with the sizes of [`emberwave_decoder_info`], and the planes do
+// written, with the sizes of `emberwave_decoder_info`, and the planes do
 // not overlap.
 enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decoder,
                                                   struct EmberwavePlane y,
