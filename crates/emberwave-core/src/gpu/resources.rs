@@ -1,6 +1,7 @@
 //! Buffers, bind groups and read-backs: what the decoder and the encoder share.
 
 use std::sync::mpsc;
+use std::time::Duration;
 
 use wgpu::util::DeviceExt;
 
@@ -102,4 +103,99 @@ pub(crate) fn read_back(
         buffer.unmap();
         Ok(data)
     })?
+}
+
+/// Timestamp queries at the boundaries of compute passes: a beginning and an
+/// end for each of a number of stages, a stage being one pass or several in
+/// a row. Only on a device created with timestamps.
+pub(crate) struct StageQueries {
+    query_set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    /// Nanoseconds per timestamp tick.
+    period_ns: f64,
+    stages: u32,
+}
+
+impl StageQueries {
+    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, stages: u32) -> Self {
+        let bytes = u64::from(2 * stages) * 8;
+        Self {
+            query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("stage timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2 * stages,
+            }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamps"),
+                size: bytes,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            readback: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp readback"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            period_ns: f64::from(queue.get_timestamp_period()),
+            stages,
+        }
+    }
+
+    /// The timestamps of a pass that begins stage `begins`, ends stage
+    /// `ends`, or both.
+    pub(crate) fn writes(
+        &self,
+        begins: Option<u32>,
+        ends: Option<u32>,
+    ) -> wgpu::ComputePassTimestampWrites<'_> {
+        wgpu::ComputePassTimestampWrites {
+            query_set: &self.query_set,
+            beginning_of_pass_write_index: begins.map(|stage| 2 * stage),
+            end_of_pass_write_index: ends.map(|stage| 2 * stage + 1),
+        }
+    }
+
+    /// Records the copy of the timestamps to where [`read`](Self::read)
+    /// finds them.
+    pub(crate) fn encode_resolve(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.resolve_query_set(&self.query_set, 0..2 * self.stages, &self.resolve, 0);
+        encoder.copy_buffer_to_buffer(
+            &self.resolve,
+            0,
+            &self.readback,
+            0,
+            u64::from(2 * self.stages) * 8,
+        );
+    }
+
+    /// The time of each stage, once the work with the timestamps is done:
+    /// `None` for a stage whose end came before its beginning, and `None`
+    /// altogether if the device wrote no timestamps. A stage shorter than one
+    /// tick of the timer is a valid measurement of zero, not a missing one.
+    pub(crate) fn read(
+        &self,
+        device: &wgpu::Device,
+    ) -> Result<Option<Vec<Option<Duration>>>, GpuError> {
+        let bytes = read_back(device, &self.readback, u64::from(2 * self.stages) * 8)?;
+        let ticks: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect();
+        // A device that wrote nothing leaves zeros.
+        if ticks.iter().all(|&tick| tick == 0) {
+            return Ok(None);
+        }
+        Ok(Some(
+            ticks
+                .chunks_exact(2)
+                .map(|pair| {
+                    (pair[1] >= pair[0]).then(|| {
+                        Duration::from_secs_f64((pair[1] - pair[0]) as f64 * self.period_ns * 1e-9)
+                    })
+                })
+                .collect(),
+        ))
+    }
 }

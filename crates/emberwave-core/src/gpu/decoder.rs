@@ -19,7 +19,9 @@ use super::context::GpuContext;
 use super::error::GpuError;
 use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{Pipelines, Stage, with_error_scope};
-use super::resources::{buffer, buffer_limit, check_size, entry, read_back, uniform_buffer};
+use super::resources::{
+    StageQueries, buffer, buffer_limit, check_size, entry, read_back, uniform_buffer,
+};
 
 /// Zero words after the payload. The dequantiser may read a little past the
 /// end of the last block; this keeps those reads deterministic.
@@ -122,17 +124,9 @@ struct ColorResources {
     grid: (u32, u32),
 }
 
-/// Number of timestamps: a begin and an end for each of three passes.
-const TIMESTAMP_QUERIES: u32 = 6;
-
-/// What it takes to read timestamps.
-struct TimestampResources {
-    query_set: wgpu::QuerySet,
-    resolve: wgpu::Buffer,
-    readback: wgpu::Buffer,
-    /// Nanoseconds per timestamp tick.
-    period_ns: f64,
-}
+/// Stages that are timed: dequantisation, the inverse transform and the
+/// colour conversion, one pass each.
+const TIMED_STAGES: u32 = 3;
 
 /// A dispatch of the inverse transform for one decomposition level.
 struct IdwtStage {
@@ -166,7 +160,7 @@ pub struct Decoder {
     idwt_stages: Vec<IdwtStage>,
 
     color: Option<ColorResources>,
-    timestamps: Option<TimestampResources>,
+    timestamps: Option<StageQueries>,
 
     /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
     lost: Arc<Mutex<Option<String>>>,
@@ -256,26 +250,9 @@ impl Decoder {
                 })
                 .collect();
 
-            let timestamps = context.supports_timestamps().then(|| TimestampResources {
-                query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("stage timestamps"),
-                    ty: wgpu::QueryType::Timestamp,
-                    count: TIMESTAMP_QUERIES,
-                }),
-                resolve: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("timestamps"),
-                    size: u64::from(TIMESTAMP_QUERIES) * 8,
-                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                }),
-                readback: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("timestamp readback"),
-                    size: u64::from(TIMESTAMP_QUERIES) * 8,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                period_ns: f64::from(queue.get_timestamp_period()),
-            });
+            let timestamps = context
+                .supports_timestamps()
+                .then(|| StageQueries::new(&device, &queue, TIMED_STAGES));
 
             Self {
                 device: device.clone(),
@@ -514,14 +491,7 @@ impl Decoder {
             }
 
             if let Some(q) = queries {
-                encoder.resolve_query_set(&q.query_set, 0..TIMESTAMP_QUERIES, &q.resolve, 0);
-                encoder.copy_buffer_to_buffer(
-                    &q.resolve,
-                    0,
-                    &q.readback,
-                    0,
-                    u64::from(TIMESTAMP_QUERIES) * 8,
-                );
+                q.encode_resolve(&mut encoder);
             }
             self.queue.submit([encoder.finish()]);
         })?;
@@ -565,16 +535,10 @@ impl Decoder {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         rgb: bool,
-        queries: Option<&TimestampResources>,
+        queries: Option<&StageQueries>,
     ) {
-        // Timestamps go at the boundaries of a pass: queries 2n and 2n + 1 for pass n.
-        let writes = |pass: u32| {
-            queries.map(|q| wgpu::ComputePassTimestampWrites {
-                query_set: &q.query_set,
-                beginning_of_pass_write_index: Some(2 * pass),
-                end_of_pass_write_index: Some(2 * pass + 1),
-            })
-        };
+        // Each pass is a stage of its own.
+        let writes = |pass: u32| queries.map(|q| q.writes(Some(pass), Some(pass)));
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -670,34 +634,17 @@ impl Decoder {
     /// times. `None` if the device wrote nothing usable.
     fn read_stage_timings(
         &self,
-        queries: &TimestampResources,
+        queries: &StageQueries,
         with_rgb: bool,
     ) -> Result<Option<StageTimings>, GpuError> {
-        let bytes = read_back(
-            &self.device,
-            &queries.readback,
-            u64::from(TIMESTAMP_QUERIES) * 8,
-        )?;
-        let ticks: Vec<u64> = bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-            .collect();
-
-        // A device that wrote nothing leaves zeros. A pass shorter than one tick
-        // of the timer is a valid measurement of zero, not a missing one.
-        if ticks.iter().all(|&tick| tick == 0) {
+        let Some(stages) = queries.read(&self.device)? else {
             return Ok(None);
-        }
-        let stage = |pass: usize| {
-            let (begin, end) = (ticks[2 * pass], ticks[2 * pass + 1]);
-            (end >= begin)
-                .then(|| Duration::from_secs_f64((end - begin) as f64 * queries.period_ns * 1e-9))
         };
-        Ok(match (stage(0), stage(1)) {
+        Ok(match (stages[0], stages[1]) {
             (Some(dequant), Some(idwt)) => Some(StageTimings {
                 dequant,
                 idwt,
-                yuv2rgb: if with_rgb { stage(2) } else { None },
+                yuv2rgb: if with_rgb { stages[2] } else { None },
             }),
             _ => None,
         })
