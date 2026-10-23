@@ -9,20 +9,20 @@
 ///
 /// Kept at the published double precision and rounded to `f32` once, the way
 /// the reference shaders convert their literals.
-const ALPHA: f32 = (-1.586_134_342_059_924_f64) as f32;
-const BETA: f32 = (-0.052_980_118_572_961_f64) as f32;
-const GAMMA: f32 = 0.882_911_075_530_934_f64 as f32;
-const DELTA: f32 = 0.443_506_852_043_971_f64 as f32;
+pub(crate) const ALPHA: f32 = (-1.586_134_342_059_924_f64) as f32;
+pub(crate) const BETA: f32 = (-0.052_980_118_572_961_f64) as f32;
+pub(crate) const GAMMA: f32 = 0.882_911_075_530_934_f64 as f32;
+pub(crate) const DELTA: f32 = 0.443_506_852_043_971_f64 as f32;
 /// Gain of the low-pass band; the high-pass band is scaled by its inverse.
-const K: f32 = 1.230_174_104_914_001_f64 as f32;
-const INV_K: f32 = (1.0_f64 / 1.230_174_104_914_001_f64) as f32;
+pub(crate) const K: f32 = 1.230_174_104_914_001_f64 as f32;
+pub(crate) const INV_K: f32 = (1.0_f64 / 1.230_174_104_914_001_f64) as f32;
 
 /// Samples of signal extension needed on each side: one per lifting step.
-const PADDING: usize = 4;
+pub(crate) const PADDING: usize = 4;
 
 /// Maps an index outside `0..len` to its whole-sample symmetric mirror image:
 /// `-1 -> 1`, `len -> len - 2`. Needs `len > PADDING`.
-fn mirror(index: isize, len: usize) -> usize {
+pub(crate) fn mirror(index: isize, len: usize) -> usize {
     let last = len as isize - 1;
     let mut index = index;
     if index < 0 {
