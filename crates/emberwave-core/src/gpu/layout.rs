@@ -14,7 +14,8 @@ use crate::encode::quant::{BandQuant, DROP_STEPS};
 use super::GpuError;
 
 /// Largest number of transmitted bands: four at level 4, three at each of the
-/// other levels, for three components. Sizes the band table in `dequant.wgsl`.
+/// other levels, for three components. Sizes the band tables of
+/// `dequant.wgsl` and `quantise.wgsl`.
 pub(crate) const MAX_BANDS: usize =
     NUM_COMPONENTS * (BANDS_PER_LEVEL + (DECOMPOSITION_LEVELS - 1) * (BANDS_PER_LEVEL - 1));
 
@@ -210,7 +211,8 @@ impl QuantParams {
                 offset: buffers
                     .band_offset(component, level, band)
                     .expect("a transmitted band has pyramid space"),
-                exponent: u32::try_from(quant.exponent).expect("band exponents are positive"),
+                // 7 to 12, positive.
+                exponent: quant.exponent as u32,
                 weight: quant.weight,
                 max_drop: u32::from(quant.max_drop()),
             };
@@ -747,7 +749,7 @@ mod tests {
     }
 
     proptest::proptest! {
-        // DequantParams and TransformLevel look bands up in the BufferLayout of the
+        // DequantParams, QuantParams and TransformLevel look bands up in the BufferLayout of the
         // same FrameLayout and `expect` to find them. Every picture size the
         // bitstream allows must keep that promise, so building the parameter
         // blocks never panics.
@@ -769,6 +771,12 @@ mod tests {
                 return Ok(());
             };
             DequantParams::new(&layout, &buffers);
+            let quant = QuantParams::new(&layout, &buffers);
+            for band in &quant.bands[..quant.band_count as usize] {
+                proptest::prop_assert!((7..=12).contains(&band.exponent));
+                proptest::prop_assert!(band.max_drop <= 15);
+                proptest::prop_assert!(band.weight > 0.0 && band.weight.is_finite());
+            }
             for level in 0..DECOMPOSITION_LEVELS {
                 TransformLevel::new(&layout, &buffers, level);
             }

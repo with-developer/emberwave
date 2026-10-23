@@ -95,7 +95,8 @@ pub struct GpuContext {
     /// decoder's and the encoder's, so that neither compiles the other's.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
     encoder_pipelines: Arc<Mutex<Option<Arc<EncoderPipelines>>>>,
-    /// Why the device was lost, once it has been; shared with the decoders.
+    /// Why the device was lost, once it has been; shared with the decoders
+    /// and the encoders.
     lost: Arc<Mutex<Option<String>>>,
 }
 
@@ -190,7 +191,8 @@ impl GpuContext {
         self.lost.lock().ok().and_then(|lost| lost.clone())
     }
 
-    /// The record of a lost device, shared with the decoders of this context.
+    /// The record of a lost device, shared with the decoders and the encoders
+    /// of this context.
     pub(crate) fn lost_record(&self) -> Arc<Mutex<Option<String>>> {
         Arc::clone(&self.lost)
     }

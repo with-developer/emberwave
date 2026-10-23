@@ -361,6 +361,13 @@ impl Encoder {
             data[at + 2],
             data[at + 3],
         ]));
+        if payload_words > budget_words {
+            // The rate control never lets this happen; a frame over its
+            // budget is not returned, whatever the GPU did.
+            return Err(GpuError::Device(format!(
+                "the GPU made a frame of {payload_words} words for a budget of {budget_words}"
+            )));
+        }
         if payload_words > capacity_words {
             // Only when the device cannot hold a buffer of the budget's size.
             return Err(GpuError::LimitExceeded {
@@ -432,8 +439,10 @@ impl Encoder {
     /// They go straight into wgpu's staging memory: one copy, not two.
     fn upload_planes(&mut self, planes: [&[u8]; 3]) -> Result<(), GpuError> {
         check_planes(&self.layout, planes)?;
-        let size =
-            wgpu::BufferSize::new(self.buffers.packed_words * 4).expect("a picture has samples");
+        // Never zero: a picture has a sample at least.
+        let Some(size) = wgpu::BufferSize::new(self.buffers.packed_words * 4) else {
+            return Ok(());
+        };
         with_error_scope(&self.device, || {
             // None only with a validation error, which the scope reports.
             let Some(mut view) = self.queue.write_buffer_with(&self.planes, 0, size) else {

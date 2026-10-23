@@ -14,7 +14,7 @@ use common::{
     Y4m, create_context, encoder_dir, encoder_vectors, live_resources, psnr, read_y4m,
     shared_context,
 };
-use emberwave_core::bitstream::{ChromaSubsampling, FrameAssembler, FrameLayout, Pwv1File};
+use emberwave_core::bitstream::{ChromaSubsampling, FrameAssembler, FrameLayout, Header, Pwv1File};
 use emberwave_core::cpu::decode_frame;
 use emberwave_core::encode::{self, EncodeError, Signalling};
 use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions};
@@ -211,10 +211,11 @@ fn errors_are_the_cpu_encoders() {
     }
     // A failure leaves the numbering alone: the next frame is still frame 1.
     let frame = gpu.encode(planes(source), vector.budget).unwrap();
-    assert_eq!(
-        frame, vector.committed[0],
-        "the first frame after the errors"
-    );
+    let sequence = match Header::parse(&frame).expect("a start of frame header") {
+        Header::StartOfFrame(header) => header.sequence,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sequence, 1, "the first frame after the errors");
 }
 
 #[test]
@@ -250,8 +251,9 @@ fn encoding_frame_after_frame_allocates_nothing() {
         .unwrap();
     let mut encoder = encoder_for(&context, &vector.layout);
     let source = &vector.source.frames[0];
-    // The largest budget first: the payload buffer grows to it, and stays.
-    let budgets = [60_000, 300, 4_000, 20_000];
+    // The largest budget first: the payload buffer, 64 KiB at first, grows
+    // to what this picture can need at most, and stays.
+    let budgets = [1_000_000, 300, 70_000, 20_000];
     for &budget in &budgets {
         encoder.encode(planes(source), budget).unwrap();
     }

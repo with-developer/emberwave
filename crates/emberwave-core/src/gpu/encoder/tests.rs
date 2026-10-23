@@ -226,9 +226,10 @@ fn quantising_the_cpus_coefficients_gives_the_cpus_tables() {
     let Some(context) = test_context() else {
         return;
     };
-    // Relative to the block's distortion with nothing dropped, or with all
-    // dropped: the sums are the CPU's, but a fused multiply-add rounds a
-    // product once where the CPU rounds twice.
+    // Relative to each distortion: the sums are the CPU's, in its order, but
+    // a fused multiply-add rounds a square once where the CPU rounds twice.
+    // A sum of 64 positive terms then moves by 64 units in the last place at
+    // most, 4e-6 of it.
     const TOLERANCE: f32 = 1e-5;
     let mut worst = 0.0f32;
     let mut entries = 0usize;
@@ -250,23 +251,21 @@ fn quantising_the_cpus_coefficients_gives_the_cpus_tables() {
                 let cost = record.to_cost().expect("numbers in range");
                 assert_eq!(cost.words, block.cost.words, "block {index}: words");
                 assert_eq!(cost.max_drop, block.cost.max_drop, "block {index}");
-                let scale = block
-                    .cost
-                    .distortion
-                    .iter()
-                    .fold(f32::MIN_POSITIVE, |a, &b| a.max(b));
                 for (drop, (g, c)) in cost
                     .distortion
                     .iter()
                     .zip(&block.cost.distortion)
                     .enumerate()
                 {
-                    let difference = (g - c).abs() / scale;
-                    worst = worst.max(difference);
+                    // A distortion of zero, nothing lost, must be zero too.
+                    let difference = (g - c).abs();
                     assert!(
-                        difference <= TOLERANCE,
+                        difference <= TOLERANCE * c.abs(),
                         "{width}x{height} {chroma:?} block {index} drop {drop}: GPU {g}, CPU {c}"
                     );
+                    if *c != 0.0 {
+                        worst = worst.max(difference / c.abs());
+                    }
                 }
                 entries += 1;
             }
@@ -412,10 +411,11 @@ fn packing_the_cpus_choices_gives_the_cpus_bytes() {
             let bands = cpu.transform(as_slices(&planes));
             let costs: Vec<BlockCost> = cpu.quantise(&bands).into_iter().map(|b| b.cost).collect();
             let total: usize = costs.iter().map(|c| usize::from(c.words[0])).sum();
+            // Even a tenth of the words fits: it drops planes, not blocks.
             let budget = HEADER_BYTES + (total as f64 * 4.0 * share) as usize;
-            let Ok(frame) = cpu.encode(as_slices(&planes), budget) else {
-                continue;
-            };
+            let frame = cpu
+                .encode(as_slices(&planes), budget)
+                .expect("the frame fits");
             let drops = rate::choose(&costs, ((budget - HEADER_BYTES) / 4) as u64).unwrap();
             let words: Vec<u32> = costs
                 .iter()
@@ -500,17 +500,14 @@ fn frames_are_the_cpu_encoders_or_as_good() {
             * gpu.layout().plane_size(Component::Y).1 as usize;
         for (seed, bytes_per_sample) in [(11, 2.0), (12, 0.4), (13, 0.1), (14, 0.02)] {
             let planes = picture(gpu.layout(), seed);
+            // Every budget fits; refusals are tests/gpu_encoder.rs's.
             let budget = HEADER_BYTES + 64 + (samples as f64 * bytes_per_sample) as usize;
-            let expected = cpu.encode(as_slices(&planes), budget);
-            let actual = gpu.encode(as_slices(&planes), budget);
-            let (expected, actual) = match (expected, actual) {
-                (Ok(expected), Ok(actual)) => (expected, actual),
-                (Err(expected), Err(GpuError::Encode(actual))) => {
-                    assert_eq!(actual, expected);
-                    continue;
-                }
-                (expected, actual) => panic!("CPU {expected:?}, GPU {actual:?}"),
-            };
+            let expected = cpu
+                .encode(as_slices(&planes), budget)
+                .expect("the frame fits");
+            let actual = gpu
+                .encode(as_slices(&planes), budget)
+                .expect("the frame fits");
             assert!(actual.len() <= budget);
             frames += 1;
             if actual == expected {
@@ -530,5 +527,6 @@ fn frames_are_the_cpu_encoders_or_as_good() {
         }
     }
     println!("{identical} of {frames} frames identical; worst loss {worst:.4} dB");
+    assert_eq!(frames, SHAPES.len() * 4);
     assert!(worst < 0.05, "the GPU's frames are {worst:.3} dB worse");
 }

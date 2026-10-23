@@ -229,8 +229,15 @@ fn create_stages<const N: usize>(
         immediate_size: 0,
     });
     entry_points.map(|entry_point| {
+        // Named after the shader, and the entry point if there are several,
+        // for validation messages and GPU captures.
+        let name = if N == 1 {
+            label.to_owned()
+        } else {
+            format!("{label} {entry_point}")
+        };
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(entry_point),
+            label: Some(&name),
             layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some(entry_point),

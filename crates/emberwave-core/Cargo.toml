@@ -1,6 +1,6 @@
 [package]
 name = "emberwave-core"
-description = "PyroWave bitstream parser and wgpu/WGSL decoder"
+description = "PyroWave bitstream parser, and wgpu/WGSL decoder and encoder"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,8 @@ publish.workspace = true
 
 [features]
 default = ["gpu"]
-# The wgpu decode pipeline. Without it only the bitstream parser and the CPU
-# reference decoder are built.
+# The wgpu decoder and encoder. Without it only the bitstream parser, the CPU
+# reference decoder and the CPU encoder are built.
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
