@@ -473,10 +473,11 @@ Nothing in a browser may block, so the player uses only the parts of the decoder
 
 - `GpuContext::from_adapter` creates the device on an adapter that can draw on the canvas. `GpuContext::new`, which blocks, does not exist in the browser build.
 - `Decoder::encode_rgb` records the decode and the colour conversion into the player's command encoder and returns. A render pass in the same encoder copies the RGBA words to the canvas (`blit.wgsl`: one triangle over the canvas, which has the size of the picture, so a fragment reads one word). One submission per frame, and the picture never leaves the GPU.
-- Error scopes cannot be waited for, so in the browser build `with_error_scope` just runs its work, and WebGPU reports errors to the console.
+- Error scopes cannot be waited for, so in the browser build `with_error_scope` just runs its work. The player catches what the browser reports instead (`on_uncaptured_error`) and shows the first error on the page with the next frame. Pictures wider or taller than the browser can draw (`max_texture_dimension_2d`, 8192 by default) are refused when the file is loaded.
 - The methods that read a frame back or time it wait for the GPU, and are not for the browser.
+- In a browser, dropping a wgpu buffer only lets go of the JavaScript object, and the GPU memory waits for the garbage collector. `Decoder` therefore destroys its large buffers when it is dropped, and the player drops the old stream before it loads the next file: about 140 MiB for a 4K stream.
 
-The page shows the frames per second, the CPU time to record and submit a frame, and the time from submitting it until the GPU is done (`onSubmittedWorkDone`), which includes drawing. In headless Chrome 155 on an Apple M3 Max (2026-10-23) the 1080p benchmark stream took 0.62 ms of CPU and 2.36 ms from submission to done, the 4K one 1.35 and 4.10 ms, both playing at their 30 frames per second.
+The page paces frames by the stream's frame rate, keeping the remainder of each interval, so 25 frames per second play as 25 on a 60 Hz display. It shows the frames per second, the CPU time to record and submit a frame, and the time from submitting a frame until the browser reports the GPU done with it (`onSubmittedWorkDone`): decoding and drawing, plus the delay of the report, averaged over the frames reported each second. In headless Chrome 155 on an Apple M3 Max (2026-10-24) the 1080p benchmark stream took about 0.6 ms of CPU and 2.2 ms from submission to done, the 4K one about 1.2 and 3.8 ms, both playing at their 30 frames per second.
 
 ## Decisions
 
