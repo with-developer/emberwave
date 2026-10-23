@@ -369,6 +369,38 @@ impl Decoder {
         Ok(timings)
     }
 
+    /// Records the decode of one complete frame, and its conversion to RGB,
+    /// into `encoder`, without submitting it or waiting for anything. Once the
+    /// caller has submitted `encoder`, [`rgba_buffer`](Self::rgba_buffer)
+    /// holds the picture: `width * height` words, one per pixel, red in the
+    /// low byte. This is the path for a player that draws the picture on the
+    /// GPU, and the only one in a browser, where nothing may block.
+    ///
+    /// The frame's data goes to the GPU with the next submission on this
+    /// decoder's queue, so record one frame per submission.
+    pub fn encode_rgb(
+        &mut self,
+        frame: &[u8],
+        color: &ColorParams,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), GpuError> {
+        self.check_device()?;
+        self.assemble_complete(frame)?;
+        self.ensure_payload_capacity()?;
+        with_error_scope(&self.device, || self.upload())?;
+        self.prepare_color(color)?;
+        self.encode_passes(encoder, true, None);
+        self.assembler.mark_frame_decoded();
+        Ok(())
+    }
+
+    /// The RGBA words that [`encode_rgb`](Self::encode_rgb) and
+    /// [`decode_rgb`](Self::decode_rgb) write, once one of them has run:
+    /// `width * height` words, one per pixel, red in the low byte, alpha 255.
+    pub fn rgba_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.color.as_ref().map(|resources| &resources.rgba)
+    }
+
     /// Feeds one packet of the frame being received. See
     /// [`FrameAssembler::push_packet`].
     pub fn push_packet(&mut self, packet: &[u8]) -> Result<(), GpuError> {
@@ -458,46 +490,7 @@ impl Decoder {
                     label: Some("decode"),
                 });
 
-            // Timestamps go at the boundaries of a pass: queries 2n and 2n + 1 for pass n.
-            let writes = |pass: u32| {
-                queries.map(|q| wgpu::ComputePassTimestampWrites {
-                    query_set: &q.query_set,
-                    beginning_of_pass_write_index: Some(2 * pass),
-                    end_of_pass_write_index: Some(2 * pass + 1),
-                })
-            };
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("dequant"),
-                    timestamp_writes: writes(0),
-                });
-                pass.set_pipeline(&self.pipelines.dequant.pipeline);
-                pass.set_bind_group(0, &self.dequant_bind_group, &[]);
-                pass.dispatch_workgroups(self.dequant_grid.0, self.dequant_grid.1, 1);
-            }
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("idwt"),
-                    timestamp_writes: writes(1),
-                });
-                pass.set_pipeline(&self.pipelines.idwt.pipeline);
-                for stage in &self.idwt_stages {
-                    pass.set_bind_group(0, &stage.bind_group, &[]);
-                    pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
-                }
-            }
-
-            if let (Some(_), Some(resources)) = (color, self.color.as_ref()) {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("yuv2rgb"),
-                    timestamp_writes: writes(2),
-                });
-                pass.set_pipeline(&self.pipelines.yuv2rgb.pipeline);
-                pass.set_bind_group(0, &resources.bind_group, &[]);
-                pass.dispatch_workgroups(resources.grid.0, resources.grid.1, 1);
-            }
+            self.encode_passes(&mut encoder, color.is_some(), queries);
 
             match (read, self.color.as_ref()) {
                 (Read::Yuv, _) => encoder.copy_buffer_to_buffer(
@@ -558,6 +551,57 @@ impl Decoder {
                 stages,
             },
         ))
+    }
+
+    /// Records the GPU stages of a frame into `encoder`: dequantisation, the
+    /// inverse transform and, with `rgb`, the colour conversion. With
+    /// `queries` each pass writes its timestamps.
+    fn encode_passes(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        rgb: bool,
+        queries: Option<&TimestampResources>,
+    ) {
+        // Timestamps go at the boundaries of a pass: queries 2n and 2n + 1 for pass n.
+        let writes = |pass: u32| {
+            queries.map(|q| wgpu::ComputePassTimestampWrites {
+                query_set: &q.query_set,
+                beginning_of_pass_write_index: Some(2 * pass),
+                end_of_pass_write_index: Some(2 * pass + 1),
+            })
+        };
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dequant"),
+                timestamp_writes: writes(0),
+            });
+            pass.set_pipeline(&self.pipelines.dequant.pipeline);
+            pass.set_bind_group(0, &self.dequant_bind_group, &[]);
+            pass.dispatch_workgroups(self.dequant_grid.0, self.dequant_grid.1, 1);
+        }
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("idwt"),
+                timestamp_writes: writes(1),
+            });
+            pass.set_pipeline(&self.pipelines.idwt.pipeline);
+            for stage in &self.idwt_stages {
+                pass.set_bind_group(0, &stage.bind_group, &[]);
+                pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
+            }
+        }
+
+        if let (true, Some(resources)) = (rgb, self.color.as_ref()) {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("yuv2rgb"),
+                timestamp_writes: writes(2),
+            });
+            pass.set_pipeline(&self.pipelines.yuv2rgb.pipeline);
+            pass.set_bind_group(0, &resources.bind_group, &[]);
+            pass.dispatch_workgroups(resources.grid.0, resources.grid.1, 1);
+        }
     }
 
     /// Creates the buffers of the colour conversion on first use and writes

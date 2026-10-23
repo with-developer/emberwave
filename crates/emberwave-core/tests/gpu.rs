@@ -810,3 +810,43 @@ fn a_thousand_4k_frames_leave_no_trace() {
     );
     assert_eq!(after, before);
 }
+
+#[test]
+fn encoding_into_a_callers_encoder_gives_the_same_picture() {
+    let context = gpu_or_return!();
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let color = ColorParams::default();
+
+    let mut decoder = decoder_for(context, &layout);
+    let expected = decoder.decode_rgb(&frames[1], &color).unwrap();
+
+    // The same frame recorded into an encoder of our own, then the RGBA words
+    // copied out the way a caller would.
+    let mut other = decoder_for(context, &layout);
+    assert!(other.rgba_buffer().is_none());
+    let device = context.device();
+    let mut encoder = device.create_command_encoder(&Default::default());
+    other.encode_rgb(&frames[1], &color, &mut encoder).unwrap();
+    let rgba = other.rgba_buffer().expect("RGBA buffer after encode_rgb");
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test readback"),
+        size: rgba.size(),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(rgba, 0, &readback, 0, rgba.size());
+    context.queue().submit([encoder.finish()]);
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |result| result.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let words = slice.get_mapped_range().expect("mapped").to_vec();
+
+    let rgb: Vec<u8> = words
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect();
+    assert!(words.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    assert_eq!(rgb, expected.data);
+}

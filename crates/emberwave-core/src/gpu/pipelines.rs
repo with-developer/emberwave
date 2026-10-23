@@ -129,6 +129,7 @@ fn create_stage(
 
 /// Runs `body` and turns validation and out-of-memory errors raised inside it
 /// into an error value instead of letting the default handler panic.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn with_error_scope<T>(
     device: &wgpu::Device,
     body: impl FnOnce() -> T,
@@ -148,4 +149,14 @@ pub(crate) fn with_error_scope<T>(
         Some(error) => Err(GpuError::Device(error.to_string())),
         None => Ok(value),
     }
+}
+
+/// In a browser nothing may block, so the scopes cannot be waited for. The
+/// work runs as it is; WebGPU reports its errors to the browser's console.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn with_error_scope<T>(
+    _device: &wgpu::Device,
+    body: impl FnOnce() -> T,
+) -> Result<T, GpuError> {
+    Ok(body())
 }
