@@ -25,25 +25,46 @@ pub struct GpuOptions {
     pub strict_webgpu: bool,
 }
 
-impl Default for GpuOptions {
-    /// All native backends unless [`BACKEND_ENV`] says otherwise, preferring
-    /// the high-performance GPU.
-    fn default() -> Self {
-        let backends = std::env::var(BACKEND_ENV)
-            .ok()
-            .and_then(|value| parse_backends(&value))
-            .unwrap_or(wgpu::Backends::PRIMARY);
+impl GpuOptions {
+    /// The options without any influence of the environment.
+    fn base() -> Self {
         Self {
-            backends,
+            backends: wgpu::Backends::PRIMARY,
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             strict_webgpu: false,
         }
     }
+
+    /// The default options with the backends taken from [`BACKEND_ENV`] if it
+    /// is set. A value that names no backend is an error here, where
+    /// [`Default`] would ignore it.
+    pub fn from_env() -> Result<Self, String> {
+        let mut options = Self::base();
+        if let Some(value) = std::env::var_os(BACKEND_ENV) {
+            let value = value.to_string_lossy();
+            options.backends = parse_backends(&value).ok_or_else(|| {
+                format!(
+                    "{BACKEND_ENV}={value} names no backend: use vulkan, metal, dx12, a comma separated list of them, or auto"
+                )
+            })?;
+        }
+        Ok(options)
+    }
 }
 
-/// Parses a backend name (`vulkan`, `metal`, `dx12`, `gl`), a comma separated
-/// list of them, or `auto` for all primary backends.
+impl Default for GpuOptions {
+    /// All native backends unless [`BACKEND_ENV`] names others, preferring the
+    /// high-performance GPU. An unusable value of the variable is ignored; use
+    /// [`GpuOptions::from_env`] to be told about it.
+    fn default() -> Self {
+        Self::from_env().unwrap_or_else(|_| Self::base())
+    }
+}
+
+/// Parses a backend name (`vulkan`, `metal` or `dx12`), a comma separated list
+/// of them, or `auto` (or `all`) for all primary backends. Anything else,
+/// including `gl`, which is not supported, gives `None`.
 pub fn parse_backends(text: &str) -> Option<wgpu::Backends> {
     let mut backends = wgpu::Backends::empty();
     for name in text.split(',') {
@@ -163,6 +184,7 @@ mod tests {
         );
         assert_eq!(parse_backends("auto"), Some(wgpu::Backends::PRIMARY));
         assert_eq!(parse_backends("opengl"), None);
+        assert_eq!(parse_backends("gl"), None);
         assert_eq!(parse_backends("vulkan,nonsense"), None);
     }
 }
