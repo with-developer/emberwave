@@ -50,7 +50,7 @@ fn inverse_line(line: &mut [f32], extended: &mut Vec<f32>) {
     extended.clear();
     extended.extend((0..len + 2 * PADDING).map(|i| {
         let source = mirror(i as isize - PADDING as isize, len);
-        let gain = if source % 2 == 0 { K } else { INV_K };
+        let gain = if source.is_multiple_of(2) { K } else { INV_K };
         line[source] * gain
     }));
 

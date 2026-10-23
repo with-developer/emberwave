@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/with-developer/emberwave"
-rust-version = "1.85"
+rust-version = "1.87"
 # Releases are GitHub Releases only; keep cargo from publishing by accident.
 publish = false
 
@@ -19,6 +19,12 @@ publish = false
 emberwave-core = { path = "crates/emberwave-core", version = "0.1.0" }
 thiserror = "2"
 proptest = "1"
+# Native backends only: GLES would need EGL and the browser backend is for the
+# wasm build, which gets its own crate (M6).
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
