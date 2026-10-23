@@ -1,14 +1,12 @@
-//! The compute pipelines, built once per device and shared by all decoders.
+//! The compute pipelines, built once per device and shared by all decoders
+//! and encoders.
 //!
 //! Compiling the shaders is the slowest part of creating a decoder (on DX12
 //! most of all), so a [`GpuContext`](super::GpuContext) builds them on first
 //! use and hands out the same ones afterwards.
 
 use super::error::GpuError;
-
-const DEQUANT_SHADER: &str = include_str!("shaders/dequant.wgsl");
-const IDWT_SHADER: &str = include_str!("shaders/idwt.wgsl");
-const YUV2RGB_SHADER: &str = include_str!("shaders/yuv2rgb.wgsl");
+use super::shader_sources;
 
 /// A compute pipeline with the bind group layout it was created with.
 #[derive(Debug)]
@@ -31,7 +29,7 @@ impl Pipelines {
             dequant: create_stage(
                 device,
                 "dequant",
-                DEQUANT_SHADER,
+                shader_sources::DEQUANT,
                 &[
                     storage_entry(0, true),
                     storage_entry(1, true),
@@ -42,7 +40,7 @@ impl Pipelines {
             idwt: create_stage(
                 device,
                 "idwt",
-                IDWT_SHADER,
+                shader_sources::IDWT,
                 &[
                     storage_entry(0, false),
                     storage_entry(1, false),
@@ -52,13 +50,121 @@ impl Pipelines {
             yuv2rgb: create_stage(
                 device,
                 "yuv2rgb",
-                YUV2RGB_SHADER,
+                shader_sources::YUV2RGB,
                 &[
                     storage_entry(0, true),
                     storage_entry(1, false),
                     uniform_entry(2),
                 ],
             ),
+        })
+    }
+}
+
+/// The entry points of `rate.wgsl`, which share one bind group layout.
+#[derive(Debug)]
+pub(crate) struct RateStages {
+    pub analyse: Stage,
+    pub cutoff: Stage,
+    pub ties: Stage,
+    pub choose: Stage,
+}
+
+/// The entry points of `scan.wgsl`, which share one bind group layout.
+#[derive(Debug)]
+pub(crate) struct ScanStages {
+    pub chunks: Stage,
+    pub totals: Stage,
+    pub add: Stage,
+}
+
+/// The stages of the encoder.
+#[derive(Debug)]
+pub(crate) struct EncoderPipelines {
+    pub fdwt: Stage,
+    pub equant: Stage,
+    pub rate: RateStages,
+    pub scan: ScanStages,
+    pub pack: Stage,
+}
+
+impl EncoderPipelines {
+    pub(crate) fn new(device: &wgpu::Device) -> Result<Self, GpuError> {
+        with_error_scope(device, || {
+            let [analyse, cutoff, ties, choose] = create_stages(
+                device,
+                "rate",
+                shader_sources::RATE,
+                ["analyse", "cutoff", "ties", "choose"],
+                &[
+                    storage_entry(0, true),
+                    storage_entry(1, false),
+                    storage_entry(2, false),
+                    storage_entry(3, false),
+                    storage_entry(4, false),
+                    storage_entry(5, false),
+                    uniform_entry(6),
+                ],
+            );
+            let [chunks, totals, add] = create_stages(
+                device,
+                "scan",
+                shader_sources::SCAN,
+                ["scan_chunks", "scan_totals", "add_totals"],
+                &[
+                    storage_entry(0, false),
+                    storage_entry(1, false),
+                    uniform_entry(2),
+                ],
+            );
+            Self {
+                fdwt: create_stage(
+                    device,
+                    "fdwt",
+                    shader_sources::FDWT,
+                    &[
+                        storage_entry(0, false),
+                        storage_entry(1, true),
+                        uniform_entry(2),
+                        storage_entry(3, true),
+                    ],
+                ),
+                equant: create_stage(
+                    device,
+                    "equant",
+                    shader_sources::EQUANT,
+                    &[
+                        storage_entry(0, true),
+                        storage_entry(1, false),
+                        uniform_entry(2),
+                    ],
+                ),
+                rate: RateStages {
+                    analyse,
+                    cutoff,
+                    ties,
+                    choose,
+                },
+                scan: ScanStages {
+                    chunks,
+                    totals,
+                    add,
+                },
+                pack: create_stage(
+                    device,
+                    "pack",
+                    shader_sources::PACK,
+                    &[
+                        storage_entry(0, true),
+                        storage_entry(1, true),
+                        storage_entry(2, true),
+                        storage_entry(3, true),
+                        storage_entry(4, false),
+                        uniform_entry(5),
+                        uniform_entry(6),
+                    ],
+                ),
+            }
         })
     }
 }
@@ -89,12 +195,26 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// The pipeline of a shader whose entry point is `main`.
 fn create_stage(
     device: &wgpu::Device,
     label: &str,
     source: &str,
     entries: &[wgpu::BindGroupLayoutEntry],
 ) -> Stage {
+    let [stage] = create_stages(device, label, source, ["main"], entries);
+    stage
+}
+
+/// The pipelines of several entry points of one shader, which share the bind
+/// group layout made of `entries`: each uses some of its bindings.
+fn create_stages<const N: usize>(
+    device: &wgpu::Device,
+    label: &str,
+    source: &str,
+    entry_points: [&str; N],
+    entries: &[wgpu::BindGroupLayoutEntry],
+) -> [Stage; N] {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -108,23 +228,28 @@ fn create_stage(
         bind_group_layouts: &[Some(&layout)],
         immediate_size: 0,
     });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: Some("main"),
-        // The shaders write every workgroup variable before they read it, so
-        // the zeroing WebGPU requires is wasted work. naga does it with one
-        // invocation per workgroup, which made the inverse transform take 0.64
-        // instead of 0.38 ms at 4K (ARCHITECTURE.md, decision D25). Browsers
-        // zero the memory regardless.
-        compilation_options: wgpu::PipelineCompilationOptions {
-            zero_initialize_workgroup_memory: false,
-            ..Default::default()
-        },
-        cache: None,
-    });
-    Stage { pipeline, layout }
+    entry_points.map(|entry_point| {
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry_point),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(entry_point),
+            // The shaders write every workgroup variable before they read it,
+            // so the zeroing WebGPU requires is wasted work. naga does it with
+            // one invocation per workgroup, which made the inverse transform
+            // take 0.64 instead of 0.38 ms at 4K (ARCHITECTURE.md, decision
+            // D25). Browsers zero the memory regardless.
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
+            cache: None,
+        });
+        Stage {
+            pipeline,
+            layout: layout.clone(),
+        }
+    })
 }
 
 /// Runs `body` and turns validation and out-of-memory errors raised inside it

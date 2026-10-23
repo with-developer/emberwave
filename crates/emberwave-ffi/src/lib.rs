@@ -196,6 +196,9 @@ impl From<GpuError> for Failure {
             GpuError::Device(_) | GpuError::Readback(_) => EmberwaveStatus::Gpu,
             GpuError::DeviceLost(_) => EmberwaveStatus::DeviceLost,
             GpuError::IncompleteFrame { .. } | GpuError::Bitstream(_) => EmberwaveStatus::Bitstream,
+            // Planes or a budget the encoder cannot take; the C API has no
+            // encoder yet, so nothing here returns it.
+            GpuError::Encode(_) => EmberwaveStatus::InvalidArgument,
         };
         Self(status, error.to_string())
     }

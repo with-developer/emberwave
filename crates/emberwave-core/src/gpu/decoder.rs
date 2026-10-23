@@ -6,10 +6,8 @@
 //! (`idwt.wgsl`), whose last level writes the 8-bit planes. On request a last
 //! stage converts YCbCr to RGB (`yuv2rgb.wgsl`).
 
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use wgpu::util::DeviceExt;
 
 use crate::bitstream::consts::DECOMPOSITION_LEVELS;
 use crate::bitstream::{
@@ -19,8 +17,9 @@ use crate::color::ColorParams;
 
 use super::context::GpuContext;
 use super::error::GpuError;
-use super::layout::{BufferLayout, DequantParams, IdwtLevel, YuvParams};
+use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{Pipelines, Stage, with_error_scope};
+use super::resources::{buffer, buffer_limit, check_size, entry, read_back, uniform_buffer};
 
 /// Zero words after the payload. The dequantiser may read a little past the
 /// end of the last block; this keeps those reads deterministic.
@@ -190,30 +189,11 @@ impl Decoder {
         // Compiled once per context, however many decoders are created.
         let pipelines = context.pipelines()?;
 
-        let check = |what: &'static str, bytes: u64| {
-            let limit = buffer_limit(&device);
-            if bytes > limit {
-                Err(GpuError::LimitExceeded {
-                    what,
-                    needed: bytes,
-                    limit,
-                })
-            } else {
-                Ok(())
-            }
-        };
-        check("the wavelet pyramid", buffers.pyramid_floats * 4)?;
-        check("the packed planes", buffers.packed_words * 4)?;
+        check_size(&device, "the wavelet pyramid", buffers.pyramid_floats * 4)?;
+        check_size(&device, "the packed planes", buffers.packed_words * 4)?;
 
         with_error_scope(&device, || {
-            let storage = |label: &str, bytes: u64, usage: wgpu::BufferUsages| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(label),
-                    size: bytes.max(16),
-                    usage,
-                    mapped_at_creation: false,
-                })
-            };
+            let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
 
             let payload_capacity_words = MIN_PAYLOAD_WORDS;
             let payload = storage(
@@ -263,7 +243,7 @@ impl Decoder {
             let idwt_stages = (0..DECOMPOSITION_LEVELS)
                 .rev()
                 .map(|level| {
-                    let stage = IdwtLevel::new(&layout, &buffers, level);
+                    let stage = TransformLevel::new(&layout, &buffers, level);
                     let params = uniform_buffer(&device, "idwt params", &stage.params);
                     IdwtStage {
                         bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -547,9 +527,11 @@ impl Decoder {
         })?;
 
         let bytes = match (read, self.color.as_ref()) {
-            (Read::Yuv, _) => self.read_back(&self.readback, self.buffers.packed_words * 4)?,
+            (Read::Yuv, _) => {
+                read_back(&self.device, &self.readback, self.buffers.packed_words * 4)?
+            }
             (Read::Rgb, Some(resources)) => {
-                self.read_back(&resources.readback, resources.rgba.size())?
+                read_back(&self.device, &resources.readback, resources.rgba.size())?
             }
             _ => {
                 self.device
@@ -634,14 +616,7 @@ impl Decoder {
 
         if self.color.is_none() {
             let bytes = u64::from(params.width) * u64::from(params.height) * 4;
-            let limit = buffer_limit(&self.device);
-            if bytes > limit {
-                return Err(GpuError::LimitExceeded {
-                    what: "the RGB image",
-                    needed: bytes,
-                    limit,
-                });
-            }
+            check_size(&self.device, "the RGB image", bytes)?;
 
             let resources = with_error_scope(&self.device, || {
                 let rgba = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -698,7 +673,11 @@ impl Decoder {
         queries: &TimestampResources,
         with_rgb: bool,
     ) -> Result<Option<StageTimings>, GpuError> {
-        let bytes = self.read_back(&queries.readback, u64::from(TIMESTAMP_QUERIES) * 8)?;
+        let bytes = read_back(
+            &self.device,
+            &queries.readback,
+            u64::from(TIMESTAMP_QUERIES) * 8,
+        )?;
         let ticks: Vec<u64> = bytes
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
@@ -775,7 +754,7 @@ impl Decoder {
             self.queue.submit([encoder.finish()]);
             staging
         })
-        .and_then(|staging| self.read_back(&staging, bytes));
+        .and_then(|staging| read_back(&self.device, &staging, bytes));
         // As in run_gpu: a failure on a device that was lost meanwhile is the loss.
         self.check_device()?;
         let data = copied?;
@@ -847,36 +826,6 @@ impl Decoder {
             payload.len() as u64 * 4,
             bytemuck::cast_slice(&[0u32; PAYLOAD_PADDING_WORDS]),
         );
-    }
-
-    /// Waits for the GPU and copies a mappable buffer's first `bytes` bytes out.
-    fn read_back(&self, buffer: &wgpu::Buffer, bytes: u64) -> Result<Vec<u8>, GpuError> {
-        // Mapping and unmapping report errors through the error scopes like
-        // the other calls. Waiting cannot: wgpu treats a device error while
-        // polling as fatal (decision D22).
-        with_error_scope(&self.device, || {
-            let slice = buffer.slice(..bytes);
-            let (sender, receiver) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                // The receiver is only gone if this function already returned.
-                let _ = sender.send(result);
-            });
-
-            self.device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .map_err(|error| GpuError::Readback(error.to_string()))?;
-            receiver
-                .recv()
-                .map_err(|error| GpuError::Readback(error.to_string()))?
-                .map_err(|error| GpuError::Readback(error.to_string()))?;
-
-            let data = slice
-                .get_mapped_range()
-                .map_err(|error| GpuError::Readback(error.to_string()))?
-                .to_vec();
-            buffer.unmap();
-            Ok(data)
-        })?
     }
 
     /// Cuts the packed planes (rows padded to whole words) into tight planes.
@@ -955,29 +904,6 @@ fn payload_capacity_bytes(needed_words: usize, limit_bytes: u64) -> Option<u64> 
     Some(rounded.min(limit))
 }
 
-/// The most bytes one buffer can have and still be bound as a storage buffer.
-fn buffer_limit(device: &wgpu::Device) -> u64 {
-    let limits = device.limits();
-    limits
-        .max_storage_buffer_binding_size
-        .min(limits.max_buffer_size)
-}
-
-fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry {
-        binding,
-        resource: buffer.as_entire_binding(),
-    }
-}
-
-fn uniform_buffer<T: bytemuck::Pod>(device: &wgpu::Device, label: &str, value: &T) -> wgpu::Buffer {
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: bytemuck::bytes_of(value),
-        usage: wgpu::BufferUsages::UNIFORM,
-    })
-}
-
 fn dequant_bind_group(
     device: &wgpu::Device,
     stage: &Stage,
@@ -1000,25 +926,10 @@ fn dequant_bind_group(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::gpu::GpuOptions;
+    use wgpu::util::DeviceExt;
 
-    /// A context, or `None` if there is no GPU and none is required.
-    fn context() -> Option<GpuContext> {
-        match GpuContext::new(&GpuOptions::default()) {
-            Ok(context) => Some(context),
-            Err(error) => {
-                let required =
-                    std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_some_and(|v| !v.is_empty());
-                assert!(
-                    !required,
-                    "a GPU is required but none is available: {error}"
-                );
-                eprintln!("no GPU available, skipping: {error}");
-                None
-            }
-        }
-    }
+    use super::*;
+    use crate::gpu::context::test_context;
 
     /// Runs `to_unorm8` of `idwt.wgsl`, the rounding of the last level, on
     /// `values` on the GPU and returns the 8-bit levels. The function is cut out
@@ -1098,7 +1009,7 @@ mod tests {
 
     #[test]
     fn the_last_level_writes_every_word_with_zero_padding() {
-        let Some(context) = context() else {
+        let Some(context) = test_context() else {
             return;
         };
 
@@ -1117,7 +1028,7 @@ mod tests {
         }
 
         for (width, height, chroma) in shapes {
-            let mut decoder = Decoder::new(&context, width, height, chroma).unwrap();
+            let mut decoder = Decoder::new(context, width, height, chroma).unwrap();
             // Anything the decode leaves unwritten keeps this pattern.
             let size = decoder.buffers.packed_words as usize * 4;
             decoder
@@ -1192,7 +1103,7 @@ mod tests {
 
     #[test]
     fn the_last_level_rounds_ties_to_even_like_the_cpu() {
-        let Some(context) = context() else {
+        let Some(context) = test_context() else {
             return;
         };
 
@@ -1215,6 +1126,6 @@ mod tests {
         // Round-half-up would get half of the ties wrong, so there must be plenty.
         assert!(ties >= 40, "only {ties} exact ties");
 
-        assert_eq!(to_unorm8_on_gpu(&context, &values), expected);
+        assert_eq!(to_unorm8_on_gpu(context, &values), expected);
     }
 }
