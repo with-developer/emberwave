@@ -19,7 +19,7 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "Emberwave",
-            path: "../../../../target/xcframework/emberwave.xcframework"
+            path: "../../../../target/xcframework/Emberwave.xcframework"
         ),
         .executableTarget(
             name: "emberwave-decode",

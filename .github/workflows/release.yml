@@ -141,7 +141,7 @@ jobs:
           ref=${GITHUB_REF_NAME//\//-}
           name="emberwave-ffi-${ref}-xcframework"
           mkdir "$name"
-          cp -R target/xcframework/emberwave.xcframework "$name/"
+          cp -R target/xcframework/Emberwave.xcframework "$name/"
           cp target/xcframework/native-static-libs-*.txt "$name/"
           cp crates/emberwave-ffi/README.md LICENSE CHANGELOG.md "$name/"
           # ditto zips a bundle as Apple's tools do.

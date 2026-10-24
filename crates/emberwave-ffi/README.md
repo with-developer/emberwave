@@ -13,6 +13,8 @@ Each [release](https://github.com/with-developer/emberwave/releases) has an arch
 | `lib/libemberwave_ffi.a` or `lib/emberwave_ffi.lib` | The static library |
 | `lib/native-static-libs.txt` | The system libraries a program linked to the static library needs as well |
 
+For apps on iPhones, iPads and Macs, `emberwave-ffi-VERSION-xcframework.zip` holds the static library as an XCFramework (see [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)).
+
 To build it yourself, with Rust 1.87 or newer:
 
 ```sh
@@ -50,6 +52,38 @@ cc app.c -I emberwave/include emberwave/lib/libemberwave_ffi.a $(cat emberwave/l
 ```
 
 On Windows that is `emberwave\lib\emberwave_ffi.lib` with the libraries named in `emberwave\lib\native-static-libs.txt`.
+
+## iPhone, iPad and Mac apps
+
+`Emberwave.xcframework`, in each release's `emberwave-ffi-VERSION-xcframework.zip`, has the static library for iPhones and iPads (iOS 12 or later), for the iOS Simulator on Macs with Apple silicon (iOS 14 or later) and for Macs with Apple silicon (macOS 11 or later), each with the header and a module map. The `native-static-libs-*.txt` files next to it name the system libraries of each; they are the same for all three. To build it yourself on a Mac with Xcode, from the root of the repository:
+
+```sh
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+scripts/build_xcframework.sh        # target/xcframework/Emberwave.xcframework
+```
+
+In Xcode, add `Emberwave.xcframework` to the app target's *Frameworks, Libraries, and Embedded Content* as *Do Not Embed*, since its libraries are static, and add Metal, QuartzCore, CoreGraphics, Foundation, CoreFoundation and `libiconv.tbd` there too. Swift imports the API as the module `Emberwave`; C and Objective-C include `<Emberwave/emberwave.h>`.
+
+```swift
+import Emberwave
+
+var context: OpaquePointer?
+guard emberwave_context_create(nil, &context) == EMBERWAVE_STATUS_OK else {
+    fatalError(String(cString: emberwave_last_error()))
+}
+defer { emberwave_context_destroy(context) }
+print("decoding on", String(cString: emberwave_context_adapter(context)))
+```
+
+A Swift package names the XCFramework as a binary target. [`examples/swift`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/swift) is one: `decode.c` in Swift, with the system libraries in its linker settings. From the root of the repository:
+
+```sh
+scripts/build_xcframework.sh macos-arm64     # the Mac's library alone
+swift run --package-path crates/emberwave-ffi/examples/swift \
+    emberwave-decode testdata/noise_192x136_420.pwv1 out.y4m
+```
+
+`scripts/check_xcframework.sh` builds the C examples and the Swift example against every library of the XCFramework. CI runs them on a Mac and in an iOS Simulator, and links them for devices. They have not run on an iPhone or an iPad yet, where an app has to be signed by its developer.
 
 ## Use
 

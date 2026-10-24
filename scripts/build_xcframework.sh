@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the C library (emberwave-ffi) as static libraries for iPhones and
 # iPads, for the iOS Simulator and for Macs, all with Apple silicon, and
-# bundles them with the header into target/xcframework/emberwave.xcframework,
+# bundles them with the header into target/xcframework/Emberwave.xcframework,
 # which Xcode and SwiftPM link like any other XCFramework.
 #
 # The header sits in Headers/Emberwave with a module map: Swift imports it as
@@ -81,7 +81,7 @@ for slice in "${slices[@]}"; do
     libraries+=(-library "target/$target/release/libemberwave_ffi.a" -headers "$OUT/headers")
 done
 
-xcodebuild -create-xcframework "${libraries[@]}" -output "$OUT/emberwave.xcframework"
+xcodebuild -create-xcframework "${libraries[@]}" -output "$OUT/Emberwave.xcframework"
 for slice in "${slices[@]}"; do
     echo "$slice needs: $(cat "$OUT/native-static-libs-$slice.txt")"
 done

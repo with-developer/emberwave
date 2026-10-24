@@ -26,7 +26,7 @@ case $CLI in
     /*) ;;
     *) CLI=$ROOT/$CLI ;;
 esac
-XCFRAMEWORK=$ROOT/target/xcframework/emberwave.xcframework
+XCFRAMEWORK=$ROOT/target/xcframework/Emberwave.xcframework
 BUILD=$ROOT/target/xcframework-check
 rm -rf target/xcframework-check
 
@@ -138,6 +138,12 @@ for slice in "${slices[@]}"; do
             echo "== in the simulator $(xcrun simctl list devices --json |
                 jq -r --arg udid "$device" '.devices | to_entries[] | .key as $runtime
                     | .value[] | select(.udid == $udid) | "\(.name), \($runtime | sub(".*SimRuntime."; ""))"')"
+            # A failure in the simulator must fail the check: the example
+            # without arguments exits with 2.
+            if on_simulator "$BUILD/$slice/emberwave_decode" 2> /dev/null; then
+                echo "simctl spawn does not pass on the exit status of the program" >&2
+                exit 1
+            fi
             exercise on_simulator "$BUILD/$slice"
             ;;
     esac
