@@ -270,7 +270,10 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
 
     // At the last level every invocation writes one word of the tile: four
     // samples of a row, the first in the low byte. Rows of a packed plane are
-    // padded to whole words, and the padding samples are zero.
+    // padded to whole words, and the padding samples are zero. Words after
+    // the row's last sample are not written: a decoder pads its rows further,
+    // to the rows of a copy into a texture (decision D41), and nothing reads
+    // that padding.
     //
     // The barrier is outside the branch on purpose: every level waits, though
     // only the last needs it. Inside `if (is_final)`, uniform as that is, it
@@ -281,8 +284,8 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         let word = tid % 8u;
         let y = u32(tile_y) + row;
         let word_x = u32(tile_x) / 4u + word;
-        if (y < comp.plane_height && word_x < comp.image_stride) {
-            let x = 4u * word_x;
+        let x = 4u * word_x;
+        if (y < comp.plane_height && x < comp.plane_width) {
             let at = row * TILE + 4u * word;
             let width = comp.plane_width;
             packed[comp.image_offset + y * comp.image_stride + word_x] = level_at(at, x, width) |

@@ -43,8 +43,38 @@ pub(crate) struct BufferLayout {
 /// Marks a band that does not exist in `band_offsets`.
 const ABSENT: u32 = u32::MAX;
 
+/// Words per row of a decoder's packed planes are a multiple of this: rows
+/// of a multiple of 256 bytes, which a copy from a buffer into a texture
+/// takes, so that a plane goes into a texture with a copy (decision D41).
+pub(crate) const DECODER_ROW_WORDS: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT / 4;
+
+/// A decoder's packed planes start at a multiple of this many words: 512
+/// bytes, `D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`, where Direct3D 12 copies
+/// into a texture from. From other offsets wgpu copies through a buffer it
+/// allocates on the spot, and panics when that fails (decision D41).
+pub(crate) const DECODER_PLANE_WORDS: u32 = 512 / 4;
+
 impl BufferLayout {
+    /// The layout of an encoder: rows of the packed planes padded to whole
+    /// words only, and the planes one after the other.
     pub(crate) fn new(layout: &FrameLayout) -> Result<Self, GpuError> {
+        Self::with_alignment(layout, 1, 1)
+    }
+
+    /// The layout of a decoder: rows of the packed planes padded to a
+    /// multiple of [`DECODER_ROW_WORDS`], planes at multiples of
+    /// [`DECODER_PLANE_WORDS`].
+    pub(crate) fn for_decoder(layout: &FrameLayout) -> Result<Self, GpuError> {
+        Self::with_alignment(layout, DECODER_ROW_WORDS, DECODER_PLANE_WORDS)
+    }
+
+    /// The layout with packed rows of a multiple of `row_words` words, and
+    /// planes that start at multiples of `plane_words`.
+    fn with_alignment(
+        layout: &FrameLayout,
+        row_words: u32,
+        plane_words: u32,
+    ) -> Result<Self, GpuError> {
         let mut band_offsets = [[[ABSENT; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
         let mut pyramid_floats = 0u64;
 
@@ -69,7 +99,8 @@ impl BufferLayout {
         let mut packed_words = 0u64;
         for component in Component::ALL {
             let (width, height) = layout.plane_size(component);
-            let stride = width.div_ceil(4);
+            let stride = width.div_ceil(4).next_multiple_of(row_words);
+            packed_words = packed_words.next_multiple_of(u64::from(plane_words));
             packed_offsets[component.index()] = to_offset(packed_words)?;
             packed_strides[component.index()] = stride;
             packed_words += u64::from(stride) * u64::from(height);
@@ -652,6 +683,35 @@ mod tests {
             BufferLayout::new(&layout).unwrap().packed_strides,
             [33, 33, 33]
         );
+
+        // A decoder's rows take 256 bytes or a multiple of it, and its planes
+        // start at multiples of 512 bytes.
+        let layout = layout_420();
+        let buffers = BufferLayout::for_decoder(&layout).unwrap();
+        assert_eq!(buffers.packed_strides, [64, 64, 64]);
+        assert_eq!(buffers.packed_offsets, [0, 64 * 120, 64 * 120 + 64 * 60]);
+        assert_eq!(buffers.packed_words, 64 * 120 + 2 * 64 * 60);
+        let layout = FrameLayout::new(3840, 2160, ChromaSubsampling::Yuv420).unwrap();
+        assert_eq!(
+            BufferLayout::for_decoder(&layout).unwrap().packed_strides,
+            [960, 512, 512]
+        );
+        // Odd heights leave gaps between the planes.
+        let layout = FrameLayout::new(131, 67, ChromaSubsampling::Yuv444).unwrap();
+        let buffers = BufferLayout::for_decoder(&layout).unwrap();
+        assert_eq!(buffers.packed_strides, [64, 64, 64]);
+        assert_eq!(buffers.packed_offsets, [0, 64 * 68, 2 * 64 * 68]);
+        // Cb ends 256 bytes short of a multiple of 512: Cr starts after a gap.
+        let layout = FrameLayout::new(1280, 722, ChromaSubsampling::Yuv420).unwrap();
+        let buffers = BufferLayout::for_decoder(&layout).unwrap();
+        assert_eq!(buffers.packed_strides, [320, 192, 192]);
+        assert_eq!(
+            buffers.packed_offsets,
+            [0, 320 * 722, 320 * 722 + 192 * 361 + 64]
+        );
+        for offset in buffers.packed_offsets {
+            assert_eq!(offset % DECODER_PLANE_WORDS, 0);
+        }
     }
 
     #[test]
