@@ -16,7 +16,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLHazardTrackingMode, MTLOrigin, MTLPixelFormat,
-    MTLResource, MTLResourceOptions, MTLSize, MTLTexture,
+    MTLResource, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
+    MTLTextureUsage,
 };
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -533,6 +534,305 @@ fn decode_on_the_app_queue(
         }
 
         for texture in [texture].into_iter().chain(planes) {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_decoder_destroy(decoder);
+    }
+}
+
+/// A texture of the app's own, made as a `CVMetalTextureCache` makes one:
+/// shared storage, `usage`, and tracked unless `untracked`, as a heap's are.
+fn app_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    format: MTLPixelFormat,
+    (width, height): (usize, usize),
+    usage: MTLTextureUsage,
+    untracked: bool,
+) -> Retained<ProtocolObject<dyn MTLTexture>> {
+    // SAFETY: a 2D texture of a pixel format and a size Metal takes.
+    let descriptor = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            format, width, height, false,
+        )
+    };
+    descriptor.setUsage(usage);
+    descriptor.setStorageMode(MTLStorageMode::Shared);
+    if untracked {
+        descriptor.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+    }
+    device
+        .newTextureWithDescriptor(&descriptor)
+        .expect("a texture")
+}
+
+/// The pointer the C API takes for `texture`.
+fn raw(texture: &Retained<ProtocolObject<dyn MTLTexture>>) -> *mut std::ffi::c_void {
+    Retained::as_ptr(texture).cast_mut().cast()
+}
+
+#[test]
+fn the_apps_own_textures_take_the_picture_and_the_planes() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no Metal device"
+        );
+        return;
+    };
+    let queue = device.newCommandQueue().expect("a command queue");
+    let mut context = ptr::null_mut();
+    // SAFETY: a Metal device and its queue, and a pointer to store the
+    // context in.
+    let status = unsafe {
+        emberwave_context_create_metal(
+            Retained::as_ptr(&device).cast_mut().cast(),
+            Retained::as_ptr(&queue).cast_mut().cast(),
+            &mut context,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    // 192 pixels wide, a copy fills the picture's texture; 200, a draw
+    // (decision D42).
+    for name in ["noise_192x136_420.pwv1", "gradient_200x120_420.pwv1"] {
+        into_app_textures(context, &device, &queue, &testdata(name));
+    }
+    // SAFETY: a live context.
+    unsafe { emberwave_context_destroy(context) };
+}
+
+/// Decodes the frames of `bytes` into textures of the app's own, waiting and
+/// not, and checks what the C API refuses to take.
+fn into_app_textures(
+    context: *mut EmberwaveContext,
+    device: &ProtocolObject<dyn MTLDevice>,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    bytes: &[u8],
+) {
+    let frames: Vec<&[u8]> = Pwv1File::parse(bytes)
+        .unwrap()
+        .frames()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    // SAFETY: live objects, buffers of the sizes passed, and pointers to store
+    // results in; the Metal textures outlive the C API's textures of them.
+    unsafe {
+        let mut stream = EmberwaveStreamInfo::default();
+        assert_eq!(
+            emberwave_probe_pwv1(bytes.as_ptr(), bytes.len(), &mut stream),
+            EmberwaveStatus::Ok
+        );
+        let mut decoder = ptr::null_mut();
+        assert_eq!(
+            emberwave_decoder_create(
+                context,
+                stream.width,
+                stream.height,
+                stream.chroma,
+                &mut decoder
+            ),
+            EmberwaveStatus::Ok
+        );
+        let mut info = EmberwaveFrameInfo::default();
+        assert_eq!(
+            emberwave_decoder_info(decoder, &mut info),
+            EmberwaveStatus::Ok
+        );
+        let (width, height) = (info.width as usize, info.height as usize);
+        let sizes = [
+            (width, height),
+            (info.chroma_width as usize, info.chroma_height as usize),
+            (info.chroma_width as usize, info.chroma_height as usize),
+        ];
+        let push = |frame: &[u8]| {
+            emberwave_decoder_clear(decoder);
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok
+            );
+        };
+        // What the decodes to CPU memory give: BGRA and the planes.
+        let expected: Vec<(Vec<u8>, [Vec<u8>; 3])> = frames[..2]
+            .iter()
+            .map(|frame| {
+                let mut rgb = vec![0u8; width * height * 3];
+                push(frame);
+                let target = EmberwavePlane {
+                    data: rgb.as_mut_ptr(),
+                    stride: width * 3,
+                };
+                assert_eq!(
+                    emberwave_decoder_decode_rgb(decoder, ptr::null(), target),
+                    EmberwaveStatus::Ok
+                );
+                let mut planes = sizes.map(|(w, h)| vec![0u8; w * h]);
+                let [y, cb, cr] = planes.each_mut().map(|plane| plane.as_mut_ptr());
+                let plane = |data, (w, _): (usize, usize)| EmberwavePlane { data, stride: w };
+                push(frame);
+                assert_eq!(
+                    emberwave_decoder_decode_yuv(
+                        decoder,
+                        plane(y, sizes[0]),
+                        plane(cb, sizes[1]),
+                        plane(cr, sizes[2])
+                    ),
+                    EmberwaveStatus::Ok
+                );
+                let bgra = rgb
+                    .chunks_exact(3)
+                    .flat_map(|p| [p[2], p[1], p[0], 255])
+                    .collect();
+                (bgra, planes)
+            })
+            .collect();
+
+        // The picture. A texture of a CVMetalTextureCache can be read but not
+        // drawn into, unless asked for: a copy fills it if it can, and the
+        // draw that fills it otherwise needs it to be a render target.
+        let copies = (width * 4).is_multiple_of(256);
+        let usage = if copies {
+            MTLTextureUsage::ShaderRead
+        } else {
+            MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget
+        };
+        let picture = app_texture(device, MTLPixelFormat::BGRA8Unorm, sizes[0], usage, false);
+        let mut texture = ptr::null_mut();
+        assert_eq!(
+            emberwave_texture_from_metal(decoder, raw(&picture), &mut texture),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        push(frames[0]);
+        assert_eq!(
+            emberwave_decoder_decode_texture(decoder, ptr::null(), texture),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        assert!(read(device, &picture) == expected[0].0, "the picture");
+        // Without a wait, read by the app's next command buffer.
+        push(frames[1]);
+        assert_eq!(
+            emberwave_decoder_submit_texture(decoder, ptr::null(), texture),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        assert!(
+            blit(queue, &picture).contents() == expected[1].0,
+            "the picture, submitted"
+        );
+
+        // The planes.
+        let planes = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR]
+            .into_iter()
+            .zip(sizes)
+            .map(|(plane, size)| {
+                let metal = app_texture(
+                    device,
+                    MTLPixelFormat::R8Unorm,
+                    size,
+                    MTLTextureUsage::ShaderRead,
+                    false,
+                );
+                let mut texture = ptr::null_mut();
+                assert_eq!(
+                    emberwave_texture_from_metal_plane(decoder, raw(&metal), plane, &mut texture),
+                    EmberwaveStatus::Ok,
+                    "{}",
+                    last_error()
+                );
+                (metal, texture)
+            })
+            .collect::<Vec<_>>();
+        push(frames[0]);
+        assert_eq!(
+            emberwave_decoder_decode_plane_textures(decoder, planes[0].1, planes[1].1, planes[2].1),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        for ((metal, _), plane) in planes.iter().zip(&expected[0].1) {
+            assert!(read(device, metal) == *plane, "a plane");
+        }
+
+        // A texture Metal does not track: a waiting decode takes it, a
+        // decode that does not wait cannot be ordered.
+        let untracked = app_texture(device, MTLPixelFormat::BGRA8Unorm, sizes[0], usage, true);
+        let mut loose = ptr::null_mut();
+        assert_eq!(
+            emberwave_texture_from_metal(decoder, raw(&untracked), &mut loose),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        push(frames[0]);
+        assert_eq!(
+            emberwave_decoder_decode_texture(decoder, ptr::null(), loose),
+            EmberwaveStatus::Ok
+        );
+        assert!(read(device, &untracked) == expected[0].0, "untracked");
+        assert_eq!(
+            emberwave_decoder_submit_texture(decoder, ptr::null(), loose),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(last_error().contains("track"), "{}", last_error());
+
+        // What is refused.
+        let ink = MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget;
+        let wrong_size = app_texture(device, MTLPixelFormat::BGRA8Unorm, (64, 64), ink, false);
+        let wrong_format = app_texture(device, MTLPixelFormat::RGBA16Float, sizes[0], ink, false);
+        let mut refused = ptr::null_mut();
+        for (metal, complaint) in [
+            (raw(&wrong_size), "rather than the picture's"),
+            (raw(&wrong_format), "pixel format"),
+            (ptr::null_mut(), "metal is NULL"),
+        ] {
+            assert_eq!(
+                emberwave_texture_from_metal(decoder, metal, &mut refused),
+                EmberwaveStatus::InvalidArgument
+            );
+            assert!(last_error().contains(complaint), "{}", last_error());
+            assert!(refused.is_null());
+        }
+        assert_eq!(
+            emberwave_texture_from_metal_plane(
+                decoder,
+                raw(&picture),
+                EMBERWAVE_PLANE_Y,
+                &mut refused
+            ),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("MTLPixelFormatR8Unorm"),
+            "{}",
+            last_error()
+        );
+        if !copies {
+            // Neither a copy nor a draw can fill a texture that is only read.
+            let read_only = app_texture(
+                device,
+                MTLPixelFormat::BGRA8Unorm,
+                sizes[0],
+                MTLTextureUsage::ShaderRead,
+                false,
+            );
+            assert_eq!(
+                emberwave_texture_from_metal(decoder, raw(&read_only), &mut refused),
+                EmberwaveStatus::InvalidArgument
+            );
+            assert!(
+                last_error().contains("neither a copy nor a draw"),
+                "{}",
+                last_error()
+            );
+        }
+
+        for texture in [texture, loose]
+            .into_iter()
+            .chain(planes.iter().map(|(_, texture)| *texture))
+        {
             emberwave_texture_destroy(texture);
         }
         emberwave_decoder_destroy(decoder);

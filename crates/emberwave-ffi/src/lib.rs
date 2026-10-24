@@ -277,6 +277,10 @@ pub struct EmberwaveTexture {
     /// The plane the texture is for, or `None` for the RGB picture. A plane
     /// of 4:4:4 has the size of the others, so only this tells them apart.
     plane: Option<Component>,
+    /// Whether Metal tracks the texture's hazards, which the decodes that do
+    /// not wait need (decision D43). Those emberwave makes are tracked, and
+    /// a caller's texture from a heap usually is not.
+    tracked: bool,
 }
 
 impl EmberwaveTexture {
@@ -286,13 +290,24 @@ impl EmberwaveTexture {
         texture: wgpu::Texture,
         plane: Option<Component>,
     ) -> *mut Self {
+        Box::into_raw(Box::new(Self::wrap(decoder, texture, plane, true)))
+    }
+
+    /// `texture`, of `decoder`'s device, for `plane` or for the RGB picture.
+    fn wrap(
+        decoder: &EmberwaveDecoder,
+        texture: wgpu::Texture,
+        plane: Option<Component>,
+        tracked: bool,
+    ) -> Self {
         let view = texture.create_view(&Default::default());
-        Box::into_raw(Box::new(Self {
+        Self {
             texture,
             view,
             context_id: decoder.decoder.context_id(),
             plane,
-        }))
+            tracked,
+        }
     }
 }
 
@@ -1297,17 +1312,7 @@ pub unsafe extern "C" fn emberwave_texture_create_plane(
             unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
             // SAFETY: as the caller promises.
             let decoder = unsafe { live(decoder) }?;
-            let component = match plane {
-                EMBERWAVE_PLANE_Y => Component::Y,
-                EMBERWAVE_PLANE_CB => Component::Cb,
-                EMBERWAVE_PLANE_CR => Component::Cr,
-                other => {
-                    return Err(Failure::argument(format!(
-                        "plane is {other}, not EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB or \
-                         EMBERWAVE_PLANE_CR"
-                    )));
-                }
-            };
+            let component = plane_component(plane)?;
             let created = decoder.decoder.create_plane_texture(component)?;
             // SAFETY: checked by the first output() above.
             unsafe { texture.write(EmberwaveTexture::boxed(decoder, created, Some(component))) };
@@ -1316,6 +1321,278 @@ pub unsafe extern "C" fn emberwave_texture_create_plane(
         // SAFETY: as the caller promises.
         || unsafe { lost(decoder) },
     )
+}
+
+/// Wraps the caller's own Metal texture, `metal`, an `id<MTLTexture>`, for
+/// the decodes of `decoder` to put the picture into, as into one of
+/// `emberwave_texture_create`'s: a texture of a `CVPixelBuffer` from a
+/// `CVMetalTextureCache`, to hand to an `AVSampleBufferDisplayLayer`, one the
+/// caller made, or a drawable (decision D44). Only on iPhones, iPads and
+/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+///
+/// The texture is on the device of the decoder's context
+/// (`emberwave_context_metal_device`), 2D, of one level, layer and sample,
+/// not a view of another texture nor memoryless, of the picture's size, and
+/// `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm`. A decode copies
+/// the picture into it when its width is a multiple of 64 pixels and it is
+/// not framebuffer-only, as a texture of a `CVPixelBuffer` is not; otherwise
+/// it draws it, which needs `MTLTextureUsageRenderTarget`. A texture that
+/// neither can fill gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`. So does one
+/// that is not right, and `texture` is then `NULL`.
+///
+/// emberwave keeps a reference to `metal` until the texture is destroyed.
+/// Keep what the texture comes from, such as the `CVMetalTextureRef`, alive
+/// until the GPU work that writes it is done: after a waiting decode has
+/// returned, or once a command buffer committed after
+/// `emberwave_decoder_submit_texture` has completed. That function takes only
+/// textures whose hazards Metal tracks, which a texture of a heap's usually
+/// is not; the decodes that wait take any.
+///
+/// # Safety
+///
+/// `decoder` is a live decoder, and `metal` is `NULL` or an
+/// `id<MTLTexture>`. `texture` points to where the new texture is stored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_metal(
+    decoder: *const EmberwaveDecoder,
+    metal: *mut c_void,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live(decoder) }?;
+            // SAFETY: as the caller promises.
+            let wrapped = unsafe { metal_import(decoder, metal, None) }?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Wraps the caller's own Metal texture, `metal`, for the Y, Cb or Cr plane
+/// of the pictures of `decoder`, as `emberwave_texture_create_plane` makes
+/// one: `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+/// `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_metal`, but the
+/// texture is `MTLPixelFormatR8Unorm` of the plane's size, and as a decode
+/// copies a plane, not framebuffer-only.
+///
+/// # Safety
+///
+/// As for `emberwave_texture_from_metal`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_metal_plane(
+    decoder: *const EmberwaveDecoder,
+    metal: *mut c_void,
+    plane: u32,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live(decoder) }?;
+            let component = plane_component(plane)?;
+            // SAFETY: as the caller promises.
+            let wrapped = unsafe { metal_import(decoder, metal, Some(component)) }?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// The plane an `EMBERWAVE_PLANE_*` value names.
+fn plane_component(plane: u32) -> Result<Component, Failure> {
+    match plane {
+        EMBERWAVE_PLANE_Y => Ok(Component::Y),
+        EMBERWAVE_PLANE_CB => Ok(Component::Cb),
+        EMBERWAVE_PLANE_CR => Ok(Component::Cr),
+        other => Err(Failure::argument(format!(
+            "plane is {other}, not EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB or EMBERWAVE_PLANE_CR"
+        ))),
+    }
+}
+
+/// The caller's `id<MTLTexture>` `metal` as a texture of `decoder`'s, for
+/// `plane` or for the picture, once it has passed the checks of
+/// `emberwave_texture_from_metal`.
+///
+/// # Safety
+///
+/// `metal` is `NULL` or an `id<MTLTexture>`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe fn metal_import(
+    decoder: &EmberwaveDecoder,
+    metal: *mut c_void,
+    plane: Option<Component>,
+) -> Result<EmberwaveTexture, Failure> {
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{
+        MTLHazardTrackingMode, MTLPixelFormat, MTLResource, MTLStorageMode, MTLTexture,
+        MTLTextureType, MTLTextureUsage,
+    };
+
+    // SAFETY: an id<MTLTexture>, as the caller promises, retained here for
+    // wgpu's texture, which keeps it until it is dropped.
+    let metal: Retained<ProtocolObject<dyn MTLTexture>> =
+        unsafe { Retained::retain(metal.cast()) }.ok_or(Failure::argument("metal is NULL"))?;
+    let device = decoder.decoder.device();
+    if !std::ptr::eq(
+        Retained::as_ptr(&metal.device()).cast::<c_void>(),
+        metal_device(device).cast_const(),
+    ) {
+        return Err(Failure::argument(
+            "the texture is not on the Metal device of the decoder's context",
+        ));
+    }
+
+    let layout = decoder.decoder.layout();
+    let (width, height) = match plane {
+        Some(component) => layout.plane_size(component),
+        None => (layout.width(), layout.height()),
+    };
+    let format = metal.pixelFormat();
+    let format = match plane {
+        Some(_) if format == MTLPixelFormat::R8Unorm => emberwave_core::gpu::PLANE_FORMAT,
+        None if format == MTLPixelFormat::RGBA8Unorm => wgpu::TextureFormat::Rgba8Unorm,
+        None if format == MTLPixelFormat::BGRA8Unorm => wgpu::TextureFormat::Bgra8Unorm,
+        Some(_) => {
+            return Err(Failure::argument(format!(
+                "the texture's pixel format is {}, not MTLPixelFormatR8Unorm",
+                format.0
+            )));
+        }
+        None => {
+            return Err(Failure::argument(format!(
+                "the texture's pixel format is {}, not MTLPixelFormatBGRA8Unorm or \
+                 MTLPixelFormatRGBA8Unorm",
+                format.0
+            )));
+        }
+    };
+    let whose = if plane.is_some() {
+        "plane's"
+    } else {
+        "picture's"
+    };
+    let problem = if metal.textureType() != MTLTextureType::Type2D {
+        Some("is not 2D".to_owned())
+    } else if (
+        metal.mipmapLevelCount(),
+        metal.arrayLength(),
+        metal.sampleCount(),
+    ) != (1, 1, 1)
+    {
+        Some("has more than one level, layer or sample".to_owned())
+    } else if (metal.width(), metal.height()) != (width as usize, height as usize) {
+        Some(format!(
+            "is {}x{} rather than the {whose} {width}x{height}",
+            metal.width(),
+            metal.height()
+        ))
+    } else if metal.parentTexture().is_some() {
+        Some("is a view of another texture".to_owned())
+    } else if metal.storageMode() == MTLStorageMode::Memoryless {
+        Some("is memoryless".to_owned())
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        return Err(Failure::argument(format!("the texture {problem}")));
+    }
+
+    // What wgpu may do with it: copies unless it is framebuffer-only, as a
+    // drawable is by default, draws with RenderTarget, sampling with
+    // ShaderRead.
+    let copies = !metal.isFramebufferOnly();
+    let mut usage = wgpu::TextureUsages::empty();
+    if copies {
+        usage |= wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC;
+    }
+    if metal.usage().contains(MTLTextureUsage::RenderTarget) {
+        usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+    }
+    if metal.usage().contains(MTLTextureUsage::ShaderRead) {
+        usage |= wgpu::TextureUsages::TEXTURE_BINDING;
+    }
+    let fillable = match plane {
+        Some(_) => copies,
+        None => {
+            (copies && (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
+                || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        }
+    };
+    if !fillable {
+        return Err(Failure::argument(
+            "neither a copy nor a draw can fill the texture: a copy needs a texture that is \
+             not framebuffer-only (and for the picture a width of a multiple of 64 pixels), \
+             a draw of the picture MTLTextureUsageRenderTarget",
+        ));
+    }
+    let tracked = metal.hazardTrackingMode() == MTLHazardTrackingMode::Tracked;
+
+    // SAFETY: the texture is on the device, 2D, of one level and layer, in
+    // the format and of the size given, as checked above.
+    let hal = unsafe {
+        wgpu::hal::metal::Device::texture_from_raw(
+            metal,
+            format,
+            MTLTextureType::Type2D,
+            1,
+            1,
+            wgpu::hal::CopyExtent {
+                width,
+                height,
+                depth: 1,
+            },
+            None,
+        )
+    };
+    // SAFETY: as above, and the usage is what the texture allows; whatever it
+    // holds, a decode writes all of it.
+    let texture = unsafe {
+        device.create_texture_from_hal::<wgpu::hal::api::Metal>(
+            hal,
+            &wgpu::TextureDescriptor {
+                label: Some("caller's texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            },
+            wgpu::TextureUses::UNINITIALIZED,
+        )
+    };
+    Ok(EmberwaveTexture::wrap(decoder, texture, plane, tracked))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+unsafe fn metal_import(
+    _decoder: &EmberwaveDecoder,
+    _metal: *mut c_void,
+    _plane: Option<Component>,
+) -> Result<EmberwaveTexture, Failure> {
+    Err(Failure(
+        EmberwaveStatus::NoGpu,
+        "Metal textures exist on iPhones, iPads and Macs only".into(),
+    ))
 }
 
 /// Destroys a texture.
@@ -1370,10 +1647,12 @@ pub unsafe extern "C" fn emberwave_decoder_decode_texture(
             // SAFETY: as the caller promises.
             let decoder = unsafe { live_mut(decoder) }?;
             // SAFETY: as the caller promises.
-            let view = unsafe { picture_view(texture, decoder.decoder.context_id()) }?;
+            let texture = unsafe { picture_texture(texture, decoder.decoder.context_id()) }?;
             // SAFETY: as the caller promises.
             let params = unsafe { conversion(decoder, color) }?;
-            decoder.decoder.decode_assembled_to_texture(&params, view)?;
+            decoder
+                .decoder
+                .decode_assembled_to_texture(&params, &texture.view)?;
             Ok(())
         },
         // SAFETY: as the caller promises; the body's borrow has ended.
@@ -1381,16 +1660,16 @@ pub unsafe extern "C" fn emberwave_decoder_decode_texture(
     )
 }
 
-/// The view of `texture`, unless it is `NULL`, on the device of another
-/// context than `context_id`'s, or for a plane.
+/// `texture`, unless it is `NULL`, on the device of another context than
+/// `context_id`'s, or for a plane.
 ///
 /// # Safety
 ///
-/// `texture` is `NULL` or a live texture, which outlives the view.
-unsafe fn picture_view<'a>(
+/// `texture` is `NULL` or a live texture, which outlives the borrow.
+unsafe fn picture_texture<'a>(
     texture: *const EmberwaveTexture,
     context_id: u64,
-) -> Result<&'a wgpu::TextureView, Failure> {
+) -> Result<&'a EmberwaveTexture, Failure> {
     // SAFETY: as the caller promises.
     let Some(texture) = (unsafe { texture.as_ref() }) else {
         return Err(Failure::argument("texture is NULL"));
@@ -1408,7 +1687,21 @@ unsafe fn picture_view<'a>(
              emberwave_decoder_decode_plane_textures fills"
         )));
     }
-    Ok(&texture.view)
+    Ok(texture)
+}
+
+/// An error unless Metal tracks the hazards of `texture`, the argument
+/// `name`, which a decode that does not wait needs (decision D43).
+fn require_tracked(texture: &EmberwaveTexture, name: &str) -> Result<(), Failure> {
+    if texture.tracked {
+        Ok(())
+    } else {
+        Err(Failure::argument(format!(
+            "Metal does not track the hazards of {name}, as it does not for a heap's \
+             textures, so the queue cannot order the decode: use the decode that waits, \
+             or a texture made with MTLHazardTrackingModeTracked"
+        )))
+    }
 }
 
 /// Decodes the frame received so far into `texture`, as
@@ -1441,10 +1734,13 @@ pub unsafe extern "C" fn emberwave_decoder_submit_texture(
             let decoder = unsafe { live_mut(decoder) }?;
             require_shared_queue(decoder)?;
             // SAFETY: as the caller promises.
-            let view = unsafe { picture_view(texture, decoder.decoder.context_id()) }?;
+            let texture = unsafe { picture_texture(texture, decoder.decoder.context_id()) }?;
+            require_tracked(texture, "texture")?;
             // SAFETY: as the caller promises.
             let params = unsafe { conversion(decoder, color) }?;
-            decoder.decoder.submit_assembled_to_texture(&params, view)?;
+            decoder
+                .decoder
+                .submit_assembled_to_texture(&params, &texture.view)?;
             Ok(())
         },
         // SAFETY: as the caller promises; the body's borrow has ended.
@@ -1474,13 +1770,17 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures(
             require_shared_queue(decoder)?;
             let context_id = decoder.decoder.context_id();
             // SAFETY: as the caller promises.
-            let targets = unsafe {
+            let textures = unsafe {
                 [
-                    plane_view(y, Component::Y, "y", context_id)?,
-                    plane_view(cb, Component::Cb, "cb", context_id)?,
-                    plane_view(cr, Component::Cr, "cr", context_id)?,
+                    plane_texture(y, Component::Y, "y", context_id)?,
+                    plane_texture(cb, Component::Cb, "cb", context_id)?,
+                    plane_texture(cr, Component::Cr, "cr", context_id)?,
                 ]
             };
+            for (texture, name) in textures.iter().zip(["y", "cb", "cr"]) {
+                require_tracked(texture, name)?;
+            }
+            let targets = textures.map(|texture| &texture.view);
             decoder
                 .decoder
                 .submit_assembled_to_plane_textures(targets)?;
@@ -1544,13 +1844,14 @@ pub unsafe extern "C" fn emberwave_decoder_decode_plane_textures(
             let decoder = unsafe { live_mut(decoder) }?;
             let context_id = decoder.decoder.context_id();
             // SAFETY: as the caller promises.
-            let targets = unsafe {
+            let textures = unsafe {
                 [
-                    plane_view(y, Component::Y, "y", context_id)?,
-                    plane_view(cb, Component::Cb, "cb", context_id)?,
-                    plane_view(cr, Component::Cr, "cr", context_id)?,
+                    plane_texture(y, Component::Y, "y", context_id)?,
+                    plane_texture(cb, Component::Cb, "cb", context_id)?,
+                    plane_texture(cr, Component::Cr, "cr", context_id)?,
                 ]
             };
+            let targets = textures.map(|texture| &texture.view);
             decoder
                 .decoder
                 .decode_assembled_to_plane_textures(targets)?;
@@ -1561,18 +1862,18 @@ pub unsafe extern "C" fn emberwave_decoder_decode_plane_textures(
     )
 }
 
-/// The view of `texture`, the argument `name`, unless it is `NULL`, on the
-/// device of another context than `context_id`'s, or not for `plane`.
+/// `texture`, the argument `name`, unless it is `NULL`, on the device of
+/// another context than `context_id`'s, or not for `plane`.
 ///
 /// # Safety
 ///
-/// `texture` is `NULL` or a live texture, which outlives the view.
-unsafe fn plane_view<'a>(
+/// `texture` is `NULL` or a live texture, which outlives the borrow.
+unsafe fn plane_texture<'a>(
     texture: *const EmberwaveTexture,
     plane: Component,
     name: &str,
     context_id: u64,
-) -> Result<&'a wgpu::TextureView, Failure> {
+) -> Result<&'a EmberwaveTexture, Failure> {
     // SAFETY: as the caller promises.
     let Some(texture) = (unsafe { texture.as_ref() }) else {
         return Err(Failure::argument(format!("{name} is NULL")));
@@ -1589,7 +1890,7 @@ unsafe fn plane_view<'a>(
             "{name} is not a texture for the {plane:?} plane"
         )));
     }
-    Ok(&texture.view)
+    Ok(texture)
 }
 
 /// The Metal texture of `texture`, an `id<MTLTexture>` in the format the

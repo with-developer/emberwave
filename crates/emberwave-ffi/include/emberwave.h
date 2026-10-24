@@ -481,6 +481,54 @@ enum EmberwaveStatus emberwave_texture_create_plane(const struct EmberwaveDecode
                                                     uint32_t plane,
                                                     struct EmberwaveTexture **texture);
 
+// Wraps the caller's own Metal texture, `metal`, an `id<MTLTexture>`, for
+// the decodes of `decoder` to put the picture into, as into one of
+// `emberwave_texture_create`'s: a texture of a `CVPixelBuffer` from a
+// `CVMetalTextureCache`, to hand to an `AVSampleBufferDisplayLayer`, one the
+// caller made, or a drawable (decision D44). Only on iPhones, iPads and
+// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+//
+// The texture is on the device of the decoder's context
+// (`emberwave_context_metal_device`), 2D, of one level, layer and sample,
+// not a view of another texture nor memoryless, of the picture's size, and
+// `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm`. A decode copies
+// the picture into it when its width is a multiple of 64 pixels and it is
+// not framebuffer-only, as a texture of a `CVPixelBuffer` is not; otherwise
+// it draws it, which needs `MTLTextureUsageRenderTarget`. A texture that
+// neither can fill gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`. So does one
+// that is not right, and `texture` is then `NULL`.
+//
+// emberwave keeps a reference to `metal` until the texture is destroyed.
+// Keep what the texture comes from, such as the `CVMetalTextureRef`, alive
+// until the GPU work that writes it is done: after a waiting decode has
+// returned, or once a command buffer committed after
+// `emberwave_decoder_submit_texture` has completed. That function takes only
+// textures whose hazards Metal tracks, which a texture of a heap's usually
+// is not; the decodes that wait take any.
+//
+// # Safety
+//
+// `decoder` is a live decoder, and `metal` is `NULL` or an
+// `id<MTLTexture>`. `texture` points to where the new texture is stored.
+enum EmberwaveStatus emberwave_texture_from_metal(const struct EmberwaveDecoder *decoder,
+                                                  void *metal,
+                                                  struct EmberwaveTexture **texture);
+
+// Wraps the caller's own Metal texture, `metal`, for the Y, Cb or Cr plane
+// of the pictures of `decoder`, as `emberwave_texture_create_plane` makes
+// one: `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+// `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_metal`, but the
+// texture is `MTLPixelFormatR8Unorm` of the plane's size, and as a decode
+// copies a plane, not framebuffer-only.
+//
+// # Safety
+//
+// As for `emberwave_texture_from_metal`.
+enum EmberwaveStatus emberwave_texture_from_metal_plane(const struct EmberwaveDecoder *decoder,
+                                                        void *metal,
+                                                        uint32_t plane,
+                                                        struct EmberwaveTexture **texture);
+
 // Destroys a texture.
 //
 // # Safety
