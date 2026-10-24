@@ -517,6 +517,7 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_texture_create`, `_destroy`, `emberwave_decoder_decode_texture` | A texture of the picture's size, RGBA or BGRA, on the decoder's device, and a decode that draws the RGB picture into it and waits |
 | `emberwave_texture_create_plane`, `emberwave_decoder_decode_plane_textures` | A one-channel texture for the Y, the Cb or the Cr plane, and a decode that copies the planes into three and waits |
 | `emberwave_texture_metal`, `emberwave_context_metal_device` | The `id<MTLTexture>` and `id<MTLDevice>` behind a texture and a context, borrowed, or `NULL` off Metal |
+| `emberwave_context_create_metal`, `emberwave_decoder_submit_texture`, `_submit_plane_textures` | A context on the client's own Metal device and queue, and decodes into textures that return without waiting, which only such a context takes |
 | `emberwave_encoder_create`, `_destroy`, `_info` | One encoder per picture size and chroma format, with the colours its frames signal; the sizes of its planes |
 | `emberwave_encoder_encode` | Encode planes from the caller's memory, with the caller's strides, into a frame of at most the budget, written into the caller's buffer of that size |
 | `emberwave_frame_packets` | Where a frame splits into packets of a given size, at its blocks |
@@ -528,7 +529,7 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 
 For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
-The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` copies the Y, Cb and Cr planes into three textures for a client that converts the colours itself, in 1.0 to 1.1 ms (D41). Vulkan and Direct3D 12 handles, decoding without waiting, and the client's own device, queue or textures are later issues (#62, #63).
+The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` copies the Y, Cb and Cr planes into three textures for a client that converts the colours itself, in 1.0 to 1.1 ms (D41). On a context made on the client's own device and queue, the submit functions do the same without waiting, and Metal orders the client's reads after them (D43). Vulkan and Direct3D 12 handles, and the client's own textures, are later issues (#63).
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
 
@@ -1102,3 +1103,42 @@ Grok reviewed the change and found no defect in the copy path: the flag and the 
 - wgpu does not offer copies into a canvas. The browser change was dropped, as above.
 - The documentation said an sRGB view fails validation. A copy does not go through the view, and the documentation now says so.
 - The texture test cannot tell a copy from a draw. The unit test above now does.
+
+### 2026-10-24 — D43: Decoding on the client's own Metal queue
+
+**Context.** D40 to D42 decode into textures on a queue of emberwave's own and wait for the GPU, so that the client's command buffers on its queue read finished pictures. The wait holds the decoding thread about as long as the GPU works, 1.3 ms at 4K on an Apple M3 Max. Nothing orders the next decode after the client's reads either, so the client keeps three textures in turn. Upstream's Metal API records the decode into the client's own command buffer, where Metal orders it (issues #62 and #63).
+
+**Decision.**
+- `emberwave_context_create_metal(device, queue)` makes a context on the client's own `MTLDevice` and `MTLCommandQueue`:
+  - wgpu's Metal adapter whose raw device is that device;
+  - `wgpu::hal::metal::Device::device_from_raw` and `Queue::queue_from_raw`;
+  - `Adapter::create_device_from_hal`;
+  - in the core, `GpuContext::device_descriptor` and `from_device`.
+
+  emberwave's command buffers then go onto the client's queue.
+- `emberwave_decoder_submit_texture` and `_submit_plane_textures` submit the decode of the assembled frame and return without waiting.
+  - In Rust they are `Decoder::submit_assembled_to_texture` and `_to_plane_textures`.
+  - The frame goes up through the queue's staging memory. The decoder's own mapped upload buffer can take a frame only after the previous one is done (D34).
+  - One poll that does not wait, after the submit, reclaims finished work and notices a lost device.
+- Metal orders the work by itself. In wgpu 30, wgpu-hal makes its buffers and textures with Metal's default, tracked hazards. Untracked ones are a TODO in its code. Metal then orders the command buffers of one queue that use the same resource by when they were committed:
+  - the client's draw committed after a decode reads its picture;
+  - the next decode waits for that draw.
+
+  So one texture takes every frame. `tests/metal.rs` checks that the textures are tracked, so a wgpu that changes this fails there.
+- The submit functions refuse decoders of other contexts. There only a wait or a shared event would order the client's reads, and the event (`add_signal_event`) is queue-wide in wgpu, where two decoders could take each other's signal.
+- The client's own textures, a drawable's or an IOSurface's, are left for later (#63). They are where an untracked heap texture could slip in.
+
+**Consequence.** `tests/metal.rs` decodes every frame of a stream into the same textures without waiting. It commits a copy out of them to the queue after each decode, and waits only at the end; each copy finds its frame. This holds for RGB and planes, and for a picture copied and one drawn. `tests/gpu.rs` covers the submitted decodes on every backend, each followed by a read.
+
+Measured from the call until a command buffer of the client's that reads the picture has completed, on the Apple M3 Max, 300 frames and three rounds:
+
+| Frame | The call, waiting | The call, submitting | Until the read, waiting | Until the read, submitting |
+|---|---|---|---|---|
+| 4K | 1.29 to 1.38 ms | 0.26 to 0.27 ms | 1.44 to 1.59 ms | 1.44 to 1.45 ms |
+| 1080p | 0.55 ms | 0.12 ms | 0.69 to 0.71 ms | 0.58 to 0.61 ms |
+
+The decoding thread is free 1 ms sooner at 4K. The client's draw completes as early as after the waiting decode at 4K, and 0.1 ms earlier at 1080p.
+
+Grok argued the other side before the work began. It agreed that tracked hazards order the work, and named their conditions: a direct use of the texture, commits after the call, and no heap. It also advised refusing the other contexts and leaving the client's textures for later.
+
+Grok's review of the change found one defect, now fixed. A submitted decode counted its frame as decoded once recorded, before finishing the commands, which can still fail: on a view in a format the draw does not take, through the Rust API, or for want of memory. The frame was then used up although nothing ran. It now counts only once submitted, and `tests/gpu.rs` checks that such a view leaves the frame. A queue with room for fewer than four command buffers in flight can stall for good, since emberwave makes its two before committing them; the header says so.
