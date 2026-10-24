@@ -21,6 +21,13 @@ curl -fsSL -o "$work/$name.zip" "$url/$name.zip"
 curl -fsSL -o "$work/SHA256SUMS" "$url/SHA256SUMS"
 (cd "$work" && grep " $name.zip\$" SHA256SUMS | shasum -a 256 -c -)
 unzip -q "$work/$name.zip" -d "$work"
+# The app is written for the C API of this checkout, which a release made
+# before a change to the API does not have.
+if ! cmp -s "$work/$name/Emberwave.xcframework/ios-arm64/Headers/Emberwave/emberwave.h" \
+    crates/emberwave-ffi/include/emberwave.h; then
+    echo "warning: the C API of $tag differs from that of this checkout, so the app may not build" \
+        "against it: check out $tag, or build the XCFramework with scripts/build_xcframework.sh" >&2
+fi
 
 mkdir -p target/xcframework
 rm -rf target/xcframework/Emberwave.xcframework

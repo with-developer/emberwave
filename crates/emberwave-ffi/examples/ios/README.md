@@ -10,7 +10,7 @@ It uses the pictures and budgets of the [browser benchmark](https://with-develop
 
 ## Running it on an iPhone
 
-You need a Mac with Xcode, an Apple ID and a cable or the same Wi-Fi as the phone. Nothing is published: the app is signed for your own devices only.
+You need a Mac with Xcode 16 or later, an Apple ID, an iPhone or iPad with iOS 16 or later, and a cable or the same Wi-Fi as the phone. Nothing is published: the app is signed for your own devices only.
 
 1. **The XCFramework.** From the root of the repository, fetch that of the release:
 
@@ -18,7 +18,7 @@ You need a Mac with Xcode, an Apple ID and a cable or the same Wi-Fi as the phon
    crates/emberwave-ffi/examples/ios/fetch_xcframework.sh
    ```
 
-   or build it, with `rustup target add aarch64-apple-ios aarch64-apple-ios-sim` and `scripts/build_xcframework.sh`.
+   or build it, with `rustup target add aarch64-apple-ios aarch64-apple-ios-sim` and `scripts/build_xcframework.sh`. The app is written for the C API of your checkout, and the script warns when the release's differs: then check out the release's tag, or build the XCFramework.
 2. **Open** `crates/emberwave-ffi/examples/ios/EmberwaveBench.xcodeproj` in Xcode.
 3. **Sign.** Select the project, the target `EmberwaveBench`, *Signing & Capabilities*, and choose your Apple ID under *Team* (a free *Personal Team* will do). If Xcode says the bundle identifier is taken, change `io.github.with-developer.emberwave-bench` to something of your own.
 4. **The phone.** Connect it, and turn on *Settings > Privacy & Security > Developer Mode* if Xcode asks for it (the phone restarts). Choose the phone as the run destination at the top of Xcode's window.
@@ -27,7 +27,7 @@ You need a Mac with Xcode, an Apple ID and a cable or the same Wi-Fi as the phon
 
 The project builds for iPhones and iPads, and for the iOS Simulator on Macs with Apple silicon only: the XCFramework has no library for the Simulator on Intel Macs.
 
-For steadier numbers, let the phone cool down first, close other apps, and keep it plugged in; the report gives the thermal state at the end. Stopping the app in Xcode and starting it again from the home screen leaves the debugger out.
+For steadier numbers, let the phone cool down first, close other apps, keep it plugged in, and leave Low Power Mode off, which slows the GPU down; the report gives the thermal state at the end and whether Low Power Mode was on. A run during which the app left the front, where iOS stops or slows its GPU work, is marked not valid. Stopping the app in Xcode and starting it again from the home screen leaves the debugger out.
 
 ## In CI
 

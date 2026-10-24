@@ -13,6 +13,9 @@ final class BenchModel: ObservableObject {
     @Published var running = false
     @Published var picture: MTLTexture?
     let emberwave: Emberwave?
+    /// Whether the app left the front during the run, which `observer` tells.
+    private var interrupted = false
+    private var observer: (any NSObjectProtocol)?
 
     init() {
         do {
@@ -32,6 +35,17 @@ final class BenchModel: ObservableObject {
         report = ""
         // The screen stays on: a phone that locks halfway through spoils the run.
         UIApplication.shared.isIdleTimerDisabled = true
+        // iOS runs no GPU work for an app in the background, and the calls do
+        // not fail: those frames take no GPU time, and the one that waits for
+        // the app to come back takes all of it. Anything else in front, even
+        // briefly, also takes the GPU. As the browser's benchmark does with a
+        // hidden page, such a run is marked.
+        interrupted = false
+        observer = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.interrupted = true }
+        }
         Task.detached(priority: .userInitiated) {
             let plan = Plan()
             var results: [SizeResult] = []
@@ -51,8 +65,20 @@ final class BenchModel: ObservableObject {
             }
             let finished = outcome
             await MainActor.run {
-                self.report = finished
-                self.status = "Done."
+                if let observer = self.observer {
+                    NotificationCenter.default.removeObserver(observer)
+                }
+                self.observer = nil
+                if self.interrupted {
+                    let warning =
+                        "The app left the front during the run, which stops or slows its GPU work: "
+                        + "run it again with the app in front."
+                    self.report = finished + "\nNot valid: " + warning
+                    self.status = warning
+                } else {
+                    self.report = finished
+                    self.status = "Done."
+                }
                 self.running = false
                 UIApplication.shared.isIdleTimerDisabled = false
             }

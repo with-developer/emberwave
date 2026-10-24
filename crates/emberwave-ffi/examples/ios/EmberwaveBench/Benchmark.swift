@@ -409,11 +409,14 @@ func makeReport(_ emberwave: Emberwave, _ plan: Plan, _ results: [SizeResult], c
         "Device: \(deviceDescription()), \(ProcessInfo.processInfo.operatingSystemVersionString)",
         "GPU: \(emberwave.adapter); emberwave \(String(cString: emberwave_version()))",
         "\(plan.frames) frames after at least \(plan.warmupFrames) and \(Int(plan.warmupMs)) ms of warm-up, "
-            + "\(plan.pictures) pictures in turn; thermal state at the end: \(thermal)",
+            + "\(plan.pictures) pictures in turn; thermal state at the end: \(thermal); "
+            + "Low Power Mode: \(ProcessInfo.processInfo.isLowPowerModeEnabled ? "on" : "off")",
         "Per frame (ms): mean / median / 99th percentile",
     ]
     for result in results {
-        lines.append("\(result.size.name) (\(result.bytesPerFrame / 1000) kB a frame):")
+        // Rounded, as the browser's report rounds them.
+        let kilobytes = Int((Double(result.bytesPerFrame) / 1000).rounded())
+        lines.append("\(result.size.name) (\(kilobytes) kB a frame):")
         lines.append("  decode into a Metal texture  \(result.texture)")
         lines.append("  decode to planes in memory   \(result.planes)")
         lines.append("  encode from memory           \(result.encode)")
