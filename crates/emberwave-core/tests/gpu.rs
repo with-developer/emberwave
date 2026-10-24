@@ -20,7 +20,9 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams, yuv_to_rgb8};
 use emberwave_core::cpu;
-use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuError, GpuOptions, TimedOutput};
+use emberwave_core::gpu::{
+    Decoder, Frame, GpuContext, GpuError, GpuOptions, TEXTURE_FORMATS, TimedOutput,
+};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
@@ -357,7 +359,13 @@ fn with_alpha(rgb: &[u8], bgra: bool) -> Vec<u8> {
 fn a_picture_drawn_into_a_texture_is_the_rgb_picture() {
     let context = gpu_or_return!();
     let color = ColorParams::default();
-    for name in ["gradient_200x120_420", "noise_131x67_444"] {
+    // 192 pixels make rows of 768 bytes, which a copy takes (decision D42);
+    // the others are drawn whatever the texture.
+    for name in [
+        "noise_192x136_420",
+        "gradient_200x120_420",
+        "noise_131x67_444",
+    ] {
         let (layout, frames) = vector_frames(name);
         let mut decoder = decoder_for(context, &layout);
 
@@ -378,33 +386,42 @@ fn a_picture_drawn_into_a_texture_is_the_rgb_picture() {
             "{name}: RGBA"
         );
 
-        // Into a BGRA texture of the caller's, recorded into its encoder.
-        let rgb = decoder.decode_rgb(&frames[1], &color).expect("RGB decode");
-        let bgra = context.device().create_texture(&wgpu::TextureDescriptor {
-            label: Some("caller's texture"),
-            size: texture.size(),
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let mut encoder = context.device().create_command_encoder(&Default::default());
-        decoder
-            .encode_rgb_to_texture(
-                &frames[1],
-                &color,
-                &bgra.create_view(&Default::default()),
-                &mut encoder,
-            )
-            .expect("recorded decode into a texture");
-        context.queue().submit([encoder.finish()]);
-        assert_eq!(
-            read_texture(context, &bgra),
-            with_alpha(&rgb.data, true),
-            "{name}: BGRA"
-        );
+        // Into textures of the caller's, recorded into its encoder: RGBA and
+        // BGRA, with and without the COPY_DST usage that lets a copy fill
+        // them. The RGB decode in between writes RGBA words again.
+        for format in TEXTURE_FORMATS {
+            for usage in [wgpu::TextureUsages::empty(), wgpu::TextureUsages::COPY_DST] {
+                let rgb = decoder.decode_rgb(&frames[1], &color).expect("RGB decode");
+                let target = context.device().create_texture(&wgpu::TextureDescriptor {
+                    label: Some("caller's texture"),
+                    size: texture.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC
+                        | usage,
+                    view_formats: &[],
+                });
+                let mut encoder = context.device().create_command_encoder(&Default::default());
+                decoder
+                    .encode_rgb_to_texture(
+                        &frames[1],
+                        &color,
+                        &target.create_view(&Default::default()),
+                        &mut encoder,
+                    )
+                    .expect("recorded decode into a texture");
+                context.queue().submit([encoder.finish()]);
+                let bgra = format == wgpu::TextureFormat::Bgra8Unorm;
+                assert_eq!(
+                    read_texture(context, &target),
+                    with_alpha(&rgb.data, bgra),
+                    "{name}: {format:?} with {usage:?}"
+                );
+            }
+        }
     }
 }
 

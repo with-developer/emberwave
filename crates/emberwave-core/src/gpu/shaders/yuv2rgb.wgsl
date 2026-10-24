@@ -10,8 +10,9 @@
 // order.
 //
 // Reads the packed 8-bit planes written by the last level of idwt.wgsl and
-// writes one RGBA word
-// per pixel (red in the low byte, alpha 255).
+// writes one RGBA word per pixel (red in the low byte, alpha 255), or with
+// `bgra` a BGRA word (blue in the low byte), for a copy into a BGRA texture
+// (decision D42).
 
 struct YuvParams {
     width: u32,
@@ -32,8 +33,9 @@ struct YuvParams {
 
     limited: u32,
     grid_width: u32,
-    pad0: u32,
-    pad1: u32,
+    // 1: blue in the low byte; 0: red.
+    bgra: u32,
+    pad: u32,
 
     // R from Cr, G from Cb, G from Cr, B from Cb.
     coefficients: vec4<f32>,
@@ -129,5 +131,6 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
 
     // Round to nearest, ties to even, like a UNORM store.
     let rgb = vec3<u32>(round(clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0));
-    rgba[index] = rgb.x | (rgb.y << 8u) | (rgb.z << 16u) | (0xffu << 24u);
+    let low_first = select(rgb, rgb.zyx, params.bgra != 0u);
+    rgba[index] = low_first.x | (low_first.y << 8u) | (low_first.z << 16u) | (0xffu << 24u);
 }

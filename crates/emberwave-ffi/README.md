@@ -137,7 +137,7 @@ target/c-example/emberwave_encode testdata/encoder/scene_200x120_420.source.y4m 
 
 ## Pictures on the GPU: Metal
 
-A client that draws with Metal can have the picture drawn into a texture on the GPU instead of copied to CPU memory: on an Apple M3 Max, a 4K frame takes 1.5 ms that way, where `emberwave_decoder_decode_rgb` takes 2.7 ms, and a 1080p frame 0.72 ms against 0.84 ms. The texture is emberwave's, the Metal objects behind it the client's to use:
+A client that draws with Metal can have the picture put into a texture on the GPU instead of copied to CPU memory: on an Apple M3 Max, a 4K frame takes 1.3 to 1.4 ms that way, where `emberwave_decoder_decode_rgb` takes 2.6 ms, and a 1080p frame 0.56 ms against 0.81 ms. The texture is emberwave's, the Metal objects behind it the client's to use:
 
 ```c
 EmberwaveTexture *textures[3];   /* one for each frame the display may still show */

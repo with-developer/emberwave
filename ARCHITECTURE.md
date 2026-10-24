@@ -528,7 +528,7 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 
 For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
-The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` draws it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.5 ms for the 4K frame (D40). `emberwave_decoder_decode_plane_textures` copies the Y, Cb and Cr planes into three textures for a client that converts the colours itself, in 1.0 to 1.1 ms (D41). Vulkan and Direct3D 12 handles, decoding without waiting, and the client's own device, queue or textures are later issues (#62, #63).
+The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` copies the Y, Cb and Cr planes into three textures for a client that converts the colours itself, in 1.0 to 1.1 ms (D41). Vulkan and Direct3D 12 handles, decoding without waiting, and the client's own device, queue or textures are later issues (#62, #63).
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
 
@@ -1081,3 +1081,24 @@ A Metal client draws the texture without a copy. `tests/metal.rs` reads the text
 One round of the planes in CPU memory at 1080p took 0.81 ms, an outlier left out of the table.
 
 The planes are the quickest way to the GPU at both sizes. The RGB texture's render pass probably costs as much as the planes' did, so an RGBA target whose rows are a multiple of 256 bytes could be filled by a copy too.
+
+### 2026-10-24 — D42: The RGB picture into textures by copy
+
+**Context.** D41 found that a render pass that only moves bytes into a texture cost about 0.3 ms more a frame than a copy on an Apple M3 Max. D40 puts the RGB picture into textures with such a pass, `draw.wgsl` (issue #70).
+
+**Decision.**
+- When the target texture has the `COPY_DST` usage and its rows are a multiple of 256 bytes, a width of a multiple of 64 pixels, the colour conversion's words are copied into it. 720p, 1080p, 1440p and 4K are such widths.
+- For a BGRA texture `yuv2rgb.wgsl` writes blue in the low byte, a flag in its parameters, since a copy cannot swap channels. `Decoder::rgba_buffer` then holds BGRA words until the next decode, as its documentation says.
+- Other textures keep the draw. `RENDER_ATTACHMENT` is still required of every target, so any target can fall back to the draw.
+- `create_texture`, and with it `emberwave_texture_create`, adds `COPY_DST`.
+- The browser player keeps drawing its canvas. WebGPU allows a canvas with `COPY_DST`, but wgpu 30's WebGPU backend reports `RENDER_ATTACHMENT` as a canvas's only usage. A player is not waiting on a frame the way a client in a stream is, and the change could not be tried in browsers here.
+- Not done:
+  - Padding the RGBA rows to 256 bytes for other widths: the read-back to the CPU and the draw take them packed, and the common widths need no padding.
+  - Writing the texture from the colour conversion with a storage texture: WebGPU writes `rgba8unorm` storage textures but not `bgra8unorm` ones without an optional feature, and every target would need a bind group of its own.
+
+**Consequence.** Through the C API on the Apple M3 Max, with a BGRA texture, 300 frames and three rounds: a 4K frame takes 1.31 to 1.38 ms instead of 1.46 to 1.52 ms, and a 1080p frame 0.56 to 0.57 ms instead of 0.71 to 0.72 ms. The planes of D41 stay faster, at 1.02 ms and 0.43 to 0.44 ms. `tests/gpu.rs` puts a 192-pixel-wide picture into RGBA and BGRA textures, with and without `COPY_DST`, and finds the RGB decode in each. With the BGRA flag broken, the test fails on the BGRA texture that takes copies. The same picture comes out either way, so a unit test pins which way each texture takes.
+
+Grok reviewed the change and found no defect in the copy path: the flag and the way stay in step, and the CPU paths get RGB. It made three points:
+- wgpu does not offer copies into a canvas. The browser change was dropped, as above.
+- The documentation said an sRGB view fails validation. A copy does not go through the view, and the documentation now says so.
+- The texture test cannot tell a copy from a draw. The unit test above now does.
