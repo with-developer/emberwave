@@ -9,12 +9,13 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 - The Y, Cb and Cr planes in textures, for Metal clients that convert the colours themselves (decision D41, [#64](https://github.com/with-developer/emberwave/issues/64)).
   - `emberwave_texture_create_plane` makes a one-channel texture (`MTLPixelFormatR8Unorm`) of one plane's size, for that plane.
   - `emberwave_decoder_decode_plane_textures` copies the planes of the frame into three of them and waits. They hold the stream's samples, byte for byte.
-  - The fastest way to the GPU: on an Apple M3 Max a 4K frame takes 1.0 to 1.1 ms, against 1.5 ms into an RGB texture, and a 1080p frame 0.45 ms against 0.7 ms. In 4:2:0 they take 1.5 bytes a pixel, where RGBA takes 4.
+  - The fastest way to the GPU: on an Apple M3 Max a 4K frame takes 1.0 to 1.1 ms, against 1.3 to 1.4 ms into an RGB texture, and a 1080p frame 0.45 ms against 0.56 ms. In 4:2:0 they take 1.5 bytes a pixel, where RGBA takes 4.
   - In Rust, `Decoder::encode_to_plane_textures`, `decode_assembled_to_plane_textures` and `create_plane_texture`, and `PLANE_FORMAT`.
 
 ### Changed
 
 - A decoder's packed planes have rows of a multiple of 256 bytes, so that copies take them into textures: 7% more memory for them at 1080p, and as much more to read back to the CPU.
+- The RGB picture goes into a texture with a copy, not a draw, when the texture takes copies (`COPY_DST`) and the picture's width is a multiple of 64 pixels, as 720p, 1080p, 1440p and 4K are (decision D42, [#70](https://github.com/with-developer/emberwave/issues/70)). The colour conversion writes blue first for a BGRA texture. On an Apple M3 Max a 4K frame into a texture through the C API takes 1.3 to 1.4 ms instead of 1.5 ms, and a 1080p frame 0.56 ms instead of 0.71 ms. The textures of `emberwave_texture_create` and `Decoder::create_texture` take copies. The browser player still draws its canvas, as wgpu offers no copies into one.
 
 ## [0.9.0] - 2026-10-24
 
