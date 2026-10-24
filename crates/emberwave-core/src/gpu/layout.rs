@@ -384,12 +384,12 @@ impl GatherParams {
     }
 
     /// Workgroups of the dispatch: the words of the longest row in x and the
-    /// rows of the tallest plane in y, 16 of each to a workgroup, and the
-    /// components in z.
+    /// pairs of rows of the tallest plane in y, 16 of each to a workgroup,
+    /// and the components in z.
     pub(crate) fn grid(&self) -> (u32, u32, u32) {
         let words = self.stride.iter().copied().max().unwrap_or(0);
         let rows = self.height.iter().copied().max().unwrap_or(0);
-        (words.div_ceil(16), rows.div_ceil(16), 3)
+        (words.div_ceil(16), rows.div_ceil(2).div_ceil(16), 3)
     }
 }
 

@@ -161,6 +161,8 @@ pub struct Encoder {
     gather_planes: wgpu::Buffer,
     gather_luma_chroma: wgpu::Buffer,
     gather_grid: (u32, u32, u32),
+    /// The sampler `gather.wgsl`'s textureGather needs.
+    gather_sampler: wgpu::Sampler,
     pyramid: wgpu::Buffer,
     /// A [`CostRecord`] per block, in block index order.
     costs: wgpu::Buffer,
@@ -279,6 +281,11 @@ impl Encoder {
                 "gather params, luma and chroma",
                 &GatherParams::new(&layout, &buffers, true),
             );
+            // Nearest and clamped to the edge, which are also the defaults.
+            let gather_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("gather"),
+                ..Default::default()
+            });
             let quant_params_data = QuantParams::new(&layout, &buffers);
             let quant_params = uniform_buffer(&device, &queue, "equant params", &quant_params_data);
             let scan_params_buffer = uniform_buffer(&device, &queue, "scan params", &scan_params);
@@ -368,6 +375,7 @@ impl Encoder {
                 gather_planes,
                 gather_luma_chroma,
                 gather_grid: gather_planes_data.grid(),
+                gather_sampler,
                 pyramid,
                 costs,
                 rate_state,
@@ -768,6 +776,10 @@ impl Encoder {
                     texture(2, views[0]),
                     texture(3, views[1]),
                     texture(4, views[2]),
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.gather_sampler),
+                    },
                 ],
             })
         })

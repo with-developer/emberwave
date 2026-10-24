@@ -10,6 +10,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Changed
 
+- Encoding from textures is faster (decision D38, [#40](https://github.com/with-developer/emberwave/issues/40)). The gather pass takes the texels four at a time with `textureGather`, where it loaded them one by one. On an Apple M3 Max a 4K frame from textures encodes in 1.71 ms instead of 1.80 ms.
 - Reading a decoded picture back to the CPU is much faster (decision D37, [#56](https://github.com/with-developer/emberwave/issues/56)): it comes straight out of the mapped buffer, and RGBA turns into RGB in a loop the compiler vectorises, where a copy per pixel took 4.5 ms at 4K. On an Apple M3 Max a 4K frame through the C API takes 2.7 ms to RGB instead of 7.6 ms, and 1.2 ms to planes instead of 1.6 ms; at 1080p 0.8 and 0.5 ms instead of 2.2 and 1.1 ms. `emberwave-cli decode` gains as much. A failed `emberwave_decoder_decode_yuv` or `_decode_rgb` may now have written some rows.
 
 ## [0.7.0] - 2026-10-24
