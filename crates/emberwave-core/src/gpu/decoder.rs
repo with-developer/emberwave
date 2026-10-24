@@ -419,12 +419,14 @@ impl Decoder {
     /// draw of the picture into `target`. Once the caller has submitted
     /// `encoder`, the texture holds the picture.
     ///
-    /// `target` is a view of a 2D texture of the picture's size in one of
-    /// [`TEXTURE_FORMATS`], with the `RENDER_ATTACHMENT` usage, such as a
-    /// canvas's or one from [`create_texture`](Self::create_texture). The
-    /// view has to show the texture as it is: its own format, and its only
-    /// mip level and layer. An unsuitable texture is [`GpuError::Texture`],
-    /// before the frame is used.
+    /// `target` is a view of a 2D texture of the picture's size, of one mip
+    /// level and one layer, in one of [`TEXTURE_FORMATS`] and with the
+    /// `RENDER_ATTACHMENT` usage, such as a canvas's or one from
+    /// [`create_texture`](Self::create_texture). An unsuitable texture is
+    /// [`GpuError::Texture`], before the frame is used. The view has to be in
+    /// the texture's own format, which cannot be checked: a view in another
+    /// format the texture allows, such as its sRGB form, fails wgpu's
+    /// validation when the work is submitted.
     pub fn encode_rgb_to_texture(
         &mut self,
         frame: &[u8],
@@ -783,6 +785,14 @@ impl Decoder {
             format!(
                 "has {} samples per texel rather than 1",
                 texture.sample_count()
+            )
+        } else if (texture.mip_level_count(), texture.depth_or_array_layers()) != (1, 1) {
+            // A view cannot be checked, but every view of a texture of one
+            // level and one layer shows all of it.
+            format!(
+                "has {} mip levels and {} layers rather than one of each",
+                texture.mip_level_count(),
+                texture.depth_or_array_layers()
             )
         } else if !texture
             .usage()

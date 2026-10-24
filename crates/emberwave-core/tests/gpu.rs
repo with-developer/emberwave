@@ -414,15 +414,15 @@ fn only_a_texture_the_picture_fits_takes_it() {
     let (layout, frames) = vector_frames("gradient_200x120_420");
     let mut decoder = decoder_for(context, &layout);
     let frame = decoder.decode(&frames[0]).expect("decode");
-    let make = |width, height, format, usage| {
+    let make_with = |width, height, format, usage, mips, layers| {
         context.device().create_texture(&wgpu::TextureDescriptor {
             label: Some("unsuitable"),
             size: wgpu::Extent3d {
                 width,
                 height,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: layers,
             },
-            mip_level_count: 1,
+            mip_level_count: mips,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
@@ -430,8 +430,13 @@ fn only_a_texture_the_picture_fits_takes_it() {
             view_formats: &[],
         })
     };
+    let make = |width, height, format, usage| make_with(width, height, format, usage, 1, 1);
     let target = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    let rgba = wgpu::TextureFormat::Rgba8Unorm;
     let unsuitable = [
+        // Views of these could show a part of them.
+        make_with(200, 120, rgba, target, 2, 1),
+        make_with(200, 120, rgba, target, 1, 2),
         make(199, 120, wgpu::TextureFormat::Rgba8Unorm, target),
         make(200, 120, wgpu::TextureFormat::R8Unorm, target),
         make(200, 120, wgpu::TextureFormat::Rgba8UnormSrgb, target),

@@ -1142,19 +1142,19 @@ pub unsafe extern "C" fn emberwave_texture_destroy(texture: *mut EmberwaveTextur
 /// full range and centred chroma whatever the pictures are, so a caller that
 /// knows better passes that, as the converted picture cannot be taken back.
 ///
-/// Nothing orders this call's writes after the caller's GPU work that still
-/// reads the texture: passing a texture that a command buffer of the caller's
-/// may still sample overwrites it under that work. Keep one texture for each
-/// such command buffer and one to decode into, three with a display's
-/// synchronisation and two frames in flight, and pass one whose readers have
-/// completed. A texture of another context's device, or of another picture
-/// size, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to
-/// decode.
+/// The call does not wait for the caller's GPU work that still reads the
+/// texture, and nothing in this interface orders its writes after that work;
+/// Metal may, by stalling the decode, or it may not. Keep one texture for
+/// each command buffer of the caller's that may still sample one and one to
+/// decode into, three with a display's synchronisation and two frames in
+/// flight, and pass one whose readers have completed. A texture of another
+/// context's device, or of another picture size, gives
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode.
 ///
 /// # Safety
 ///
-/// `decoder` is a live decoder and `texture` a live texture that no other
-/// thread is using, and `color` is `NULL` or points to an `EmberwaveColor`.
+/// `decoder` is a live decoder that no other thread is using, `texture` is a
+/// live texture, and `color` is `NULL` or points to an `EmberwaveColor`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_decoder_decode_texture(
     decoder: *mut EmberwaveDecoder,
