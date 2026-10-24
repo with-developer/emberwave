@@ -1,5 +1,5 @@
 /*
- * emberwave: decode PyroWave video on the GPU.
+ * emberwave: decode and encode PyroWave video on the GPU.
  * https://github.com/with-developer/emberwave
  * SPDX-License-Identifier: MIT
  *
@@ -8,8 +8,9 @@
  *   emberwave_last_error() describes it, on the thread that made the call.
  * - Objects are opaque. *_create makes one, *_destroy frees it, and
  *   destroying NULL does nothing.
- * - A context may be used by several threads at once. A decoder may move
- *   between threads, but only one thread may use it at a time.
+ * - A context may be used by several threads at once. A decoder or an
+ *   encoder may move between threads, but only one thread may use it at a
+ *   time.
  * - A panic inside emberwave is reported as EMBERWAVE_STATUS_INTERNAL.
  *   Destroy the object it happened in.
  */
@@ -66,6 +67,18 @@
 // 4:2:0 chroma sits on the left one of the two luma samples it covers.
 #define EMBERWAVE_SITING_LEFT 1
 
+// The primaries of sRGB and BT.709.
+#define EMBERWAVE_PRIMARIES_SRGB 0
+
+// The primaries of BT.2020.
+#define EMBERWAVE_PRIMARIES_BT2020 1
+
+// The sRGB transfer function, for standard dynamic range.
+#define EMBERWAVE_TRANSFER_SRGB 0
+
+// The PQ transfer function of SMPTE ST 2084, for high dynamic range.
+#define EMBERWAVE_TRANSFER_PQ 1
+
 // The result of a call.
 typedef enum EmberwaveStatus {
   // The call succeeded.
@@ -84,18 +97,23 @@ typedef enum EmberwaveStatus {
   // The GPU reported an error, or reading the picture back failed.
   EMBERWAVE_STATUS_GPU = 5,
   // The GPU device was lost (a driver reset, or a GPU that went away). The
-  // context and its decoders cannot be used any more; create new ones.
+  // context and its decoders and encoders cannot be used any more; create
+  // new ones.
   EMBERWAVE_STATUS_DEVICE_LOST = 6,
   // A bug in emberwave. Destroy the object the call was made on.
   EMBERWAVE_STATUS_INTERNAL = 7,
 } EmberwaveStatus;
 
-// A GPU device, shared by the decoders created on it. Creating one compiles
-// the shaders, so make one and keep it.
+// A GPU device, shared by the decoders and encoders created on it. Creating
+// one compiles the shaders, so make one and keep it.
 typedef struct EmberwaveContext EmberwaveContext;
 
 // Decodes the frames of one stream: one picture size and chroma format.
 typedef struct EmberwaveDecoder EmberwaveDecoder;
+
+// Encodes the pictures of one stream on the GPU: one picture size and
+// chroma format.
+typedef struct EmberwaveEncoder EmberwaveEncoder;
 
 // What a stream says about its pictures.
 typedef struct EmberwaveStreamInfo {
@@ -128,7 +146,7 @@ typedef struct EmberwaveContextOptions {
   uint32_t flags;
 } EmberwaveContextOptions;
 
-// The sizes of the planes a decoder writes.
+// The sizes of the planes a decoder writes or an encoder reads.
 typedef struct EmberwaveFrameInfo {
   // Width of the luma plane, and of the picture.
   uint32_t width;
@@ -160,6 +178,44 @@ typedef struct EmberwaveColor {
   // An `EMBERWAVE_SITING_*` value.
   uint32_t chroma_siting;
 } EmberwaveColor;
+
+// What the frames of an encoder say about their colours, in every start of
+// frame header. A decoder converts to RGB with the matrix, the range and the
+// chroma siting; the primaries and the transfer function are for whatever
+// shows the picture.
+typedef struct EmberwaveSignalling {
+  // `EMBERWAVE_MATRIX_BT709` or `EMBERWAVE_MATRIX_BT2020`: the format
+  // cannot signal BT.601.
+  uint32_t matrix;
+  // An `EMBERWAVE_RANGE_*` value.
+  uint32_t range;
+  // An `EMBERWAVE_SITING_*` value.
+  uint32_t chroma_siting;
+  // An `EMBERWAVE_PRIMARIES_*` value.
+  uint32_t primaries;
+  // An `EMBERWAVE_TRANSFER_*` value.
+  uint32_t transfer;
+  // Zeros: room for what later versions may add.
+  uint32_t reserved[3];
+} EmberwaveSignalling;
+
+// One plane of a picture to encode, in the caller's memory.
+typedef struct EmberwaveSourcePlane {
+  // The first byte of the first row.
+  const uint8_t *data;
+  // Bytes from the start of one row to the start of the next: at least the
+  // width of the plane.
+  size_t stride;
+} EmberwaveSourcePlane;
+
+// One packet of a frame: where it starts in the frame and how many bytes it
+// has.
+typedef struct EmberwavePacket {
+  // Bytes before the packet in the frame.
+  size_t offset;
+  // Bytes of the packet.
+  size_t size;
+} EmberwavePacket;
 
 #ifdef __cplusplus
 extern "C" {
@@ -219,8 +275,8 @@ enum EmberwaveStatus emberwave_probe_packet(const uint8_t *data,
 enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptions *options,
                                               struct EmberwaveContext **context);
 
-// Destroys a context. Decoders created on it keep working, and keep the GPU
-// device until they are destroyed as well.
+// Destroys a context. Decoders and encoders created on it keep working, and
+// keep the GPU device until they are destroyed as well.
 //
 // # Safety
 //
@@ -335,6 +391,91 @@ enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decod
 enum EmberwaveStatus emberwave_decoder_decode_rgb(struct EmberwaveDecoder *decoder,
                                                   const struct EmberwaveColor *color,
                                                   struct EmberwavePlane rgb);
+
+// Creates an encoder on `context` for pictures of `width` x `height` pixels
+// in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. Width and
+// height are from 1 to 16384, and even for 4:2:0; other sizes give
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`. `signalling` is what the frames say
+// about their colours; with `NULL`, BT.709, video range, centred chroma and
+// the primaries and transfer function of sRGB. The GPU memory the encoder
+// needs is allocated here, but for the frame's, which grows to the largest
+// budget it is given.
+//
+// # Safety
+//
+// `context` is a live context, and `signalling` is `NULL` or points to an
+// `EmberwaveSignalling`. `encoder` points to where the new encoder is
+// stored; it is set to `NULL` when the call fails.
+enum EmberwaveStatus emberwave_encoder_create(const struct EmberwaveContext *context,
+                                              uint32_t width,
+                                              uint32_t height,
+                                              uint32_t chroma,
+                                              const struct EmberwaveSignalling *signalling,
+                                              struct EmberwaveEncoder **encoder);
+
+// Destroys an encoder and frees its GPU memory.
+//
+// # Safety
+//
+// `encoder` is `NULL`, or an encoder from `emberwave_encoder_create` that
+// has not been destroyed and that no other thread is using.
+void emberwave_encoder_destroy(struct EmberwaveEncoder *encoder);
+
+// The sizes of the planes the encoder takes.
+//
+// # Safety
+//
+// `encoder` is a live encoder that no other thread is using, and `info`
+// points to an `EmberwaveFrameInfo` to fill in.
+enum EmberwaveStatus emberwave_encoder_info(struct EmberwaveEncoder *encoder,
+                                            struct EmberwaveFrameInfo *info);
+
+// Encodes one picture into a frame of at most `budget` bytes, writes it to
+// `frame` and stores its size in `*size`: a start of frame header and the
+// coded blocks, which `emberwave_frame_packets` splits into packets for a
+// decoder. The planes have the sizes of `emberwave_encoder_info`, each row
+// `stride` bytes from the next, and the bytes between the rows are not
+// read. A budget too small for even the smallest frame is
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
+// `*size`; nothing is encoded then, and the next frame takes the sequence
+// number this one would have had. Waits for the GPU.
+//
+// # Safety
+//
+// `encoder` is a live encoder that no other thread is using. Each plane's
+// `data` points to `stride * (height - 1) + width` readable bytes. `frame`
+// points to `budget` bytes that may be written, and `size` to a `size_t`;
+// neither overlaps the planes or the other.
+enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
+                                              struct EmberwaveSourcePlane y,
+                                              struct EmberwaveSourcePlane cb,
+                                              struct EmberwaveSourcePlane cr,
+                                              uint8_t *frame,
+                                              size_t budget,
+                                              size_t *size);
+
+// Splits a frame into packets of at most `max_packet_bytes` bytes, at the
+// boundaries of its blocks, and stores how many in `*count`. With `packets`
+// not `NULL`, also where each starts in the frame and its size, in order;
+// with fewer than `*count` places there (`capacity`), nothing is written to
+// `packets` and the result is `EMBERWAVE_STATUS_INVALID_ARGUMENT`. The first
+// packet starts with the start of frame header. A block larger than
+// `max_packet_bytes` gets a packet of its own, as does the rest of a frame
+// from a malformed block on, so a packet can be larger. A decoder takes the
+// packets in any order.
+//
+// # Safety
+//
+// `frame` points to `size` readable bytes (or is `NULL` with `size` 0),
+// `packets` is `NULL` or points to `capacity` `EmberwavePacket`s that may be
+// written, and `count` points to a `size_t`; neither `packets` nor `count`
+// overlaps the frame.
+enum EmberwaveStatus emberwave_frame_packets(const uint8_t *frame,
+                                             size_t size,
+                                             size_t max_packet_bytes,
+                                             struct EmberwavePacket *packets,
+                                             size_t capacity,
+                                             size_t *count);
 
 #ifdef __cplusplus
 }  // extern "C"

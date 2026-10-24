@@ -6,6 +6,8 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Added
 
+- An encoder in the C API ([#42](https://github.com/with-developer/emberwave/issues/42)): `emberwave_encoder_create`, `_encode`, `_info` and `_destroy` encode planes with row strides into a frame in the caller's buffer, with the colour signalling of `EmberwaveSignalling`, and `emberwave_frame_packets` splits a frame into packets for a decoder (decision D33). `examples/c/encode.c` shows them in use.
+- `gpu::Encoder::encode_strided` encodes planes whose rows are a stride apart, and a stride below the width is the new `EncodeError::PlaneStride`.
 - Encoding pictures that are on the GPU already ([#33](https://github.com/with-developer/emberwave/issues/33)): `gpu::Encoder::encode_textures` takes a `TexturePicture`, three `R8Unorm` textures or NV12's layout of an `R8Unorm` and an `Rg8Unorm` texture, and makes the bytes `encode` makes of the same picture in CPU memory, without the CPU writing the planes (decision D32). An unsuitable texture is the new `GpuError::Texture`. `emberwave-cli bench-encode --gpu --textures` times it.
 
 ## [0.5.0] - 2026-10-24

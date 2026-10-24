@@ -196,7 +196,7 @@ fn the_forward_transform_matches_the_cpu() {
         let mut gpu = Encoder::new(context, width, height, chroma, Signalling::default()).unwrap();
         let cpu = CpuEncoder::new(width, height, chroma, Signalling::default()).unwrap();
         let planes = picture(gpu.layout(), width ^ height);
-        gpu.upload_planes(as_slices(&planes)).unwrap();
+        gpu.upload_planes(as_slices(&planes), None).unwrap();
         gpu.run_stages(true);
         let bands = cpu.transform(as_slices(&planes));
 
@@ -567,7 +567,7 @@ fn workgroups_past_the_end_change_nothing() {
     let mut gpu = Encoder::new(context, 1056, 544, Yuv444, Signalling::default()).unwrap();
     let blocks = gpu.layout().block_count();
     let planes = picture(gpu.layout(), 21);
-    gpu.upload_planes(as_slices(&planes)).unwrap();
+    gpu.upload_planes(as_slices(&planes), None).unwrap();
     gpu.run_stages(true);
     let device = &gpu.device;
     let expected = gpu.read_costs();
@@ -693,7 +693,7 @@ fn gathering_textures_writes_the_words_of_the_upload() {
             }
         }
         let bytes = gpu.buffers.packed_words * 4;
-        gpu.upload_planes(as_slices(&planes)).unwrap();
+        gpu.upload_planes(as_slices(&planes), None).unwrap();
         gpu.run(|this, encoder| this.encode_upload(encoder));
         let uploaded = gpu.read_buffer(&gpu.planes, 0, bytes);
 

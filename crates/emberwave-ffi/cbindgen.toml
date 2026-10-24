@@ -3,7 +3,7 @@
 # EMBERWAVE_BLESS=1 cargo test -p emberwave-ffi --test header rewrites it.
 language = "C"
 header = """/*
- * emberwave: decode PyroWave video on the GPU.
+ * emberwave: decode and encode PyroWave video on the GPU.
  * https://github.com/with-developer/emberwave
  * SPDX-License-Identifier: MIT
  *
@@ -12,8 +12,9 @@ header = """/*
  *   emberwave_last_error() describes it, on the thread that made the call.
  * - Objects are opaque. *_create makes one, *_destroy frees it, and
  *   destroying NULL does nothing.
- * - A context may be used by several threads at once. A decoder may move
- *   between threads, but only one thread may use it at a time.
+ * - A context may be used by several threads at once. A decoder or an
+ *   encoder may move between threads, but only one thread may use it at a
+ *   time.
  * - A panic inside emberwave is reported as EMBERWAVE_STATUS_INTERNAL.
  *   Destroy the object it happened in.
  */"""

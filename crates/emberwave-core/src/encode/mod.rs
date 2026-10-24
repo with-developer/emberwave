@@ -85,6 +85,18 @@ pub enum EncodeError {
         /// Bytes of the smallest frame.
         minimum: usize,
     },
+    /// A plane's rows are closer together than the plane is wide.
+    #[error(
+        "the rows of the {component:?} plane are {stride} bytes apart, less than its {width} samples"
+    )]
+    PlaneStride {
+        /// Which plane.
+        component: Component,
+        /// Bytes from the start of one row to the start of the next.
+        stride: usize,
+        /// Samples in a row.
+        width: usize,
+    },
 }
 
 /// The wavelet coefficients of a picture: `[component][level][band]`,
@@ -315,6 +327,36 @@ pub(crate) fn check_planes(layout: &FrameLayout, planes: [&[u8]; 3]) -> Result<(
         let (width, height) = layout.plane_size(component);
         let expected = width as usize * height as usize;
         if plane.len() != expected {
+            return Err(EncodeError::PlaneSize {
+                component,
+                expected,
+                actual: plane.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// An error unless `planes` hold the planes of [`FrameLayout::plane_size`]
+/// with their rows `strides` bytes apart: each at least its width, and at
+/// least `(height - 1) * stride + width` bytes in the plane.
+pub(crate) fn check_strided_planes(
+    layout: &FrameLayout,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+) -> Result<(), EncodeError> {
+    for ((component, plane), stride) in Component::ALL.into_iter().zip(planes).zip(strides) {
+        let (width, height) = layout.plane_size(component);
+        let (width, height) = (width as usize, height as usize);
+        if stride < width {
+            return Err(EncodeError::PlaneStride {
+                component,
+                stride,
+                width,
+            });
+        }
+        let expected = (height - 1).saturating_mul(stride).saturating_add(width);
+        if plane.len() < expected {
             return Err(EncodeError::PlaneSize {
                 component,
                 expected,

@@ -730,3 +730,92 @@ fn encoding_from_textures_frame_after_frame_allocates_nothing() {
         "live GPU objects and memory"
     );
 }
+
+#[test]
+fn planes_with_padded_rows_encode_as_back_to_back_ones_do() {
+    // Rows `extra` bytes longer than the plane, filled with what a capture
+    // might leave there, which the encoder must not read.
+    let context = gpu_or_return!();
+    for vector in vectors().into_iter().take(3) {
+        let mut tight = encoder_for(context, &vector.layout);
+        let mut strided = encoder_for(context, &vector.layout);
+        for (index, source) in vector.source.frames.iter().enumerate() {
+            let extra = 13 + index;
+            let mut strides = [0; 3];
+            let padded: [Vec<u8>; 3] = std::array::from_fn(|i| {
+                let (width, _) = vector.layout.plane_size(Component::ALL[i]);
+                let width = width as usize;
+                strides[i] = width + extra;
+                source[i]
+                    .chunks_exact(width)
+                    .flat_map(|row| {
+                        row.iter()
+                            .copied()
+                            .chain((0..extra).map(|j| (j * 37) as u8))
+                    })
+                    .collect()
+            });
+            let expected = tight.encode(planes(source), vector.budget).unwrap();
+            let frame = strided
+                .encode_strided(planes(&padded), strides, vector.budget)
+                .unwrap();
+            assert!(frame == expected, "{} frame {index}", vector.name);
+        }
+    }
+
+    let layout = FrameLayout::new(64, 32, ChromaSubsampling::Yuv420).unwrap();
+    let mut encoder = encoder_for(context, &layout);
+    let source: [Vec<u8>; 3] = std::array::from_fn(|i| {
+        let (width, height) = layout.plane_size(Component::ALL[i]);
+        vec![90; (width * height) as usize]
+    });
+    match encoder.encode_strided(planes(&source), [64, 31, 32], 10_000) {
+        Err(GpuError::Encode(EncodeError::PlaneStride {
+            component: Component::Cb,
+            stride: 31,
+            width: 32,
+        })) => {}
+        other => panic!("a stride below the width: {:?}", other.map(drop)),
+    }
+    // The last row may end at the plane's width; a byte short is an error.
+    let short = &source[2][..32 * 15 + 31];
+    match encoder.encode_strided([&source[0], &source[1], short], [64, 32, 32], 10_000) {
+        Err(GpuError::Encode(EncodeError::PlaneSize {
+            component: Component::Cr,
+            expected: 512,
+            actual: 511,
+        })) => {}
+        other => panic!("a short plane: {:?}", other.map(drop)),
+    }
+    let frame = encoder
+        .encode_strided(planes(&source), [64, 32, 32], 10_000)
+        .unwrap();
+    assert_eq!(sequence_of(&frame), 1, "the first frame after the errors");
+    // With rows wider than the plane, the last row also ends at the
+    // plane's width: (height - 1) * stride + width bytes suffice.
+    let stride = 40;
+    let exact: Vec<u8> = source[1]
+        .chunks_exact(32)
+        .enumerate()
+        .flat_map(|(row, samples)| {
+            let padding = if row == 15 { 0 } else { stride - 32 };
+            samples
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(7, padding))
+        })
+        .collect();
+    assert_eq!(exact.len(), 15 * stride + 32);
+    let padded = encoder
+        .encode_strided([&source[0], &exact, &source[2]], [64, stride, 32], 10_000)
+        .unwrap();
+    // Frame 2 of the same picture, sequence numbers in every block header
+    // included.
+    let mut reference = encoder_for(context, &layout);
+    reference.encode(planes(&source), 10_000).unwrap();
+    let tight = reference.encode(planes(&source), 10_000).unwrap();
+    assert!(
+        padded == tight,
+        "the frame of the exactly sized padded plane"
+    );
+}
