@@ -6,6 +6,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Added
 
+- An iPhone and iPad benchmark app, `crates/emberwave-ffi/examples/ios` ([#66](https://github.com/with-developer/emberwave/issues/66)). It times decoding into Metal textures, decoding to planes in memory and encoding on the device's GPU through the C API, with the pictures and budgets of the browser benchmark. It also draws the last picture from its texture. CI runs it in an iOS Simulator, where it also reads a texture back through Metal.
 - Pictures on the GPU for Metal clients (decision D40, [#27](https://github.com/with-developer/emberwave/issues/27)).
   - `emberwave_texture_create` makes a texture of the picture's size, RGBA or BGRA, on the decoder's device.
   - `emberwave_decoder_decode_texture` draws the RGB picture into it and waits.

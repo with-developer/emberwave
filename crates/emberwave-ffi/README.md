@@ -162,6 +162,8 @@ In Swift, `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` take
 
 Vulkan and Direct3D 12 handles, decoding without waiting, on the client's own device and queue or into its own textures, and the picture as Y, Cb and Cr planes are not part of the interface yet.
 
+[`examples/ios`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/ios) is an iPhone and iPad app that does all of this in Swift: it times decoding into textures, decoding to planes and encoding on the device's GPU, and draws the last picture from its texture. Its README says how to run it on a phone.
+
 ## Rules
 
 - **Errors.** Functions that can fail return an `EmberwaveStatus`. After a failure, `emberwave_last_error()` describes it, for the thread that made the call, until that thread's next failure.
