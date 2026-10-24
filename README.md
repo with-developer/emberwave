@@ -10,7 +10,7 @@ A portable ([wgpu](https://wgpu.rs)) port of the [PyroWave](https://github.com/T
 
 PyroWave is an intra-only codec built for very fast GPU encode and decode (upstream reports under ~0.1 ms at 1080p and ~0.2 ms at 4K) for local-network game streaming. Its reference implementation is written as Vulkan compute shaders. **emberwave reimplements the decoder in Rust + WGSL on top of wgpu**, so a single code base can target Vulkan, Metal, DX12 and WebGPU.
 
-> **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output, up to 4K (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode). CI runs the tests on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Decoding works, converts to RGB on the GPU and comes with a command line tool, a browser player and a C API. An encoder makes streams that upstream's decoder reads, at upstream's PSNR or above for the same bytes, on the CPU or on the GPU, which encodes a 4K frame in about 1.9 ms on the same machine, faster than upstream's own encoder (3.2 to 3.4 ms at the same precision), also from pictures that are in GPU memory already. A 4K frame decodes in about 1.1 ms on an Apple M3 Max (1.4 ms including the conversion to RGB), 1.4 times the time of upstream's own Metal decoder at FP32 (see [Performance](#performance)). Releases and their changes are in [`CHANGELOG.md`](CHANGELOG.md).
+> **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output, up to 4K (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode). CI runs the tests on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Decoding works, converts to RGB on the GPU and comes with a command line tool, a browser player and a C API. An encoder makes streams that upstream's decoder reads, at upstream's PSNR or above for the same bytes, on the CPU or on the GPU, which encodes a 4K frame in about 1.9 ms on the same machine, faster than upstream's own encoder (3.2 to 3.4 ms at the same precision), also from pictures that are in GPU memory already. A 4K frame decodes in about 0.9 ms on an Apple M3 Max (1.2 ms including the conversion to RGB), 1.1 times the time of upstream's own Metal decoder at FP32 (see [Performance](#performance)). Releases and their changes are in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Quick start
 
@@ -66,13 +66,13 @@ Decode time per frame on an Apple M3 Max (Metal), RGB output kept in GPU memory,
 
 | Stream | mean | p99 |
 |---|---|---|
-| 1080p | 0.56 | 0.77 |
-| 1440p | 0.76 | 1.10 |
-| 4K | 1.34 | 1.57 |
+| 1080p | 0.52 | 0.68 |
+| 1440p | 0.68 | 0.94 |
+| 4K | 1.19 | 1.52 |
 
-Upstream's own Metal decoder is faster on the same machine: 0.79 ms for a 4K frame at FP32 against emberwave's 1.04 ms (planes only). [`BENCHMARKS.md`](BENCHMARKS.md) has the method and all the numbers.
+Upstream's own Metal decoder is faster on the same machine: 0.76 ms for a 4K frame at FP32 against emberwave's 0.87 ms (planes only). [`BENCHMARKS.md`](BENCHMARKS.md) has the method and all the numbers.
 
-Encoding a 4K frame within 1.2 MB takes 1.93 ms on the GPU, from the planes in CPU memory to the frame in CPU memory, and 3.18 ms with upstream's encoder at FP32.
+Encoding a 4K frame within 1.2 MB takes 1.92 ms on the GPU, from the planes in CPU memory to the frame in CPU memory, and 3.34 ms with upstream's encoder at FP32.
 <!-- bench-summary:end -->
 
 ## Goals
@@ -136,7 +136,7 @@ emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 
 
 - **현재 상태(프리알파)**: 비트스트림 파서, GPU 디코더(역양자화, 역 DWT, YUV→RGB), CLI(`emberwave-cli`)가 동작합니다. 원본 인코더가 만든 스트림을 원본 디코더와 PSNR 64 dB 이상(원본 FP32 모드 기준 86 dB 이상)으로 일치하게 디코딩하고, 4K 스트림도 같은 기준을 통과합니다. CI는 Linux(lavapipe), macOS(Metal), Windows(DX12, WARP)에서 테스트를 돌립니다.
 - **빠른 시작**: Rust 1.87 이상과 GPU(없으면 Linux는 Mesa lavapipe, Windows는 내장 WARP)가 있으면 위 Quick start의 네 줄로 PNG를 얻습니다. 처음 빌드는 몇 분 걸립니다.
-- **성능**: Apple M3 Max(Metal)에서 4K 한 프레임을 약 1.1 ms(RGB 변환 포함 1.4 ms)에 디코딩하며, 같은 기계에서 원본 Metal 디코더(FP32)의 1.4배입니다. 측정 환경과 전체 수치는 위 Performance 표와 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.
+- **성능**: Apple M3 Max(Metal)에서 4K 한 프레임을 약 0.9 ms(RGB 변환 포함 1.2 ms)에 디코딩하며, 같은 기계에서 원본 Metal 디코더(FP32)의 1.1배입니다. 측정 환경과 전체 수치는 위 Performance 표와 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.
 - **릴리스**: v0.1.0이 첫 릴리스, v0.2.0이 속도 개선, v0.3.0이 브라우저 플레이어와 C API, v0.4.0이 인코더(CPU와 GPU), v0.5.0이 GPU 인코더 가속(4K 약 1.9 ms로 업스트림보다 빠름)과 기기 손실·Vulkan 로더 관련 수정, v0.6.0이 C API 인코더와 GPU 텍스처 입력 인코딩 릴리스입니다. Linux(x86_64), macOS(Apple Silicon), Windows(x86_64)용 `emberwave-cli`와 C 라이브러리(`emberwave-ffi`)를 [releases](https://github.com/with-developer/emberwave/releases)에서 받을 수 있습니다. 4K 1000프레임을 반복 디코딩해도 GPU 자원과 프로세스 메모리가 늘지 않는 것을 확인했습니다.
 - **브라우저 플레이어**: [with-developer.github.io/emberwave](https://with-developer.github.io/emberwave/)에서 `.pwv1` 파일을 열면 WebGPU로 페이지 안에서 디코딩해 재생합니다. 파일은 어디에도 올라가지 않습니다.
 - **C API**: `crates/emberwave-ffi`가 C에서 쓰는 헤더(`emberwave.h`)와 공유·정적 라이브러리를 제공합니다. 네트워크로 받은 패킷을 넣고 YUV 평면이나 RGB를 호출자 메모리로 받습니다. 인코더도 있어서(#42), 호스트는 stride가 있는 평면을 바이트 예산 안의 프레임으로 인코딩하고 패킷으로 나눕니다. 릴리스마다 3개 OS용으로 빌드해 올리고, C 예제가 CI에서 모든 테스트 벡터를 디코딩하고 인코더 소스 둘을 인코딩해 다시 디코딩합니다.

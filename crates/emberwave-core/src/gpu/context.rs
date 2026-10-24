@@ -222,9 +222,7 @@ impl GpuContext {
         if matches!(error, GpuError::DeviceLost(_)) {
             return error;
         }
-        if self.lost().is_none() {
-            let _ = self.device.poll(wgpu::PollType::Poll);
-        }
+        notice_loss(&self.device, &self.lost);
         match self.lost() {
             Some(reason) => GpuError::DeviceLost(reason),
             None => error,
@@ -270,6 +268,18 @@ impl GpuContext {
         cached(&self.encoder_pipelines, || {
             EncoderPipelines::new(&self.device)
         })
+    }
+}
+
+/// After a call failed on `device`: polls it once, without waiting, while
+/// `lost` records no loss, so that wgpu reports a destroyed device, which it
+/// does only when the device is polled with no work left on it. Not once a
+/// loss is recorded: a device that the driver lost has called back already,
+/// and wgpu panics when a poll finds it (decision D22).
+pub(crate) fn notice_loss(device: &wgpu::Device, lost: &Mutex<Option<String>>) {
+    let recorded = lost.lock().map_or(true, |lost| lost.is_some());
+    if !recorded {
+        let _ = device.poll(wgpu::PollType::Poll);
     }
 }
 

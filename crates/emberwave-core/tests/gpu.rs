@@ -831,4 +831,15 @@ fn encoding_into_a_callers_encoder_gives_the_same_picture() {
         .collect();
     assert!(words.chunks_exact(4).all(|pixel| pixel[3] == 255));
     assert_eq!(rgb, expected.data);
+
+    // The same decoder, back to the decodes that wait, which upload through a
+    // buffer of their own (decision D34) where encode_rgb writes through the
+    // queue: each path finds the payload the other left and replaces it.
+    for frame in [&frames[0], &frames[1]] {
+        let from_both = other.decode_rgb(frame, &color).unwrap();
+        assert_eq!(
+            from_both.data,
+            decoder.decode_rgb(frame, &color).unwrap().data
+        );
+    }
 }
