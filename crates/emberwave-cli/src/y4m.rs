@@ -12,6 +12,10 @@ use crate::Result;
 /// for "unrelated images".
 pub const DEFAULT_FRAME_RATE: (u32, u32) = (30, 1);
 
+/// The longest header or frame line read: far more than any has, and a
+/// bound on what a file that is not Y4M can make the reader hold.
+const MAX_LINE: u64 = 64 * 1024;
+
 /// What the header of a Y4M file says about its pictures.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamInfo {
@@ -85,7 +89,8 @@ impl Writer {
     }
 }
 
-/// A Y4M file read into memory.
+/// A Y4M file read into memory, for the tests of the reader.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct Video {
     pub width: usize,
@@ -123,7 +128,7 @@ impl<R: BufRead> Reader<R> {
     /// Reads the header line.
     pub fn new(mut input: R) -> Result<Self> {
         let mut line = Vec::new();
-        input.read_until(b'\n', &mut line)?;
+        (&mut input).take(MAX_LINE).read_until(b'\n', &mut line)?;
         if line.last() != Some(&b'\n') {
             return Err("not a Y4M file: no header line".into());
         }
@@ -139,7 +144,11 @@ impl<R: BufRead> Reader<R> {
     /// The Y, Cb and Cr planes of the next frame, or `None` at the end.
     pub fn next_frame(&mut self) -> Result<Option<[Vec<u8>; 3]>> {
         let mut marker = Vec::new();
-        if self.input.read_until(b'\n', &mut marker)? == 0 {
+        if (&mut self.input)
+            .take(MAX_LINE)
+            .read_until(b'\n', &mut marker)?
+            == 0
+        {
             return Ok(None);
         }
         if marker.last() != Some(&b'\n') {
@@ -164,17 +173,15 @@ impl<R: BufRead> Reader<R> {
 
 /// Opens a Y4M file to read frame by frame.
 pub fn open(path: &Path) -> Result<Reader<BufReader<File>>> {
-    Reader::new(BufReader::new(File::open(path)?))
+    File::open(path)
+        .map_err(Into::into)
+        .and_then(|file| Reader::new(BufReader::new(file)))
         .map_err(|error| format!("{}: {error}", path.display()).into())
 }
 
-/// Reads a whole 8-bit 4:2:0 or 4:4:4 Y4M file.
-pub fn read(path: &Path) -> Result<Video> {
-    let data = std::fs::read(path)?;
-    parse(&data).map_err(|error| format!("{}: {error}", path.display()).into())
-}
-
-/// Parses the contents of an 8-bit 4:2:0 or 4:4:4 Y4M file.
+/// Parses the contents of an 8-bit 4:2:0 or 4:4:4 Y4M file, for the tests
+/// of the reader; the commands read frame by frame.
+#[cfg(test)]
 fn parse(data: &[u8]) -> Result<Video> {
     let mut reader = Reader::new(data)?;
     let mut frames = Vec::new();

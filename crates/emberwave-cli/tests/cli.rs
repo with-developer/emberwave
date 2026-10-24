@@ -777,3 +777,91 @@ fn bench_encode_times_pictures_in_textures() {
         "{json}"
     );
 }
+
+#[test]
+fn output_into_a_closed_pipe_ends_quietly() {
+    // As when the output goes to `head`: the reader is gone before the first
+    // line, which is no reason for an error, let alone a panic.
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+    let output = cli()
+        .arg("info")
+        .arg(testdata(&format!("{VECTOR}.pwv1")))
+        .arg("--verbose")
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary runs")
+        .wait_with_output()
+        .expect("it ends");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn errors_name_the_file_and_a_psnr_must_be_a_number() {
+    let missing = scratch("errors").join("missing.pwv1");
+    for command in ["info", "decode"] {
+        let mut run = cli();
+        run.arg(command).arg(&missing);
+        if command == "decode" {
+            run.arg("--out-dir").arg(scratch("errors-out"));
+        }
+        let output = run.output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("missing.pwv1"),
+            "{command}: {}",
+            stderr(&output)
+        );
+    }
+    let reference = testdata(&format!("{VECTOR}.ref.y4m"));
+    let output = cli()
+        .arg("compare")
+        .arg(missing.with_extension("y4m"))
+        .arg(&reference)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("missing.y4m"),
+        "{}",
+        stderr(&output)
+    );
+
+    // No PSNR is below NaN, so a NaN minimum would pass anything.
+    let output = cli()
+        .arg("compare")
+        .arg(&reference)
+        .arg(&reference)
+        .args(["--min-psnr", "nan"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("finite"), "{}", stderr(&output));
+}
+
+#[test]
+fn a_file_without_frames_is_an_error_for_every_command() {
+    // The 24 bytes of a PWV1 header and no frame.
+    let dir = scratch("no-frames");
+    let header_only = dir.join("empty.pwv1");
+    let bytes = std::fs::read(testdata(&format!("{VECTOR}.pwv1"))).unwrap();
+    std::fs::write(&header_only, &bytes[..24]).unwrap();
+    for command in ["decode", "bench"] {
+        let mut run = cli();
+        run.arg(command).arg(&header_only);
+        if command == "decode" {
+            run.arg("--out-dir").arg(dir.join("out"));
+        }
+        let Some(output) = run_on_gpu(&mut run) else {
+            return;
+        };
+        assert!(!output.status.success(), "{command}");
+        assert!(
+            stderr(&output).contains("no frames"),
+            "{command}: {}",
+            stderr(&output)
+        );
+    }
+}

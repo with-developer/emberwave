@@ -1,6 +1,6 @@
 //! `emberwave-cli compare`: compare two Y4M files plane by plane.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{Result, chroma_name, y4m};
 
@@ -13,43 +13,56 @@ pub struct Args {
     b: PathBuf,
 
     /// Fail unless every plane of every frame reaches this PSNR in dB
-    #[arg(long)]
+    #[arg(long, value_parser = parse_finite)]
     min_psnr: Option<f64>,
 }
 
+/// A number that is not infinite or NaN: no PSNR is below NaN, so
+/// `--min-psnr nan` would pass anything.
+fn parse_finite(text: &str) -> std::result::Result<f64, String> {
+    let value: f64 = text.parse().map_err(|error| format!("{error}"))?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err("must be a finite number".to_owned())
+    }
+}
+
 pub fn run(args: &Args) -> Result<()> {
-    let a = y4m::read(&args.a)?;
-    let b = y4m::read(&args.b)?;
-    if (a.width, a.height, a.chroma) != (b.width, b.height, b.chroma) {
+    // Frame by frame, so that two large files do not have to fit in memory.
+    let mut a = y4m::open(&args.a)?;
+    let mut b = y4m::open(&args.b)?;
+    let (ha, hb) = (*a.header(), *b.header());
+    if (ha.width, ha.height, ha.chroma) != (hb.width, hb.height, hb.chroma) {
         return Err(format!(
             "the files differ in format: {}x{} {} against {}x{} {}",
-            a.width,
-            a.height,
-            chroma_name(a.chroma),
-            b.width,
-            b.height,
-            chroma_name(b.chroma)
+            ha.width,
+            ha.height,
+            chroma_name(ha.chroma),
+            hb.width,
+            hb.height,
+            chroma_name(hb.chroma)
         )
         .into());
-    }
-    if a.frames.len() != b.frames.len() {
-        return Err(format!(
-            "the files have different numbers of frames: {} against {}",
-            a.frames.len(),
-            b.frames.len()
-        )
-        .into());
-    }
-
-    // Nothing compared is not a pass: `worst` would stay infinite.
-    if a.frames.is_empty() {
-        return Err("the files have no frames to compare".into());
     }
 
     let mut worst = f64::INFINITY;
-    for (index, (frame_a, frame_b)) in a.frames.iter().zip(&b.frames).enumerate() {
+    let mut index = 0;
+    loop {
+        let next_a = a.next_frame().map_err(|error| in_file(&args.a, error))?;
+        let next_b = b.next_frame().map_err(|error| in_file(&args.b, error))?;
+        let (frame_a, frame_b) = match (next_a, next_b) {
+            (Some(frame_a), Some(frame_b)) => (frame_a, frame_b),
+            (None, None) => break,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(format!(
+                    "the files have different numbers of frames: one ends after {index}"
+                )
+                .into());
+            }
+        };
         let mut line = format!("frame {index:>4}:");
-        for (name, (plane_a, plane_b)) in ["Y", "Cb", "Cr"].iter().zip(frame_a.iter().zip(frame_b))
+        for (name, (plane_a, plane_b)) in ["Y", "Cb", "Cr"].iter().zip(frame_a.iter().zip(&frame_b))
         {
             let db = psnr(plane_a, plane_b);
             worst = worst.min(db);
@@ -59,9 +72,14 @@ pub fn run(args: &Args) -> Result<()> {
                 max_diff(plane_a, plane_b)
             ));
         }
-        println!("{line}");
+        out!("{line}");
+        index += 1;
     }
-    println!("worst PSNR: {} dB", format_db(worst));
+    // Nothing compared is not a pass: `worst` would stay infinite.
+    if index == 0 {
+        return Err("the files have no frames to compare".into());
+    }
+    out!("worst PSNR: {} dB", format_db(worst));
 
     match args.min_psnr {
         Some(min) if worst < min => Err(format!(
@@ -71,6 +89,11 @@ pub fn run(args: &Args) -> Result<()> {
         .into()),
         _ => Ok(()),
     }
+}
+
+/// `error` with the file it came from.
+fn in_file(path: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    format!("{}: {error}", path.display()).into()
 }
 
 /// PSNR in dB of two 8-bit planes; infinite if they are identical.

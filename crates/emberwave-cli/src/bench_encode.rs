@@ -224,6 +224,8 @@ pub fn run(args: &Args) -> Result<()> {
         .into());
     }
     let (width, height) = (u32::try_from(header.width)?, u32::try_from(header.height)?);
+    // A size the format cannot have is refused before the video is read.
+    FrameLayout::new(width, height, header.chroma)?;
     // In memory first, as `bench` has its file, so that the encodes follow
     // each other as they would in a stream, with no reading in between: a
     // GPU that waits for the CPU slows down, and not every GPU alike.
@@ -285,7 +287,7 @@ pub fn run(args: &Args) -> Result<()> {
     );
     let series = measurement.series();
     if args.json {
-        println!(
+        out!(
             "{}",
             json_object(
                 &[
@@ -305,11 +307,11 @@ pub fn run(args: &Args) -> Result<()> {
             )
         );
     } else {
-        println!("adapter:  {adapter} ({backend})");
-        println!("encoding: {description}");
-        println!("frames:   {count} measured after {warmup} warm-up frames");
-        println!();
-        print_table(&series);
+        out!("adapter:  {adapter} ({backend})");
+        out!("encoding: {description}");
+        out!("frames:   {count} measured after {warmup} warm-up frames");
+        out!();
+        print_table(&series)?;
     }
     Ok(())
 }

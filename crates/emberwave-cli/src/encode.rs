@@ -215,7 +215,7 @@ pub fn run(args: &Args) -> Result<()> {
     // The time of a frame is that of the encoder's call: the picture in
     // memory to the frame in memory, the transfers to and from a GPU included.
     let summary = Summary::of(&times).ok_or("no frames")?;
-    println!(
+    out!(
         "encoded {count} frames to {}: {} bytes per frame; mean {:.3} ms, p50 {:.3} ms, p99 {:.3} ms per frame",
         args.out.display(),
         bytes / count,
