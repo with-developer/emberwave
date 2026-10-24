@@ -4,6 +4,10 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ## [Unreleased]
 
+### Added
+
+- A benchmark page for browsers, [`bench.html`](https://with-developer.github.io/emberwave/bench.html) next to the player: it encodes test streams at 1080p, 1440p and 4K in the page and times their decoding to RGB in GPU memory frame by frame, on any device with WebGPU, a phone included, and gives a report to copy.
+
 ### Changed
 
 - Decoding is faster on the CPU's side (decision D34, [#45](https://github.com/with-developer/emberwave/issues/45)): the decodes that wait for their frame write it into an upload buffer the decoder keeps rather than through `Queue::write_buffer`, which takes new memory for every frame. On an Apple M3 Max a 4K frame decodes to planes in about 0.89 ms instead of 1.06 ms, the CPU's part falling from 0.23 to 0.08 ms. `encode_rgb` still writes through the queue.
