@@ -2,13 +2,20 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] - 2026-10-24
+
+Encoding for hosts: the encoder in the C API, with planes at any row stride and packets for the network, and in Rust from pictures that are on the GPU already, such as a screen capture's.
 
 ### Added
 
 - An encoder in the C API ([#42](https://github.com/with-developer/emberwave/issues/42)): `emberwave_encoder_create`, `_encode`, `_info` and `_destroy` encode planes with row strides into a frame in the caller's buffer, with the colour signalling of `EmberwaveSignalling`, and `emberwave_frame_packets` splits a frame into packets for a decoder (decision D33). `examples/c/encode.c` shows them in use.
 - `gpu::Encoder::encode_strided` encodes planes whose rows are a stride apart, and a stride below the width is the new `EncodeError::PlaneStride`.
 - Encoding pictures that are on the GPU already ([#33](https://github.com/with-developer/emberwave/issues/33)): `gpu::Encoder::encode_textures` takes a `TexturePicture`, three `R8Unorm` textures or NV12's layout of an `R8Unorm` and an `Rg8Unorm` texture, and makes the bytes `encode` makes of the same picture in CPU memory, without the CPU writing the planes (decision D32). An unsuitable texture is the new `GpuError::Texture`. `emberwave-cli bench-encode --gpu --textures` times it.
+
+### Changed
+
+- `GpuError` has a new variant, `Texture`, and `EncodeError` one, `PlaneStride`; a `match` over every variant needs arms for them.
+- A context asks for the adapter's largest 2D textures, as it asks for its largest buffers, so that the textures of pictures to encode can be as large as the pictures; one limited to WebGPU's guarantees keeps 8192.
 
 ## [0.5.0] - 2026-10-24
 
