@@ -831,6 +831,39 @@ fn decoding_frame_after_frame_allocates_nothing() {
 }
 
 #[test]
+fn a_decoder_makes_its_read_back_buffers_when_a_decode_first_reads_back() {
+    // A context of its own: the counters belong to the device.
+    let Some(context) = create_context(&GpuOptions::default()) else {
+        return;
+    };
+    let buffers = || context.device().get_internal_counters().hal.buffers.read();
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(&context, &layout);
+    let color = ColorParams::default();
+
+    // What a player does: record into its own encoder, or wait without
+    // reading back. The 4K decoder of a browser saves 43.5 MiB this way.
+    let mut encoder = context.device().create_command_encoder(&Default::default());
+    decoder
+        .encode_rgb(&frames[0], &color, &mut encoder)
+        .expect("recorded decode");
+    context.queue().submit([encoder.finish()]);
+    decoder
+        .time_frame(&frames[1], TimedOutput::Rgb(color))
+        .expect("timed decode");
+    let player = buffers();
+    assert!(player > 0, "wgpu's counters read zero: are they enabled?");
+
+    decoder.decode(&frames[0]).expect("decode");
+    assert_eq!(buffers(), player + 1, "the planes' read-back buffer");
+    decoder.decode_rgb(&frames[0], &color).expect("RGB decode");
+    assert_eq!(buffers(), player + 2, "and the RGB one");
+    decoder.decode(&frames[1]).expect("decode");
+    decoder.decode_rgb(&frames[1], &color).expect("RGB decode");
+    assert_eq!(buffers(), player + 2, "each made once");
+}
+
+#[test]
 fn a_lost_device_is_an_error_rather_than_a_stale_result() {
     // A context of its own, since destroying the device loses it for good.
     let Some(context) = create_context(&GpuOptions::default()) else {
