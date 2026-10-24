@@ -339,7 +339,9 @@ pub(crate) fn check_planes(layout: &FrameLayout, planes: [&[u8]; 3]) -> Result<(
 
 /// An error unless `planes` hold the planes of [`FrameLayout::plane_size`]
 /// with their rows `strides` bytes apart: each at least its width, and at
-/// least `(height - 1) * stride + width` bytes in the plane.
+/// least `(height - 1) * stride + width` bytes in the plane. For the GPU
+/// encoder's strided input.
+#[cfg(feature = "gpu")]
 pub(crate) fn check_strided_planes(
     layout: &FrameLayout,
     planes: [&[u8]; 3],

@@ -10,7 +10,7 @@ use emberwave_core::bitstream::Pwv1File;
 use emberwave_core::gpu::Decoder;
 
 use crate::stats::Summary;
-use crate::{ColorArgs, GpuArgs, MatrixChoice, RangeChoice, Result, y4m};
+use crate::{ColorArgs, GpuArgs, MatrixChoice, RangeChoice, Result, read_file, y4m};
 
 /// Output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -60,10 +60,14 @@ pub fn run(args: &Args) -> Result<()> {
         );
     }
 
-    let bytes = std::fs::read(&args.input)?;
+    let bytes = read_file(&args.input)?;
     let file = Pwv1File::parse(&bytes)?;
     let header = *file.header();
     let stream = header.stream;
+    // Before anything is written, as bench and compare refuse it too.
+    if file.frames().next().is_none() {
+        return Err("the file has no frames".into());
+    }
 
     let context = args.gpu.create_context(false)?;
     let mut decoder = Decoder::new(&context, stream.width, stream.height, stream.chroma)?;
@@ -108,12 +112,9 @@ pub fn run(args: &Args) -> Result<()> {
             Format::Png => {
                 let rgb = decoder.decode_rgb(frame, &color)?;
                 let elapsed = start.elapsed();
-                write_png(
-                    &args.out_dir.join(format!("{stem}_{index:06}.png")),
-                    rgb.width,
-                    rgb.height,
-                    &rgb.data,
-                )?;
+                let path = args.out_dir.join(format!("{stem}_{index:06}.png"));
+                write_png(&path, rgb.width, rgb.height, &rgb.data)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
                 times_ms.push(elapsed.as_secs_f64() * 1000.0);
             }
             Format::Y4m => {
@@ -133,7 +134,7 @@ pub fn run(args: &Args) -> Result<()> {
     }
 
     match Summary::of(&times_ms) {
-        Some(summary) => println!(
+        Some(summary) => out!(
             "decoded {} frames to {}: mean {:.3} ms, p50 {:.3} ms, p99 {:.3} ms per frame",
             times_ms.len(),
             args.out_dir.display(),
@@ -141,7 +142,7 @@ pub fn run(args: &Args) -> Result<()> {
             summary.p50,
             summary.p99
         ),
-        None => println!("the file has no frames"),
+        None => return Err("the file has no frames".into()),
     }
     Ok(())
 }
@@ -152,6 +153,10 @@ fn write_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<()> {
     encoder.set_depth(png::BitDepth::Eight);
     // Speed over size: these images are for looking at and for tests.
     encoder.set_compression(png::Compression::Fast);
-    encoder.write_header()?.write_image_data(rgb)?;
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgb)?;
+    // Writes the end of the file and flushes it, and says if that failed,
+    // which dropping the writer would not.
+    writer.finish()?;
     Ok(())
 }

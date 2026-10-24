@@ -1,6 +1,15 @@
 //! Command line front end of emberwave: decode PyroWave (`.pwv1`) files with
 //! wgpu, encode them, measure the decode and encode times, and inspect files.
 
+/// `println!` that returns an error rather than panicking when standard
+/// output is gone, as when it goes to `head`, which `main` then ends quietly.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        writeln!(std::io::stdout(), $($arg)*)?
+    }};
+}
+
 mod bench;
 mod bench_encode;
 mod compare;
@@ -19,6 +28,11 @@ use emberwave_core::gpu::{GpuContext, GpuOptions, parse_backends};
 
 /// The error type of the command line tool: anything that can be printed.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// The bytes of the file at `path`, or an error that names it.
+pub fn read_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()).into())
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -183,9 +197,18 @@ fn main() -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // Whoever read the output, such as `head`, has all it wanted.
+        Err(error) if is_broken_pipe(&*error) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Whether `error` is a write to a pipe whose reader has gone.
+fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
 }

@@ -179,15 +179,18 @@ impl FrameAssembler {
                             available: data.len(),
                         });
                     }
+                    // A block of an older frame is ignored, whatever else is
+                    // wrong with it, as upstream ignores it.
+                    let freshness = self.freshness(header.sequence);
+                    if freshness == Freshness::Stale {
+                        return Ok(());
+                    }
+                    // Before the data moves on: a block shorter than its
+                    // header would not move it.
                     if size < HEADER_BYTES {
                         return Err(Error::BlockTooSmall {
                             words: usize::from(header.payload_words),
                         });
-                    }
-
-                    let freshness = self.freshness(header.sequence);
-                    if freshness == Freshness::Stale {
-                        return Ok(());
                     }
 
                     let count = self.layout.block_count();
@@ -487,6 +490,25 @@ mod tests {
         let words = a.frame().block(7).unwrap();
         assert_eq!(words[2] & 0xff, 0x11);
         assert_eq!(a.frame().payload().len(), 3);
+    }
+
+    #[test]
+    fn a_block_of_an_older_frame_is_ignored_even_when_malformed() {
+        // As upstream: whether a block is stale comes before its own checks.
+        let mut a = assembler();
+        a.push_packet(&block(0, 3, 0)).unwrap();
+        // One word, shorter than its own header.
+        let tiny = |sequence: u8| {
+            let word0 = (1u32 << 16) | (u32::from(sequence) << 28);
+            [word0.to_le_bytes(), 0u32.to_le_bytes()].concat()
+        };
+        assert!(a.push_packet(&tiny(0)).is_ok(), "frame 0 is older than 3");
+        assert_eq!((a.sequence(), a.received_blocks()), (Some(3), 1));
+        assert!(matches!(
+            a.push_packet(&tiny(3)),
+            Err(Error::BlockTooSmall { words: 1 })
+        ));
+        assert_eq!((a.sequence(), a.received_blocks()), (Some(3), 1));
     }
 
     #[test]

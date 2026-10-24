@@ -270,7 +270,7 @@ Decoding is not bit-exact between implementations: the transform is floating poi
 - The first copy of a block wins; later copies of the same `block_index` are ignored.
 - A header or block is validated before anything changes, and one that is rejected changes nothing, even if it belongs to a newer frame. Upstream does it the other way round: it starts the new frame as soon as a non-stale header arrives and validates afterwards, so a corrupt packet can discard the frame being assembled.
 - The output is a table with the word offset of every block (`u32::MAX` for blocks that were not received) and the received blocks concatenated, headers included. This is exactly what the GPU dequantisation stage consumes.
-- A frame is ready when `received >= total_blocks`. A frame that lost packets may be decoded anyway if the coarsest bands are complete and more than 90 percent of the blocks arrived; the thresholds are parameters.
+- A frame is ready when `received >= total_blocks`. A frame that lost packets may be decoded anyway if the coarsest bands are complete and more than 90 percent of the blocks arrived; the thresholds are parameters. As upstream's, the test of the coarsest bands counts a block that the encoder never sent, because it was all zeros, as missing: in the committed gradient stream 4 or 5 of the 9 coarsest detail blocks are never sent, and a frame of it that lost any other block is not ready for a partial decode either. A complete frame is not affected.
 
 ### Where the implementation differs from or goes beyond `bitstream.md`
 
@@ -284,6 +284,7 @@ Decoding is not bit-exact between implementations: the transform is floating poi
 | Reproducibility | The encoder's output is not byte-for-byte reproducible: the unused bits of a block's last sign byte are leftover GPU memory | Tests use committed bitstreams and compare decoded pictures, never bitstreams |
 | A duplicate block that is malformed | Silently skipped, because the checks come after the duplicate test | Validated like any other block, so it is rejected |
 | An old header of an unknown kind | Ignored with the rest of the packet | The same; a current or newer one is an error |
+| A block of an older frame that is malformed | Ignored with the rest of the packet, as staleness is tested first | The same: staleness first, then the block's size, index and internals |
 
 ### Verification
 

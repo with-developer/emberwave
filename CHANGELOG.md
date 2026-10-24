@@ -12,6 +12,13 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 - Decoding is faster on the CPU's side (decision D34, [#45](https://github.com/with-developer/emberwave/issues/45)): the decodes that wait for their frame write it into an upload buffer the decoder keeps rather than through `Queue::write_buffer`, which takes new memory for every frame. On an Apple M3 Max a 4K frame decodes to planes in about 0.89 ms instead of 1.06 ms, the CPU's part falling from 0.23 to 0.08 ms. `encode_rgb` still writes through the queue.
 
+### Fixed
+
+- `emberwave-cli decode` reported success when writing a PNG failed, on a full disk or past a file size limit, and left an empty or cut file: the PNG writer was dropped without being finished. It now fails, naming the file.
+- Output piped into a program that stops reading, such as `emberwave-cli info FILE | head`, made the command panic; it now ends quietly.
+- Errors of `emberwave-cli` name the file they are about. `compare` reads both files frame by frame rather than whole, `bench-encode` refuses a picture size the format cannot have before it reads the video, the Y4M reader reads no header or frame line longer than 64 KiB, `compare --min-psnr` refuses NaN, which every PSNR passed, and `decode` of a PWV1 file without frames is an error, as it is for `bench` and `compare`.
+- `FrameAssembler` ignores a block of an older frame even when its size is wrong, as upstream does, rather than rejecting the packet.
+
 ## [0.6.0] - 2026-10-24
 
 Encoding for hosts: the encoder in the C API, with planes at any row stride and packets for the network, and in Rust from pictures that are on the GPU already, such as a screen capture's.

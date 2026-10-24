@@ -105,19 +105,30 @@ pub(crate) fn warm_up(
 }
 
 /// Prints mean, median, 99th percentile, minimum and maximum of each series.
-pub(crate) fn print_table(series: &[&Series]) {
-    println!(
+pub(crate) fn print_table(series: &[&Series]) -> Result<()> {
+    out!(
         "{:<20}{:>9}{:>9}{:>9}{:>9}{:>9}   (ms per frame)",
-        "", "mean", "p50", "p99", "min", "max"
+        "",
+        "mean",
+        "p50",
+        "p99",
+        "min",
+        "max"
     );
     for s in series {
         if let Some(summary) = Summary::of(&s.samples) {
-            println!(
+            out!(
                 "{:<20}{:>9.3}{:>9.3}{:>9.3}{:>9.3}{:>9.3}",
-                s.name, summary.mean, summary.p50, summary.p99, summary.min, summary.max
+                s.name,
+                summary.mean,
+                summary.p50,
+                summary.p99,
+                summary.min,
+                summary.max
             );
         }
     }
+    Ok(())
 }
 
 /// A JSON object of `fields`, whose values are JSON already, then the unit
@@ -154,7 +165,7 @@ pub fn run(args: &Args) -> Result<()> {
         return Err("--frames must be at least 1".into());
     }
 
-    let bytes = std::fs::read(&args.input)?;
+    let bytes = crate::read_file(&args.input)?;
     let file = Pwv1File::parse(&bytes)?;
     let stream = file.header().stream;
     let frames: Vec<&[u8]> = file.frames().collect::<std::result::Result<_, _>>()?;
@@ -250,7 +261,7 @@ pub fn run(args: &Args) -> Result<()> {
     );
 
     if args.json {
-        println!(
+        out!(
             "{}",
             json(
                 args,
@@ -262,11 +273,11 @@ pub fn run(args: &Args) -> Result<()> {
             )
         );
     } else {
-        println!("adapter:  {} ({:?})", adapter.name, adapter.backend);
-        println!("decoding: {description}");
-        println!("frames:   {count} measured after {warmup} warm-up frames");
-        println!();
-        print_table(&series);
+        out!("adapter:  {} ({:?})", adapter.name, adapter.backend);
+        out!("decoding: {description}");
+        out!("frames:   {count} measured after {warmup} warm-up frames");
+        out!();
+        print_table(&series)?;
     }
     Ok(())
 }
