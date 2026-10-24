@@ -791,4 +791,31 @@ fn planes_with_padded_rows_encode_as_back_to_back_ones_do() {
         .encode_strided(planes(&source), [64, 32, 32], 10_000)
         .unwrap();
     assert_eq!(sequence_of(&frame), 1, "the first frame after the errors");
+    // With rows wider than the plane, the last row also ends at the
+    // plane's width: (height - 1) * stride + width bytes suffice.
+    let stride = 40;
+    let exact: Vec<u8> = source[1]
+        .chunks_exact(32)
+        .enumerate()
+        .flat_map(|(row, samples)| {
+            let padding = if row == 15 { 0 } else { stride - 32 };
+            samples
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(7, padding))
+        })
+        .collect();
+    assert_eq!(exact.len(), 15 * stride + 32);
+    let padded = encoder
+        .encode_strided([&source[0], &exact, &source[2]], [64, stride, 32], 10_000)
+        .unwrap();
+    // Frame 2 of the same picture, sequence numbers in every block header
+    // included.
+    let mut reference = encoder_for(context, &layout);
+    reference.encode(planes(&source), 10_000).unwrap();
+    let tight = reference.encode(planes(&source), 10_000).unwrap();
+    assert!(
+        padded == tight,
+        "the frame of the exactly sized padded plane"
+    );
 }

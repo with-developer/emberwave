@@ -10,6 +10,7 @@
  * The video is 8-bit 4:2:0 or 4:4:4. With MIN_PSNR the program fails when a
  * plane of a frame comes back below that many dB.
  */
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,10 +60,12 @@ static int open_video(const char *path, Video *video)
         } else if (token[0] == 'H') {
             video->height = (unsigned)strtoul(token + 1, NULL, 10);
         } else if (token[0] == 'C') {
-            /* 420jpeg, 420mpeg2, 420paldv and 444 are 8-bit; 420p10 is not. */
-            if (strncmp(token + 1, "444", 3) == 0 && token[4] != 'p') {
+            /* 420jpeg, 420mpeg2, 420paldv and 444 are 8-bit; 420p10 and
+             * 444p12 are not. */
+            int deep = token[4] == 'p' && isdigit((unsigned char)token[5]);
+            if (strncmp(token + 1, "444", 3) == 0 && !deep) {
                 video->chroma = EMBERWAVE_CHROMA_444;
-            } else if (strncmp(token + 1, "420", 3) != 0 || token[4] == 'p') {
+            } else if (strncmp(token + 1, "420", 3) != 0 || deep) {
                 fprintf(stderr, "%s: colour space %s is not 8-bit 4:2:0 or 4:4:4\n", path, token + 1);
                 return 0;
             }
@@ -79,16 +82,26 @@ static int open_video(const char *path, Video *video)
  * of the file and -1, having said why, for a broken frame. */
 static int read_frame(Video *video, unsigned char *planes[3], const size_t sizes[3])
 {
-    char line[256];
+    char magic[5];
+    size_t got = fread(magic, 1, sizeof magic, video->file);
+    int c;
     int plane;
 
-    if (!fgets(line, sizeof line, video->file)) {
+    if (got == 0) {
         return 0;
     }
-    if (strncmp(line, "FRAME", 5) != 0) {
+    if (got != sizeof magic || memcmp(magic, "FRAME", sizeof magic) != 0) {
         fprintf(stderr, "a frame does not start with FRAME\n");
         return -1;
     }
+    /* Frame parameters, however long, up to the end of the line. */
+    do {
+        c = fgetc(video->file);
+        if (c == EOF) {
+            fprintf(stderr, "the last frame is cut short\n");
+            return -1;
+        }
+    } while (c != '\n');
     for (plane = 0; plane < 3; plane++) {
         if (fread(planes[plane], 1, sizes[plane], video->file) != sizes[plane]) {
             fprintf(stderr, "the last frame is cut short\n");

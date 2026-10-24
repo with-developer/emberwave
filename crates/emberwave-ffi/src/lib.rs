@@ -50,7 +50,8 @@ pub enum EmberwaveStatus {
     /// The GPU reported an error, or reading the picture back failed.
     Gpu = 5,
     /// The GPU device was lost (a driver reset, or a GPU that went away). The
-    /// context and its decoders cannot be used any more; create new ones.
+    /// context and its decoders and encoders cannot be used any more; create
+    /// new ones.
     DeviceLost = 6,
     /// A bug in emberwave. Destroy the object the call was made on.
     Internal = 7,
@@ -134,7 +135,7 @@ pub struct EmberwaveStreamInfo {
     pub frame_rate_den: u32,
 }
 
-/// The sizes of the planes a decoder writes.
+/// The sizes of the planes a decoder writes or an encoder reads.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EmberwaveFrameInfo {
@@ -257,8 +258,9 @@ impl From<GpuError> for Failure {
             GpuError::Device(_) | GpuError::Readback(_) => EmberwaveStatus::Gpu,
             GpuError::DeviceLost(_) => EmberwaveStatus::DeviceLost,
             GpuError::IncompleteFrame { .. } | GpuError::Bitstream(_) => EmberwaveStatus::Bitstream,
-            // Planes, textures or a budget the encoder cannot take; the C
-            // API has no encoder yet, so nothing here returns them.
+            // Planes or a budget the encoder cannot take, from
+            // emberwave_encoder_encode; textures, which the C API has no way
+            // to pass yet.
             GpuError::Encode(_) | GpuError::Texture(_) => EmberwaveStatus::InvalidArgument,
         };
         Self(status, error.to_string())
@@ -760,8 +762,8 @@ pub unsafe extern "C" fn emberwave_context_create(
     })
 }
 
-/// Destroys a context. Decoders created on it keep working, and keep the GPU
-/// device until they are destroyed as well.
+/// Destroys a context. Decoders and encoders created on it keep working, and
+/// keep the GPU device until they are destroyed as well.
 ///
 /// # Safety
 ///
@@ -1127,8 +1129,8 @@ pub unsafe extern "C" fn emberwave_encoder_info(
 ///
 /// `encoder` is a live encoder that no other thread is using. Each plane's
 /// `data` points to `stride * (height - 1) + width` readable bytes. `frame`
-/// points to `budget` bytes that may be written and do not overlap the
-/// planes, and `size` to a `size_t`.
+/// points to `budget` bytes that may be written, and `size` to a `size_t`;
+/// neither overlaps the planes or the other.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_encoder_encode(
     encoder: *mut EmberwaveEncoder,
@@ -1202,7 +1204,8 @@ pub unsafe extern "C" fn emberwave_encoder_encode(
 ///
 /// `frame` points to `size` readable bytes (or is `NULL` with `size` 0),
 /// `packets` is `NULL` or points to `capacity` `EmberwavePacket`s that may be
-/// written, and `count` points to a `size_t`.
+/// written, and `count` points to a `size_t`; neither `packets` nor `count`
+/// overlaps the frame.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_frame_packets(
     frame: *const u8,
@@ -1215,30 +1218,36 @@ pub unsafe extern "C" fn emberwave_frame_packets(
     run(|| {
         // SAFETY: as the caller promises.
         unsafe { output(count, "count", 0) }?;
-        // SAFETY: as the caller promises.
-        let bytes = unsafe { input(frame, size) }?;
         if max_packet_bytes == 0 {
             return Err(Failure::argument("max_packet_bytes is 0"));
         }
-        let split = encode::packets(bytes, max_packet_bytes);
+        // Worked out before anything is written, so that no borrow of the
+        // frame is alive while the results are.
+        let described: Vec<EmberwavePacket> = {
+            // SAFETY: as the caller promises.
+            let bytes = unsafe { input(frame, size) }?;
+            encode::packets(bytes, max_packet_bytes)
+                .iter()
+                .map(|packet| EmberwavePacket {
+                    offset: packet.as_ptr() as usize - bytes.as_ptr() as usize,
+                    size: packet.len(),
+                })
+                .collect()
+        };
         // SAFETY: as the caller promises.
-        unsafe { count.write(split.len()) };
+        unsafe { count.write(described.len()) };
         if packets.is_null() {
             return Ok(());
         }
-        if capacity < split.len() {
+        if capacity < described.len() {
             return Err(Failure::argument(format!(
                 "capacity is {capacity}, less than the {} packets of the frame",
-                split.len()
+                described.len()
             )));
         }
-        for (i, packet) in split.iter().enumerate() {
-            let described = EmberwavePacket {
-                offset: packet.as_ptr() as usize - bytes.as_ptr() as usize,
-                size: packet.len(),
-            };
+        for (i, packet) in described.into_iter().enumerate() {
             // SAFETY: i is below capacity, which the caller promises.
-            unsafe { packets.add(i).write(described) };
+            unsafe { packets.add(i).write(packet) };
         }
         Ok(())
     })
@@ -1393,6 +1402,14 @@ mod tests {
         assert_eq!(status, EmberwaveStatus::DeviceLost);
         // SAFETY: a live encoder.
         assert!(unsafe { encoder_lost(encoder) }.is_some());
+        // What wgpu does when the device fails while it is waited for: the
+        // panic of an encode is the loss.
+        let status = run_or_lost(
+            || panic!("the device failed while it was waited for"),
+            // SAFETY: a live encoder.
+            || unsafe { encoder_lost(encoder) },
+        );
+        assert_eq!(status, EmberwaveStatus::DeviceLost);
         // So does making another encoder on the context.
         let mut other = std::ptr::null_mut();
         assert_eq!(create(&mut other), EmberwaveStatus::DeviceLost);

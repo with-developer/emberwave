@@ -193,6 +193,28 @@ fn frames_through_the_c_api_equal_the_rust_encoder() {
     for (width, height, chroma) in SHAPES {
         let layout = FrameLayout::new(width, height, chroma).unwrap();
         let tight = encoder_for(context, &layout, None);
+        let mut info = EmberwaveFrameInfo::default();
+        // SAFETY: a live encoder and an info to fill in.
+        let status = unsafe { emberwave_encoder_info(tight, &mut info) };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        let (chroma_width, chroma_height) = layout.plane_size(Component::Cb);
+        assert_eq!(
+            (
+                info.width,
+                info.height,
+                info.chroma_width,
+                info.chroma_height
+            ),
+            (width, height, chroma_width, chroma_height)
+        );
+        assert_eq!(
+            info.chroma,
+            if chroma == ChromaSubsampling::Yuv420 {
+                EMBERWAVE_CHROMA_420
+            } else {
+                EMBERWAVE_CHROMA_444
+            }
+        );
         let padded = encoder_for(context, &layout, None);
         let mut rust =
             Encoder::new(&rust_context, width, height, chroma, Signalling::default()).unwrap();
@@ -240,7 +262,8 @@ fn a_budget_too_small_gives_the_size_of_the_smallest_frame() {
     let (status, _, minimum) = encode_c(encoder, planes, 7);
     assert_eq!(status, EmberwaveStatus::InvalidArgument);
     assert!(last_error().contains("smallest frame"), "{}", last_error());
-    assert!(minimum >= 8, "{minimum}");
+    // The header alone: every block may drop all it has.
+    assert_eq!(minimum, 8);
     let (status, frame, size) = encode_c(encoder, planes, minimum);
     assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
     assert!(size <= minimum);
@@ -262,40 +285,105 @@ fn every_start_of_frame_header_says_what_the_signalling_does() {
         return;
     };
     let layout = FrameLayout::new(200, 120, ChromaSubsampling::Yuv420).unwrap();
-    let hdr = EmberwaveSignalling {
-        matrix: EMBERWAVE_MATRIX_BT2020,
-        range: EMBERWAVE_RANGE_FULL,
-        chroma_siting: EMBERWAVE_SITING_LEFT,
-        primaries: EMBERWAVE_PRIMARIES_BT2020,
-        transfer: EMBERWAVE_TRANSFER_PQ,
+    // The fields in the header's terms: matrix, range, siting, primaries,
+    // transfer function.
+    type Fields = (
+        YcbcrTransform,
+        YcbcrRange,
+        ChromaSiting,
+        ColorPrimaries,
+        TransferFunction,
+    );
+    let default_fields: Fields = (
+        YcbcrTransform::Bt709,
+        YcbcrRange::Limited,
+        ChromaSiting::Center,
+        ColorPrimaries::Srgb,
+        TransferFunction::Srgb,
+    );
+    let defaults = EmberwaveSignalling {
+        matrix: EMBERWAVE_MATRIX_BT709,
+        range: EMBERWAVE_RANGE_LIMITED,
+        chroma_siting: EMBERWAVE_SITING_CENTER,
+        primaries: EMBERWAVE_PRIMARIES_SRGB,
+        transfer: EMBERWAVE_TRANSFER_SRGB,
         reserved: [0; 3],
     };
-    let expected = [
+    // NULL, the defaults spelt out, and each field away from its default on
+    // its own, so that one field cannot stand in for another.
+    let cases: [(Option<EmberwaveSignalling>, Fields); 7] = [
+        (None, default_fields),
+        (Some(defaults), default_fields),
         (
-            None,
+            Some(EmberwaveSignalling {
+                matrix: EMBERWAVE_MATRIX_BT2020,
+                ..defaults
+            }),
             (
-                YcbcrTransform::Bt709,
-                YcbcrRange::Limited,
-                ChromaSiting::Center,
-                ColorPrimaries::Srgb,
-                TransferFunction::Srgb,
+                YcbcrTransform::Bt2020,
+                default_fields.1,
+                default_fields.2,
+                default_fields.3,
+                default_fields.4,
             ),
         ),
         (
-            Some(&hdr),
+            Some(EmberwaveSignalling {
+                range: EMBERWAVE_RANGE_FULL,
+                ..defaults
+            }),
             (
-                YcbcrTransform::Bt2020,
+                default_fields.0,
                 YcbcrRange::Full,
+                default_fields.2,
+                default_fields.3,
+                default_fields.4,
+            ),
+        ),
+        (
+            Some(EmberwaveSignalling {
+                chroma_siting: EMBERWAVE_SITING_LEFT,
+                ..defaults
+            }),
+            (
+                default_fields.0,
+                default_fields.1,
                 ChromaSiting::Left,
+                default_fields.3,
+                default_fields.4,
+            ),
+        ),
+        (
+            Some(EmberwaveSignalling {
+                primaries: EMBERWAVE_PRIMARIES_BT2020,
+                ..defaults
+            }),
+            (
+                default_fields.0,
+                default_fields.1,
+                default_fields.2,
                 ColorPrimaries::Bt2020,
+                default_fields.4,
+            ),
+        ),
+        (
+            Some(EmberwaveSignalling {
+                transfer: EMBERWAVE_TRANSFER_PQ,
+                ..defaults
+            }),
+            (
+                default_fields.0,
+                default_fields.1,
+                default_fields.2,
+                default_fields.3,
                 TransferFunction::Pq,
             ),
         ),
     ];
     let source = picture(&layout, 1);
     let mut storage = Vec::new();
-    for (signalling, fields) in expected {
-        let encoder = encoder_for(context, &layout, signalling);
+    for (index, (signalling, fields)) in cases.iter().enumerate() {
+        let encoder = encoder_for(context, &layout, signalling.as_ref());
         let planes = source_planes(&layout, &source, 0, &mut storage);
         let (status, frame, _) = encode_c(encoder, planes, 9_000);
         assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
@@ -310,7 +398,8 @@ fn every_start_of_frame_header_says_what_the_signalling_does() {
                 header.color_primaries,
                 header.transfer_function,
             ),
-            fields
+            *fields,
+            "case {index}"
         );
         // SAFETY: live, destroyed once.
         unsafe { emberwave_encoder_destroy(encoder) };
@@ -395,6 +484,10 @@ fn bad_encoder_arguments_are_errors_with_a_message() {
     no_data[1].data = ptr::null();
     let mut narrow = planes;
     narrow[2].stride = 31;
+    // Rows so far apart that the plane would span more than memory: refused
+    // before anything is read.
+    let mut huge = planes;
+    huge[0].stride = usize::MAX / 2;
     let cases = [
         (
             ptr::null_mut(),
@@ -416,6 +509,13 @@ fn bad_encoder_arguments_are_errors_with_a_message() {
             frame.as_mut_ptr(),
             &mut size,
             "cr.stride is 31",
+        ),
+        (
+            encoder,
+            huge,
+            frame.as_mut_ptr(),
+            &mut size,
+            "y spans more memory than a pointer can address",
         ),
         (encoder, planes, ptr::null_mut(), &mut size, "frame is NULL"),
         (
@@ -482,6 +582,27 @@ fn frames_split_into_the_packets_of_the_rust_function() {
         assert_eq!(status, EmberwaveStatus::InvalidArgument);
         assert_eq!(count, needed);
         assert!(packets.iter().all(|p| *p == EmberwavePacket::default()));
+        // Room to spare: the packets, and the rest untouched.
+        let unused = EmberwavePacket {
+            offset: usize::MAX,
+            size: usize::MAX,
+        };
+        let mut packets = vec![unused; needed + 3];
+        // SAFETY: room for `needed + 3` packets.
+        let status = unsafe {
+            emberwave_frame_packets(
+                frame.as_ptr(),
+                frame.len(),
+                100,
+                packets.as_mut_ptr(),
+                packets.len(),
+                &mut count,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        assert_eq!(count, needed);
+        assert_eq!(packets[..needed], packets_c(frame, 100)[..]);
+        assert!(packets[needed..].iter().all(|p| *p == unused));
     }
     let mut count = 0;
     // SAFETY: a byte that is not read, and a count.

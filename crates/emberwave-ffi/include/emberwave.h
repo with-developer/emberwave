@@ -97,7 +97,8 @@ typedef enum EmberwaveStatus {
   // The GPU reported an error, or reading the picture back failed.
   EMBERWAVE_STATUS_GPU = 5,
   // The GPU device was lost (a driver reset, or a GPU that went away). The
-  // context and its decoders cannot be used any more; create new ones.
+  // context and its decoders and encoders cannot be used any more; create
+  // new ones.
   EMBERWAVE_STATUS_DEVICE_LOST = 6,
   // A bug in emberwave. Destroy the object the call was made on.
   EMBERWAVE_STATUS_INTERNAL = 7,
@@ -145,7 +146,7 @@ typedef struct EmberwaveContextOptions {
   uint32_t flags;
 } EmberwaveContextOptions;
 
-// The sizes of the planes a decoder writes.
+// The sizes of the planes a decoder writes or an encoder reads.
 typedef struct EmberwaveFrameInfo {
   // Width of the luma plane, and of the picture.
   uint32_t width;
@@ -274,8 +275,8 @@ enum EmberwaveStatus emberwave_probe_packet(const uint8_t *data,
 enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptions *options,
                                               struct EmberwaveContext **context);
 
-// Destroys a context. Decoders created on it keep working, and keep the GPU
-// device until they are destroyed as well.
+// Destroys a context. Decoders and encoders created on it keep working, and
+// keep the GPU device until they are destroyed as well.
 //
 // # Safety
 //
@@ -443,8 +444,8 @@ enum EmberwaveStatus emberwave_encoder_info(struct EmberwaveEncoder *encoder,
 //
 // `encoder` is a live encoder that no other thread is using. Each plane's
 // `data` points to `stride * (height - 1) + width` readable bytes. `frame`
-// points to `budget` bytes that may be written and do not overlap the
-// planes, and `size` to a `size_t`.
+// points to `budget` bytes that may be written, and `size` to a `size_t`;
+// neither overlaps the planes or the other.
 enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
                                               struct EmberwaveSourcePlane y,
                                               struct EmberwaveSourcePlane cb,
@@ -467,7 +468,8 @@ enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
 //
 // `frame` points to `size` readable bytes (or is `NULL` with `size` 0),
 // `packets` is `NULL` or points to `capacity` `EmberwavePacket`s that may be
-// written, and `count` points to a `size_t`.
+// written, and `count` points to a `size_t`; neither `packets` nor `count`
+// overlaps the frame.
 enum EmberwaveStatus emberwave_frame_packets(const uint8_t *frame,
                                              size_t size,
                                              size_t max_packet_bytes,
