@@ -694,6 +694,7 @@ fn bench_encode_reports_per_frame_times_on_the_cpu_and_the_gpu() {
     assert_eq!(json["frames"], 5);
     assert_eq!(json["warmup"], 1);
     assert_eq!(json["bytes_per_frame"], 6000);
+    assert_eq!(json["picture"], "planes");
     assert_eq!(json["unit"], "ms");
     for series in ["total", "cpu prepare", "gpu wall"] {
         let numbers = &json["series"][series];
@@ -726,5 +727,53 @@ fn bench_encode_reports_per_frame_times_on_the_cpu_and_the_gpu() {
             .any(|line| line == "frames:   2 measured after 0 warm-up frames"),
         "{}",
         stdout(&output)
+    );
+}
+
+#[test]
+fn bench_encode_times_pictures_in_textures() {
+    let source = testdata("encoder/scene_200x120_420.source.y4m");
+    let args = [
+        "--bytes-per-frame",
+        "6000",
+        "--frames",
+        "3",
+        "--warmup",
+        "1",
+        "--warmup-seconds",
+        "0",
+    ];
+    // Textures are the GPU's: without --gpu the option is refused.
+    let output = cli()
+        .arg("bench-encode")
+        .arg(&source)
+        .args(args)
+        .arg("--textures")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--gpu"), "{}", stderr(&output));
+
+    let Some(output) = run_on_gpu(cli().arg("bench-encode").arg(&source).args(args).args([
+        "--gpu",
+        "--textures",
+        "--json",
+    ])) else {
+        return;
+    };
+    assert!(output.status.success(), "{}", stderr(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(json["picture"], "textures");
+    assert!(
+        json["description"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("encoded on the GPU from textures")),
+        "{json}"
+    );
+    assert!(
+        json["series"]["total"]["mean"]
+            .as_f64()
+            .is_some_and(|mean| mean > 0.0),
+        "{json}"
     );
 }

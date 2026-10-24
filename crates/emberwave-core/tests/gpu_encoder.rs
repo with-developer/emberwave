@@ -1,7 +1,8 @@
 //! The GPU encoder through its public API: on the sources of the encoder's
 //! vectors in `testdata/encoder/`, against the CPU encoder's committed
 //! streams; on a device limited to what WebGPU guarantees; frame after frame;
-//! and on a lost device (decision D29).
+//! from textures as from CPU memory; and on a lost device (decisions D29 and
+//! D32).
 //!
 //! Like `tests/gpu.rs`, they skip without a GPU unless
 //! `EMBERWAVE_REQUIRE_GPU` is set.
@@ -14,10 +15,12 @@ use common::{
     Y4m, create_context, encoder_dir, encoder_vectors, live_resources, psnr, read_y4m,
     shared_context,
 };
-use emberwave_core::bitstream::{ChromaSubsampling, FrameAssembler, FrameLayout, Header, Pwv1File};
+use emberwave_core::bitstream::{
+    ChromaSubsampling, Component, FrameAssembler, FrameLayout, Header, Pwv1File,
+};
 use emberwave_core::cpu::decode_frame;
 use emberwave_core::encode::{self, EncodeError, Signalling};
-use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions};
+use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions, TexturePicture};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
@@ -76,6 +79,105 @@ fn encoder_for(context: &GpuContext, layout: &FrameLayout) -> Encoder {
 
 fn planes(frame: &[Vec<u8>; 3]) -> [&[u8]; 3] {
     [&frame[0], &frame[1], &frame[2]]
+}
+
+/// A texture of `format` and `usage` on `context`'s device, filled with
+/// `data` if there is any: rows of texels without padding.
+fn texture(
+    context: &GpuContext,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+    (width, height): (u32, u32),
+    data: &[u8],
+) -> wgpu::Texture {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = context.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("test picture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: usage | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    if !data.is_empty() {
+        let texel_bytes = format
+            .block_copy_size(None)
+            .expect("an uncompressed format");
+        context.queue().write_texture(
+            texture.as_image_copy(),
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * texel_bytes),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+    }
+    texture
+}
+
+/// A picture in textures on a context's device: a texture per plane, and Cb
+/// and Cr interleaved in another, as NV12 keeps them.
+struct Textures {
+    planes: [wgpu::TextureView; 3],
+    chroma: wgpu::TextureView,
+}
+
+impl Textures {
+    fn new(context: &GpuContext, layout: &FrameLayout, source: &[Vec<u8>; 3]) -> Self {
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING;
+        let view = |texture: wgpu::Texture| texture.create_view(&Default::default());
+        let planes = std::array::from_fn(|i| {
+            let size = layout.plane_size(Component::ALL[i]);
+            view(texture(
+                context,
+                wgpu::TextureFormat::R8Unorm,
+                usage,
+                size,
+                &source[i],
+            ))
+        });
+        let interleaved: Vec<u8> = source[1]
+            .iter()
+            .zip(&source[2])
+            .flat_map(|(&cb, &cr)| [cb, cr])
+            .collect();
+        let size = layout.plane_size(Component::Cb);
+        let chroma = view(texture(
+            context,
+            wgpu::TextureFormat::Rg8Unorm,
+            usage,
+            size,
+            &interleaved,
+        ));
+        Self { planes, chroma }
+    }
+
+    fn planes(&self) -> TexturePicture<'_> {
+        TexturePicture::Planes([&self.planes[0], &self.planes[1], &self.planes[2]])
+    }
+
+    fn luma_chroma(&self) -> TexturePicture<'_> {
+        TexturePicture::LumaChroma {
+            luma: &self.planes[0],
+            chroma: &self.chroma,
+        }
+    }
+}
+
+/// The sequence number of a frame, from its start of frame header.
+fn sequence_of(frame: &[u8]) -> u8 {
+    match Header::parse(frame).expect("a start of frame header") {
+        Header::StartOfFrame(header) => header.sequence,
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The PSNR of the CPU decode of `frame` against `source`, of all samples.
@@ -389,4 +491,242 @@ fn nothing_is_made_on_a_lost_device() {
             encoder.map(drop)
         );
     }
+}
+
+#[test]
+fn pictures_in_textures_encode_as_the_same_planes_do() {
+    // gather.wgsl packs the textures into the planes that the upload from
+    // CPU memory fills, so the frames are the same bytes, also on a device
+    // limited to what WebGPU guarantees (decision D32).
+    let context = gpu_or_return!();
+    let mut contexts = vec![(context.clone(), usize::MAX)];
+    let strict = GpuOptions {
+        strict_webgpu: true,
+        ..GpuOptions::default()
+    };
+    if let Some(strict) = create_context(&strict) {
+        contexts.push((strict, 3));
+    }
+    for (context, count) in &contexts {
+        for vector in vectors().into_iter().take(*count) {
+            let mut from_planes = encoder_for(context, &vector.layout);
+            let mut from_textures = encoder_for(context, &vector.layout);
+            let mut from_luma_chroma = encoder_for(context, &vector.layout);
+            for (index, source) in vector.source.frames.iter().enumerate() {
+                let expected = from_planes.encode(planes(source), vector.budget).unwrap();
+                let textures = Textures::new(context, &vector.layout, source);
+                let frame = from_textures
+                    .encode_textures(textures.planes(), vector.budget)
+                    .unwrap();
+                assert!(frame == expected, "{} frame {index}: planes", vector.name);
+                let frame = from_luma_chroma
+                    .encode_textures(textures.luma_chroma(), vector.budget)
+                    .unwrap();
+                assert!(
+                    frame == expected,
+                    "{} frame {index}: luma and chroma",
+                    vector.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn textures_that_cannot_hold_their_planes_are_errors() {
+    let context = gpu_or_return!();
+    let layout = FrameLayout::new(64, 32, ChromaSubsampling::Yuv420).unwrap();
+    let mut encoder = encoder_for(context, &layout);
+    let source: [Vec<u8>; 3] = std::array::from_fn(|i| {
+        let (width, height) = layout.plane_size(Component::ALL[i]);
+        vec![100 + 20 * i as u8; (width * height) as usize]
+    });
+    let good = Textures::new(context, &layout, &source);
+    let bound = wgpu::TextureUsages::TEXTURE_BINDING;
+    let view = |texture: wgpu::Texture| texture.create_view(&Default::default());
+    let rgba = view(texture(
+        context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        bound,
+        (64, 32),
+        &[],
+    ));
+    let small = view(texture(
+        context,
+        wgpu::TextureFormat::R8Unorm,
+        bound,
+        (32, 32),
+        &[],
+    ));
+    let unbound = view(texture(
+        context,
+        wgpu::TextureFormat::R8Unorm,
+        wgpu::TextureUsages::empty(),
+        (64, 32),
+        &[],
+    ));
+    let flat_chroma = view(texture(
+        context,
+        wgpu::TextureFormat::R8Unorm,
+        bound,
+        (32, 16),
+        &[],
+    ));
+    let cases = [
+        (
+            "format",
+            TexturePicture::Planes([&rgba, &good.planes[1], &good.planes[2]]),
+            "the Y texture is Rgba8Unorm rather than R8Unorm",
+        ),
+        (
+            "size",
+            TexturePicture::Planes([&small, &good.planes[1], &good.planes[2]]),
+            "the Y texture is 32x32 rather than 64x32",
+        ),
+        (
+            "usage",
+            TexturePicture::Planes([&unbound, &good.planes[1], &good.planes[2]]),
+            "the Y texture lacks the TEXTURE_BINDING usage",
+        ),
+        (
+            "chroma",
+            TexturePicture::LumaChroma {
+                luma: &good.planes[0],
+                chroma: &flat_chroma,
+            },
+            "the chroma texture is R8Unorm rather than Rg8Unorm",
+        ),
+    ];
+    for (what, picture, message) in cases {
+        match encoder.encode_textures(picture, 100_000) {
+            Err(GpuError::Texture(actual)) => assert_eq!(actual, message, "{what}"),
+            other => panic!("{what}: {:?}", other.map(drop)),
+        }
+    }
+    let multisampled = context
+        .device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("multisampled"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 4,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: bound | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default());
+    let picture = TexturePicture::Planes([&multisampled, &good.planes[1], &good.planes[2]]);
+    match encoder.encode_textures(picture, 100_000) {
+        Err(GpuError::Texture(actual)) => assert_eq!(
+            actual,
+            "the Y texture has 4 samples per texel rather than 1"
+        ),
+        other => panic!("samples: {:?}", other.map(drop)),
+    }
+    // The views are wgpu's to check: an array view of a texture that holds
+    // the plane fails in its validation.
+    let layers = context.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("two layers"),
+        size: wgpu::Extent3d {
+            width: 64,
+            height: 32,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: bound | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let array = layers.create_view(&Default::default());
+    let picture = TexturePicture::Planes([&array, &good.planes[1], &good.planes[2]]);
+    match encoder.encode_textures(picture, 100_000) {
+        Err(GpuError::Device(_)) => {}
+        other => panic!("an array view: {:?}", other.map(drop)),
+    }
+    // A failure leaves the numbering alone: the next frame is still frame 1.
+    let frame = encoder.encode_textures(good.planes(), 100_000).unwrap();
+    assert_eq!(sequence_of(&frame), 1, "the first frame after the errors");
+
+    // A 2D view of one layer of an array texture is a plane like any other.
+    context.queue().write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &layers,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: 1 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &source[0],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(64),
+            rows_per_image: Some(32),
+        },
+        wgpu::Extent3d {
+            width: 64,
+            height: 32,
+            depth_or_array_layers: 1,
+        },
+    );
+    let second = layers.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        base_array_layer: 1,
+        array_layer_count: Some(1),
+        ..Default::default()
+    });
+    let picture = TexturePicture::Planes([&second, &good.planes[1], &good.planes[2]]);
+    let from_layer = encoder.encode_textures(picture, 100_000).unwrap();
+    // Frame 2 of the planes, sequence numbers in every block header included.
+    let mut reference = encoder_for(context, &layout);
+    reference.encode(planes(&source), 100_000).unwrap();
+    let expected = reference.encode(planes(&source), 100_000).unwrap();
+    assert!(from_layer == expected, "the frame of a layer's view");
+}
+
+#[test]
+fn encoding_from_textures_frame_after_frame_allocates_nothing() {
+    // A context of its own: the counters belong to the device. The bind
+    // group of each frame's textures goes when the frame is done.
+    let Some(context) = create_context(&GpuOptions::default()) else {
+        return;
+    };
+    let vector = vectors()
+        .into_iter()
+        .find(|v| v.name == "scene_200x120_420")
+        .unwrap();
+    let mut encoder = encoder_for(&context, &vector.layout);
+    let textures: Vec<Textures> = vector
+        .source
+        .frames
+        .iter()
+        .map(|source| Textures::new(&context, &vector.layout, source))
+        .collect();
+    let mut encode = |round: usize| {
+        let frame = &textures[round % textures.len()];
+        // Each frame in both layouts, in turn.
+        let picture = if (round / textures.len()).is_multiple_of(2) {
+            frame.planes()
+        } else {
+            frame.luma_chroma()
+        };
+        encoder.encode_textures(picture, vector.budget).unwrap();
+    };
+    for round in 0..4 {
+        encode(round);
+    }
+    let before = live_resources(&context);
+    for round in 0..24 {
+        encode(round);
+    }
+    assert_eq!(
+        live_resources(&context),
+        before,
+        "live GPU objects and memory"
+    );
 }

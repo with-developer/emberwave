@@ -12,6 +12,8 @@ publish.workspace = true
 emberwave-core.workspace = true
 clap.workspace = true
 png.workspace = true
+# For pictures in textures (bench-encode --textures).
+wgpu.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

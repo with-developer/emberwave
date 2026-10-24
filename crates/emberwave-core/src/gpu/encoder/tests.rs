@@ -98,7 +98,7 @@ impl Encoder {
         self.run(|this, encoder| {
             if transform {
                 this.encode_upload(encoder);
-                this.encode_transform(encoder, None);
+                this.encode_transform(encoder, None, None);
             }
             this.encode_quantisation(encoder, None);
         });
@@ -632,4 +632,117 @@ fn workgroups_past_the_end_change_nothing() {
     }
     let total = gpu.read_words(&gpu.chunk_totals, u64::from(scan.chunk_count) * 4, 1)[0];
     assert_eq!(total, sum);
+}
+
+/// A texture of `format` on the encoder's device holding `data`, row-major
+/// without padding: a picture's plane, or Cb and Cr interleaved.
+fn texture_of(
+    gpu: &Encoder,
+    format: wgpu::TextureFormat,
+    (width, height): (u32, u32),
+    data: &[u8],
+) -> wgpu::Texture {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("test picture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let texel_bytes = format
+        .block_copy_size(None)
+        .expect("an uncompressed format");
+    gpu.queue.write_texture(
+        texture.as_image_copy(),
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * texel_bytes),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    texture
+}
+
+#[test]
+fn gathering_textures_writes_the_words_of_the_upload() {
+    // The packed planes, padding included, from textures as from the CPU,
+    // for every byte value: so a picture in textures encodes to the bytes
+    // of the same picture in CPU memory (decision D32).
+    let Some(context) = test_context() else {
+        return;
+    };
+    for (width, height, chroma) in SHAPES {
+        let mut gpu = Encoder::new(context, width, height, chroma, Signalling::default()).unwrap();
+        let layout = gpu.layout.clone();
+        // Every value in each plane that has room for them, after a picture.
+        let mut planes = picture(&layout, width ^ height);
+        for (component, plane) in Component::ALL.into_iter().zip(&mut planes) {
+            let shift = 85 * component.index();
+            for (i, sample) in plane.iter_mut().enumerate().take(256) {
+                *sample = ((i + shift) % 256) as u8;
+            }
+        }
+        let bytes = gpu.buffers.packed_words * 4;
+        gpu.upload_planes(as_slices(&planes)).unwrap();
+        gpu.run(|this, encoder| this.encode_upload(encoder));
+        let uploaded = gpu.read_buffer(&gpu.planes, 0, bytes);
+
+        let sizes = Component::ALL.map(|component| layout.plane_size(component));
+        let textures: Vec<wgpu::Texture> = (0..3)
+            .map(|i| texture_of(&gpu, wgpu::TextureFormat::R8Unorm, sizes[i], &planes[i]))
+            .collect();
+        let views: Vec<wgpu::TextureView> = textures
+            .iter()
+            .map(|texture| texture.create_view(&Default::default()))
+            .collect();
+        let interleaved: Vec<u8> = planes[1]
+            .iter()
+            .zip(&planes[2])
+            .flat_map(|(&cb, &cr)| [cb, cr])
+            .collect();
+        let chroma_texture =
+            texture_of(&gpu, wgpu::TextureFormat::Rg8Unorm, sizes[1], &interleaved);
+        let chroma_view = chroma_texture.create_view(&Default::default());
+
+        let pictures = [
+            (
+                "planes",
+                TexturePicture::Planes([&views[0], &views[1], &views[2]]),
+            ),
+            (
+                "luma and chroma",
+                TexturePicture::LumaChroma {
+                    luma: &views[0],
+                    chroma: &chroma_view,
+                },
+            ),
+        ];
+        for (name, picture) in pictures {
+            // A pattern where the gather must write, padding included.
+            gpu.queue
+                .write_buffer(&gpu.planes, 0, &vec![0xab; bytes as usize]);
+            let bind_group = gpu.gather_bind_group(picture).unwrap();
+            gpu.run(|this, encoder| this.encode_transform(encoder, Some(&bind_group), None));
+            let gathered = gpu.read_buffer(&gpu.planes, 0, bytes);
+            assert!(
+                gathered == uploaded,
+                "{width}x{height} {chroma:?} {name}: {} of {bytes} bytes differ",
+                gathered
+                    .iter()
+                    .zip(&uploaded)
+                    .filter(|(a, b)| a != b)
+                    .count()
+            );
+        }
+    }
 }

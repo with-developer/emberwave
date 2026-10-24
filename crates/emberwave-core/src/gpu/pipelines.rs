@@ -81,6 +81,7 @@ pub(crate) struct ScanStages {
 /// The stages of the encoder.
 #[derive(Debug)]
 pub(crate) struct EncoderPipelines {
+    pub gather: Stage,
     pub fdwt: Stage,
     pub equant: Stage,
     pub rate: RateStages,
@@ -118,6 +119,18 @@ impl EncoderPipelines {
                 ],
             );
             Self {
+                gather: create_stage(
+                    device,
+                    "gather",
+                    shader_sources::GATHER,
+                    &[
+                        storage_entry(0, false),
+                        uniform_entry(1),
+                        texture_entry(2),
+                        texture_entry(3),
+                        texture_entry(4),
+                    ],
+                ),
                 fdwt: create_stage(
                     device,
                     "fdwt",
@@ -190,6 +203,20 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false,
             min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+/// A 2D texture of floats that is read with `textureLoad`, filterable or not.
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
         },
         count: None,
     }

@@ -294,6 +294,7 @@ dependencies = [
  "emberwave-core",
  "png",
  "serde_json",
+ "wgpu",
 ]
 
 [[package]]

@@ -151,13 +151,16 @@ impl GpuContext {
         adapter: wgpu::Adapter,
         options: &GpuOptions,
     ) -> Result<Self, GpuError> {
-        // The portable default limits, except that buffers may be as large as
-        // the adapter allows: large frames need large buffers.
+        // The portable default limits, except that buffers and textures may
+        // be as large as the adapter allows: large frames need large
+        // buffers, and the textures of pictures to encode are as large as
+        // the pictures, up to 16384 where WebGPU guarantees 8192.
         let mut limits = wgpu::Limits::default();
         if !options.strict_webgpu {
             let supported = adapter.limits();
             limits.max_storage_buffer_binding_size = supported.max_storage_buffer_binding_size;
             limits.max_buffer_size = supported.max_buffer_size;
+            limits.max_texture_dimension_2d = supported.max_texture_dimension_2d;
         }
 
         let timestamps = options.timestamps

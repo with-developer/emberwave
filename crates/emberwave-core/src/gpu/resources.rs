@@ -56,6 +56,14 @@ pub(crate) fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry
     }
 }
 
+/// A bind group entry for a texture view.
+pub(crate) fn texture(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(view),
+    }
+}
+
 /// A uniform buffer holding `value`, written through the queue. Not
 /// `DeviceExt::create_buffer_init`, which maps the buffer at its creation
 /// and panics when the device is lost (issue #35).

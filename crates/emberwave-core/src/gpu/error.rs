@@ -58,4 +58,8 @@ pub enum GpuError {
     /// The planes or the budget do not suit the encoder.
     #[error(transparent)]
     Encode(#[from] crate::encode::EncodeError),
+    /// A texture of a [`TexturePicture`](super::TexturePicture) cannot hold
+    /// its plane: its format, size, dimension, samples or usage.
+    #[error("unsuitable texture: {0}")]
+    Texture(String),
 }
