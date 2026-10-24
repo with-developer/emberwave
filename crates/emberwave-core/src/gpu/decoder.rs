@@ -109,13 +109,14 @@ pub struct Timings {
 }
 
 /// Where a decode puts the picture beyond the decoder's own buffers: back to
-/// the CPU, or drawn into a texture.
+/// the CPU, or drawn into a texture, or its planes into three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Read<'a> {
     Nothing,
     Yuv,
     Rgb,
     Texture(&'a wgpu::TextureView),
+    Planes([&'a wgpu::TextureView; 3]),
 }
 
 /// Buffers of the colour conversion, created when it is first used.
@@ -208,6 +209,11 @@ pub const TEXTURE_FORMATS: [wgpu::TextureFormat; 2] = [
     wgpu::TextureFormat::Bgra8Unorm,
 ];
 
+/// The format of the textures the decoder copies the planes into: one
+/// unsigned normalised 8-bit channel, which holds the samples of the stream
+/// exactly (decision D41).
+pub const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
 impl Decoder {
     /// Creates a decoder for pictures of `width` x `height` luma pixels.
     ///
@@ -223,7 +229,7 @@ impl Decoder {
             return Err(GpuError::DeviceLost(reason));
         }
         let layout = FrameLayout::new(width, height, chroma)?;
-        let buffers = BufferLayout::new(&layout)?;
+        let buffers = BufferLayout::for_decoder(&layout)?;
         let device = context.device().clone();
         let queue = context.queue().clone();
         // Compiled once per context, however many decoders are created.
@@ -483,21 +489,104 @@ impl Decoder {
             )));
         }
         let layout = self.layout();
+        self.new_texture(
+            "decoded picture",
+            (layout.width(), layout.height()),
+            format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        )
+    }
+
+    /// Records the decode of one complete frame into `encoder`, as
+    /// [`encode_rgb_to_texture`](Self::encode_rgb_to_texture) does but
+    /// without the colour conversion, and then copies of its Y, Cb and Cr
+    /// planes into `targets`, in that order. Once the caller has submitted
+    /// `encoder`, the textures hold the planes: the samples of the stream, as
+    /// [`decode`](Self::decode) gives them, for a caller that converts the
+    /// colours itself (decision D41).
+    ///
+    /// `targets` are views of three different 2D textures of the planes'
+    /// sizes ([`FrameLayout::plane_size`]), of one mip level and one layer, in
+    /// [`PLANE_FORMAT`] and with the `COPY_DST` usage, such as those of
+    /// [`create_plane_texture`](Self::create_plane_texture). An unsuitable
+    /// texture is [`GpuError::Texture`], before the frame is used. Only the
+    /// views' textures matter.
+    pub fn encode_to_plane_textures(
+        &mut self,
+        frame: &[u8],
+        targets: [&wgpu::TextureView; 3],
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), GpuError> {
+        self.check_device()?;
+        self.check_plane_targets(targets)?;
+        self.assemble_complete(frame)?;
+        self.ensure_payload_capacity()?;
+        with_error_scope(&self.device, || self.upload())?;
+        self.encode_passes(encoder, false, None);
+        self.encode_plane_copies(encoder, targets);
+        self.assembler.mark_frame_decoded();
+        Ok(())
+    }
+
+    /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
+    /// calls and copies its planes into `targets`, as
+    /// [`encode_to_plane_textures`](Self::encode_to_plane_textures) does, and
+    /// waits for the GPU. When this returns the textures hold the planes, for
+    /// any queue of the device to read; textures another queue may still be
+    /// reading must not be passed. Blocks that did not arrive decode as zeros.
+    pub fn decode_assembled_to_plane_textures(
+        &mut self,
+        targets: [&wgpu::TextureView; 3],
+    ) -> Result<(), GpuError> {
+        self.check_plane_targets(targets)?;
+        self.run_gpu(
+            None,
+            Read::Planes(targets),
+            false,
+            Duration::ZERO,
+            &mut |_| {},
+        )?;
+        Ok(())
+    }
+
+    /// A texture that [`encode_to_plane_textures`](Self::encode_to_plane_textures)
+    /// and [`decode_assembled_to_plane_textures`](Self::decode_assembled_to_plane_textures)
+    /// can copy the plane of `component` into: the plane's size, in
+    /// [`PLANE_FORMAT`], for copying into, sampling and copying from
+    /// (`COPY_DST`, `TEXTURE_BINDING` and `COPY_SRC`).
+    pub fn create_plane_texture(&self, component: Component) -> Result<wgpu::Texture, GpuError> {
+        self.check_device()?;
+        let size = self.layout().plane_size(component);
+        self.new_texture(
+            "decoded plane",
+            size,
+            PLANE_FORMAT,
+            wgpu::TextureUsages::COPY_DST,
+        )
+    }
+
+    /// A texture of `size` and `format` that the decoder can write with
+    /// `usage`, and that can be sampled and copied from.
+    fn new_texture(
+        &self,
+        label: &str,
+        (width, height): (u32, u32),
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+    ) -> Result<wgpu::Texture, GpuError> {
         with_error_scope(&self.device, || {
             self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("decoded picture"),
+                label: Some(label),
                 size: wgpu::Extent3d {
-                    width: layout.width(),
-                    height: layout.height(),
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
+                usage: usage | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             })
         })
@@ -510,8 +599,8 @@ impl Decoder {
 
     /// [`GpuContext::id`] of the context the decoder was made on: an object
     /// made on a context of another id is on another device, whatever
-    /// comparing devices says. [`encode_rgb_to_texture`](Self::encode_rgb_to_texture)
-    /// and [`decode_assembled_to_texture`](Self::decode_assembled_to_texture)
+    /// comparing devices says. The methods that draw into textures, such as
+    /// [`decode_assembled_to_texture`](Self::decode_assembled_to_texture),
     /// cannot tell from a texture view which device it is on, and a view of
     /// another context's makes wgpu fail, or names an unrelated view of this
     /// device: the caller keeps track.
@@ -688,7 +777,7 @@ impl Decoder {
         // What the frame copies back and where to: the planes, or the RGBA
         // words, into the buffer just made sure of.
         let copy_back = match read {
-            Read::Nothing | Read::Texture(_) => None,
+            Read::Nothing | Read::Texture(_) | Read::Planes(_) => None,
             Read::Yuv => self
                 .readback
                 .as_ref()
@@ -726,8 +815,10 @@ impl Decoder {
                 );
             }
             self.encode_passes(&mut encoder, color.is_some(), queries);
-            if let Read::Texture(target) = read {
-                self.encode_draw(&mut encoder, target);
+            match read {
+                Read::Texture(target) => self.encode_draw(&mut encoder, target),
+                Read::Planes(targets) => self.encode_plane_copies(&mut encoder, targets),
+                Read::Nothing | Read::Yuv | Read::Rgb => {}
             }
             if let Some((source, target, bytes)) = copy_back {
                 encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
@@ -769,40 +860,45 @@ impl Decoder {
 
     /// An error unless `target` shows a texture the picture can be drawn into.
     fn check_target(&self, target: &wgpu::TextureView) -> Result<(), GpuError> {
-        let texture = target.texture();
-        let (width, height) = (self.layout().width(), self.layout().height());
-        let problem = if texture.dimension() != wgpu::TextureDimension::D2 {
-            format!("is {:?} rather than 2D", texture.dimension())
-        } else if !TEXTURE_FORMATS.contains(&texture.format()) {
-            format!("is {:?}, not one of {TEXTURE_FORMATS:?}", texture.format())
-        } else if (texture.width(), texture.height()) != (width, height) {
-            format!(
-                "is {}x{} rather than the picture's {width}x{height}",
-                texture.width(),
-                texture.height()
-            )
-        } else if texture.sample_count() != 1 {
-            format!(
-                "has {} samples per texel rather than 1",
-                texture.sample_count()
-            )
-        } else if (texture.mip_level_count(), texture.depth_or_array_layers()) != (1, 1) {
-            // A view cannot be checked, but every view of a texture of one
-            // level and one layer shows all of it.
-            format!(
-                "has {} mip levels and {} layers rather than one of each",
-                texture.mip_level_count(),
-                texture.depth_or_array_layers()
-            )
-        } else if !texture
-            .usage()
-            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
-        {
-            "lacks the RENDER_ATTACHMENT usage".to_owned()
-        } else {
-            return Ok(());
-        };
-        Err(GpuError::Texture(format!("the target texture {problem}")))
+        let size = (self.layout().width(), self.layout().height());
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        target_problem(
+            target.texture(),
+            &TEXTURE_FORMATS,
+            usage,
+            "the picture's",
+            size,
+        )
+        .map_or(Ok(()), |problem| {
+            Err(GpuError::Texture(format!("the target texture {problem}")))
+        })
+    }
+
+    /// An error unless `targets` show three different textures that the Y,
+    /// Cb and Cr planes, in that order, can be copied into.
+    fn check_plane_targets(&self, targets: [&wgpu::TextureView; 3]) -> Result<(), GpuError> {
+        for (component, target) in Component::ALL.into_iter().zip(targets) {
+            let size = self.layout().plane_size(component);
+            let usage = wgpu::TextureUsages::COPY_DST;
+            if let Some(problem) = target_problem(
+                target.texture(),
+                &[PLANE_FORMAT],
+                usage,
+                "the plane's",
+                size,
+            ) {
+                return Err(GpuError::Texture(format!(
+                    "the texture of the {component:?} plane {problem}"
+                )));
+            }
+        }
+        let [y, cb, cr] = targets.map(|target| target.texture());
+        if y == cb || y == cr || cb == cr {
+            return Err(GpuError::Texture(
+                "two of the planes have the same texture".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Makes the pipeline that draws into textures of `format`, and its bind
@@ -865,11 +961,41 @@ impl Decoder {
         pass.draw(0..3, 0..1);
     }
 
+    /// Records copies of the Y, Cb and Cr planes into the textures of
+    /// `targets`. The rows of the packed planes are a multiple of 256 bytes
+    /// long ([`BufferLayout::for_decoder`]), as a copy takes them, and a copy
+    /// leaves out what pads them; the planes start at multiples of 512 bytes,
+    /// where Direct3D 12 copies from. A render pass per plane, the other way
+    /// to take the padding out, cost about 0.3 ms more on an Apple M3 Max,
+    /// 1080p and 4K alike (decision D41).
+    fn encode_plane_copies(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: [&wgpu::TextureView; 3],
+    ) {
+        for (component, target) in Component::ALL.into_iter().zip(targets) {
+            let i = component.index();
+            let texture = target.texture();
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &self.packed,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: u64::from(self.buffers.packed_offsets[i]) * 4,
+                        bytes_per_row: Some(self.buffers.packed_strides[i] * 4),
+                        rows_per_image: None,
+                    },
+                },
+                texture.as_image_copy(),
+                texture.size(),
+            );
+        }
+    }
+
     /// Makes the buffer that `read` copies the picture back into, the first
     /// time a decode needs it.
     fn make_readback(&mut self, read: Read<'_>) -> Result<(), GpuError> {
         let (slot, bytes, label) = match read {
-            Read::Nothing | Read::Texture(_) => return Ok(()),
+            Read::Nothing | Read::Texture(_) | Read::Planes(_) => return Ok(()),
             Read::Yuv => (
                 &mut self.readback,
                 self.buffers.packed_words * 4,
@@ -1200,8 +1326,49 @@ impl Decoder {
     }
 }
 
+/// What keeps `texture` from being a target of `size` in one of `formats`
+/// that the decoder writes with `usage`, if anything, said after the texture:
+/// the size is `whose`.
+fn target_problem(
+    texture: &wgpu::Texture,
+    formats: &[wgpu::TextureFormat],
+    usage: wgpu::TextureUsages,
+    whose: &str,
+    (width, height): (u32, u32),
+) -> Option<String> {
+    let problem = if texture.dimension() != wgpu::TextureDimension::D2 {
+        format!("is {:?} rather than 2D", texture.dimension())
+    } else if !formats.contains(&texture.format()) {
+        format!("is {:?}, not one of {formats:?}", texture.format())
+    } else if (texture.width(), texture.height()) != (width, height) {
+        format!(
+            "is {}x{} rather than {whose} {width}x{height}",
+            texture.width(),
+            texture.height()
+        )
+    } else if texture.sample_count() != 1 {
+        format!(
+            "has {} samples per texel rather than 1",
+            texture.sample_count()
+        )
+    } else if (texture.mip_level_count(), texture.depth_or_array_layers()) != (1, 1) {
+        // A view cannot be checked, but every view of a texture of one level
+        // and one layer shows all of it.
+        format!(
+            "has {} mip levels and {} layers rather than one of each",
+            texture.mip_level_count(),
+            texture.depth_or_array_layers()
+        )
+    } else if !texture.usage().contains(usage) {
+        format!("lacks the {usage:?} usage")
+    } else {
+        return None;
+    };
+    Some(problem)
+}
+
 /// A plane in the packed buffer, in bytes: its rows are padded to whole
-/// words.
+/// words, and in a decoder to a multiple of 256 bytes.
 #[derive(Debug, Clone, Copy)]
 struct PackedPlane {
     width: usize,
@@ -1394,7 +1561,10 @@ mod tests {
         };
 
         // Odd widths leave padding in the last word of a row; 4:2:0 chroma
-        // ends at level 1, whose size need not be a multiple of the tile.
+        // ends at level 1, whose size need not be a multiple of the tile. The
+        // words after that, up to a multiple of 256 bytes, are there for
+        // copies only (BufferLayout::for_decoder): the decode leaves them
+        // alone, though its tiles reach into them, and nothing reads them.
         let mut shapes = Vec::new();
         for width in [1u32, 2, 3, 5, 31, 33, 127, 129, 131] {
             for height in [1u32, 2, 3, 33, 131] {
@@ -1429,9 +1599,11 @@ mod tests {
                 let (w, h) = decoder.layout().plane_size(component);
                 let stride = decoder.buffers.packed_strides[i] as usize * 4;
                 let start = decoder.buffers.packed_offsets[i] as usize * 4;
+                let words = w.div_ceil(4) as usize * 4;
                 for row in 0..h as usize {
-                    let line = &packed[start + row * stride..start + (row + 1) * stride];
-                    let (samples, padding) = line.split_at(w as usize);
+                    let line = &packed[start + row * stride..][..stride];
+                    let (written, unwritten) = line.split_at(words);
+                    let (samples, padding) = written.split_at(w as usize);
                     assert!(
                         samples.iter().all(|&s| s == 128),
                         "{width}x{height} {chroma:?} {component:?} row {row}: {samples:?}"
@@ -1439,6 +1611,11 @@ mod tests {
                     assert!(
                         padding.iter().all(|&p| p == 0),
                         "{width}x{height} {chroma:?} {component:?} row {row}, padding {padding:?}"
+                    );
+                    assert!(
+                        unwritten.iter().all(|&p| p == 0xA5),
+                        "{width}x{height} {chroma:?} {component:?} row {row}: written past the \
+                         samples"
                     );
                 }
             }

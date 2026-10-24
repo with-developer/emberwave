@@ -15,7 +15,8 @@ mod resources;
 
 pub use context::{BACKEND_ENV, GpuContext, GpuOptions, parse_backends};
 pub use decoder::{
-    Decoder, Frame, FramePlane, RgbFrame, StageTimings, TEXTURE_FORMATS, TimedOutput, Timings,
+    Decoder, Frame, FramePlane, PLANE_FORMAT, RgbFrame, StageTimings, TEXTURE_FORMATS, TimedOutput,
+    Timings,
 };
 pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
 pub use error::GpuError;

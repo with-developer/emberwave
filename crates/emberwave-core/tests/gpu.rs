@@ -299,11 +299,12 @@ fn the_rows_handed_out_are_those_of_the_decoded_frame() {
     }
 }
 
-/// The pixels of a 2D texture of 4-byte texels, row after row, read back
-/// through a buffer whose rows are padded to 256 bytes as copies need.
+/// The texels of a 2D texture, row after row, read back through a buffer
+/// whose rows are padded to 256 bytes as copies need.
 fn read_texture(context: &GpuContext, texture: &wgpu::Texture) -> Vec<u8> {
     let (width, height) = (texture.width(), texture.height());
-    let row = width * 4;
+    let texel = texture.format().block_copy_size(None).expect("texel size");
+    let row = width * texel;
     let padded =
         row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let device = context.device();
@@ -459,6 +460,152 @@ fn only_a_texture_the_picture_fits_takes_it() {
         let outcome = decoder.encode_rgb_to_texture(&frames[0], &color, &view, &mut encoder);
         assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
     }
+}
+
+#[test]
+fn planes_drawn_into_textures_are_the_decoded_planes() {
+    let context = gpu_or_return!();
+    // 4:2:0 with half-size chroma, and 4:4:4 of an odd size, whose rows end
+    // inside a word of the packed planes.
+    for name in ["gradient_200x120_420", "noise_131x67_444"] {
+        let (layout, frames) = vector_frames(name);
+        let mut decoder = decoder_for(context, &layout);
+
+        // Into textures of the decoder's, waiting for the GPU.
+        let frame = decoder.decode(&frames[0]).expect("decode");
+        let textures =
+            Component::ALL.map(|component| decoder.create_plane_texture(component).expect("plane"));
+        let views = textures
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        decoder
+            .decode_assembled_to_plane_textures(views.each_ref())
+            .expect("decode into plane textures");
+        for (component, texture) in Component::ALL.into_iter().zip(&textures) {
+            let plane = &frame.planes[component.index()];
+            assert_eq!(
+                (texture.width(), texture.height()),
+                (plane.width, plane.height),
+                "{name}: {component:?} size"
+            );
+            assert_eq!(
+                read_texture(context, texture),
+                plane.data,
+                "{name}: {component:?}"
+            );
+        }
+
+        // Into textures of the caller's, recorded into its encoder.
+        let frame = decoder.decode(&frames[1]).expect("decode");
+        let textures = Component::ALL.map(|component| {
+            let (width, height) = layout.plane_size(component);
+            context.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("caller's plane"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: emberwave_core::gpu::PLANE_FORMAT,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        });
+        let views = textures
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+        let mut encoder = context.device().create_command_encoder(&Default::default());
+        decoder
+            .encode_to_plane_textures(&frames[1], views.each_ref(), &mut encoder)
+            .expect("recorded decode into plane textures");
+        context.queue().submit([encoder.finish()]);
+        for (component, texture) in Component::ALL.into_iter().zip(&textures) {
+            assert_eq!(
+                read_texture(context, texture),
+                frame.planes[component.index()].data,
+                "{name}: {component:?}, recorded"
+            );
+        }
+    }
+}
+
+#[test]
+fn only_textures_the_planes_fit_take_them() {
+    let context = gpu_or_return!();
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(context, &layout);
+    let frame = decoder.decode(&frames[0]).expect("decode");
+    let make = |(width, height), format, usage| {
+        context.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("plane"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        })
+    };
+    let target = wgpu::TextureUsages::COPY_DST;
+    let r8 = wgpu::TextureFormat::R8Unorm;
+    let (luma, chroma) = ((200, 120), (100, 60));
+    let y = make(luma, r8, target);
+    let cb = make(chroma, r8, target);
+    let cr = make(chroma, r8, target);
+    let unsuitable: [[&wgpu::Texture; 3]; 5] = [
+        // The planes in the wrong order: the sizes give it away.
+        [&cb, &y, &cr],
+        [&y, &cb, &cb],
+        [
+            &y,
+            &cb,
+            &make(chroma, wgpu::TextureFormat::Rgba8Unorm, target),
+        ],
+        [
+            &y,
+            &make(chroma, r8, wgpu::TextureUsages::TEXTURE_BINDING),
+            &cr,
+        ],
+        [&make((200, 60), r8, target), &cb, &cr],
+    ];
+    for textures in unsuitable {
+        let views = textures.map(|texture| texture.create_view(&Default::default()));
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        let outcome = decoder.decode_assembled_to_plane_textures(views.each_ref());
+        assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+        // The frame is still there to decode.
+        assert_eq!(decoder.decode_assembled().expect("decode"), frame);
+        let mut encoder = context.device().create_command_encoder(&Default::default());
+        let outcome = decoder.encode_to_plane_textures(&frames[0], views.each_ref(), &mut encoder);
+        assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+    }
+
+    // The picture's texture takes no planes, and the planes' no picture.
+    let views = [&y, &cb, &cr].map(|texture| texture.create_view(&Default::default()));
+    decoder.clear();
+    decoder.push_packet(&frames[0]).expect("packet");
+    let outcome = decoder.decode_assembled_to_texture(&ColorParams::default(), &views[0]);
+    assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+    let picture = decoder
+        .create_texture(wgpu::TextureFormat::Rgba8Unorm)
+        .expect("texture")
+        .create_view(&Default::default());
+    let outcome = decoder.decode_assembled_to_plane_textures([&picture, &views[1], &views[2]]);
+    assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+    decoder
+        .decode_assembled_to_plane_textures(views.each_ref())
+        .expect("the right textures");
 }
 
 #[test]

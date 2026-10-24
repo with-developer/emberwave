@@ -658,3 +658,134 @@ fn a_texture_that_does_not_fit_is_refused_before_the_frame_is_used() {
         emberwave_context_destroy(other_context);
     }
 }
+
+/// Textures for the Y, Cb and Cr planes of `decoder`'s pictures.
+fn plane_textures(decoder: *const EmberwaveDecoder) -> [*mut EmberwaveTexture; 3] {
+    [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+        let mut texture = ptr::null_mut();
+        // SAFETY: a live decoder and a pointer to store the texture in.
+        let status = unsafe { emberwave_texture_create_plane(decoder, plane, &mut texture) };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        texture
+    })
+}
+
+#[test]
+fn planes_reach_textures_and_their_metal_handles() {
+    let Some(context) = context() else {
+        return;
+    };
+    let bytes = testdata("noise_131x67_444.pwv1");
+    let frame = frames(&bytes)[0];
+    let decoder = decoder_for(context, &bytes);
+    let [y, cb, cr] = plane_textures(decoder);
+    // SAFETY: a live context, decoder and textures, and pointers to store
+    // results in.
+    unsafe {
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_decode_plane_textures(decoder, y, cb, cr),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        let metal = on_metal(context);
+        for texture in [y, cb, cr] {
+            assert_eq!(!emberwave_texture_metal(texture).is_null(), metal);
+            emberwave_texture_destroy(texture);
+        }
+
+        let mut texture = ptr::null_mut();
+        assert_eq!(
+            emberwave_texture_create_plane(decoder, 3, &mut texture),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(texture.is_null());
+        assert!(last_error().contains("plane is 3"), "{}", last_error());
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}
+
+#[test]
+fn plane_textures_that_do_not_fit_are_refused_before_the_frame_is_used() {
+    let Some(context) = context() else {
+        return;
+    };
+    let Some(other_context) = crate::context() else {
+        return;
+    };
+    // 4:4:4, where the planes are all of a size and only the textures' planes
+    // tell them apart.
+    let noise = testdata("noise_131x67_444.pwv1");
+    let solid = testdata("solid_160x96_420.pwv1");
+    let frame = frames(&noise)[0];
+    let decoder = decoder_for(context, &noise);
+    let small = decoder_for(context, &solid);
+    let elsewhere = decoder_for(other_context, &noise);
+    let [y, cb, cr] = plane_textures(decoder);
+    let small_planes = plane_textures(small);
+    let other_planes = plane_textures(elsewhere);
+    let (small_y, other_y) = (small_planes[0], other_planes[0]);
+    let mut picture = ptr::null_mut();
+    // SAFETY: live decoders and textures, and NULL where the test means it.
+    unsafe {
+        assert_eq!(
+            emberwave_texture_create(decoder, EMBERWAVE_TEXTURE_RGBA8, &mut picture),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        for ([y, cb, cr], complaint) in [
+            ([cb, y, cr], "y is not a texture for the Y plane"),
+            ([y, cr, cb], "cb is not a texture for the Cb plane"),
+            ([y, cb, cb], "cr is not a texture for the Cr plane"),
+            ([picture, cb, cr], "y is not a texture for the Y plane"),
+            ([small_y, cb, cr], "160x96"),
+            ([other_y, cb, cr], "another context"),
+            ([y, cb, ptr::null_mut()], "cr is NULL"),
+        ] {
+            assert_eq!(
+                emberwave_decoder_decode_plane_textures(decoder, y, cb, cr),
+                EmberwaveStatus::InvalidArgument
+            );
+            assert!(last_error().contains(complaint), "{}", last_error());
+        }
+        assert_eq!(
+            emberwave_decoder_decode_plane_textures(ptr::null_mut(), y, cb, cr),
+            EmberwaveStatus::InvalidArgument
+        );
+        // A plane's texture is not the picture's.
+        assert_eq!(
+            emberwave_decoder_decode_texture(decoder, ptr::null(), y),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(last_error().contains("Y plane"), "{}", last_error());
+
+        // The frame is still there to decode.
+        assert!(emberwave_decoder_is_ready(decoder, false));
+        assert_eq!(
+            emberwave_decoder_decode_plane_textures(decoder, y, cb, cr),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        for texture in [[y, cb, cr], small_planes, other_planes]
+            .into_iter()
+            .flatten()
+            .chain([picture])
+        {
+            emberwave_texture_destroy(texture);
+        }
+        for decoder in [decoder, small, elsewhere] {
+            emberwave_decoder_destroy(decoder);
+        }
+        emberwave_context_destroy(context);
+        emberwave_context_destroy(other_context);
+    }
+}

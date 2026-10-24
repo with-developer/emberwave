@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (v0.9.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. The encoder runs on the CPU (`emberwave_core::encode`) and on the GPU (`emberwave_core::gpu`). `emberwave-cli` decodes and encodes files with them, `emberwave-web` plays them in a browser and `emberwave-ffi` offers the decoder and the GPU encoder to C, also as an XCFramework for iPhone, iPad and Mac apps, and hands Metal clients the decoded picture in a texture. Decode and encode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
+> **Status (v0.9.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. The encoder runs on the CPU (`emberwave_core::encode`) and on the GPU (`emberwave_core::gpu`). `emberwave-cli` decodes and encodes files with them, `emberwave-web` plays them in a browser and `emberwave-ffi` offers the decoder and the GPU encoder to C, also as an XCFramework for iPhone, iPad and Mac apps, and hands Metal clients the decoded picture in a texture, or its planes in three. Decode and encode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
 
 ## Overview
 
@@ -356,7 +356,7 @@ The lifting, and the loads and stores around it, are written out with constant i
 
 The last level of each component writes the decoded plane as 8-bit samples, which is what upstream's UNORM storage images hold. A sample is `round(clamp(v + 0.5, 0, 1) * 255)` (`to_unorm8` in `idwt.wgsl`); the float picture never goes to memory. The vertical pass leaves the 8-bit levels of its 32x32 tile in the window array, which is free by then, and after one barrier each of the 256 invocations writes one word: four samples of a tile row. Every level waits at that barrier, though only the last needs it. Inside `if (is_final)` the barrier would be legal, since `is_final` is the same for the whole workgroup, but there it crashed WARP, Direct3D's software rasteriser, in CI; a bisection of the commits pinned the crash on it.
 
-WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words with zero samples; the CPU side cuts the padding off.
+WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words with zero samples. A decoder's rows are then padded with words it never writes to a multiple of 256 bytes, the rows a copy into a texture takes, and its planes start at multiples of 512 bytes (D41). The CPU side cuts the padding off.
 
 ### Colour conversion
 
@@ -515,6 +515,7 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_decoder_push_packet`, `_is_ready`, `_clear` | Feed packets as they arrive; ask whether the frame, or enough of it, is there |
 | `emberwave_decoder_decode_yuv`, `_decode_rgb` | Decode and copy the planes, or RGB, into the caller's memory, row by row with the caller's strides |
 | `emberwave_texture_create`, `_destroy`, `emberwave_decoder_decode_texture` | A texture of the picture's size, RGBA or BGRA, on the decoder's device, and a decode that draws the RGB picture into it and waits |
+| `emberwave_texture_create_plane`, `emberwave_decoder_decode_plane_textures` | A one-channel texture for the Y, the Cb or the Cr plane, and a decode that copies the planes into three and waits |
 | `emberwave_texture_metal`, `emberwave_context_metal_device` | The `id<MTLTexture>` and `id<MTLDevice>` behind a texture and a context, borrowed, or `NULL` off Metal |
 | `emberwave_encoder_create`, `_destroy`, `_info` | One encoder per picture size and chroma format, with the colours its frames signal; the sizes of its planes |
 | `emberwave_encoder_encode` | Encode planes from the caller's memory, with the caller's strides, into a frame of at most the budget, written into the caller's buffer of that size |
@@ -527,7 +528,7 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 
 For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
-The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` draws it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.5 ms for the 4K frame (D40). Vulkan and Direct3D 12 handles, decoding without waiting, and the client's own device, queue or textures are later issues (#62, #63, #64).
+The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` draws it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.5 ms for the 4K frame (D40). `emberwave_decoder_decode_plane_textures` copies the Y, Cb and Cr planes into three textures for a client that converts the colours itself, in 1.0 to 1.1 ms (D41). Vulkan and Direct3D 12 handles, decoding without waiting, and the client's own device, queue or textures are later issues (#62, #63).
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
 
@@ -1031,3 +1032,52 @@ Picture sizes between 8192x4320 and 16384x16384 that the native decoder takes ar
 | 1080p | 0.72 ms | 0.84 ms | 0.52 ms |
 
 A Metal client draws the texture without a copy. `tests/metal.rs` reads the textures through Metal, on a queue of its own as an app does, and finds the RGB picture in both formats. The browser player draws through the same pass, and its canvas is still bit-exact against the reference decodes.
+
+### 2026-10-24 — D41: The planes in textures
+
+**Context.** D40 hands Metal clients the RGB picture, converted with the colours the stream signals or the caller passes. A client that converts the colours itself needs the samples: for high dynamic range, for its display, or for a stream that signals the wrong colours, as upstream's Metal encoder's do. Upstream's Metal API writes Y, Cb and Cr into the app's textures. The planes also take less memory: 1.5 bytes a pixel in 4:2:0, where RGBA takes 4 (issue #64).
+
+**Decision.**
+- The textures:
+  - Three textures of one unsigned normalised 8-bit channel, `R8Unorm`: Y at the picture's size, and Cb and Cr at the chroma planes' size, half in 4:2:0.
+  - They hold the stream's samples, as `decode` gives them, byte for byte.
+- Copies from the packed planes fill them:
+  - A copy from a buffer into a texture takes rows of a multiple of 256 bytes, so a decoder's packed rows are now padded to such a multiple (`BufferLayout::for_decoder`).
+  - The words of padding are never written, and nothing reads them. `idwt.wgsl`'s last level stops at the row's last sample, where before it stopped at the end of the row's words, which were the same words until now. The encoder's planes keep rows of whole words, which its tests compare word for word.
+  - At 1080p the padding grows the planes by 7%. At 4K only chroma rows grow, and luma rows are 3840 bytes, a multiple of 256 already.
+  - The planes the CPU reads back grow by as much, which the timings below do not show.
+  - The planes start at multiples of 512 bytes, as Direct3D 12 copies only from those. From other offsets wgpu copies through a buffer it allocates during the copy, and panics if that allocation fails. Without the alignment that would happen to Cb in 4:4:4 with an odd height, and to Cr in 4:2:0 when the height leaves 2 over a multiple of 4.
+- Rust: `Decoder::encode_to_plane_textures`, `decode_assembled_to_plane_textures` and `create_plane_texture`.
+  - Targets are checked as in D40, with `COPY_DST` where the picture's texture needs `RENDER_ATTACHMENT`.
+  - The three targets must also be different textures.
+- The C API:
+  - `emberwave_texture_create_plane` with `EMBERWAVE_PLANE_Y`, `_CB` or `_CR` makes a texture for one plane, and `emberwave_decoder_decode_plane_textures(decoder, y, cb, cr)` fills three.
+  - A texture remembers its plane. In 4:4:4 the three are of one size, so only that catches textures passed in the wrong order.
+  - A plane's texture does not take the RGB picture, nor the picture's texture a plane. `emberwave_texture_metal` and `_destroy` serve both kinds.
+  - The header says where 4:2:0 chroma sits. Vertically it is halfway between two luma rows. Horizontally it follows the stream's siting.
+- Alternatives:
+  - Render passes that unpack each plane in a fragment shader. Measured first, they cost about 0.3 ms more per frame than copies, at 1080p and 4K alike: 1.27 ms at 4K and 0.76 ms at 1080p, even with Cb and Cr drawn as two attachments of one pass. The GPU did a third less work than for the RGB texture, but a frame waited for alone gained nothing at 1080p.
+  - Compute shaders that write the textures: WebGPU cannot write `R8Unorm` storage textures.
+  - Cb and Cr interleaved in one `Rg8Unorm` texture, as NV12 and CoreVideo's biplanar formats have them. That is the same memory plus an interleave, a layout unlike upstream's, and no match in 4:4:4.
+  - An object that holds three textures, with functions of its own. That gives the same three `id<MTLTexture>`s, with every texture function doubled.
+  - Plane formats among `emberwave_texture_create`'s. A format would then also say a size, and Y and Cb would share a format in 4:4:4.
+- Grok argued the other side, in two rounds.
+  - First round, on the interface. It chose the same one, a texture per plane that remembers its plane, for the reasons above, and added three points:
+    - The unorm round trip is exact.
+    - 4:2:0 sizes are even, so chroma is exactly half.
+    - Chroma siting belongs in the header.
+  - Second round, a review of the copies. Three findings were confirmed and fixed:
+    - The last level wrote zeros into the new padding, as far as its tiles reached. It now stops at the samples, and the padding test checks that the rest keeps its marker.
+    - Direct3D 12's 512-byte offsets are needed in 4:2:0 too, and a failed allocation of wgpu's own buffer panics. Planes now start at multiples of 512 bytes.
+    - The Metal read-back test covered 4:2:0 only. It now covers 4:4:4 too, whose planes only their contents tell apart.
+
+**Consequence.** On Metal the textures equal `decode`'s planes byte for byte, in 4:2:0 and in 4:4:4 of an odd size. CI checks the same on lavapipe and WARP. `tests/metal.rs` reads them through Metal on a queue of its own and compares them with `emberwave_decoder_decode_yuv`. Measured on the Apple M3 Max through the C API, 300 frames and six rounds over two runs:
+
+| Frame | Planes into textures | RGB into a texture | Planes in CPU memory | RGB in CPU memory |
+|---|---|---|---|---|
+| 4K | 1.02 to 1.07 ms | 1.47 to 1.49 ms | 1.19 to 1.20 ms | 2.54 to 2.72 ms |
+| 1080p | 0.43 to 0.45 ms | 0.70 to 0.71 ms | 0.51 to 0.52 ms | 0.80 to 0.82 ms |
+
+One round of the planes in CPU memory at 1080p took 0.81 ms, an outlier left out of the table.
+
+The planes are the quickest way to the GPU at both sizes. The RGB texture's render pass probably costs as much as the planes' did, so an RGBA target whose rows are a multiple of 256 bytes could be filled by a copy too.
