@@ -128,3 +128,19 @@ About the encoder, written by hand about the run of 2026-10-24 with the changes 
 - **From textures** (the run at commit `991f541`, decision D32): a 4K frame takes 1.80 ms from an R8 texture per plane against 1.93 ms from CPU memory. The CPU's part falls from 0.23 to 0.02 ms, but the pass that packs the textures into the planes makes the transform 0.12 ms longer, more than the copy from the upload buffer it replaces; reading the textures in the transform itself would save that ([#40](https://github.com/with-developer/emberwave/issues/40)). At 1080p both take 0.80 ms. A screen capture that would otherwise come back to CPU memory saves its read-back as well.
 - **Upstream** copies the planes once, into textures it keeps from frame to frame (`replaceRegion`), as emberwave copies them once into its upload buffer, whose contents the GPU then copies again into its planes buffer. Upstream also has an entry point that encodes from pictures already in GPU memory (`pyrowave_encoder_encode_gpu`), which these numbers do not use; emberwave's, `Encoder::encode_textures` ([#33](https://github.com/with-developer/emberwave/issues/33)), has a table of its own below.
 - **How firm the numbers are.** Upstream's FP32 time for 4K was 3.18 ms in the run before this one and 3.39 ms in this one, emberwave's 1.88 and 1.91 ms: the comparison holds either way. A first run read the pictures from the file between the encodes, which made emberwave's encode slower and upstream's hardly at all: a GPU that waits for the CPU slows down, and not every GPU alike. Both tools read the pictures into memory first, as the decoder benchmarks have their streams.
+
+## In the browser, phones included
+
+[`bench.html`](https://with-developer.github.io/emberwave/bench.html), next to the browser player, measures on whatever device opens it: it encodes test streams at the three sizes in the page, four pictures each at the budgets above, and decodes them in turn to RGB in GPU memory through WebGPU, waiting for each frame, 300 frames after at least 30 and a second of warm-up ([`ARCHITECTURE.md`](ARCHITECTURE.md#browser-player)). The times include what the browser adds to the GPU work: its checks, its process boundary and the delay until it reports the frame done. Browsers coarsen their clocks, Safari to a millisecond, so the mean is taken over the whole run.
+
+Mean milliseconds per frame, 2026-10-24:
+
+| Device | Browser | 1080p | 1440p | 4K | CPU part at 4K |
+|---|---|---|---|---|---|
+| iPhone 17 | Safari 27.0.1 | 2.36 | 3.90 | 8.05 | 0.26 |
+| Apple M3 Max | Chrome 155, headless, four runs | 0.70 to 1.00 | 0.98 to 1.04 | 1.69 to 1.88 | 0.56 |
+| Apple M3 Max, natively | `emberwave-cli bench --output rgb`, from the table above | 0.52 | 0.68 | 1.19 | 0.10 |
+
+- **On the iPhone 17** a 4K frame decodes in about 8 ms, under half the 16.7 ms of a frame at 60 Hz, and a 1080p frame in 2.4 ms. The CPU's part is small, 0.11 to 0.26 ms; the rest is the GPU and the browser's report. Safari's per-frame medians and 99th percentiles, 2, 4 and 8 ms and 3, 5 and 9 ms, are as coarse as its clock. Its user agent reads "iPhone OS 18_7".
+- **Next to the M3 Max** in Chrome the phone takes 2.4 to 4.8 times as long, more at 4K than at 1080p; the first size of a run on the Mac varied most between runs. A native app would not pay the browser's share, which the M3 Max shows at 0.2 to 0.7 ms a frame.
+
