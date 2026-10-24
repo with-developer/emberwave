@@ -212,17 +212,17 @@ final class Emberwave {
         }
 
         let (cw, ch) = (size.width / 2, size.height / 2)
-        var planes = [
-            [UInt8](repeating: 0, count: size.width * size.height),
-            [UInt8](repeating: 0, count: cw * ch),
-            [UInt8](repeating: 0, count: cw * ch),
-        ]
+        // Three arrays, not one of three: Swift gives a closure exclusive
+        // access to the whole of the array whose element it changes.
+        var lumaPlane = [UInt8](repeating: 0, count: size.width * size.height)
+        var cbPlane = [UInt8](repeating: 0, count: cw * ch)
+        var crPlane = [UInt8](repeating: 0, count: cw * ch)
         progress("\(size.name): decoding to planes in CPU memory")
         let planeTimes = try time(plan) { index in
             try push(index)
-            try planes[0].withUnsafeMutableBufferPointer { y in
-                try planes[1].withUnsafeMutableBufferPointer { cb in
-                    try planes[2].withUnsafeMutableBufferPointer { cr in
+            try lumaPlane.withUnsafeMutableBufferPointer { y in
+                try cbPlane.withUnsafeMutableBufferPointer { cb in
+                    try crPlane.withUnsafeMutableBufferPointer { cr in
                         try check(
                             emberwave_decoder_decode_yuv(
                                 decoder,
