@@ -75,6 +75,8 @@ Upstream's own Metal decoder is faster on the same machine: 0.76 ms for a 4K fra
 Encoding a 4K frame within 1.2 MB takes 1.92 ms on the GPU, from the planes in CPU memory to the frame in CPU memory, and 3.34 ms with upstream's encoder at FP32.
 <!-- bench-summary:end -->
 
+In Safari on an iPhone 17 the [benchmark page](https://with-developer.github.io/emberwave/bench.html) decodes a 1080p frame in 2.4 ms and a 4K frame in 8.1 ms, to RGB in GPU memory ([`BENCHMARKS.md`](BENCHMARKS.md#in-the-browser-phones-included)).
+
 ## Goals
 
 - Decode bitstreams produced by the original PyroWave encoder, straight from a file, and match the reference decoder's output. PyroWave decoding is floating-point and not bit-exact by design, so the acceptance bar is PSNR ≥ 60 dB per plane against the reference decoder.
@@ -138,7 +140,7 @@ emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 
 - **빠른 시작**: Rust 1.87 이상과 GPU(없으면 Linux는 Mesa lavapipe, Windows는 내장 WARP)가 있으면 위 Quick start의 네 줄로 PNG를 얻습니다. 처음 빌드는 몇 분 걸립니다.
 - **성능**: Apple M3 Max(Metal)에서 4K 한 프레임을 약 0.9 ms(RGB 변환 포함 1.2 ms)에 디코딩하며, 같은 기계에서 원본 Metal 디코더(FP32)의 1.1배입니다. 측정 환경과 전체 수치는 위 Performance 표와 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.
 - **릴리스**: v0.1.0이 첫 릴리스, v0.2.0이 속도 개선, v0.3.0이 브라우저 플레이어와 C API, v0.4.0이 인코더(CPU와 GPU), v0.5.0이 GPU 인코더 가속(4K 약 1.9 ms로 업스트림보다 빠름)과 기기 손실·Vulkan 로더 관련 수정, v0.6.0이 C API 인코더와 GPU 텍스처 입력 인코딩 릴리스입니다. Linux(x86_64), macOS(Apple Silicon), Windows(x86_64)용 `emberwave-cli`와 C 라이브러리(`emberwave-ffi`)를 [releases](https://github.com/with-developer/emberwave/releases)에서 받을 수 있습니다. 4K 1000프레임을 반복 디코딩해도 GPU 자원과 프로세스 메모리가 늘지 않는 것을 확인했습니다.
-- **브라우저 플레이어**: [with-developer.github.io/emberwave](https://with-developer.github.io/emberwave/)에서 `.pwv1` 파일을 열면 WebGPU로 페이지 안에서 디코딩해 재생합니다. 파일은 어디에도 올라가지 않습니다. [벤치마크 페이지](https://with-developer.github.io/emberwave/bench.html)는 그 기기(휴대폰 포함)에서 1080p·1440p·4K 디코딩 시간을 재고 복사할 수 있는 결과를 보여 줍니다.
+- **브라우저 플레이어**: [with-developer.github.io/emberwave](https://with-developer.github.io/emberwave/)에서 `.pwv1` 파일을 열면 WebGPU로 페이지 안에서 디코딩해 재생합니다. 파일은 어디에도 올라가지 않습니다. [벤치마크 페이지](https://with-developer.github.io/emberwave/bench.html)는 그 기기(휴대폰 포함)에서 1080p·1440p·4K 디코딩 시간을 재고 복사할 수 있는 결과를 보여 줍니다. iPhone 17(Safari)에서는 1080p 한 프레임에 2.4 ms, 4K에 8.1 ms입니다.
 - **C API**: `crates/emberwave-ffi`가 C에서 쓰는 헤더(`emberwave.h`)와 공유·정적 라이브러리를 제공합니다. 네트워크로 받은 패킷을 넣고 YUV 평면이나 RGB를 호출자 메모리로 받습니다. 인코더도 있어서(#42), 호스트는 stride가 있는 평면을 바이트 예산 안의 프레임으로 인코딩하고 패킷으로 나눕니다. 릴리스마다 3개 OS용으로 빌드해 올리고, C 예제가 CI에서 모든 테스트 벡터를 디코딩하고 인코더 소스 둘을 인코딩해 다시 디코딩합니다.
 - **인코더**: `emberwave-cli encode`가 Y4M을 프레임당 바이트 예산 안에서 PWV1로 인코딩합니다. 업스트림 디코더가 그대로 읽고, 같은 바이트에서 PSNR이 업스트림 인코더와 같거나 높습니다(장면 영상에서 +0.6~+3.4 dB). `--gpu`를 주면 GPU에서 인코딩하며, Apple M3 Max에서 4K 한 프레임이 업로드와 읽기를 포함해 약 1.9 ms로 CPU보다 100배 이상 빠르고, 같은 정밀도의 원본 인코더(3.2~3.4 ms)보다 빠릅니다. GPU 메모리의 텍스처에 있는 그림도 바로 인코딩합니다(`Encoder::encode_textures`, 4K 약 1.8 ms). GPU 인코더의 프레임은 CPU 인코더와 같거나 일부 블록만 다르며(자연 영상에서 보낸 블록의 약 0.5%) PSNR은 같고, Apple M3 Max에서 커밋된 벡터는 모두 바이트 단위로 같습니다.
 - **남은 일**: 텍스처 입력을 변환 첫 레벨에서 바로 읽어 GPU 인코딩을 더 줄이기(#40), 그림을 GPU에서 호출자의 그래픽 API와 공유하는 C API(#27). GPU 메모리에 있는 그림(텍스처)을 바로 인코딩하는 기능(#33)은 들어갔습니다.
