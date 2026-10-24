@@ -552,6 +552,107 @@ fn planes_drawn_into_textures_are_the_decoded_planes() {
 }
 
 #[test]
+fn decodes_submitted_without_waiting_reach_their_textures() {
+    let context = gpu_or_return!();
+    let color = ColorParams::default();
+    // A picture copied and one drawn into its texture (decision D42).
+    for name in ["noise_192x136_420", "gradient_200x120_420"] {
+        let (layout, frames) = vector_frames(name);
+        let mut decoder = decoder_for(context, &layout);
+        let texture = decoder
+            .create_texture(wgpu::TextureFormat::Bgra8Unorm)
+            .expect("texture");
+        let view = texture.create_view(&Default::default());
+        let planes =
+            Component::ALL.map(|component| decoder.create_plane_texture(component).expect("plane"));
+        let plane_views = planes
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+
+        // Frame after frame into the same textures: the copy that reads one
+        // back is submitted after the decode, and the next decode after it.
+        for frame in &frames {
+            let rgb = decoder.decode_rgb(frame, &color).expect("RGB decode");
+            let yuv = decoder.decode(frame).expect("decode");
+            decoder.clear();
+            decoder.push_packet(frame).expect("packet");
+            decoder
+                .submit_assembled_to_texture(&color, &view)
+                .expect("submitted decode");
+            assert_eq!(
+                read_texture(context, &texture),
+                with_alpha(&rgb.data, true),
+                "{name}: BGRA"
+            );
+            decoder.clear();
+            decoder.push_packet(frame).expect("packet");
+            decoder
+                .submit_assembled_to_plane_textures(plane_views.each_ref())
+                .expect("submitted decode into planes");
+            for (component, texture) in Component::ALL.into_iter().zip(&planes) {
+                assert_eq!(
+                    read_texture(context, texture),
+                    yuv.planes[component.index()].data,
+                    "{name}: {component:?}"
+                );
+            }
+        }
+
+        // An unsuitable texture leaves the frame to decode.
+        let unsuitable = context.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("too small"),
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        let outcome = decoder
+            .submit_assembled_to_texture(&color, &unsuitable.create_view(&Default::default()));
+        assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+        assert!(decoder.is_ready(false), "{name}: the frame is still there");
+    }
+
+    // A view in the texture's sRGB format, which the checks cannot see, fails
+    // when the draw's commands are finished: the frame is not used up.
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(context, &layout);
+    let texture = context.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("sRGB view"),
+        size: wgpu::Extent3d {
+            width: layout.width(),
+            height: layout.height(),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+    });
+    let srgb = texture.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+        ..Default::default()
+    });
+    decoder.push_packet(&frames[0]).expect("packet");
+    let outcome = decoder.submit_assembled_to_texture(&color, &srgb);
+    assert!(matches!(outcome, Err(GpuError::Device(_))), "{outcome:?}");
+    assert!(decoder.is_ready(false), "the frame is still there");
+    decoder
+        .submit_assembled_to_texture(&color, &texture.create_view(&Default::default()))
+        .expect("a view in the texture's format");
+}
+
+#[test]
 fn only_textures_the_planes_fit_take_them() {
     let context = gpu_or_return!();
     let (layout, frames) = vector_frames("gradient_200x120_420");
