@@ -15,7 +15,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLDevice, MTLOrigin, MTLPixelFormat, MTLResource, MTLResourceOptions, MTLSize, MTLTexture,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLHazardTrackingMode, MTLOrigin, MTLPixelFormat,
+    MTLResource, MTLResourceOptions, MTLSize, MTLTexture,
 };
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -38,6 +39,37 @@ fn read(
     device: &ProtocolObject<dyn MTLDevice>,
     texture: &ProtocolObject<dyn MTLTexture>,
 ) -> Vec<u8> {
+    let queue = device.newCommandQueue().expect("a command queue");
+    blit(&queue, texture).contents()
+}
+
+/// A copy of a texture into a buffer the CPU can read, committed and maybe
+/// not done yet.
+struct Copy {
+    commands: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    size: usize,
+}
+
+impl Copy {
+    /// The pixels, once the copy is done.
+    fn contents(self) -> Vec<u8> {
+        self.commands.waitUntilCompleted();
+        // SAFETY: shared storage, which the CPU may read once the copy
+        // completed.
+        unsafe {
+            std::slice::from_raw_parts(self.buffer.contents().as_ptr().cast::<u8>(), self.size)
+        }
+        .to_vec()
+    }
+}
+
+/// Copies the pixels of `texture` into a buffer the CPU can read with a blit
+/// committed to `queue`, a queue of the texture's device, without waiting.
+fn blit(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+) -> Copy {
     let (width, height) = (texture.width(), texture.height());
     let texel = if texture.pixelFormat() == MTLPixelFormat::R8Unorm {
         1
@@ -45,10 +77,10 @@ fn read(
         4
     };
     let row = width * texel;
-    let buffer = device
+    let buffer = texture
+        .device()
         .newBufferWithLength_options(row * height, MTLResourceOptions::StorageModeShared)
         .expect("a buffer");
-    let queue = device.newCommandQueue().expect("a command queue");
     let commands = queue.commandBuffer().expect("a command buffer");
     let blit = commands.blitCommandEncoder().expect("a blit encoder");
     let origin = MTLOrigin { x: 0, y: 0, z: 0 };
@@ -57,8 +89,8 @@ fn read(
         height,
         depth: 1,
     };
-    // SAFETY: the texture is on `device`, the region lies inside it, and the
-    // buffer holds `height` rows of `row` bytes.
+    // SAFETY: the texture is on the queue's device, the region lies inside
+    // it, and the buffer holds `height` rows of `row` bytes.
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
             texture, 0, 0, origin, size, &buffer, 0, row, row * height,
@@ -66,10 +98,11 @@ fn read(
     }
     blit.endEncoding();
     commands.commit();
-    commands.waitUntilCompleted();
-    // SAFETY: shared storage, which the CPU may read once the copy completed.
-    unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), row * height) }
-        .to_vec()
+    Copy {
+        commands,
+        buffer,
+        size: row * height,
+    }
 }
 
 #[test]
@@ -302,6 +335,204 @@ fn read_planes(
                 "the texture is on the context's device"
             );
             assert_eq!(&read(device, metal), plane);
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_decoder_destroy(decoder);
+    }
+}
+
+#[test]
+fn decodes_on_the_app_queue_need_no_wait() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no Metal device"
+        );
+        return;
+    };
+    let queue = device.newCommandQueue().expect("a command queue");
+    let mut context = ptr::null_mut();
+    // SAFETY: a Metal device and its queue, and a pointer to store the
+    // context in.
+    let status = unsafe {
+        emberwave_context_create_metal(
+            Retained::as_ptr(&device).cast_mut().cast(),
+            Retained::as_ptr(&queue).cast_mut().cast(),
+            &mut context,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    // SAFETY: a live context.
+    let on = unsafe { emberwave_context_metal_device(context) };
+    assert!(
+        ptr::eq(on.cast_const().cast(), Retained::as_ptr(&device)),
+        "the context is on the app's device"
+    );
+    // 192 pixels wide, the picture is copied into its texture; 200, drawn
+    // (decision D42).
+    for name in ["noise_192x136_420.pwv1", "gradient_200x120_420.pwv1"] {
+        decode_on_the_app_queue(context, &queue, &testdata(name));
+    }
+    // SAFETY: a live context.
+    unsafe { emberwave_context_destroy(context) };
+}
+
+/// Decodes every frame of the PWV1 file `bytes` into the same textures
+/// without waiting, each followed by copies out of them committed to the
+/// context's queue, and waits only at the end: each copy finds its frame.
+fn decode_on_the_app_queue(
+    context: *mut EmberwaveContext,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    bytes: &[u8],
+) {
+    let frames: Vec<&[u8]> = Pwv1File::parse(bytes)
+        .unwrap()
+        .frames()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(frames.len() > 1, "frames that differ");
+    // SAFETY: live objects, buffers of the sizes passed, and pointers to store
+    // results in; the Metal pointers are borrowed while their objects live.
+    unsafe {
+        let mut stream = EmberwaveStreamInfo::default();
+        assert_eq!(
+            emberwave_probe_pwv1(bytes.as_ptr(), bytes.len(), &mut stream),
+            EmberwaveStatus::Ok
+        );
+        let mut decoder = ptr::null_mut();
+        assert_eq!(
+            emberwave_decoder_create(
+                context,
+                stream.width,
+                stream.height,
+                stream.chroma,
+                &mut decoder
+            ),
+            EmberwaveStatus::Ok
+        );
+        let mut info = EmberwaveFrameInfo::default();
+        assert_eq!(
+            emberwave_decoder_info(decoder, &mut info),
+            EmberwaveStatus::Ok
+        );
+        let (width, height) = (info.width as usize, info.height as usize);
+        let sizes = [
+            (width, height),
+            (info.chroma_width as usize, info.chroma_height as usize),
+            (info.chroma_width as usize, info.chroma_height as usize),
+        ];
+
+        // What the decodes that wait give: BGRA and the planes.
+        let expected: Vec<(Vec<u8>, [Vec<u8>; 3])> = frames
+            .iter()
+            .map(|frame| {
+                let mut rgb = vec![0u8; width * height * 3];
+                // The same frames again: forget their order.
+                emberwave_decoder_clear(decoder);
+                assert_eq!(
+                    emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                    EmberwaveStatus::Ok
+                );
+                let target = EmberwavePlane {
+                    data: rgb.as_mut_ptr(),
+                    stride: width * 3,
+                };
+                assert_eq!(
+                    emberwave_decoder_decode_rgb(decoder, ptr::null(), target),
+                    EmberwaveStatus::Ok
+                );
+                let mut planes = sizes.map(|(w, h)| vec![0u8; w * h]);
+                let [y, cb, cr] = planes.each_mut().map(|plane| plane.as_mut_ptr());
+                let plane = |data, (w, _): (usize, usize)| EmberwavePlane { data, stride: w };
+                // The same frames again: forget their order.
+                emberwave_decoder_clear(decoder);
+                assert_eq!(
+                    emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                    EmberwaveStatus::Ok
+                );
+                assert_eq!(
+                    emberwave_decoder_decode_yuv(
+                        decoder,
+                        plane(y, sizes[0]),
+                        plane(cb, sizes[1]),
+                        plane(cr, sizes[2])
+                    ),
+                    EmberwaveStatus::Ok
+                );
+                let bgra = rgb
+                    .chunks_exact(3)
+                    .flat_map(|p| [p[2], p[1], p[0], 255])
+                    .collect();
+                (bgra, planes)
+            })
+            .collect();
+
+        let mut texture = ptr::null_mut();
+        assert_eq!(
+            emberwave_texture_create(decoder, EMBERWAVE_TEXTURE_BGRA8, &mut texture),
+            EmberwaveStatus::Ok
+        );
+        let planes = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+            let mut texture = ptr::null_mut();
+            assert_eq!(
+                emberwave_texture_create_plane(decoder, plane, &mut texture),
+                EmberwaveStatus::Ok
+            );
+            texture
+        });
+        let metal = |texture| -> &ProtocolObject<dyn MTLTexture> {
+            &*emberwave_texture_metal(texture).cast()
+        };
+        // The queue orders the work by the textures only while Metal tracks
+        // them, as wgpu-hal 30 has it. A wgpu that stops would fail here.
+        for texture in [texture].into_iter().chain(planes) {
+            assert_eq!(
+                metal(texture).hazardTrackingMode(),
+                MTLHazardTrackingMode::Tracked
+            );
+        }
+
+        let mut copies = Vec::new();
+        for frame in &frames {
+            emberwave_decoder_clear(decoder);
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok
+            );
+            assert_eq!(
+                emberwave_decoder_submit_texture(decoder, ptr::null(), texture),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            let picture = blit(queue, metal(texture));
+            emberwave_decoder_clear(decoder);
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok
+            );
+            assert_eq!(
+                emberwave_decoder_submit_plane_textures(decoder, planes[0], planes[1], planes[2]),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            let plane_copies = planes.map(|plane| blit(queue, metal(plane)));
+            copies.push((picture, plane_copies));
+        }
+        for (index, ((picture, plane_copies), (bgra, yuv))) in
+            copies.into_iter().zip(&expected).enumerate()
+        {
+            assert!(picture.contents() == *bgra, "frame {index}: the picture");
+            for (component, (copy, plane)) in plane_copies.into_iter().zip(yuv).enumerate() {
+                assert!(
+                    copy.contents() == *plane,
+                    "frame {index}: plane {component}"
+                );
+            }
+        }
+
+        for texture in [texture].into_iter().chain(planes) {
             emberwave_texture_destroy(texture);
         }
         emberwave_decoder_destroy(decoder);

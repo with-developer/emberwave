@@ -789,3 +789,74 @@ fn plane_textures_that_do_not_fit_are_refused_before_the_frame_is_used() {
         emberwave_context_destroy(other_context);
     }
 }
+
+#[test]
+fn a_decode_without_a_wait_needs_the_callers_own_queue() {
+    // Only a context on the caller's queue orders the caller's reads after a
+    // decode that does not wait (decision D43); emberwave_context_create
+    // makes a queue of its own.
+    let Some(context) = context() else {
+        return;
+    };
+    let bytes = testdata("gradient_200x120_420.pwv1");
+    let frame = frames(&bytes)[0];
+    let decoder = decoder_for(context, &bytes);
+    let [y, cb, cr] = plane_textures(decoder);
+    let mut picture = ptr::null_mut();
+    // SAFETY: a live context, decoder and textures, and pointers to store
+    // results in.
+    unsafe {
+        assert_eq!(
+            emberwave_texture_create(decoder, EMBERWAVE_TEXTURE_RGBA8, &mut picture),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_submit_texture(decoder, ptr::null(), picture),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(last_error().contains("caller's queue"), "{}", last_error());
+        assert_eq!(
+            emberwave_decoder_submit_plane_textures(decoder, y, cb, cr),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(emberwave_decoder_is_ready(decoder, false));
+        assert_eq!(
+            emberwave_decoder_decode_texture(decoder, ptr::null(), picture),
+            EmberwaveStatus::Ok
+        );
+        for texture in [picture, y, cb, cr] {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}
+
+#[test]
+fn a_metal_context_needs_a_device_and_a_queue() {
+    let mut context = ptr::null_mut();
+    // SAFETY: NULL where the test means it, and a pointer to store the
+    // context in.
+    unsafe {
+        assert_eq!(
+            emberwave_context_create_metal(ptr::null_mut(), ptr::null_mut(), &mut context),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(last_error().contains("device is NULL"), "{}", last_error());
+        assert!(context.is_null());
+    }
+    // Elsewhere there is no Metal: the pointers are not even looked at.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let mut marker = 0u8;
+        let anything = std::ptr::from_mut(&mut marker).cast();
+        // SAFETY: never dereferenced off Apple systems.
+        let status = unsafe { emberwave_context_create_metal(anything, anything, &mut context) };
+        assert_eq!(status, EmberwaveStatus::NoGpu);
+        assert!(context.is_null());
+    }
+}

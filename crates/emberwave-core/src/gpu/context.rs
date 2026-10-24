@@ -178,25 +178,42 @@ impl GpuContext {
         adapter: wgpu::Adapter,
         options: &GpuOptions,
     ) -> Result<Self, GpuError> {
-        let limits = required_limits(&adapter.limits(), options.strict_webgpu);
+        let (device, queue) = adapter
+            .request_device(&Self::device_descriptor(&adapter, options))
+            .await?;
+        Ok(Self::from_device(adapter, device, queue))
+    }
 
+    /// What a context asks of `adapter` for `options`: the features and the
+    /// limits that [`from_adapter`](Self::from_adapter) requests. For a device
+    /// made another way, such as on objects of the caller's graphics API with
+    /// `wgpu::Adapter::create_device_from_hal`, which
+    /// [`from_device`](Self::from_device) then takes.
+    pub fn device_descriptor(
+        adapter: &wgpu::Adapter,
+        options: &GpuOptions,
+    ) -> wgpu::DeviceDescriptor<'static> {
         let timestamps = options.timestamps
             && !options.strict_webgpu
             && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let required_features = if timestamps {
-            wgpu::Features::TIMESTAMP_QUERY
-        } else {
-            wgpu::Features::empty()
-        };
+        wgpu::DeviceDescriptor {
+            label: Some("emberwave"),
+            required_features: if timestamps {
+                wgpu::Features::TIMESTAMP_QUERY
+            } else {
+                wgpu::Features::empty()
+            },
+            required_limits: required_limits(&adapter.limits(), options.strict_webgpu),
+            ..Default::default()
+        }
+    }
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("emberwave"),
-                required_features,
-                required_limits: limits,
-                ..Default::default()
-            })
-            .await?;
+    /// Creates a context on a device of `adapter` made with
+    /// [`device_descriptor`](Self::device_descriptor), and its queue. The
+    /// context takes over the device's lost callback. Without the limits of
+    /// the descriptor, making the pipelines fails, naming the limit.
+    pub fn from_device(adapter: wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
 
         // A lost device stays lost. Errors of a lost device do not reach the
         // error scopes, so the decoders check this record before and after
@@ -209,7 +226,7 @@ impl GpuContext {
             }
         });
 
-        Ok(Self {
+        Self {
             adapter,
             device,
             queue,
@@ -218,7 +235,7 @@ impl GpuContext {
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             lost,
-        })
+        }
     }
 
     /// Why the device was lost, if it was: a driver reset, a GPU that went

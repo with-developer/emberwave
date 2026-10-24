@@ -317,6 +317,7 @@ dependencies = [
  "emberwave-core",
  "objc2",
  "objc2-metal",
+ "pollster",
  "wgpu",
 ]
 

@@ -432,10 +432,7 @@ impl Decoder {
     ) -> Result<(), GpuError> {
         self.check_device()?;
         self.assemble_complete(frame)?;
-        self.ensure_payload_capacity()?;
-        with_error_scope(&self.device, || self.upload())?;
-        self.prepare_color(color, false)?;
-        self.encode_passes(encoder, true, None);
+        self.record_assembled(Some(color), Read::Nothing, encoder)?;
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -482,15 +479,7 @@ impl Decoder {
         self.check_device()?;
         self.check_target(target)?;
         self.assemble_complete(frame)?;
-        self.ensure_payload_capacity()?;
-        with_error_scope(&self.device, || self.upload())?;
-        let fill = Fill::of(target.texture());
-        self.prepare_color(color, fill == Fill::Copy { bgra: true })?;
-        if fill == Fill::Draw {
-            self.prepare_draw(target.texture().format())?;
-        }
-        self.encode_passes(encoder, true, None);
-        self.encode_picture(encoder, target, fill);
+        self.record_assembled(Some(color), Read::Texture(target), encoder)?;
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -515,6 +504,25 @@ impl Decoder {
             &mut |_| {},
         )?;
         Ok(())
+    }
+
+    /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
+    /// calls into `target`, as
+    /// [`decode_assembled_to_texture`](Self::decode_assembled_to_texture)
+    /// does, but returns once the work is submitted to the queue, without
+    /// waiting for it. Work submitted to the queue later runs after it. On
+    /// Metal, which orders the command buffers of a queue that use a texture
+    /// by when they were committed, that is all the ordering a client needs
+    /// whose queue the context shares (decision D43). The frame goes to the
+    /// GPU through the queue's staging memory: the decoder's own upload
+    /// buffer can only take a frame once the previous one is done.
+    pub fn submit_assembled_to_texture(
+        &mut self,
+        color: &ColorParams,
+        target: &wgpu::TextureView,
+    ) -> Result<(), GpuError> {
+        self.check_target(target)?;
+        self.submit_assembled(Some(color), Read::Texture(target))
     }
 
     /// A texture that [`encode_rgb_to_texture`](Self::encode_rgb_to_texture)
@@ -563,10 +571,7 @@ impl Decoder {
         self.check_device()?;
         self.check_plane_targets(targets)?;
         self.assemble_complete(frame)?;
-        self.ensure_payload_capacity()?;
-        with_error_scope(&self.device, || self.upload())?;
-        self.encode_passes(encoder, false, None);
-        self.encode_plane_copies(encoder, targets);
+        self.record_assembled(None, Read::Planes(targets), encoder)?;
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -590,6 +595,20 @@ impl Decoder {
             &mut |_| {},
         )?;
         Ok(())
+    }
+
+    /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
+    /// calls into the plane textures `targets`, as
+    /// [`decode_assembled_to_plane_textures`](Self::decode_assembled_to_plane_textures)
+    /// does, but returns once the work is submitted, as
+    /// [`submit_assembled_to_texture`](Self::submit_assembled_to_texture)
+    /// does.
+    pub fn submit_assembled_to_plane_textures(
+        &mut self,
+        targets: [&wgpu::TextureView; 3],
+    ) -> Result<(), GpuError> {
+        self.check_plane_targets(targets)?;
+        self.submit_assembled(None, Read::Planes(targets))
     }
 
     /// A texture that [`encode_to_plane_textures`](Self::encode_to_plane_textures)
@@ -808,16 +827,7 @@ impl Decoder {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
-        let fill = match read {
-            Read::Texture(target) => Some(Fill::of(target.texture())),
-            Read::Nothing | Read::Yuv | Read::Rgb | Read::Planes(_) => None,
-        };
-        if let Some(color) = color {
-            self.prepare_color(color, fill == Some(Fill::Copy { bgra: true }))?;
-        }
-        if let (Read::Texture(target), Some(Fill::Draw)) = (read, fill) {
-            self.prepare_draw(target.texture().format())?;
-        }
+        let fill = self.prepare_output(color, read)?;
         let prepare = assembled_in + prepare_start.elapsed();
 
         self.make_readback(read)?;
@@ -862,13 +872,7 @@ impl Decoder {
                 );
             }
             self.encode_passes(&mut encoder, color.is_some(), queries);
-            match (read, fill) {
-                (Read::Texture(target), Some(fill)) => {
-                    self.encode_picture(&mut encoder, target, fill);
-                }
-                (Read::Planes(targets), _) => self.encode_plane_copies(&mut encoder, targets),
-                _ => {}
-            }
+            self.encode_output(&mut encoder, read, fill);
             if let Some((source, target, bytes)) = copy_back {
                 encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
             }
@@ -905,6 +909,96 @@ impl Decoder {
             gpu_wall,
             stages,
         })
+    }
+
+    /// Makes ready what a decode with `color` and `read` needs besides its
+    /// passes: the colour conversion's parameters, in the channel order a
+    /// copy into the texture of `read` needs, and the draw, if the texture
+    /// takes one. Says how the picture gets into that texture.
+    fn prepare_output(
+        &mut self,
+        color: Option<&ColorParams>,
+        read: Read<'_>,
+    ) -> Result<Option<Fill>, GpuError> {
+        let fill = match read {
+            Read::Texture(target) => Some(Fill::of(target.texture())),
+            Read::Nothing | Read::Yuv | Read::Rgb | Read::Planes(_) => None,
+        };
+        if let Some(color) = color {
+            self.prepare_color(color, fill == Some(Fill::Copy { bgra: true }))?;
+        }
+        if let (Read::Texture(target), Some(Fill::Draw)) = (read, fill) {
+            self.prepare_draw(target.texture().format())?;
+        }
+        Ok(fill)
+    }
+
+    /// Records, after the passes, what `read` asks of textures, which
+    /// [`prepare_output`](Self::prepare_output) made ready.
+    fn encode_output(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        read: Read<'_>,
+        fill: Option<Fill>,
+    ) {
+        match (read, fill) {
+            (Read::Texture(target), Some(fill)) => self.encode_picture(encoder, target, fill),
+            (Read::Planes(targets), _) => self.encode_plane_copies(encoder, targets),
+            _ => {}
+        }
+    }
+
+    /// Records the decode of the frame the assembler holds into `encoder`,
+    /// its data uploaded through the queue: the passes, with the colour
+    /// conversion if `color` is given, and then what `read` asks of
+    /// textures. The caller marks the frame decoded once that cannot fail
+    /// any more.
+    fn record_assembled(
+        &mut self,
+        color: Option<&ColorParams>,
+        read: Read<'_>,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), GpuError> {
+        self.ensure_payload_capacity()?;
+        with_error_scope(&self.device, || self.upload())?;
+        let fill = self.prepare_output(color, read)?;
+        self.encode_passes(encoder, color.is_some(), None);
+        self.encode_output(encoder, read, fill);
+        Ok(())
+    }
+
+    /// Records the decode of the frame the assembler holds, as
+    /// [`record_assembled`](Self::record_assembled) does, and submits it
+    /// without waiting for it. The frame counts as decoded only once it is
+    /// submitted: finishing the commands can still fail, as for a view in a
+    /// format the draw does not take, and then the frame is still there.
+    fn submit_assembled(
+        &mut self,
+        color: Option<&ColorParams>,
+        read: Read<'_>,
+    ) -> Result<(), GpuError> {
+        self.check_device()?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("decode"),
+            });
+        let outcome = self
+            .record_assembled(color, read, &mut encoder)
+            .and_then(|()| {
+                with_error_scope(&self.device, || {
+                    self.queue.submit([encoder.finish()]);
+                })
+            });
+        if outcome.is_ok() {
+            self.assembler.mark_frame_decoded();
+        }
+        // Nothing waits for the work, so nothing else polls the device: one
+        // poll that does not wait hands back what finished work held, and
+        // tells of a lost device.
+        notice_loss(&self.device, &self.lost);
+        self.check_device()?;
+        outcome
     }
 
     /// An error unless `target` shows a texture the picture can be drawn into.

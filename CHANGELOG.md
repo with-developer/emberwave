@@ -11,6 +11,11 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
   - `emberwave_decoder_decode_plane_textures` copies the planes of the frame into three of them and waits. They hold the stream's samples, byte for byte.
   - The fastest way to the GPU: on an Apple M3 Max a 4K frame takes 1.0 to 1.1 ms, against 1.3 to 1.4 ms into an RGB texture, and a 1080p frame 0.45 ms against 0.56 ms. In 4:2:0 they take 1.5 bytes a pixel, where RGBA takes 4.
   - In Rust, `Decoder::encode_to_plane_textures`, `decode_assembled_to_plane_textures` and `create_plane_texture`, and `PLANE_FORMAT`.
+- Decoding on the Metal client's own queue, without waiting (decision D43, [#62](https://github.com/with-developer/emberwave/issues/62), [#63](https://github.com/with-developer/emberwave/issues/63)).
+  - `emberwave_context_create_metal` makes a context on the client's `id<MTLDevice>` and `id<MTLCommandQueue>`.
+  - On it, `emberwave_decoder_submit_texture` and `emberwave_decoder_submit_plane_textures` return once the work is on the queue. Metal runs the client's command buffers committed afterwards after the decode, and the next decode after them, so one texture takes every frame.
+  - On an Apple M3 Max a 4K frame takes the decoding thread 0.26 ms instead of 1.3 ms, and the client's draw completes as early as after the waiting decode, at 1080p 0.1 ms earlier.
+  - In Rust, `Decoder::submit_assembled_to_texture` and `submit_assembled_to_plane_textures`, and `GpuContext::device_descriptor` and `from_device` for a context on a device made elsewhere.
 
 ### Changed
 
