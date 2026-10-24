@@ -12,13 +12,11 @@ use std::sync::{Arc, Mutex};
 
 use emberwave_core::bitstream::{Pwv1File, consts, pwv1};
 use emberwave_core::color::ColorParams;
-use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions};
+use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions, TEXTURE_FORMATS};
 use wasm_bindgen::prelude::*;
 
 mod bench;
 pub use bench::Bench;
-
-const BLIT_SHADER: &str = include_str!("blit.wgsl");
 
 /// Frame rate for a stream that does not say: PWV1 files without one hold
 /// unrelated pictures, shown at this pace.
@@ -48,15 +46,15 @@ fn now_ms() -> f64 {
         .map_or(0.0, |performance| performance.now())
 }
 
-/// A canvas format without sRGB encoding: the samples are gamma encoded
-/// already, as they are in the stream.
+/// A canvas format the decoder draws into, in the order the browser
+/// prefers them: 8-bit RGBA or BGRA without sRGB encoding, as the samples are
+/// gamma encoded already. WebGPU canvases always offer both.
 fn surface_format(surface: &wgpu::Surface<'_>, adapter: &wgpu::Adapter) -> wgpu::TextureFormat {
-    let formats = surface.get_capabilities(adapter).formats;
-    formats
-        .iter()
-        .copied()
-        .find(|format| !format.is_srgb())
-        .or_else(|| formats.first().copied())
+    surface
+        .get_capabilities(adapter)
+        .formats
+        .into_iter()
+        .find(|format| TEXTURE_FORMATS.contains(format))
         .unwrap_or(wgpu::TextureFormat::Bgra8Unorm)
 }
 
@@ -82,8 +80,6 @@ struct Stream {
     width: u32,
     height: u32,
     frame_rate: f64,
-    /// Binds the decoder's RGBA words for the blit, once they exist.
-    bind_group: Option<wgpu::BindGroup>,
 }
 
 /// The frames of a file that can be played, in order: how many there are,
@@ -119,9 +115,6 @@ pub struct Player {
     context: GpuContext,
     adapter: wgpu::Adapter,
     surface: wgpu::Surface<'static>,
-    blit: wgpu::RenderPipeline,
-    /// Width and height of the picture, for the blit shader.
-    picture: wgpu::Buffer,
     stream: Option<Stream>,
     gpu_times: Arc<Mutex<GpuTimes>>,
     /// The first GPU error the browser reported since the last frame. Error
@@ -164,45 +157,11 @@ impl Player {
                 first.get_or_insert_with(|| error.to_string());
             }
         }));
-        let format = surface_format(&surface, &adapter);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit"),
-            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
-        });
-        let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("blit"),
-            layout: None,
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(format.into())],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let picture = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("picture size"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         Ok(Self {
             context,
             adapter,
             surface,
-            blit,
-            picture,
             stream: None,
             gpu_times: Arc::default(),
             gpu_error,
@@ -290,11 +249,6 @@ impl Player {
         };
         self.surface.configure(self.context.device(), &config);
 
-        let mut size = [0u8; 16];
-        size[..4].copy_from_slice(&stream.width.to_le_bytes());
-        size[4..8].copy_from_slice(&stream.height.to_le_bytes());
-        self.context.queue().write_buffer(&self.picture, 0, &size);
-
         let frame_rate = if header.frame_rate_num != 0 && header.frame_rate_den != 0 {
             f64::from(header.frame_rate_num) / f64::from(header.frame_rate_den)
         } else {
@@ -316,7 +270,6 @@ impl Player {
             width: stream.width,
             height: stream.height,
             frame_rate,
-            bind_group: None,
         });
         Ok(description)
     }
@@ -380,59 +333,18 @@ impl Player {
         let Some((frame, after)) = frame else {
             return Err(JsError::new("the frames ran out"));
         };
+        // The canvas has the picture's size, so the decoder draws straight
+        // into it.
+        let view = target.texture.create_view(&Default::default());
         stream
             .decoder
-            .encode_rgb(frame, &stream.color, &mut encoder)
+            .encode_rgb_to_texture(frame, &stream.color, &view, &mut encoder)
             .map_err(js_error)?;
         stream.next = if after >= stream.end {
             pwv1::HEADER_BYTES
         } else {
             after
         };
-
-        if stream.bind_group.is_none() {
-            let rgba = stream
-                .decoder
-                .rgba_buffer()
-                .ok_or_else(|| JsError::new("the decoder made no RGB picture"))?;
-            stream.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit"),
-                layout: &self.blit.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: rgba.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.picture.as_entire_binding(),
-                    },
-                ],
-            }));
-        }
-
-        let view = target.texture.create_view(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("blit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.blit);
-            pass.set_bind_group(0, stream.bind_group.as_ref(), &[]);
-            pass.draw(0..3, 0..1);
-        }
         queue.submit([encoder.finish()]);
 
         let submitted = now_ms();

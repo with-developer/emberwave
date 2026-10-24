@@ -514,6 +514,8 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_decoder_create`, `_destroy`, `_info` | One decoder per picture size and chroma format; the sizes of its planes |
 | `emberwave_decoder_push_packet`, `_is_ready`, `_clear` | Feed packets as they arrive; ask whether the frame, or enough of it, is there |
 | `emberwave_decoder_decode_yuv`, `_decode_rgb` | Decode and copy the planes, or RGB, into the caller's memory, row by row with the caller's strides |
+| `emberwave_texture_create`, `_destroy`, `emberwave_decoder_decode_texture` | A texture of the picture's size, RGBA or BGRA, on the decoder's device, and a decode that draws the RGB picture into it and waits |
+| `emberwave_texture_metal`, `emberwave_context_metal_device` | The `id<MTLTexture>` and `id<MTLDevice>` behind a texture and a context, borrowed, or `NULL` off Metal |
 | `emberwave_encoder_create`, `_destroy`, `_info` | One encoder per picture size and chroma format, with the colours its frames signal; the sizes of its planes |
 | `emberwave_encoder_encode` | Encode planes from the caller's memory, with the caller's strides, into a frame of at most the budget, written into the caller's buffer of that size |
 | `emberwave_frame_packets` | Where a frame splits into packets of a given size, at its blocks |
@@ -525,7 +527,7 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 
 For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
-The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). Handing the picture to the caller's graphics API on the GPU would need the Vulkan, Metal or Direct3D 12 object behind a wgpu buffer and a way for each API to import it; that is left for later.
+The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` draws it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.5 ms for the 4K frame (D40). Vulkan and Direct3D 12 handles, decoding without waiting, and the client's own device, queue or textures are later issues (#62, #63, #64).
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
 
@@ -992,3 +994,40 @@ The low ones:
 - The benchmark with the invalid buffer stops at 1080p with the browser's message.
 
 Picture sizes between 8192x4320 and 16384x16384 that the native decoder takes are refused in the browser.
+
+### 2026-10-24 — D40: Pictures on the GPU for Metal clients
+
+**Context.** Through the C API a client got the picture in CPU memory: 2.7 ms for a 4K frame to RGB on an Apple M3 Max, against 1.2 ms when it stays on the GPU (issue #27). Upstream's Metal C API takes the app's `id<MTLDevice>` and records the decode into the app's command buffer. It writes Y, Cb and Cr into the app's textures, so the app's queue orders the work. wgpu submits on queues of its own and does not record into a foreign command buffer.
+
+**Decision.**
+- `Decoder::encode_rgb_to_texture` and `decode_assembled_to_texture` draw the RGB picture into a texture with a render pass. That pass is `draw.wgsl`, the browser player's blit, now in the core. A copy from the RGBA buffer would take rows of a multiple of 256 bytes, so it would need a second, padded layout of a buffer the read-back takes packed.
+- The targets are 2D textures of the picture's size in `Rgba8Unorm` or `Bgra8Unorm`. sRGB forms are refused, as the samples are gamma encoded already. The browser player draws its canvas this way too.
+- The C API gets an `EmberwaveTexture`:
+  - It is made by emberwave on the decoder's device, in RGBA or BGRA; BGRA is for copies onto a display's drawable.
+  - `emberwave_decoder_decode_texture` draws into it and waits for the GPU, as the other decodes do.
+  - `emberwave_texture_metal` and `emberwave_context_metal_device` give the `id<MTLTexture>` and the `id<MTLDevice>` through wgpu's `as_hal`. The pointers are borrowed, and `NULL` off Metal.
+  - The documentation states the bridging rules and how long the pointers live.
+- Ordering. The call's return orders the client's reads after the draw. Nothing orders the next decode after those reads, so keeping three textures in turn is a stated rule, not a hint.
+- Contexts get a process-unique id. Every context makes its own `wgpu::Instance`, and `wgpu::Device` equality said that devices of two contexts were equal. A texture of another context then reached wgpu-core, which panicked on a view id missing from its registry; it could also have named an unrelated view. The C API compares context ids.
+- Deferred to issues:
+  - Decoding without waiting, with an `MTLSharedEvent` signalled after the draw, which wgpu-hal can encode (#62).
+  - Contexts on the client's own `MTLDevice` and queue, and drawing into textures of the client's own, imported with `create_texture_from_hal` (#63).
+  - Y, Cb and Cr planes in textures (#64).
+  - Vulkan and Direct3D 12 handles.
+
+  The libraries' Apple systems, iPhones, iPads and Macs with Apple silicon, have one GPU each, so the device a context takes is the system's.
+- Grok argued the other side, in two rounds:
+  - Waiting leaves the GPU idle until the app commits: #62.
+  - Textures of the app's own, and BGRA for drawables: BGRA now, the app's own in #63.
+  - The bridging rules and the rotation rule belong in the header: done.
+  - The 256-byte remark in the shader overstated the case: corrected.
+  - Requiring an explicit colour conversion: withdrawn after the second round. `NULL` follows the frame as for `decode_rgb`, and the header repeats the warning about upstream's Metal encoder.
+
+**Consequence.** Measured on the Apple M3 Max through the C API, 300 frames and two rounds:
+
+| Frame | Into a texture | RGB in CPU memory | Planes in CPU memory |
+|---|---|---|---|
+| 4K | 1.50 ms | 2.70 ms | 1.23 to 1.35 ms |
+| 1080p | 0.72 ms | 0.84 ms | 0.52 ms |
+
+A Metal client draws the texture without a copy. `tests/metal.rs` reads the textures through Metal, on a queue of its own as an app does, and finds the RGB picture in both formats. The browser player draws through the same pass, and its canvas is still bit-exact against the reference decodes.

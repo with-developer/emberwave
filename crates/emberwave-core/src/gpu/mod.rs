@@ -14,7 +14,9 @@ mod pipelines;
 mod resources;
 
 pub use context::{BACKEND_ENV, GpuContext, GpuOptions, parse_backends};
-pub use decoder::{Decoder, Frame, FramePlane, RgbFrame, StageTimings, TimedOutput, Timings};
+pub use decoder::{
+    Decoder, Frame, FramePlane, RgbFrame, StageTimings, TEXTURE_FORMATS, TimedOutput, Timings,
+};
 pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
 pub use error::GpuError;
 
@@ -26,6 +28,9 @@ pub mod shader_sources {
     pub const IDWT: &str = include_str!("shaders/idwt.wgsl");
     /// 8-bit YCbCr planes to RGB.
     pub const YUV2RGB: &str = include_str!("shaders/yuv2rgb.wgsl");
+    /// The RGB picture drawn into a texture: a vertex and a fragment shader,
+    /// `vs` and `fs`, so not among the compute shaders of [`ALL`].
+    pub const DRAW: &str = include_str!("shaders/draw.wgsl");
     /// A picture in textures packed into the encoder's planes buffer.
     pub const GATHER: &str = include_str!("shaders/gather.wgsl");
     /// Forward wavelet transform of one level, for the encoder.

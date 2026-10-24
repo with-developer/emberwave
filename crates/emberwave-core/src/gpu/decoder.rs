@@ -18,7 +18,7 @@ use crate::color::ColorParams;
 use super::context::{GpuContext, notice_loss};
 use super::error::GpuError;
 use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
-use super::pipelines::{Pipelines, Stage, with_error_scope};
+use super::pipelines::{DrawPipeline, Pipelines, Stage, with_error_scope};
 use super::resources::{
     StageQueries, buffer, buffer_limit, check_size, entry, map_for_writing, read_back,
     read_back_with, uniform_buffer,
@@ -108,12 +108,14 @@ pub struct Timings {
     pub stages: Option<StageTimings>,
 }
 
-/// What a decode reads back to the CPU.
+/// Where a decode puts the picture beyond the decoder's own buffers: back to
+/// the CPU, or drawn into a texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Read {
+enum Read<'a> {
     Nothing,
     Yuv,
     Rgb,
+    Texture(&'a wgpu::TextureView),
 }
 
 /// Buffers of the colour conversion, created when it is first used.
@@ -155,6 +157,8 @@ struct IdwtStage {
 pub struct Decoder {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// [`GpuContext::id`] of the context the decoder was made on.
+    context_id: u64,
     assembler: FrameAssembler,
     buffers: BufferLayout,
 
@@ -180,11 +184,29 @@ pub struct Decoder {
     idwt_stages: Vec<IdwtStage>,
 
     color: Option<ColorResources>,
+    /// What draws the RGB picture into a texture, made by the first such
+    /// draw, and made again for a target of another format.
+    draw: Option<DrawResources>,
     timestamps: Option<StageQueries>,
 
     /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
     lost: Arc<Mutex<Option<String>>>,
 }
+
+/// The pipeline of `draw.wgsl` for one target format, and its bind group:
+/// the RGBA words and the picture's size, a buffer the bind group keeps.
+struct DrawResources {
+    pipeline: DrawPipeline,
+    bind_group: wgpu::BindGroup,
+}
+
+/// The texture formats the decoder draws into: 8-bit RGBA or BGRA, as most
+/// graphics APIs and displays take them. Not their sRGB forms: the samples
+/// are gamma encoded already, and an sRGB target would encode them again.
+pub const TEXTURE_FORMATS: [wgpu::TextureFormat; 2] = [
+    wgpu::TextureFormat::Rgba8Unorm,
+    wgpu::TextureFormat::Bgra8Unorm,
+];
 
 impl Decoder {
     /// Creates a decoder for pictures of `width` x `height` luma pixels.
@@ -293,8 +315,10 @@ impl Decoder {
                 dequant_grid,
                 idwt_stages,
                 color: None,
+                draw: None,
                 timestamps,
                 lost: context.lost_record(),
+                context_id: context.id(),
             }
         })
         .map_err(|error| context.explain(error))
@@ -388,6 +412,111 @@ impl Decoder {
     /// clones of the handle included.
     pub fn rgba_buffer(&self) -> Option<&wgpu::Buffer> {
         self.color.as_ref().map(|resources| &resources.rgba)
+    }
+
+    /// Records the decode of one complete frame and its conversion to RGB
+    /// into `encoder`, as [`encode_rgb`](Self::encode_rgb) does, and then a
+    /// draw of the picture into `target`. Once the caller has submitted
+    /// `encoder`, the texture holds the picture.
+    ///
+    /// `target` is a view of a 2D texture of the picture's size, of one mip
+    /// level and one layer, in one of [`TEXTURE_FORMATS`] and with the
+    /// `RENDER_ATTACHMENT` usage, such as a canvas's or one from
+    /// [`create_texture`](Self::create_texture). An unsuitable texture is
+    /// [`GpuError::Texture`], before the frame is used. The view has to be in
+    /// the texture's own format, which cannot be checked: a view in another
+    /// format the texture allows, such as its sRGB form, fails wgpu's
+    /// validation when the work is submitted.
+    pub fn encode_rgb_to_texture(
+        &mut self,
+        frame: &[u8],
+        color: &ColorParams,
+        target: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), GpuError> {
+        self.check_device()?;
+        self.check_target(target)?;
+        self.assemble_complete(frame)?;
+        self.ensure_payload_capacity()?;
+        with_error_scope(&self.device, || self.upload())?;
+        self.prepare_color(color)?;
+        self.prepare_draw(target.texture().format())?;
+        self.encode_passes(encoder, true, None);
+        self.encode_draw(encoder, target);
+        self.assembler.mark_frame_decoded();
+        Ok(())
+    }
+
+    /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
+    /// calls, converts it to RGB and draws it into `target`, as
+    /// [`encode_rgb_to_texture`](Self::encode_rgb_to_texture) does, and waits
+    /// for the GPU. When this returns the texture holds the picture, for any
+    /// queue of the device to read; a texture another queue may still be
+    /// reading must not be passed. Blocks that did not arrive decode as zeros.
+    pub fn decode_assembled_to_texture(
+        &mut self,
+        color: &ColorParams,
+        target: &wgpu::TextureView,
+    ) -> Result<(), GpuError> {
+        self.check_target(target)?;
+        self.run_gpu(
+            Some(color),
+            Read::Texture(target),
+            false,
+            Duration::ZERO,
+            &mut |_| {},
+        )?;
+        Ok(())
+    }
+
+    /// A texture that [`encode_rgb_to_texture`](Self::encode_rgb_to_texture)
+    /// and [`decode_assembled_to_texture`](Self::decode_assembled_to_texture)
+    /// can draw into: the picture's size, in `format`, one of
+    /// [`TEXTURE_FORMATS`], for drawing into, sampling and copying from
+    /// (`RENDER_ATTACHMENT`, `TEXTURE_BINDING` and `COPY_SRC`). BGRA suits a
+    /// copy onto a display's surface, which usually is BGRA.
+    pub fn create_texture(&self, format: wgpu::TextureFormat) -> Result<wgpu::Texture, GpuError> {
+        self.check_device()?;
+        if !TEXTURE_FORMATS.contains(&format) {
+            return Err(GpuError::Texture(format!(
+                "{format:?} is not one of {TEXTURE_FORMATS:?}"
+            )));
+        }
+        let layout = self.layout();
+        with_error_scope(&self.device, || {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("decoded picture"),
+                size: wgpu::Extent3d {
+                    width: layout.width(),
+                    height: layout.height(),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        })
+    }
+
+    /// The GPU device the decoder runs on.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// [`GpuContext::id`] of the context the decoder was made on: an object
+    /// made on a context of another id is on another device, whatever
+    /// comparing devices says. [`encode_rgb_to_texture`](Self::encode_rgb_to_texture)
+    /// and [`decode_assembled_to_texture`](Self::decode_assembled_to_texture)
+    /// cannot tell from a texture view which device it is on, and a view of
+    /// another context's makes wgpu fail, or names an unrelated view of this
+    /// device: the caller keeps track.
+    pub fn context_id(&self) -> u64 {
+        self.context_id
     }
 
     /// Feeds one packet of the frame being received. See
@@ -516,7 +645,7 @@ impl Decoder {
     fn run_gpu(
         &mut self,
         color: Option<&ColorParams>,
-        read: Read,
+        read: Read<'_>,
         timed: bool,
         assembled_in: Duration,
         consume: &mut dyn FnMut(&[u8]),
@@ -539,7 +668,7 @@ impl Decoder {
     fn run_gpu_on_device(
         &mut self,
         color: Option<&ColorParams>,
-        read: Read,
+        read: Read<'_>,
         timed: bool,
         assembled_in: Duration,
         consume: &mut dyn FnMut(&[u8]),
@@ -550,13 +679,16 @@ impl Decoder {
         if let Some(color) = color {
             self.prepare_color(color)?;
         }
+        if let Read::Texture(target) = read {
+            self.prepare_draw(target.texture().format())?;
+        }
         let prepare = assembled_in + prepare_start.elapsed();
 
         self.make_readback(read)?;
         // What the frame copies back and where to: the planes, or the RGBA
         // words, into the buffer just made sure of.
         let copy_back = match read {
-            Read::Nothing => None,
+            Read::Nothing | Read::Texture(_) => None,
             Read::Yuv => self
                 .readback
                 .as_ref()
@@ -594,6 +726,9 @@ impl Decoder {
                 );
             }
             self.encode_passes(&mut encoder, color.is_some(), queries);
+            if let Read::Texture(target) = read {
+                self.encode_draw(&mut encoder, target);
+            }
             if let Some((source, target, bytes)) = copy_back {
                 encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
             }
@@ -632,11 +767,109 @@ impl Decoder {
         })
     }
 
+    /// An error unless `target` shows a texture the picture can be drawn into.
+    fn check_target(&self, target: &wgpu::TextureView) -> Result<(), GpuError> {
+        let texture = target.texture();
+        let (width, height) = (self.layout().width(), self.layout().height());
+        let problem = if texture.dimension() != wgpu::TextureDimension::D2 {
+            format!("is {:?} rather than 2D", texture.dimension())
+        } else if !TEXTURE_FORMATS.contains(&texture.format()) {
+            format!("is {:?}, not one of {TEXTURE_FORMATS:?}", texture.format())
+        } else if (texture.width(), texture.height()) != (width, height) {
+            format!(
+                "is {}x{} rather than the picture's {width}x{height}",
+                texture.width(),
+                texture.height()
+            )
+        } else if texture.sample_count() != 1 {
+            format!(
+                "has {} samples per texel rather than 1",
+                texture.sample_count()
+            )
+        } else if (texture.mip_level_count(), texture.depth_or_array_layers()) != (1, 1) {
+            // A view cannot be checked, but every view of a texture of one
+            // level and one layer shows all of it.
+            format!(
+                "has {} mip levels and {} layers rather than one of each",
+                texture.mip_level_count(),
+                texture.depth_or_array_layers()
+            )
+        } else if !texture
+            .usage()
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            "lacks the RENDER_ATTACHMENT usage".to_owned()
+        } else {
+            return Ok(());
+        };
+        Err(GpuError::Texture(format!("the target texture {problem}")))
+    }
+
+    /// Makes the pipeline that draws into textures of `format`, and its bind
+    /// group, unless they are there. The colour conversion's buffers come
+    /// first, from [`prepare_color`](Self::prepare_color).
+    fn prepare_draw(&mut self, format: wgpu::TextureFormat) -> Result<(), GpuError> {
+        if self
+            .draw
+            .as_ref()
+            .is_some_and(|draw| draw.pipeline.format == format)
+        {
+            return Ok(());
+        }
+        let Some(color) = &self.color else {
+            return Err(GpuError::Device(
+                "there is no RGB picture to draw".to_owned(),
+            ));
+        };
+        let pipeline = DrawPipeline::new(&self.device, format)?;
+        let size = [self.layout().width(), self.layout().height(), 0, 0];
+        let bind_group = with_error_scope(&self.device, || {
+            let picture = uniform_buffer(&self.device, &self.queue, "picture size", &size);
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("draw"),
+                layout: &pipeline.layout,
+                entries: &[entry(0, &color.rgba), entry(1, &picture)],
+            })
+        })?;
+        self.draw = Some(DrawResources {
+            pipeline,
+            bind_group,
+        });
+        Ok(())
+    }
+
+    /// Records the draw of the RGB picture into `target`, which
+    /// [`prepare_draw`](Self::prepare_draw) made ready.
+    fn encode_draw(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+        let Some(draw) = &self.draw else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("draw"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&draw.pipeline.pipeline);
+        pass.set_bind_group(0, &draw.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     /// Makes the buffer that `read` copies the picture back into, the first
     /// time a decode needs it.
-    fn make_readback(&mut self, read: Read) -> Result<(), GpuError> {
+    fn make_readback(&mut self, read: Read<'_>) -> Result<(), GpuError> {
         let (slot, bytes, label) = match read {
-            Read::Nothing => return Ok(()),
+            Read::Nothing | Read::Texture(_) => return Ok(()),
             Read::Yuv => (
                 &mut self.readback,
                 self.buffers.packed_words * 4,

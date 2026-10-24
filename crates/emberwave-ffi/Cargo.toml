@@ -21,6 +21,25 @@ wgpu.workspace = true
 # tests/header.rs generates the C header to check the committed one.
 cbindgen = { version = "0.29", default-features = false }
 
+# tests/metal.rs reads the C API's textures through Metal itself, as an app
+# does. wgpu uses both crates on Apple systems already.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLBlitCommandEncoder",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+    "MTLTypes",
+] }
+
 # The workspace forbids unsafe code, and a C API cannot do without it, so this
 # crate has a table of its own: unsafe code is allowed, but every unsafe
 # operation needs an unsafe block of its own with a SAFETY comment.

@@ -315,6 +315,8 @@ version = "0.8.0"
 dependencies = [
  "cbindgen",
  "emberwave-core",
+ "objc2",
+ "objc2-metal",
  "wgpu",
 ]
 
