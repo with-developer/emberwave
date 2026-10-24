@@ -3,10 +3,12 @@
 `EmberwaveBench` times emberwave on the device's own GPU, through Metal, with the C API of the XCFramework, as an app that uses emberwave would:
 
 - **decode into a Metal texture**: a frame's bytes to the picture in a texture, the path of a player (`emberwave_decoder_decode_texture`);
+- **decode into Y, Cb, Cr textures**: the same frames to their planes in three textures, for a player that converts the colours itself (`emberwave_decoder_decode_plane_textures`);
+- **decode on the app's queue**: the same frames into a texture on the app's own command queue, where the call does not wait (`emberwave_context_create_metal`, `emberwave_decoder_submit_texture`), timed until the app's next command buffer, a copy of one pixel standing in for its draw, has read the picture;
 - **decode to planes in memory**: the same frames to Y, Cb and Cr planes in CPU memory (`emberwave_decoder_decode_yuv`);
 - **encode from memory**: pictures in CPU memory to frames within the byte budget, on the GPU (`emberwave_encoder_encode`).
 
-It uses the pictures and budgets of the [browser benchmark](https://with-developer.github.io/emberwave/bench.html), 1080p, 1440p and 4K, so that the two compare: the browser's goes through WebGPU in Safari, this one through Metal directly. It shows the last decoded picture, drawn from the texture with the app's own Metal code, and checks that a texture read back through Metal holds what the RGB decode gives.
+It uses the pictures and budgets of the [browser benchmark](https://with-developer.github.io/emberwave/bench.html), 1080p, 1440p and 4K, so that the two compare: the browser's goes through WebGPU in Safari, this one through Metal directly. It shows the last decoded picture, drawn from the texture with the app's own Metal code. It also checks the textures, read back through Metal on queues of its own: the picture against the RGB decode, the planes against those decoded to memory, and a decode on the app's queue read by the app's next command buffer there.
 
 ## Running it on an iPhone
 
@@ -23,7 +25,7 @@ You need a Mac with Xcode 16 or later, an Apple ID, an iPhone or iPad with iOS 1
 3. **Sign.** Select the project, the target `EmberwaveBench`, *Signing & Capabilities*, and choose your Apple ID under *Team* (a free *Personal Team* will do). If Xcode says the bundle identifier is taken, change `io.github.with-developer.emberwave-bench` to something of your own.
 4. **The phone.** Connect it, and turn on *Settings > Privacy & Security > Developer Mode* if Xcode asks for it (the phone restarts). Choose the phone as the run destination at the top of Xcode's window.
 5. **Run** (Command-R). The scheme builds the Release configuration with Metal's API validation off, so that the timings are those of the app as it would ship. With a free account, the first start asks you to trust the developer: *Settings > General > VPN & Device Management*.
-6. **Benchmark.** In the app, tap *Run* and wait about a minute with the app in front; the screen stays on meanwhile. Then *Copy the results*.
+6. **Benchmark.** In the app, tap *Run* and wait about two minutes with the app in front; the screen stays on meanwhile. Then *Copy the results*.
 
 The project builds for iPhones and iPads, and for the iOS Simulator on Macs with Apple silicon only: the XCFramework has no library for the Simulator on Intel Macs.
 
@@ -31,4 +33,4 @@ For steadier numbers, let the phone cool down first, close other apps, keep it p
 
 ## In CI
 
-`scripts/check_ios_app.sh` builds the app for iPhones, which checks that it links, and for the iOS Simulator, where it runs it with `-autorun`: a shorter benchmark of every size and the texture check, printed to the log. CI runs it on a macOS runner after the XCFramework is built (see the CI job `XCFramework`).
+`scripts/check_ios_app.sh` builds the app for iPhones, which checks that it links, and for the iOS Simulator, where it runs it with `-autorun`: a shorter benchmark of every size and the three checks, printed to the log. CI runs it on a macOS runner after the XCFramework is built (see the CI job `XCFramework`).

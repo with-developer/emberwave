@@ -2,10 +2,12 @@
 # Builds the iPhone benchmark app (crates/emberwave-ffi/examples/ios) against
 # the XCFramework that scripts/build_xcframework.sh made: for iPhones, which
 # only checks that it links, and for the iOS Simulator, where it then runs
-# with -autorun. That runs a short benchmark of every picture size, and a
-# check that reads a texture of emberwave_decoder_decode_texture back through
-# Metal on the app's own queue and finds the RGB picture. The check fails
-# unless the app prints its report and "texture check: ok".
+# with -autorun. That runs a short benchmark of every picture size and three
+# checks, which read textures back through Metal on queues of the app's own:
+# the picture's texture against the RGB decode, the Y, Cb and Cr textures
+# against the planes decoded to memory, and a decode on the app's own queue,
+# read by the app's next command buffer there without a wait. The check
+# fails unless the app prints its report and passes all three.
 #
 # Usage: scripts/check_ios_app.sh
 #
@@ -48,7 +50,9 @@ if grep -q "^failed:" "$BUILD/autorun.log"; then
     echo "the app failed" >&2
     exit 1
 fi
-grep -q "^texture check: ok" "$BUILD/autorun.log"
+for check in texture plane queue; do
+    grep -q "^$check check: ok" "$BUILD/autorun.log"
+done
 for size in 1080p 1440p 4K; do
     grep -q "^$size (" "$BUILD/autorun.log"
 done

@@ -8,7 +8,7 @@ import UIKit
 /// Runs the benchmark off the main thread and publishes what it does.
 @MainActor
 final class BenchModel: ObservableObject {
-    @Published var status = "Tap Run. It takes about a minute; keep the app in front."
+    @Published var status = "Tap Run. It takes about two minutes; keep the app in front."
     @Published var report = ""
     @Published var running = false
     @Published var picture: MTLTexture?
@@ -20,7 +20,7 @@ final class BenchModel: ObservableObject {
     init() {
         do {
             emberwave = try Emberwave()
-            status = "GPU: \(emberwave?.adapter ?? "none"). Tap Run; it takes about a minute."
+            status = "GPU: \(emberwave?.adapter ?? "none"). Tap Run; it takes about two minutes."
         } catch {
             emberwave = nil
             status = "No GPU: \(error)"
@@ -58,7 +58,7 @@ final class BenchModel: ObservableObject {
                     results.append(result)
                     await MainActor.run { self.picture = result.picture }
                 }
-                let check = try emberwave.checkTexture()
+                let check = try emberwave.checkTextures()
                 outcome = makeReport(emberwave, plan, results, check: check)
             } catch {
                 outcome = makeReport(emberwave, plan, results, check: "failed: \(error)")
