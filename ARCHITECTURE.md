@@ -518,6 +518,7 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_texture_create_plane`, `emberwave_decoder_decode_plane_textures` | A one-channel texture for the Y, the Cb or the Cr plane, and a decode that copies the planes into three and waits |
 | `emberwave_texture_metal`, `emberwave_context_metal_device` | The `id<MTLTexture>` and `id<MTLDevice>` behind a texture and a context, borrowed, or `NULL` off Metal |
 | `emberwave_context_create_metal`, `emberwave_decoder_submit_texture`, `_submit_plane_textures` | A context on the client's own Metal device and queue, and decodes into textures that return without waiting, which only such a context takes |
+| `emberwave_texture_from_metal`, `_from_metal_plane` | The client's own `id<MTLTexture>`, such as a `CVPixelBuffer`'s, as a texture every decode above fills |
 | `emberwave_encoder_create`, `_destroy`, `_info` | One encoder per picture size and chroma format, with the colours its frames signal; the sizes of its planes |
 | `emberwave_encoder_encode` | Encode planes from the caller's memory, with the caller's strides, into a frame of at most the budget, written into the caller's buffer of that size |
 | `emberwave_frame_packets` | Where a frame splits into packets of a given size, at its blocks |
@@ -529,7 +530,7 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 
 For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
-The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` copies the Y, Cb and Cr planes into three textures for a client that converts the colours itself, in 1.0 to 1.1 ms (D41). On a context made on the client's own device and queue, the submit functions do the same without waiting, and Metal orders the client's reads after them (D43). Vulkan and Direct3D 12 handles, and the client's own textures, are later issues (#63).
+The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` copies the Y, Cb and Cr planes into three textures for a client that converts the colours itself, in 1.0 to 1.1 ms (D41). On a context made on the client's own device and queue, the submit functions do the same without waiting, and Metal orders the client's reads after them (D43). The client's own textures, such as those of `CVPixelBuffer`s for an `AVSampleBufferDisplayLayer`, take the decodes as well (D44). Vulkan and Direct3D 12 handles are later work.
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
 
@@ -1142,3 +1143,34 @@ The decoding thread is free 1 ms sooner at 4K. The client's draw completes as ea
 Grok argued the other side before the work began. It agreed that tracked hazards order the work, and named their conditions: a direct use of the texture, commits after the call, and no heap. It also advised refusing the other contexts and leaving the client's textures for later.
 
 Grok's review of the change found one defect, now fixed. A submitted decode counted its frame as decoded once recorded, before finishing the commands, which can still fail: on a view in a format the draw does not take, through the Rust API, or for want of memory. The frame was then used up although nothing ran. It now counts only once submitted, and `tests/gpu.rs` checks that such a view leaves the frame. A queue with room for fewer than four command buffers in flight can stall for good, since emberwave makes its two before committing them; the header says so.
+
+### 2026-10-24 — D44: The client's own Metal textures
+
+**Context.** D40 to D43 decode into textures that emberwave makes. A Metal client often has textures of its own to fill. One case is the BGRA texture of a `CVPixelBuffer`, made by a `CVMetalTextureCache`, whose pixel buffer goes to an `AVSampleBufferDisplayLayer`, as Moonlight on iOS shows its frames. Other cases are a texture from a pool of its own, or a drawable. Without a way in, such a client copies every picture once more (the rest of issue #63).
+
+**Decision.**
+- `emberwave_texture_from_metal` and `_from_metal_plane` wrap the client's `id<MTLTexture>`, with wgpu-hal's `metal::Device::texture_from_raw` and `Device::create_texture_from_hal`. The result is an `EmberwaveTexture` like those emberwave makes, so every decode takes it, waiting or not. emberwave holds a reference to the `MTLTexture` while the wrapper lives. The client keeps the object behind it, such as the `CVMetalTextureRef`, until the GPU has written it.
+- Checked at import:
+  - the device of the decoder's context;
+  - 2D, of one level, layer and sample;
+  - the picture's or the plane's size;
+  - BGRA8 or RGBA8, or R8 for a plane;
+  - not a view of another texture, not memoryless.
+- What wgpu may do with the texture follows from the `MTLTexture`:
+  - copies unless it is framebuffer-only;
+  - draws with `MTLTextureUsageRenderTarget`;
+  - sampling with `ShaderRead`.
+
+  A texture of a `CVMetalTextureCache` can only be read unless the client asks for more, yet a blit may write it, as it is not framebuffer-only. At the usual widths a copy fills it. A drawable is framebuffer-only and takes a draw. A texture that neither a copy nor a draw can fill is refused at import, as is a framebuffer-only plane, since planes are copied.
+- In the core, a picture's target needs `RENDER_ATTACHMENT` only when a draw fills it. A target that takes a copy needs `COPY_DST` and rows of a multiple of 256 bytes, and nothing more.
+- A decode that does not wait takes only textures whose hazards Metal tracks, as D43's ordering rests on them. A `CVMetalTextureCache`'s are tracked; a heap's are not by default. The waiting decodes take any, as the wait orders the client's reads.
+- Not done: NV12, Cb and Cr in one `Rg8Unorm` plane, as `420v` pixel buffers have them. The BGRA picture and the three R8 planes are what the decoder gives.
+
+**Consequence.** `tests/metal.rs` makes textures as a `CVMetalTextureCache` does: shared storage, read only, or a render target where only a draw can fill them. It decodes into them, waiting and not, the picture at a width a copy takes and at one that needs the draw, and the planes. It reads them back through Metal and finds the decodes to CPU memory. It also checks what is refused:
+- an untracked texture by a submit only;
+- the wrong size or pixel format;
+- a picture's texture that neither way can fill.
+
+Grok argued the other side before the work. It kept the two functions and the usages read from the texture, and named the facts above about `CVMetalTextureCache` textures and drawables. It added the refusal of views, of memoryless textures and of framebuffer-only planes, and suggested leaving NV12 out.
+
+Grok's review of the change found no defect. It traced the reference taken at import to wgpu's release of it, and the device that the wrapper keeps alive. It checked the declared usages against wgpu-core's checks of copies and draws, and the browser's canvas, which keeps drawing. It also confirmed that the tests fail without the choice of a copy, the refusal of a draw without its usage, or the check of tracking.

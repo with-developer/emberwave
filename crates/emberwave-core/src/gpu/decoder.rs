@@ -212,10 +212,10 @@ enum Fill {
 }
 
 impl Fill {
-    /// How the picture gets into `texture`, a target that passed
-    /// `check_target`: a copy when the texture takes one and its rows are a
-    /// multiple of 256 bytes, as a copy's must be, a draw otherwise. On an
-    /// Apple M3 Max the copy takes 0.12 to 0.16 ms less a frame.
+    /// How the picture gets into `texture`: a copy when the texture takes one
+    /// and its rows are a multiple of 256 bytes, as a copy's must be, a draw
+    /// otherwise. On an Apple M3 Max the copy takes 0.12 to 0.16 ms less a
+    /// frame.
     fn of(texture: &wgpu::Texture) -> Self {
         let row_bytes = texture.width() * 4;
         if texture.usage().contains(wgpu::TextureUsages::COPY_DST)
@@ -454,21 +454,20 @@ impl Decoder {
     /// `encoder`, the texture holds the picture.
     ///
     /// `target` is a view of a 2D texture of the picture's size, of one mip
-    /// level and one layer, in one of [`TEXTURE_FORMATS`] and with the
-    /// `RENDER_ATTACHMENT` usage, such as a canvas's or one from
-    /// [`create_texture`](Self::create_texture). An unsuitable texture is
-    /// [`GpuError::Texture`], before the frame is used. The view has to be in
-    /// the texture's own format, which cannot be checked: a view in another
-    /// format the texture allows, such as its sRGB form, fails wgpu's
-    /// validation when the picture is drawn.
+    /// level and one layer, in one of [`TEXTURE_FORMATS`], such as a canvas's
+    /// or one from [`create_texture`](Self::create_texture). An unsuitable
+    /// texture is [`GpuError::Texture`], before the frame is used.
     ///
-    /// A texture that also has the `COPY_DST` usage, and a width of a
-    /// multiple of 64 pixels, so that its rows are a multiple of 256 bytes
-    /// as a copy's are, takes the picture with a copy, which costs less than
-    /// the draw other textures take (decision D42). A copy does not go
-    /// through the view: whatever its format, the texture gets the picture's
-    /// bytes, and a view in an sRGB format then decodes them once more when
-    /// it is sampled.
+    /// A texture with the `COPY_DST` usage and a width of a multiple of 64
+    /// pixels, so that its rows are a multiple of 256 bytes as a copy's are,
+    /// takes the picture with a copy, which costs less than a draw (decision
+    /// D42). Any other texture takes a draw, and needs the
+    /// `RENDER_ATTACHMENT` usage for it. A copy does not go through the view:
+    /// whatever its format, the texture gets the picture's bytes, and a view
+    /// in an sRGB format then decodes them once more when it is sampled. A
+    /// draw needs the view in the texture's own format, which cannot be
+    /// checked: a view in another format the texture allows, such as its sRGB
+    /// form, fails wgpu's validation when the picture is drawn.
     pub fn encode_rgb_to_texture(
         &mut self,
         frame: &[u8],
@@ -1001,20 +1000,30 @@ impl Decoder {
         outcome
     }
 
-    /// An error unless `target` shows a texture the picture can be drawn into.
+    /// An error unless `target` shows a texture the picture can be put into:
+    /// a copy needs `COPY_DST` and rows of a multiple of 256 bytes, anything
+    /// else a draw, which needs `RENDER_ATTACHMENT` (decisions D42, D44).
     fn check_target(&self, target: &wgpu::TextureView) -> Result<(), GpuError> {
+        let texture = target.texture();
         let size = (self.layout().width(), self.layout().height());
-        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
-        target_problem(
-            target.texture(),
-            &TEXTURE_FORMATS,
-            usage,
-            "the picture's",
-            size,
-        )
-        .map_or(Ok(()), |problem| {
-            Err(GpuError::Texture(format!("the target texture {problem}")))
-        })
+        let any = wgpu::TextureUsages::empty();
+        if let Some(problem) = target_problem(texture, &TEXTURE_FORMATS, any, "the picture's", size)
+        {
+            return Err(GpuError::Texture(format!("the target texture {problem}")));
+        }
+        if Fill::of(texture) == Fill::Draw
+            && !texture
+                .usage()
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            return Err(GpuError::Texture(
+                "the target texture lacks the RENDER_ATTACHMENT usage that a draw needs: \
+                 only a texture with the COPY_DST usage and a width of a multiple of 64 \
+                 pixels takes a copy"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// An error unless `targets` show three different textures that the Y,

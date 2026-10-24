@@ -387,10 +387,16 @@ fn a_picture_drawn_into_a_texture_is_the_rgb_picture() {
         );
 
         // Into textures of the caller's, recorded into its encoder: RGBA and
-        // BGRA, with and without the COPY_DST usage that lets a copy fill
-        // them. The RGB decode in between writes RGBA words again.
+        // BGRA, with the RENDER_ATTACHMENT usage that a draw needs, the
+        // COPY_DST usage that lets a copy fill them, or both. The RGB decode
+        // in between writes RGBA words again.
+        let (draw, copy) = (
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+            wgpu::TextureUsages::COPY_DST,
+        );
+        let copies = (layout.width() * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         for format in TEXTURE_FORMATS {
-            for usage in [wgpu::TextureUsages::empty(), wgpu::TextureUsages::COPY_DST] {
+            for usage in [draw, draw | copy, copy] {
                 let rgb = decoder.decode_rgb(&frames[1], &color).expect("RGB decode");
                 let target = context.device().create_texture(&wgpu::TextureDescriptor {
                     label: Some("caller's texture"),
@@ -399,20 +405,22 @@ fn a_picture_drawn_into_a_texture_is_the_rgb_picture() {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::COPY_SRC
-                        | usage,
+                    usage: wgpu::TextureUsages::COPY_SRC | usage,
                     view_formats: &[],
                 });
                 let mut encoder = context.device().create_command_encoder(&Default::default());
-                decoder
-                    .encode_rgb_to_texture(
-                        &frames[1],
-                        &color,
-                        &target.create_view(&Default::default()),
-                        &mut encoder,
-                    )
-                    .expect("recorded decode into a texture");
+                let outcome = decoder.encode_rgb_to_texture(
+                    &frames[1],
+                    &color,
+                    &target.create_view(&Default::default()),
+                    &mut encoder,
+                );
+                if usage == copy && !copies {
+                    // Neither a copy nor a draw can fill it (decision D44).
+                    assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+                    continue;
+                }
+                outcome.expect("recorded decode into a texture");
                 context.queue().submit([encoder.finish()]);
                 let bgra = format == wgpu::TextureFormat::Bgra8Unorm;
                 assert_eq!(
