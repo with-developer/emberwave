@@ -819,3 +819,40 @@ fn planes_with_padded_rows_encode_as_back_to_back_ones_do() {
         "the frame of the exactly sized padded plane"
     );
 }
+
+#[test]
+fn a_frame_that_outgrows_the_payload_buffer_decodes_as_in_a_new_decoder() {
+    // A decoder's payload buffer, and the upload buffer it keeps for it
+    // (decision D34), start at 64 KiB and grow with the frames. A large frame
+    // after a small one decodes as in a decoder that saw nothing before, and
+    // so does the small one after the large.
+    let context = gpu_or_return!();
+    let (width, height) = (640, 360);
+    let chroma = ChromaSubsampling::Yuv444;
+    let mut state = 0x2545_f491_u32;
+    let noise: [Vec<u8>; 3] = std::array::from_fn(|_| {
+        (0..width * height)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect()
+    });
+    let mut cpu = encode::Encoder::new(width, height, chroma, Signalling::default()).unwrap();
+    let small = cpu.encode(planes(&noise), 20_000).unwrap();
+    let large = cpu.encode(planes(&noise), 600_000).unwrap();
+    assert!(large.len() > 4 * 64 * 1024, "{} bytes", large.len());
+
+    let mut used = Decoder::new(context, width, height, chroma).unwrap();
+    let fresh = || Decoder::new(context, width, height, chroma).unwrap();
+    used.decode(&small).unwrap();
+    for frame in [&large, &small] {
+        let after_others = used.decode(frame).unwrap();
+        let first = fresh().decode(frame).unwrap();
+        for (plane, (a, b)) in after_others.planes.iter().zip(&first.planes).enumerate() {
+            assert!(a.data == b.data, "{} bytes, plane {plane}", frame.len());
+        }
+    }
+}

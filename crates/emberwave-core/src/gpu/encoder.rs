@@ -15,7 +15,7 @@
 //! last place of a coefficient, so a frame is the CPU encoder's frame or
 //! one that differs in a few of its blocks (decision D29).
 
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES};
@@ -26,7 +26,7 @@ use crate::encode::{
     stream_header,
 };
 
-use super::context::GpuContext;
+use super::context::{GpuContext, notice_loss};
 use super::error::GpuError;
 use super::layout::{
     BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
@@ -34,7 +34,8 @@ use super::layout::{
 };
 use super::pipelines::{EncoderPipelines, with_error_scope};
 use super::resources::{
-    StageQueries, buffer, buffer_limit, check_size, entry, read_back, texture, uniform_buffer,
+    StageQueries, buffer, buffer_limit, check_size, entry, map_for_writing, read_back, texture,
+    uniform_buffer,
 };
 
 /// A dispatch of the forward transform for one decomposition level.
@@ -492,6 +493,9 @@ impl Encoder {
         let outcome = self.encode_on_device(input, budget, timed);
         // As in the decoder: a failure on a device that was lost meanwhile
         // is the loss, and whatever came back is not to be trusted.
+        if outcome.is_err() {
+            notice_loss(&self.device, &self.lost);
+        }
         self.check_device()?;
         outcome
     }
@@ -675,26 +679,7 @@ impl Encoder {
         if self.upload_mapped {
             return Ok(());
         }
-        let (sender, receiver) = mpsc::channel();
-        with_error_scope(&self.device, || {
-            self.upload
-                .slice(..)
-                .map_async(wgpu::MapMode::Write, move |result| {
-                    // The receiver is only gone if this function returned.
-                    let _ = sender.send(result);
-                });
-        })?;
-        // Only a lost device fails here, which the caller reports as such.
-        let failed = |error: &dyn std::fmt::Display| {
-            GpuError::Device(format!("mapping the upload buffer failed: {error}"))
-        };
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|error| failed(&error))?;
-        receiver
-            .recv()
-            .map_err(|error| failed(&error))?
-            .map_err(|error| failed(&error))?;
+        map_for_writing(&self.device, &self.upload)?;
         self.upload_mapped = true;
         Ok(())
     }

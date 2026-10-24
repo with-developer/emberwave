@@ -15,12 +15,13 @@ use crate::bitstream::{
 };
 use crate::color::ColorParams;
 
-use super::context::GpuContext;
+use super::context::{GpuContext, notice_loss};
 use super::error::GpuError;
 use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{Pipelines, Stage, with_error_scope};
 use super::resources::{
-    StageQueries, buffer, buffer_limit, check_size, entry, read_back, uniform_buffer,
+    StageQueries, buffer, buffer_limit, check_size, entry, map_for_writing, read_back,
+    uniform_buffer,
 };
 
 /// Zero words after the payload. The dequantiser may read a little past the
@@ -128,6 +129,18 @@ struct ColorResources {
 /// colour conversion, one pass each.
 const TIMED_STAGES: u32 = 3;
 
+/// Where the CPU writes a frame's block table and payload for the GPU to
+/// copy, in the decodes that wait for their frame (decision D34): kept from
+/// frame to frame, so that a frame goes into memory that is there already,
+/// where `Queue::write_buffer` allocates new memory for every frame and the
+/// first writes to it cost more than the copy.
+struct FrameUpload {
+    /// The block table, then, from the table's full size on, the payload.
+    buffer: wgpu::Buffer,
+    /// Whether `buffer` is mapped for writing.
+    mapped: bool,
+}
+
 /// A dispatch of the inverse transform for one decomposition level.
 struct IdwtStage {
     bind_group: wgpu::BindGroup,
@@ -147,6 +160,10 @@ pub struct Decoder {
     payload: wgpu::Buffer,
     payload_capacity_words: usize,
     block_offsets: wgpu::Buffer,
+    /// Made on the first decode that waits for its frame, and made again
+    /// when the payload buffer grows; `encode_rgb`, which does not wait,
+    /// writes through the queue instead, as a browser has to.
+    upload: Option<FrameUpload>,
     pyramid: wgpu::Buffer,
     packed: wgpu::Buffer,
     readback: wgpu::Buffer,
@@ -269,6 +286,7 @@ impl Decoder {
                 payload,
                 payload_capacity_words,
                 block_offsets,
+                upload: None,
                 pyramid,
                 packed,
                 readback,
@@ -444,8 +462,12 @@ impl Decoder {
         self.check_device()?;
         let outcome = self.run_gpu_on_device(color, read, timed, assembled_in);
         // The device can be lost while the frame is on it, and wgpu tells
-        // during the wait. Whatever failed then is the loss, and whatever came
-        // back is not to be trusted.
+        // during the wait, or for a destroyed device when it is next polled.
+        // Whatever failed then is the loss, and whatever came back is not to
+        // be trusted.
+        if outcome.is_err() {
+            notice_loss(&self.device, &self.lost);
+        }
         self.check_device()?;
         outcome
     }
@@ -461,9 +483,7 @@ impl Decoder {
     ) -> Result<(Vec<u8>, Timings), GpuError> {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
-        // In an error scope like all GPU work, so that a failed copy comes back
-        // as an error instead of reaching wgpu's default handler, which panics.
-        with_error_scope(&self.device, || self.upload())?;
+        let (table_bytes, payload_bytes) = self.upload_mapped()?;
         if let Some(color) = color {
             self.prepare_color(color)?;
         }
@@ -478,6 +498,23 @@ impl Decoder {
                     label: Some("decode"),
                 });
 
+            if let Some(upload) = &self.upload {
+                let payload_start = self.table_capacity_bytes();
+                encoder.copy_buffer_to_buffer(
+                    &upload.buffer,
+                    0,
+                    &self.block_offsets,
+                    0,
+                    table_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &upload.buffer,
+                    payload_start,
+                    &self.payload,
+                    0,
+                    payload_bytes,
+                );
+            }
             self.encode_passes(&mut encoder, color.is_some(), queries);
 
             match (read, self.color.as_ref()) {
@@ -761,7 +798,71 @@ impl Decoder {
         Ok(())
     }
 
-    /// Uploads the block table and the payload of the assembled frame.
+    /// Bytes of the block table: where the payload starts in the upload
+    /// buffer.
+    fn table_capacity_bytes(&self) -> u64 {
+        u64::from(self.layout().block_count()) * 4
+    }
+
+    /// Writes the block table and the payload of the assembled frame into
+    /// the upload buffer, which is made, or made larger, first if it has to
+    /// be, and returns the bytes of each for the copies at the start of the
+    /// frame's command buffer. The previous frame is done, so mapping the
+    /// buffer waits for nothing.
+    fn upload_mapped(&mut self) -> Result<(u64, u64), GpuError> {
+        let payload_start = self.table_capacity_bytes();
+        let capacity_bytes = payload_start + self.payload_capacity_words as u64 * 4;
+        let upload = match &mut self.upload {
+            Some(upload) if upload.buffer.size() >= capacity_bytes => upload,
+            slot => {
+                let buffer = with_error_scope(&self.device, || {
+                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("frame upload"),
+                        size: capacity_bytes,
+                        usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: true,
+                    })
+                })?;
+                // Work already submitted keeps the old buffer until it is done.
+                if let Some(old) = slot.take() {
+                    old.buffer.destroy();
+                }
+                slot.insert(FrameUpload {
+                    buffer,
+                    mapped: true,
+                })
+            }
+        };
+        if !upload.mapped {
+            map_for_writing(&self.device, &upload.buffer)?;
+            upload.mapped = true;
+        }
+
+        let frame = self.assembler.frame();
+        let table: &[u8] = bytemuck::cast_slice(frame.block_offsets());
+        let payload: &[u8] = bytemuck::cast_slice(frame.payload());
+        let payload_bytes = (payload.len() + PAYLOAD_PADDING_WORDS * 4) as u64;
+        {
+            let mut view = upload
+                .buffer
+                .slice(..payload_start + payload_bytes)
+                .get_mapped_range_mut()
+                .map_err(|error| GpuError::Device(error.to_string()))?;
+            let start = payload_start as usize;
+            view.slice(..table.len()).copy_from_slice(table);
+            view.slice(start..start + payload.len())
+                .copy_from_slice(payload);
+            view.slice(start + payload.len()..start + payload_bytes as usize)
+                .fill(0);
+        }
+        with_error_scope(&self.device, || upload.buffer.unmap())?;
+        upload.mapped = false;
+        Ok((table.len() as u64, payload_bytes))
+    }
+
+    /// Uploads the block table and the payload of the assembled frame through
+    /// the queue, for `encode_rgb`, which does not wait for its frame and so
+    /// cannot map the upload buffer.
     fn upload(&self) {
         let frame = self.assembler.frame();
         self.queue.write_buffer(
@@ -831,6 +932,9 @@ impl Drop for Decoder {
             &self.packed,
             &self.readback,
         ];
+        if let Some(upload) = &self.upload {
+            buffers.push(&upload.buffer);
+        }
         if let Some(color) = &self.color {
             buffers.extend([&color.rgba, &color.readback]);
         }

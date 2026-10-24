@@ -83,6 +83,35 @@ pub(crate) fn uniform_buffer<T: bytemuck::Pod>(
     buffer
 }
 
+/// Maps `buffer` for writing and waits until it is. Callers map a buffer
+/// the GPU is done with, so this waits for nothing but wgpu's bookkeeping;
+/// only a lost device makes it fail.
+pub(crate) fn map_for_writing(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+) -> Result<(), GpuError> {
+    let (sender, receiver) = mpsc::channel();
+    with_error_scope(device, || {
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Write, move |result| {
+                // The receiver is only gone if this function returned.
+                let _ = sender.send(result);
+            });
+    })?;
+    let failed = |error: &dyn std::fmt::Display| {
+        GpuError::Device(format!("mapping the upload buffer failed: {error}"))
+    };
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| failed(&error))?;
+    receiver
+        .recv()
+        .map_err(|error| failed(&error))?
+        .map_err(|error| failed(&error))?;
+    Ok(())
+}
+
 /// Waits for the GPU and copies a mappable buffer's first `bytes` bytes out.
 pub(crate) fn read_back(
     device: &wgpu::Device,

@@ -866,3 +866,15 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 - Only the GPU encoder: the context is a GPU context. Pictures in GPU memory (`encode_textures`) need handles of the caller's graphics API and wait for #27.
 
 **Consequence.** `examples/c/encode.c` encodes a Y4M file, splits each frame into packets of 1,200 bytes, decodes them with the C decoder, last packet first, and checks the PSNR; CI runs it on Linux, macOS and Windows. Frames through the C API are the bytes of the Rust encoder, with tight or padded rows.
+
+### 2026-10-24 — D34: The decoder's frame upload through a buffer it keeps
+
+**Context.** A 4K frame decoded to planes in about 1.05 ms on an Apple M3 Max, upstream's decoder at FP32 in 0.79 ms. The GPU times were close, 0.55 against 0.50 ms; the difference was on the CPU, which took 0.23 ms to prepare a frame: 72 µs to assemble it and 174 µs to hand its 1.2 MB of blocks to `Queue::write_buffer` (medians of 300 frames), about 7 GB/s. That is what D30 found for the encoder: `write_buffer` takes new staging memory for every call, and the first writes to it cost more than the copy (issue #45).
+
+**Decision.**
+- The decodes that wait for their frame (`decode`, `decode_rgb`, `time_frame`, and the C API's) write the block table and the payload into an upload buffer the decoder keeps, mapped for writing before each frame, which waits for nothing since the frame before is done, and copied into the decoder's buffers at the start of the frame's command buffer. It is made on the first such decode, and made again when the payload buffer grows, so a decoder that only records into the caller's command encoder never has it.
+- `encode_rgb`, which records the decode into the caller's command encoder without waiting, and so cannot know when the previous frame let go of the buffer, still writes through the queue. So does the browser player, where nothing may block.
+- When a frame fails, the decoder and the encoder poll the device once, without waiting, while no loss is recorded, as `GpuContext::explain` does (D31's companion fix of #35): a destroyed device fails the mapping before anything else has polled it, and is reported as lost only after a poll.
+
+**Consequence.** Measured alternately with the build before, three rounds of 600 frames each: a 4K frame decodes to planes in 0.87 to 0.91 ms instead of 1.05 to 1.07 ms, and to RGB in 1.20 to 1.21 ms instead of 1.34 to 1.40 ms; the CPU's part falls from 0.23 to 0.08 ms. At 1440p the planes take 0.50 to 0.54 ms instead of 0.61 to 0.63, at 1080p 0.39 ms instead of 0.46 to 0.51 in two rounds of three (the third had a slower GPU, after as before). A decoder keeps a second buffer of the payload's size, 1.2 MB at 4K.
+
