@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.0] - 2026-10-24
+
+Faster native clients: a decoded picture reaches the CPU in a third of the time, through the C API and the command line tool, and pictures in textures encode faster. Also fixes from a review of the browser pages, which now hold a file once, survive a lost GPU and refuse files that would ask for gigabytes.
 
 ### Added
 
