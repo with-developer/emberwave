@@ -4,6 +4,14 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ## [Unreleased]
 
+### Added
+
+- Decoding into the Metal client's own textures (decision D44, [#63](https://github.com/with-developer/emberwave/issues/63)).
+  - `emberwave_texture_from_metal` and `emberwave_texture_from_metal_plane` wrap an `id<MTLTexture>` of the client's, such as the BGRA texture of a `CVPixelBuffer` for an `AVSampleBufferDisplayLayer`. Every decode into textures then fills it.
+  - A copy fills a texture that is not framebuffer-only, as a `CVMetalTextureCache`'s is not, at a width of a multiple of 64 pixels. A draw fills a render target.
+  - The decodes that do not wait take only textures whose hazards Metal tracks.
+  - In Rust, a picture's target needs `RENDER_ATTACHMENT` only where a draw fills it.
+
 ### Changed
 
 - The iPhone and iPad benchmark app also times decoding into Y, Cb and Cr textures and on the app's own queue, and checks both through Metal: the planes against those decoded to memory, and a decode on the app's queue against the RGB decode, read by the app's next command buffer without a wait. CI runs the checks in an iOS Simulator.

@@ -147,4 +147,5 @@ emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 
 - **인코더**: `emberwave-cli encode`가 Y4M을 프레임당 바이트 예산 안에서 PWV1로 인코딩합니다. 업스트림 디코더가 그대로 읽고, 같은 바이트에서 PSNR이 업스트림 인코더와 같거나 높습니다(장면 영상에서 +0.6~+3.4 dB). `--gpu`를 주면 GPU에서 인코딩하며, Apple M3 Max에서 4K 한 프레임이 업로드와 읽기를 포함해 약 1.9 ms로 CPU보다 100배 이상 빠르고, 같은 정밀도의 원본 인코더(3.2~3.4 ms)보다 빠릅니다. GPU 메모리의 텍스처에 있는 그림도 바로 인코딩합니다(`Encoder::encode_textures`, 4K 약 1.8 ms). GPU 인코더의 프레임은 CPU 인코더와 같거나 일부 블록만 다르며(자연 영상에서 보낸 블록의 약 0.5%) PSNR은 같고, Apple M3 Max에서 커밋된 벡터는 모두 바이트 단위로 같습니다.
 - **GPU에서 그림 넘기기(#27, #64)**: Metal 클라이언트는 디코딩한 그림을 CPU로 복사하지 않고 텍스처로 받아 `id<MTLTexture>`로 바로 그릴 수 있습니다(M3 Max 4K: 1.3~1.4 ms, CPU로 RGB 복사 시 2.6 ms). 색 변환을 직접 하는 클라이언트는 Y·Cb·Cr 평면을 R8 텍스처 세 장으로 받습니다. 가장 빠른 경로입니다(4K 1.0~1.1 ms, 1080p 0.45 ms).
 - **앱의 큐에서 대기 없이(#62, #63)**: 앱의 `MTLDevice`·`MTLCommandQueue`로 컨텍스트를 만들면 `emberwave_decoder_submit_texture`가 GPU를 기다리지 않고 돌아옵니다. Metal이 같은 큐의 순서로 앱의 그리기를 디코딩 뒤에 둡니다. 4K에서 디코딩 스레드가 1.3 ms 대신 0.26 ms만 묶이고, 텍스처 하나로 충분합니다.
-- **남은 일**: 앱의 텍스처(드로어블·IOSurface)로 디코딩(#63), Vulkan·D3D12 핸들.
+- **앱의 텍스처로(#63)**: `emberwave_texture_from_metal`로 앱의 `MTLTexture`(예: `AVSampleBufferDisplayLayer`에 넘길 `CVPixelBuffer`의 텍스처)에 바로 디코딩합니다.
+- **남은 일**: Vulkan·D3D12 핸들.
