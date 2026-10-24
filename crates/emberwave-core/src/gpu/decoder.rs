@@ -201,6 +201,35 @@ struct DrawResources {
     bind_group: wgpu::BindGroup,
 }
 
+/// How the RGB picture gets into a texture (decision D42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// A copy of the colour conversion's words, written in the texture's
+    /// channel order: blue first with `bgra`.
+    Copy { bgra: bool },
+    /// A draw of `draw.wgsl`, for the textures a copy cannot fill.
+    Draw,
+}
+
+impl Fill {
+    /// How the picture gets into `texture`, a target that passed
+    /// `check_target`: a copy when the texture takes one and its rows are a
+    /// multiple of 256 bytes, as a copy's must be, a draw otherwise. On an
+    /// Apple M3 Max the copy takes 0.12 to 0.16 ms less a frame.
+    fn of(texture: &wgpu::Texture) -> Self {
+        let row_bytes = texture.width() * 4;
+        if texture.usage().contains(wgpu::TextureUsages::COPY_DST)
+            && row_bytes.is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+        {
+            Self::Copy {
+                bgra: texture.format() == wgpu::TextureFormat::Bgra8Unorm,
+            }
+        } else {
+            Self::Draw
+        }
+    }
+}
+
 /// The texture formats the decoder draws into: 8-bit RGBA or BGRA, as most
 /// graphics APIs and displays take them. Not their sRGB forms: the samples
 /// are gamma encoded already, and an sRGB target would encode them again.
@@ -405,7 +434,7 @@ impl Decoder {
         self.assemble_complete(frame)?;
         self.ensure_payload_capacity()?;
         with_error_scope(&self.device, || self.upload())?;
-        self.prepare_color(color)?;
+        self.prepare_color(color, false)?;
         self.encode_passes(encoder, true, None);
         self.assembler.mark_frame_decoded();
         Ok(())
@@ -414,15 +443,17 @@ impl Decoder {
     /// The RGBA words that [`encode_rgb`](Self::encode_rgb) and
     /// [`decode_rgb`](Self::decode_rgb) write, once one of them has run:
     /// `width * height` words, one per pixel, red in the low byte, alpha 255.
-    /// The buffer belongs to the decoder: dropping the decoder destroys it,
-    /// clones of the handle included.
+    /// After a decode copied into a BGRA texture they are BGRA words, blue in
+    /// the low byte, until the next decode. The buffer belongs to the
+    /// decoder: dropping the decoder destroys it, clones of the handle
+    /// included.
     pub fn rgba_buffer(&self) -> Option<&wgpu::Buffer> {
         self.color.as_ref().map(|resources| &resources.rgba)
     }
 
     /// Records the decode of one complete frame and its conversion to RGB
-    /// into `encoder`, as [`encode_rgb`](Self::encode_rgb) does, and then a
-    /// draw of the picture into `target`. Once the caller has submitted
+    /// into `encoder`, as [`encode_rgb`](Self::encode_rgb) does, and then
+    /// what puts the picture into `target`. Once the caller has submitted
     /// `encoder`, the texture holds the picture.
     ///
     /// `target` is a view of a 2D texture of the picture's size, of one mip
@@ -432,7 +463,15 @@ impl Decoder {
     /// [`GpuError::Texture`], before the frame is used. The view has to be in
     /// the texture's own format, which cannot be checked: a view in another
     /// format the texture allows, such as its sRGB form, fails wgpu's
-    /// validation when the work is submitted.
+    /// validation when the picture is drawn.
+    ///
+    /// A texture that also has the `COPY_DST` usage, and a width of a
+    /// multiple of 64 pixels, so that its rows are a multiple of 256 bytes
+    /// as a copy's are, takes the picture with a copy, which costs less than
+    /// the draw other textures take (decision D42). A copy does not go
+    /// through the view: whatever its format, the texture gets the picture's
+    /// bytes, and a view in an sRGB format then decodes them once more when
+    /// it is sampled.
     pub fn encode_rgb_to_texture(
         &mut self,
         frame: &[u8],
@@ -445,10 +484,13 @@ impl Decoder {
         self.assemble_complete(frame)?;
         self.ensure_payload_capacity()?;
         with_error_scope(&self.device, || self.upload())?;
-        self.prepare_color(color)?;
-        self.prepare_draw(target.texture().format())?;
+        let fill = Fill::of(target.texture());
+        self.prepare_color(color, fill == Fill::Copy { bgra: true })?;
+        if fill == Fill::Draw {
+            self.prepare_draw(target.texture().format())?;
+        }
         self.encode_passes(encoder, true, None);
-        self.encode_draw(encoder, target);
+        self.encode_picture(encoder, target, fill);
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -477,10 +519,11 @@ impl Decoder {
 
     /// A texture that [`encode_rgb_to_texture`](Self::encode_rgb_to_texture)
     /// and [`decode_assembled_to_texture`](Self::decode_assembled_to_texture)
-    /// can draw into: the picture's size, in `format`, one of
-    /// [`TEXTURE_FORMATS`], for drawing into, sampling and copying from
-    /// (`RENDER_ATTACHMENT`, `TEXTURE_BINDING` and `COPY_SRC`). BGRA suits a
-    /// copy onto a display's surface, which usually is BGRA.
+    /// can put the picture into: the picture's size, in `format`, one of
+    /// [`TEXTURE_FORMATS`], for drawing and copying into, sampling and copying
+    /// from (`RENDER_ATTACHMENT`, `COPY_DST`, `TEXTURE_BINDING` and
+    /// `COPY_SRC`). BGRA suits a copy onto a display's surface, which usually
+    /// is BGRA.
     pub fn create_texture(&self, format: wgpu::TextureFormat) -> Result<wgpu::Texture, GpuError> {
         self.check_device()?;
         if !TEXTURE_FORMATS.contains(&format) {
@@ -493,7 +536,7 @@ impl Decoder {
             "decoded picture",
             (layout.width(), layout.height()),
             format,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
         )
     }
 
@@ -765,10 +808,14 @@ impl Decoder {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
+        let fill = match read {
+            Read::Texture(target) => Some(Fill::of(target.texture())),
+            Read::Nothing | Read::Yuv | Read::Rgb | Read::Planes(_) => None,
+        };
         if let Some(color) = color {
-            self.prepare_color(color)?;
+            self.prepare_color(color, fill == Some(Fill::Copy { bgra: true }))?;
         }
-        if let Read::Texture(target) = read {
+        if let (Read::Texture(target), Some(Fill::Draw)) = (read, fill) {
             self.prepare_draw(target.texture().format())?;
         }
         let prepare = assembled_in + prepare_start.elapsed();
@@ -815,10 +862,12 @@ impl Decoder {
                 );
             }
             self.encode_passes(&mut encoder, color.is_some(), queries);
-            match read {
-                Read::Texture(target) => self.encode_draw(&mut encoder, target),
-                Read::Planes(targets) => self.encode_plane_copies(&mut encoder, targets),
-                Read::Nothing | Read::Yuv | Read::Rgb => {}
+            match (read, fill) {
+                (Read::Texture(target), Some(fill)) => {
+                    self.encode_picture(&mut encoder, target, fill);
+                }
+                (Read::Planes(targets), _) => self.encode_plane_copies(&mut encoder, targets),
+                _ => {}
             }
             if let Some((source, target, bytes)) = copy_back {
                 encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
@@ -932,6 +981,36 @@ impl Decoder {
             bind_group,
         });
         Ok(())
+    }
+
+    /// Records what puts the RGB picture into `target`: a copy of the colour
+    /// conversion's words, which [`prepare_color`](Self::prepare_color) wrote
+    /// in the texture's channel order, or a draw.
+    fn encode_picture(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        fill: Fill,
+    ) {
+        match (fill, &self.color) {
+            (Fill::Copy { .. }, Some(color)) => {
+                let texture = target.texture();
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &color.rgba,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(texture.width() * 4),
+                            rows_per_image: None,
+                        },
+                    },
+                    texture.as_image_copy(),
+                    texture.size(),
+                );
+            }
+            (Fill::Copy { .. }, None) => {}
+            (Fill::Draw, _) => self.encode_draw(encoder, target),
+        }
     }
 
     /// Records the draw of the RGB picture into `target`, which
@@ -1065,9 +1144,11 @@ impl Decoder {
     }
 
     /// Creates the buffers of the colour conversion on first use and writes
-    /// the parameters, which may change from call to call.
-    fn prepare_color(&mut self, color: &ColorParams) -> Result<(), GpuError> {
-        let params = YuvParams::new(self.assembler.layout(), &self.buffers, color);
+    /// the parameters, which may change from call to call: with `bgra` the
+    /// words have blue in the low byte, for a copy into a BGRA texture.
+    fn prepare_color(&mut self, color: &ColorParams, bgra: bool) -> Result<(), GpuError> {
+        let mut params = YuvParams::new(self.assembler.layout(), &self.buffers, color);
+        params.bgra = u32::from(bgra);
 
         if self.color.is_none() {
             let bytes = u64::from(params.width) * u64::from(params.height) * 4;
@@ -1552,6 +1633,51 @@ mod tests {
         let word0 = (width - 1) | ((height - 1) << 14) | (1 << 28) | (1 << 31);
         let word1 = u32::from(chroma == ChromaSubsampling::Yuv444) << 26;
         [word0.to_le_bytes(), word1.to_le_bytes()].concat()
+    }
+
+    #[test]
+    fn a_copy_fills_the_textures_it_can_and_a_draw_the_others() {
+        // The texture tests see the same picture either way: this pins which
+        // way each texture takes (decision D42).
+        let Some(context) = test_context() else {
+            return;
+        };
+        let texture = |width, format, usage| {
+            context.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height: 8,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | usage,
+                view_formats: &[],
+            })
+        };
+        let (rgba, bgra) = (
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let copies = wgpu::TextureUsages::COPY_DST;
+        let none = wgpu::TextureUsages::empty();
+        for (width, format, usage, fill) in [
+            (64, rgba, copies, Fill::Copy { bgra: false }),
+            (1920, bgra, copies, Fill::Copy { bgra: true }),
+            (3840, rgba, copies, Fill::Copy { bgra: false }),
+            (1920, bgra, none, Fill::Draw),
+            (200, rgba, copies, Fill::Draw),
+            (1000, bgra, copies, Fill::Draw),
+        ] {
+            assert_eq!(
+                Fill::of(&texture(width, format, usage)),
+                fill,
+                "{width} wide, {format:?}, {usage:?}"
+            );
+        }
     }
 
     #[test]
