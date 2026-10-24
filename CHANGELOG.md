@@ -7,6 +7,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 ### Added
 
 - A benchmark page for browsers, [`bench.html`](https://with-developer.github.io/emberwave/bench.html) next to the player: it encodes test streams at 1080p, 1440p and 4K in the page and times their decoding to RGB in GPU memory frame by frame, on any device with WebGPU, a phone included, and gives a report to copy.
+- The C library for apps on iPhones, iPads and Macs, as `Emberwave.xcframework` (decision D35, [#52](https://github.com/with-developer/emberwave/issues/52)). Each release has it as `emberwave-ffi-VERSION-xcframework.zip`. It holds static libraries for devices (iOS 12 or later), for the iOS Simulator on Apple silicon and for Macs with Apple silicon, with the header and a module map, so that Swift can `import Emberwave`. `scripts/build_xcframework.sh` builds it, and `crates/emberwave-ffi/examples/swift` is the decoding example in Swift. CI runs the C and Swift examples, linked with it, on a Mac and in an iOS Simulator.
 
 ### Changed
 
@@ -18,6 +19,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 - Output piped into a program that stops reading, such as `emberwave-cli info FILE | head`, made the command panic; it now ends quietly.
 - Errors of `emberwave-cli` name the file they are about. `compare` reads both files frame by frame rather than whole, `bench-encode` refuses a picture size the format cannot have before it reads the video, the Y4M reader reads no header or frame line longer than 64 KiB, `compare --min-psnr` refuses NaN, which every PSNR passed, and `decode` of a PWV1 file without frames is an error, as it is for `bench` and `compare`.
 - `FrameAssembler` ignores a block of an older frame even when its size is wrong, as upstream does, rather than rejecting the packet.
+- No context could be created where the adapter falls short of a WebGPU default limit that emberwave does not need. Metal gives the iOS Simulator, and Apple GPUs before the A11, 15 inter-stage variables, one fewer than the default. A context now asks for no limit beyond the adapter's (decision D36, [#54](https://github.com/with-developer/emberwave/issues/54)).
 
 ## [0.6.0] - 2026-10-24
 

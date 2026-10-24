@@ -84,6 +84,27 @@ pub fn parse_backends(text: &str) -> Option<wgpu::Backends> {
     (!backends.is_empty()).then_some(backends)
 }
 
+/// The limits a context asks for: the portable default limits, except that
+/// buffers and textures may be as large as the adapter allows, and that no
+/// limit is beyond what the adapter has. Large frames need large buffers, and
+/// the textures of pictures to encode are as large as the pictures, up to
+/// 16384 where WebGPU guarantees 8192. Some adapters fall short of a default
+/// that emberwave does not need: Metal gives the iOS Simulator and Apple GPUs
+/// before the A11 15 inter-stage variables, one fewer than WebGPU's default,
+/// and the compute shaders use none. A limit the shaders do need fails where
+/// the pipelines are made, naming it. With `strict_webgpu`, the defaults
+/// exactly.
+fn required_limits(supported: &wgpu::Limits, strict_webgpu: bool) -> wgpu::Limits {
+    if strict_webgpu {
+        return wgpu::Limits::default();
+    }
+    let mut limits = wgpu::Limits::default().or_worse_values_from(supported);
+    limits.max_storage_buffer_binding_size = supported.max_storage_buffer_binding_size;
+    limits.max_buffer_size = supported.max_buffer_size;
+    limits.max_texture_dimension_2d = supported.max_texture_dimension_2d;
+    limits
+}
+
 /// Held while [`GpuContext::new`] makes a context, so that two never overlap
 /// (decision D31).
 #[cfg(not(target_arch = "wasm32"))]
@@ -151,17 +172,7 @@ impl GpuContext {
         adapter: wgpu::Adapter,
         options: &GpuOptions,
     ) -> Result<Self, GpuError> {
-        // The portable default limits, except that buffers and textures may
-        // be as large as the adapter allows: large frames need large
-        // buffers, and the textures of pictures to encode are as large as
-        // the pictures, up to 16384 where WebGPU guarantees 8192.
-        let mut limits = wgpu::Limits::default();
-        if !options.strict_webgpu {
-            let supported = adapter.limits();
-            limits.max_storage_buffer_binding_size = supported.max_storage_buffer_binding_size;
-            limits.max_buffer_size = supported.max_buffer_size;
-            limits.max_texture_dimension_2d = supported.max_texture_dimension_2d;
-        }
+        let limits = required_limits(&adapter.limits(), options.strict_webgpu);
 
         let timestamps = options.timestamps
             && !options.strict_webgpu
@@ -337,5 +348,50 @@ mod tests {
         assert_eq!(parse_backends("opengl"), None);
         assert_eq!(parse_backends("gl"), None);
         assert_eq!(parse_backends("vulkan,nonsense"), None);
+    }
+
+    #[test]
+    fn a_context_asks_for_no_limit_beyond_the_adapter() {
+        // Metal's limits for the iOS Simulator and Apple GPUs before the A11.
+        let supported = wgpu::Limits {
+            max_inter_stage_shader_variables: 15,
+            ..wgpu::Limits::default()
+        };
+        let limits = required_limits(&supported, false);
+        assert_eq!(limits.max_inter_stage_shader_variables, 15);
+        assert!(limits.check_limits(&supported));
+
+        // An alignment the adapter needs coarser than the default, a minimum
+        // rather than a maximum, is kept at the adapter's.
+        let supported = wgpu::Limits {
+            min_storage_buffer_offset_alignment: 1024,
+            ..wgpu::Limits::default()
+        };
+        let limits = required_limits(&supported, false);
+        assert_eq!(limits.min_storage_buffer_offset_alignment, 1024);
+        assert!(limits.check_limits(&supported));
+    }
+
+    #[test]
+    fn a_context_asks_for_the_largest_buffers_and_textures_and_otherwise_the_defaults() {
+        let supported = wgpu::Limits {
+            max_storage_buffer_binding_size: 1 << 31,
+            max_buffer_size: 1 << 34,
+            max_texture_dimension_2d: 16384,
+            max_inter_stage_shader_variables: 31,
+            max_compute_workgroup_storage_size: 32768,
+            ..wgpu::Limits::default()
+        };
+        let limits = required_limits(&supported, false);
+        assert_eq!(limits.max_storage_buffer_binding_size, 1 << 31);
+        assert_eq!(limits.max_buffer_size, 1 << 34);
+        assert_eq!(limits.max_texture_dimension_2d, 16384);
+        // Better than the default elsewhere, the adapter's values are not
+        // asked for: a device with the defaults behaves alike everywhere.
+        assert_eq!(limits.max_inter_stage_shader_variables, 16);
+        assert_eq!(limits.max_compute_workgroup_storage_size, 16384);
+
+        // Strict WebGPU: the defaults, however much the adapter has.
+        assert_eq!(required_limits(&supported, true), wgpu::Limits::default());
     }
 }

@@ -8,3 +8,6 @@
 # The browser build (scripts/build_web.sh)
 /web/pkg/
 /web/samples/
+
+# SwiftPM's build directory, if the Swift example is built in place
+/crates/emberwave-ffi/examples/swift/.build/
