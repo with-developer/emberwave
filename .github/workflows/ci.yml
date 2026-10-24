@@ -106,3 +106,23 @@ jobs:
       - name: Run the C example
         shell: bash
         run: scripts/check_c_example.sh target/debug
+
+  xcframework:
+    name: XCFramework (iOS Simulator, macOS)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable toolchain with the iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-ios --target aarch64-apple-ios-sim --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: scripts/build_xcframework.sh
+      - run: cargo build -p emberwave-cli
+      # The C and Swift examples, linked with the XCFramework, decode the test
+      # vectors on this Mac and in an iOS Simulator; for devices they are
+      # linked only.
+      - run: scripts/check_xcframework.sh target/debug/emberwave-cli

@@ -1,9 +1,9 @@
 name: Release
 
 # Pushing a tag vX.Y.Z builds emberwave-cli and the C library (emberwave-ffi)
-# for Linux, macOS and Windows and publishes a GitHub release with the
-# archives, their checksums and the CHANGELOG.md section of that version as
-# the notes. Run by hand (workflow_dispatch), on a branch or a tag, it builds
+# for Linux, macOS and Windows, and the C library as an XCFramework for iOS
+# and macOS, and publishes a GitHub release with the archives, their
+# checksums and the CHANGELOG.md section of that version as the notes. Run by hand (workflow_dispatch), on a branch or a tag, it builds
 # and packages the same archives without checking or publishing anything: a
 # rehearsal before tagging.
 
@@ -120,8 +120,40 @@ jobs:
           path: emberwave-*.${{ matrix.archive }}
           if-no-files-found: error
 
+  xcframework:
+    name: build (XCFramework)
+    needs: check
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable toolchain with the iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-ios --target aarch64-apple-ios-sim --no-self-update
+          rustup default stable
+      - name: Build
+        run: scripts/build_xcframework.sh
+      - name: Package
+        run: |
+          ref=${GITHUB_REF_NAME//\//-}
+          name="emberwave-ffi-${ref}-xcframework"
+          mkdir "$name"
+          cp -R target/xcframework/emberwave.xcframework "$name/"
+          cp target/xcframework/native-static-libs-*.txt "$name/"
+          cp crates/emberwave-ffi/README.md LICENSE CHANGELOG.md "$name/"
+          # ditto zips a bundle as Apple's tools do.
+          ditto -c -k --keepParent "$name" "$name.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xcframework
+          path: emberwave-ffi-*-xcframework.zip
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, xcframework]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
