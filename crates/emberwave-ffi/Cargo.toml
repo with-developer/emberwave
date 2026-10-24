@@ -17,6 +17,18 @@ crate-type = ["cdylib", "rlib"]
 emberwave-core.workspace = true
 wgpu.workspace = true
 
+# A context on the caller's own Metal device and queue
+# (emberwave_context_create_metal). wgpu uses these crates on Apple systems
+# already, and the core uses pollster.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLCommandQueue",
+    "MTLDevice",
+] }
+pollster.workspace = true
+
 [dev-dependencies]
 # tests/header.rs generates the C header to check the committed one.
 cbindgen = { version = "0.29", default-features = false }

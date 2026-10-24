@@ -299,6 +299,36 @@ enum EmberwaveStatus emberwave_probe_packet(const uint8_t *data,
 enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptions *options,
                                               struct EmberwaveContext **context);
 
+// Creates a context on the caller's own Metal device and command queue:
+// `device` is an `id<MTLDevice>` and `queue` an `id<MTLCommandQueue>` of it,
+// which emberwave retains while the context, or anything made on it, lives.
+// emberwave's GPU work then goes onto the caller's queue, and
+// `emberwave_decoder_submit_texture` and
+// `emberwave_decoder_submit_plane_textures` need not wait for it: Metal runs
+// the command buffers the caller commits to the queue after such a call
+// after the decode, and a decode after the command buffers committed before
+// it, for the textures they share (decision D43). Only on iPhones, iPads and
+// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+//
+// The queue is shared:
+// - Commit the command buffers that read the textures after the call that
+//   decoded into them has returned, from whichever thread.
+// - Use the textures in them directly, not through a heap or through an
+//   argument buffer without `useResource`: Metal does not track those.
+// - emberwave commits two command buffers a decode. A queue's default of 64
+//   command buffers in flight is plenty, and a full queue makes a call wait
+//   until the GPU frees one. A queue made with room for fewer than four can
+//   wait for good: emberwave makes its two before it commits them.
+//
+// # Safety
+//
+// `device` is `NULL` or an `id<MTLDevice>`, and `queue` is `NULL` or an
+// `id<MTLCommandQueue>`. `context` points to where the new context is
+// stored; it is set to `NULL` when the call fails.
+enum EmberwaveStatus emberwave_context_create_metal(void *device,
+                                                    void *queue,
+                                                    struct EmberwaveContext **context);
+
 // Destroys a context. Decoders and encoders created on it keep working, and
 // keep the GPU device until they are destroyed as well.
 //
@@ -488,6 +518,41 @@ void emberwave_texture_destroy(struct EmberwaveTexture *texture);
 enum EmberwaveStatus emberwave_decoder_decode_texture(struct EmberwaveDecoder *decoder,
                                                       const struct EmberwaveColor *color,
                                                       const struct EmberwaveTexture *texture);
+
+// Decodes the frame received so far into `texture`, as
+// `emberwave_decoder_decode_texture` does, but returns once the work is on
+// the queue, without waiting for it. Only for a decoder whose context runs
+// on the caller's own queue (`emberwave_context_create_metal`), where the
+// queue orders the work: the caller's command buffers committed to it after
+// this call returns see the picture, and the decode waits for those
+// committed before it that still read the texture. One texture can then
+// take every frame. A decoder of another context gives
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, as nothing there would order the
+// caller's reads after the decode.
+//
+// The frame goes to the GPU through memory wgpu allocates for it, which a
+// waiting decode does without. A failure that the GPU reports later, such
+// as a lost device, is that of a later call.
+//
+// # Safety
+//
+// As for `emberwave_decoder_decode_texture`.
+enum EmberwaveStatus emberwave_decoder_submit_texture(struct EmberwaveDecoder *decoder,
+                                                      const struct EmberwaveColor *color,
+                                                      const struct EmberwaveTexture *texture);
+
+// Decodes the frame received so far into the plane textures `y`, `cb` and
+// `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
+// the work is on the queue, as `emberwave_decoder_submit_texture` does, and
+// only for a decoder on the caller's own queue.
+//
+// # Safety
+//
+// As for `emberwave_decoder_decode_plane_textures`.
+enum EmberwaveStatus emberwave_decoder_submit_plane_textures(struct EmberwaveDecoder *decoder,
+                                                             const struct EmberwaveTexture *y,
+                                                             const struct EmberwaveTexture *cb,
+                                                             const struct EmberwaveTexture *cr);
 
 // Decodes the frame received so far and copies its Y, Cb and Cr planes into
 // `y`, `cb` and `cr` on the GPU, then waits for the GPU: when this returns,

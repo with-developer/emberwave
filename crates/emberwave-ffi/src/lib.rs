@@ -238,11 +238,31 @@ pub struct EmberwavePacket {
 pub struct EmberwaveContext {
     context: GpuContext,
     adapter: CString,
+    /// Whether the context runs on the caller's own Metal queue
+    /// (`emberwave_context_create_metal`), where decodes need not wait.
+    shared_queue: bool,
+}
+
+impl EmberwaveContext {
+    /// A new context of `created`'s, on the caller's queue with
+    /// `shared_queue`.
+    fn boxed(created: GpuContext, shared_queue: bool) -> *mut Self {
+        let info = created.adapter_info();
+        let adapter = format!("{} ({:?})", info.name, info.backend).replace('\0', "");
+        Box::into_raw(Box::new(Self {
+            context: created,
+            adapter: CString::new(adapter).unwrap_or_default(),
+            shared_queue,
+        }))
+    }
 }
 
 /// Decodes the frames of one stream: one picture size and chroma format.
 pub struct EmberwaveDecoder {
     decoder: Decoder,
+    /// Whether the decoder's context runs on the caller's own queue, which
+    /// the decoder keeps when the context is destroyed.
+    shared_queue: bool,
 }
 
 /// A texture on a decoder's GPU device that `emberwave_decoder_decode_texture`
@@ -815,16 +835,126 @@ pub unsafe extern "C" fn emberwave_context_create(
             None => GpuOptions::default(),
         };
         let created = GpuContext::new(&gpu_options)?;
-        let info = created.adapter_info();
-        let adapter = format!("{} ({:?})", info.name, info.backend).replace('\0', "");
-        let boxed = Box::new(EmberwaveContext {
-            context: created,
-            adapter: CString::new(adapter).unwrap_or_default(),
-        });
         // SAFETY: checked by the first output() above.
-        unsafe { context.write(Box::into_raw(boxed)) };
+        unsafe { context.write(EmberwaveContext::boxed(created, false)) };
         Ok(())
     })
+}
+
+/// Creates a context on the caller's own Metal device and command queue:
+/// `device` is an `id<MTLDevice>` and `queue` an `id<MTLCommandQueue>` of it,
+/// which emberwave retains while the context, or anything made on it, lives.
+/// emberwave's GPU work then goes onto the caller's queue, and
+/// `emberwave_decoder_submit_texture` and
+/// `emberwave_decoder_submit_plane_textures` need not wait for it: Metal runs
+/// the command buffers the caller commits to the queue after such a call
+/// after the decode, and a decode after the command buffers committed before
+/// it, for the textures they share (decision D43). Only on iPhones, iPads and
+/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+///
+/// The queue is shared:
+/// - Commit the command buffers that read the textures after the call that
+///   decoded into them has returned, from whichever thread.
+/// - Use the textures in them directly, not through a heap or through an
+///   argument buffer without `useResource`: Metal does not track those.
+/// - emberwave commits two command buffers a decode. A queue's default of 64
+///   command buffers in flight is plenty, and a full queue makes a call wait
+///   until the GPU frees one. A queue made with room for fewer than four can
+///   wait for good: emberwave makes its two before it commits them.
+///
+/// # Safety
+///
+/// `device` is `NULL` or an `id<MTLDevice>`, and `queue` is `NULL` or an
+/// `id<MTLCommandQueue>`. `context` points to where the new context is
+/// stored; it is set to `NULL` when the call fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_context_create_metal(
+    device: *mut c_void,
+    queue: *mut c_void,
+    context: *mut *mut EmberwaveContext,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        unsafe { output(context, "context", std::ptr::null_mut()) }?;
+        if device.is_null() {
+            return Err(Failure::argument("device is NULL"));
+        }
+        if queue.is_null() {
+            return Err(Failure::argument("queue is NULL"));
+        }
+        // SAFETY: as the caller promises.
+        let created = unsafe { metal_context(device, queue) }?;
+        // SAFETY: checked by the first output() above.
+        unsafe { context.write(EmberwaveContext::boxed(created, true)) };
+        Ok(())
+    })
+}
+
+/// A context on the `id<MTLDevice>` `device` and its `id<MTLCommandQueue>`
+/// `queue`, through wgpu's Metal objects made from them.
+///
+/// # Safety
+///
+/// `device` and `queue` are Metal objects of those kinds.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuContext, Failure> {
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{MTLCommandQueue, MTLDevice};
+
+    // SAFETY: Metal objects, as the caller promises, retained here for wgpu,
+    // which keeps them as long as the device it makes of them.
+    let device: Retained<ProtocolObject<dyn MTLDevice>> =
+        unsafe { Retained::retain(device.cast()) }.ok_or(Failure::argument("device is NULL"))?;
+    // SAFETY: as above.
+    let queue: Retained<ProtocolObject<dyn MTLCommandQueue>> =
+        unsafe { Retained::retain(queue.cast()) }.ok_or(Failure::argument("queue is NULL"))?;
+    if !std::ptr::eq(&*queue.device(), &*device) {
+        return Err(Failure::argument("queue is a queue of another device"));
+    }
+
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = wgpu::Backends::METAL;
+    let instance = wgpu::Instance::new(descriptor);
+    let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::METAL))
+        .into_iter()
+        .find(|adapter| {
+            // SAFETY: only the adapter's device is looked at, to compare it.
+            unsafe { adapter.as_hal::<wgpu::hal::api::Metal>() }
+                .is_some_and(|hal| std::ptr::eq(hal.raw_device(), &*device))
+        })
+        .ok_or(Failure(
+            EmberwaveStatus::NoGpu,
+            "wgpu offers no Metal adapter on that device".into(),
+        ))?;
+
+    let descriptor = GpuContext::device_descriptor(&adapter, &GpuOptions::default());
+    // SAFETY: the device is the adapter's, and the queue the device's, as
+    // checked above. The timestamp period does not matter: such a context
+    // does not ask for timestamps.
+    let open: wgpu::hal::OpenDevice<wgpu::hal::api::Metal> = unsafe {
+        wgpu::hal::OpenDevice {
+            device: wgpu::hal::metal::Device::device_from_raw(
+                device,
+                descriptor.required_features,
+                &descriptor.required_limits,
+            ),
+            queue: wgpu::hal::metal::Queue::queue_from_raw(queue, 1.0),
+        }
+    };
+    // SAFETY: the device and the queue are the adapter's and have the
+    // features and the limits of the descriptor, as above.
+    let (device, queue) = unsafe { adapter.create_device_from_hal(open, &descriptor) }
+        .map_err(|error| Failure(EmberwaveStatus::NoGpu, error.to_string()))?;
+    Ok(GpuContext::from_device(adapter, device, queue))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+unsafe fn metal_context(_device: *mut c_void, _queue: *mut c_void) -> Result<GpuContext, Failure> {
+    Err(Failure(
+        EmberwaveStatus::NoGpu,
+        "Metal contexts are made on iPhones, iPads and Macs only".into(),
+    ))
 }
 
 /// Destroys a context. Decoders and encoders created on it keep working, and
@@ -889,7 +1019,10 @@ pub unsafe extern "C" fn emberwave_decoder_create(
         let chroma = chroma_subsampling(chroma)?;
         let created =
             Decoder::new(&context.context, width, height, chroma).map_err(creation_failure)?;
-        let boxed = Box::new(EmberwaveDecoder { decoder: created });
+        let boxed = Box::new(EmberwaveDecoder {
+            decoder: created,
+            shared_queue: context.shared_queue,
+        });
         // SAFETY: checked by the first output() above.
         unsafe { decoder.write(Box::into_raw(boxed)) };
         Ok(())
@@ -1237,32 +1370,139 @@ pub unsafe extern "C" fn emberwave_decoder_decode_texture(
             // SAFETY: as the caller promises.
             let decoder = unsafe { live_mut(decoder) }?;
             // SAFETY: as the caller promises.
-            let Some(texture) = (unsafe { texture.as_ref() }) else {
-                return Err(Failure::argument("texture is NULL"));
-            };
-            // Not wgpu's device equality, which devices of two contexts can
-            // pass (GpuContext::id).
-            if texture.context_id != decoder.decoder.context_id() {
-                return Err(Failure::argument(
-                    "the texture is on the GPU device of another context",
-                ));
-            }
-            if let Some(plane) = texture.plane {
-                return Err(Failure::argument(format!(
-                    "the texture is for the {plane:?} plane, which \
-                     emberwave_decoder_decode_plane_textures fills"
-                )));
-            }
+            let view = unsafe { picture_view(texture, decoder.decoder.context_id()) }?;
             // SAFETY: as the caller promises.
             let params = unsafe { conversion(decoder, color) }?;
-            decoder
-                .decoder
-                .decode_assembled_to_texture(&params, &texture.view)?;
+            decoder.decoder.decode_assembled_to_texture(&params, view)?;
             Ok(())
         },
         // SAFETY: as the caller promises; the body's borrow has ended.
         || unsafe { lost(decoder) },
     )
+}
+
+/// The view of `texture`, unless it is `NULL`, on the device of another
+/// context than `context_id`'s, or for a plane.
+///
+/// # Safety
+///
+/// `texture` is `NULL` or a live texture, which outlives the view.
+unsafe fn picture_view<'a>(
+    texture: *const EmberwaveTexture,
+    context_id: u64,
+) -> Result<&'a wgpu::TextureView, Failure> {
+    // SAFETY: as the caller promises.
+    let Some(texture) = (unsafe { texture.as_ref() }) else {
+        return Err(Failure::argument("texture is NULL"));
+    };
+    // Not wgpu's device equality, which devices of two contexts can pass
+    // (GpuContext::id).
+    if texture.context_id != context_id {
+        return Err(Failure::argument(
+            "the texture is on the GPU device of another context",
+        ));
+    }
+    if let Some(plane) = texture.plane {
+        return Err(Failure::argument(format!(
+            "the texture is for the {plane:?} plane, which \
+             emberwave_decoder_decode_plane_textures fills"
+        )));
+    }
+    Ok(&texture.view)
+}
+
+/// Decodes the frame received so far into `texture`, as
+/// `emberwave_decoder_decode_texture` does, but returns once the work is on
+/// the queue, without waiting for it. Only for a decoder whose context runs
+/// on the caller's own queue (`emberwave_context_create_metal`), where the
+/// queue orders the work: the caller's command buffers committed to it after
+/// this call returns see the picture, and the decode waits for those
+/// committed before it that still read the texture. One texture can then
+/// take every frame. A decoder of another context gives
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, as nothing there would order the
+/// caller's reads after the decode.
+///
+/// The frame goes to the GPU through memory wgpu allocates for it, which a
+/// waiting decode does without. A failure that the GPU reports later, such
+/// as a lost device, is that of a later call.
+///
+/// # Safety
+///
+/// As for `emberwave_decoder_decode_texture`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_submit_texture(
+    decoder: *mut EmberwaveDecoder,
+    color: *const EmberwaveColor,
+    texture: *const EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            require_shared_queue(decoder)?;
+            // SAFETY: as the caller promises.
+            let view = unsafe { picture_view(texture, decoder.decoder.context_id()) }?;
+            // SAFETY: as the caller promises.
+            let params = unsafe { conversion(decoder, color) }?;
+            decoder.decoder.submit_assembled_to_texture(&params, view)?;
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Decodes the frame received so far into the plane textures `y`, `cb` and
+/// `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
+/// the work is on the queue, as `emberwave_decoder_submit_texture` does, and
+/// only for a decoder on the caller's own queue.
+///
+/// # Safety
+///
+/// As for `emberwave_decoder_decode_plane_textures`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures(
+    decoder: *mut EmberwaveDecoder,
+    y: *const EmberwaveTexture,
+    cb: *const EmberwaveTexture,
+    cr: *const EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            require_shared_queue(decoder)?;
+            let context_id = decoder.decoder.context_id();
+            // SAFETY: as the caller promises.
+            let targets = unsafe {
+                [
+                    plane_view(y, Component::Y, "y", context_id)?,
+                    plane_view(cb, Component::Cb, "cb", context_id)?,
+                    plane_view(cr, Component::Cr, "cr", context_id)?,
+                ]
+            };
+            decoder
+                .decoder
+                .submit_assembled_to_plane_textures(targets)?;
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// An error unless `decoder`'s context runs on the caller's own queue, which
+/// the decodes that do not wait need.
+fn require_shared_queue(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
+    if decoder.shared_queue {
+        Ok(())
+    } else {
+        Err(Failure::argument(
+            "the decoder's context is not on the caller's queue \
+             (emberwave_context_create_metal), so nothing would order the \
+             caller's reads after the decode: use the decode that waits",
+        ))
+    }
 }
 
 /// Decodes the frame received so far and copies its Y, Cb and Cr planes into

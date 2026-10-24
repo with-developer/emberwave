@@ -178,7 +178,32 @@ id<MTLTexture> luma = (__bridge id<MTLTexture>)emberwave_texture_metal(planes[ne
 
 A texture is for the plane it was made for, and a decode refuses textures passed in another order. The client converts with the matrix and range the stream signals (`emberwave_probe_packet`) or that it knows better. In 4:2:0 a chroma sample sits vertically halfway between two rows of luma, and horizontally halfway between two luma samples with `EMBERWAVE_SITING_CENTER`, on the left one with `EMBERWAVE_SITING_LEFT`. Device, ordering and pointers are as for the RGB texture.
 
-Vulkan and Direct3D 12 handles, decoding without waiting, and decoding on the client's own device and queue or into its own textures are not part of the interface yet.
+### On the client's own queue, without waiting
+
+The decodes above wait for the GPU, because emberwave works on a queue of its own and nothing else would order the client's reads after its writes. A context made on the client's own device and command queue needs neither the wait nor the textures in turn. Metal orders the command buffers of one queue that use the same texture by when they were committed, so the client's draw committed after a decode reads the new picture, and the next decode waits for that draw (decision D43):
+
+```objc
+id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+id<MTLCommandQueue> queue = [device newCommandQueue];
+EmberwaveContext *context;
+emberwave_context_create_metal((__bridge void *)device, (__bridge void *)queue, &context);
+/* ... a decoder on it, and one texture for every frame ... */
+
+/* For every frame that is ready: */
+emberwave_decoder_submit_texture(decoder, NULL, texture);   /* returns once the work is on the queue */
+id<MTLCommandBuffer> commands = [queue commandBuffer];       /* the same queue, committed after */
+/* ... encode the draw that samples the texture ... */
+[commands commit];
+```
+
+`emberwave_decoder_submit_plane_textures` does the same for the planes. On an Apple M3 Max a 4K frame takes the decoding thread 0.26 ms instead of 1.3 ms, and the client's draw completes as soon as after the waiting decode, at 1080p 0.1 ms sooner. The rules of a shared queue:
+- Use the textures directly in the command buffers that read them, not through a heap or through an argument buffer without `useResource`, as Metal does not track those.
+- Commit those command buffers after the call has returned.
+- emberwave commits two command buffers a decode; a queue's default of 64 in flight is plenty. A queue made with room for fewer than four can wait for good, as emberwave makes its two before it commits them.
+
+On a context of `emberwave_context_create` the submit functions refuse to work, as nothing there orders the reads.
+
+Vulkan and Direct3D 12 handles, and decoding into textures of the client's own, such as a drawable's or an IOSurface's, are not part of the interface yet.
 
 [`examples/ios`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/ios) is an iPhone and iPad app that does all of this in Swift: it times decoding into textures, decoding to planes and encoding on the device's GPU, and draws the last picture from its texture. Its README says how to run it on a phone.
 
