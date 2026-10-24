@@ -209,7 +209,8 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// A 2D texture of floats that is read with `textureLoad`, filterable or not.
+/// A 2D texture of floats, filterable or not, which `gather.wgsl` reads with
+/// `textureGather` through a sampler that does not filter.
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,

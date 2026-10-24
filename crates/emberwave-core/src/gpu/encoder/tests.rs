@@ -10,11 +10,13 @@ use crate::gpu::resources::{entry, read_back, uniform_buffer};
 
 use ChromaSubsampling::{Yuv420, Yuv444};
 
-/// Sizes and chroma formats: aligned and not, odd 4:4:4, the minimum frame,
+/// Sizes and chroma formats: aligned and not, odd 4:4:4, 4:2:0 whose chroma
+/// rows end inside a word and whose chroma height is odd, the minimum frame,
 /// and more than one tile at every level.
-const SHAPES: [(u32, u32, ChromaSubsampling); 5] = [
+const SHAPES: [(u32, u32, ChromaSubsampling); 6] = [
     (200, 120, Yuv420),
     (131, 67, Yuv444),
+    (196, 70, Yuv420),
     (640, 360, Yuv420),
     (2, 2, Yuv420),
     (1056, 544, Yuv444),
