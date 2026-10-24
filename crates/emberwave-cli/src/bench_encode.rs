@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use emberwave_core::bitstream::consts::HEADER_BYTES;
-use emberwave_core::bitstream::{ChromaSubsampling, Component};
+use emberwave_core::bitstream::{ChromaSubsampling, Component, FrameLayout};
 use emberwave_core::encode::{self, Signalling};
 use emberwave_core::gpu;
 
@@ -63,6 +63,63 @@ enum Encoder {
 enum Picture<'a> {
     Planes([&'a [u8]; 3]),
     Textures(gpu::TexturePicture<'a>),
+}
+
+/// The pictures of the video, taken in turn: in CPU memory, or in textures,
+/// an R8 texture per plane.
+enum Pictures {
+    Planes(Vec<[Vec<u8>; 3]>),
+    Textures(Vec<[wgpu::TextureView; 3]>),
+}
+
+impl Pictures {
+    fn len(&self) -> usize {
+        match self {
+            Self::Planes(frames) => frames.len(),
+            Self::Textures(textures) => textures.len(),
+        }
+    }
+
+    /// Picture `i`, from the first again after the last.
+    fn get(&self, i: usize) -> Picture<'_> {
+        match self {
+            Self::Planes(frames) => {
+                let frame = &frames[i % frames.len()];
+                Picture::Planes([&frame[0], &frame[1], &frame[2]])
+            }
+            Self::Textures(textures) => {
+                let [y, cb, cr] = &textures[i % textures.len()];
+                Picture::Textures(gpu::TexturePicture::Planes([y, cb, cr]))
+            }
+        }
+    }
+
+    /// The same pictures in textures on the context's device, made one
+    /// frame at a time: each frame's upload is submitted and done, and its
+    /// planes freed, before the next is made.
+    fn into_textures(self, context: &gpu::GpuContext, layout: &FrameLayout) -> Result<Self> {
+        let Self::Planes(frames) = self else {
+            return Ok(self);
+        };
+        let max = context.device().limits().max_texture_dimension_2d;
+        let (width, height) = layout.plane_size(Component::Y);
+        if width.max(height) > max {
+            return Err(format!(
+                "--textures: {width}x{height} is larger than the {max} texels a texture of this GPU may have"
+            )
+            .into());
+        }
+        let mut textures = Vec::with_capacity(frames.len());
+        for frame in frames {
+            textures.push(std::array::from_fn(|i| {
+                plane_texture(context, layout.plane_size(Component::ALL[i]), &frame[i])
+            }));
+            // wgpu uploads what write_texture stages with the next submission.
+            context.queue().submit([]);
+            context.device().poll(wgpu::PollType::wait_indefinitely())?;
+        }
+        Ok(Self::Textures(textures))
+    }
 }
 
 /// The series of a measurement: `total` always, the others on a GPU.
@@ -178,8 +235,7 @@ pub fn run(args: &Args) -> Result<()> {
         return Err("the Y4M file has no frames".into());
     }
 
-    // With --textures, a texture per plane of every frame, on the device.
-    let mut textures = Vec::new();
+    let mut pictures = Pictures::Planes(frames);
     let (mut encoder, adapter, backend) = if args.gpu {
         let context = args.gpu_args.create_context(true)?;
         let info = context.adapter_info();
@@ -191,18 +247,7 @@ pub fn run(args: &Args) -> Result<()> {
             Signalling::default(),
         )?;
         if args.textures {
-            let layout = encoder.layout().clone();
-            textures = frames
-                .iter()
-                .map(|frame| {
-                    std::array::from_fn::<_, 3, _>(|i| {
-                        let size = layout.plane_size(Component::ALL[i]);
-                        plane_texture(&context, size, &frame[i])
-                    })
-                })
-                .collect();
-            // Uploaded before the first encode is timed.
-            context.device().poll(wgpu::PollType::wait_indefinitely())?;
+            pictures = pictures.into_textures(&context, encoder.layout())?;
         }
         (
             Encoder::Gpu(Box::new(encoder)),
@@ -219,33 +264,24 @@ pub fn run(args: &Args) -> Result<()> {
     };
 
     // One pass over the video unless --frames says otherwise.
-    let count = args.frames.unwrap_or(frames.len());
-    let picture = |i: usize| {
-        let i = i % frames.len();
-        match textures.get(i) {
-            Some([y, cb, cr]) => Picture::Textures(gpu::TexturePicture::Planes([y, cb, cr])),
-            None => {
-                let frame = &frames[i];
-                Picture::Planes([&frame[0][..], &frame[1][..], &frame[2][..]])
-            }
-        }
-    };
-
+    let count = args.frames.unwrap_or(pictures.len());
     let mut measurement = Measurement::new();
     let warmup = warm_up(args.warmup, args.warmup_seconds, |i| {
-        measurement.encode(&mut encoder, picture(i), args.bytes_per_frame)
+        measurement.encode(&mut encoder, pictures.get(i), args.bytes_per_frame)
     })?;
     let mut measurement = Measurement::new();
     for i in 0..count {
-        measurement.encode(&mut encoder, picture(i), args.bytes_per_frame)?;
+        measurement.encode(&mut encoder, pictures.get(i), args.bytes_per_frame)?;
     }
+    // What was encoded, rather than what was asked for.
+    let from_textures = matches!(pictures, Pictures::Textures(_));
 
     let description = format!(
         "{width}x{height} {}, {} bytes per frame, encoded on the {}{}",
         chroma_name(header.chroma),
         args.bytes_per_frame,
         if args.gpu { "GPU" } else { "CPU" },
-        if args.textures { " from textures" } else { "" }
+        if from_textures { " from textures" } else { "" }
     );
     let series = measurement.series();
     if args.json {
@@ -261,8 +297,8 @@ pub fn run(args: &Args) -> Result<()> {
                     ("warmup", warmup.to_string()),
                     ("bytes_per_frame", args.bytes_per_frame.to_string()),
                     (
-                        "input",
-                        quote(if args.textures { "textures" } else { "planes" }),
+                        "picture",
+                        quote(if from_textures { "textures" } else { "planes" }),
                     ),
                 ],
                 &series,

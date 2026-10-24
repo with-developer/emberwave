@@ -603,9 +603,90 @@ fn textures_that_cannot_hold_their_planes_are_errors() {
             other => panic!("{what}: {:?}", other.map(drop)),
         }
     }
+    let multisampled = context
+        .device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("multisampled"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 4,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: bound | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default());
+    let picture = TexturePicture::Planes([&multisampled, &good.planes[1], &good.planes[2]]);
+    match encoder.encode_textures(picture, 100_000) {
+        Err(GpuError::Texture(actual)) => assert_eq!(
+            actual,
+            "the Y texture has 4 samples per texel rather than 1"
+        ),
+        other => panic!("samples: {:?}", other.map(drop)),
+    }
+    // The views are wgpu's to check: an array view of a texture that holds
+    // the plane fails in its validation.
+    let layers = context.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("two layers"),
+        size: wgpu::Extent3d {
+            width: 64,
+            height: 32,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: bound | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let array = layers.create_view(&Default::default());
+    let picture = TexturePicture::Planes([&array, &good.planes[1], &good.planes[2]]);
+    match encoder.encode_textures(picture, 100_000) {
+        Err(GpuError::Device(_)) => {}
+        other => panic!("an array view: {:?}", other.map(drop)),
+    }
     // A failure leaves the numbering alone: the next frame is still frame 1.
     let frame = encoder.encode_textures(good.planes(), 100_000).unwrap();
     assert_eq!(sequence_of(&frame), 1, "the first frame after the errors");
+
+    // A 2D view of one layer of an array texture is a plane like any other.
+    context.queue().write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &layers,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: 1 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &source[0],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(64),
+            rows_per_image: Some(32),
+        },
+        wgpu::Extent3d {
+            width: 64,
+            height: 32,
+            depth_or_array_layers: 1,
+        },
+    );
+    let second = layers.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        base_array_layer: 1,
+        array_layer_count: Some(1),
+        ..Default::default()
+    });
+    let picture = TexturePicture::Planes([&second, &good.planes[1], &good.planes[2]]);
+    let from_layer = encoder.encode_textures(picture, 100_000).unwrap();
+    // Frame 2 of the planes, sequence numbers in every block header included.
+    let mut reference = encoder_for(context, &layout);
+    reference.encode(planes(&source), 100_000).unwrap();
+    let expected = reference.encode(planes(&source), 100_000).unwrap();
+    assert!(from_layer == expected, "the frame of a layer's view");
 }
 
 #[test]
@@ -627,11 +708,12 @@ fn encoding_from_textures_frame_after_frame_allocates_nothing() {
         .map(|source| Textures::new(&context, &vector.layout, source))
         .collect();
     let mut encode = |round: usize| {
-        let textures = &textures[round % textures.len()];
-        let picture = if round.is_multiple_of(2) {
-            textures.planes()
+        let frame = &textures[round % textures.len()];
+        // Each frame in both layouts, in turn.
+        let picture = if (round / textures.len()).is_multiple_of(2) {
+            frame.planes()
         } else {
-            textures.luma_chroma()
+            frame.luma_chroma()
         };
         encoder.encode_textures(picture, vector.budget).unwrap();
     };

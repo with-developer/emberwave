@@ -81,10 +81,13 @@ pub struct EncodeTimings {
 
 /// A picture in GPU memory, for [`Encoder::encode_textures`]: views of 2D
 /// textures on the encoder's device, each texture of the size of the plane
-/// it holds, with one sample per texel and the `TEXTURE_BINDING` usage. A
-/// view shows the texture's first mip level and layer. Neither that nor the
-/// device can the encoder check, and wgpu does not always notice a texture
-/// of another device.
+/// it holds, with one sample per texel and the `TEXTURE_BINDING` usage.
+///
+/// The encoder checks the textures, not the views. A view is to be 2D and
+/// show one layer of the texture's first mip level: an array view fails as
+/// [`GpuError::Device`] when the frame's GPU work is made, and a view of
+/// another mip level goes unnoticed. So does, at times, a texture of another
+/// device, which wgpu may take for one of this device's.
 #[derive(Debug, Clone, Copy)]
 pub enum TexturePicture<'a> {
     /// Y, Cb and Cr, each in an `R8Unorm` texture.
@@ -944,8 +947,6 @@ impl PackBuffers<'_> {
     }
 }
 
-/// The payload buffer for `words` words and the read-back buffer that takes
-/// it with the summary.
 /// An error unless the texture of `view` can hold a plane of `width` x
 /// `height` samples in `format`; `name` names the plane in the error.
 fn check_texture(
@@ -981,6 +982,8 @@ fn check_texture(
     Err(GpuError::Texture(format!("the {name} texture {problem}")))
 }
 
+/// The payload buffer for `words` words and the read-back buffer that takes
+/// it with the summary.
 fn payload_buffers(device: &wgpu::Device, words: u64) -> (wgpu::Buffer, wgpu::Buffer) {
     let payload = buffer(
         device,

@@ -694,7 +694,7 @@ fn bench_encode_reports_per_frame_times_on_the_cpu_and_the_gpu() {
     assert_eq!(json["frames"], 5);
     assert_eq!(json["warmup"], 1);
     assert_eq!(json["bytes_per_frame"], 6000);
-    assert_eq!(json["input"], "planes");
+    assert_eq!(json["picture"], "planes");
     assert_eq!(json["unit"], "ms");
     for series in ["total", "cpu prepare", "gpu wall"] {
         let numbers = &json["series"][series];
@@ -763,7 +763,7 @@ fn bench_encode_times_pictures_in_textures() {
     };
     assert!(output.status.success(), "{}", stderr(&output));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
-    assert_eq!(json["input"], "textures");
+    assert_eq!(json["picture"], "textures");
     assert!(
         json["description"]
             .as_str()
