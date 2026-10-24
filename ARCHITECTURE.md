@@ -1010,7 +1010,7 @@ Picture sizes between 8192x4320 and 16384x16384 that the native decoder takes ar
   - `emberwave_decoder_decode_texture` draws into it and waits for the GPU, as the other decodes do.
   - `emberwave_texture_metal` and `emberwave_context_metal_device` give the `id<MTLTexture>` and the `id<MTLDevice>` through wgpu's `as_hal`. The pointers are borrowed, and `NULL` off Metal.
   - The documentation states the bridging rules and how long the pointers live.
-- Ordering. The call's return orders the client's reads after the draw. Nothing orders the next decode after those reads, so keeping three textures in turn is a stated rule, not a hint.
+- Ordering. The call's return orders the client's reads after the draw. Nothing orders the next decode after those reads, so keeping three textures in turn is a stated rule, not a hint. (Later, D43: on a context of the client's own queue, Metal orders both ways, and one tracked texture does.)
 - Contexts get a process-unique id. Every context makes its own `wgpu::Instance`, and `wgpu::Device` equality said that devices of two contexts were equal. A texture of another context then reached wgpu-core, which panicked on a view id missing from its registry; it could also have named an unrelated view. The C API compares context ids.
 - Deferred to issues:
   - Decoding without waiting, with an `MTLSharedEvent` signalled after the draw, which wgpu-hal can encode (#62).
@@ -1091,7 +1091,7 @@ The planes are the quickest way to the GPU at both sizes. The RGB texture's rend
 **Decision.**
 - When the target texture has the `COPY_DST` usage and its rows are a multiple of 256 bytes, a width of a multiple of 64 pixels, the colour conversion's words are copied into it. 720p, 1080p, 1440p and 4K are such widths.
 - For a BGRA texture `yuv2rgb.wgsl` writes blue in the low byte, a flag in its parameters, since a copy cannot swap channels. `Decoder::rgba_buffer` then holds BGRA words until the next decode, as its documentation says.
-- Other textures keep the draw. `RENDER_ATTACHMENT` is still required of every target, so any target can fall back to the draw.
+- Other textures keep the draw. `RENDER_ATTACHMENT` is still required of every target, so any target can fall back to the draw. (Later, D44: a target that takes a copy needs no render target.)
 - `create_texture`, and with it `emberwave_texture_create`, adds `COPY_DST`.
 - The browser player keeps drawing its canvas. WebGPU allows a canvas with `COPY_DST`, but wgpu 30's WebGPU backend reports `RENDER_ATTACHMENT` as a canvas's only usage. A player is not waiting on a frame the way a client in a stream is, and the change could not be tried in browsers here.
 - Not done:
@@ -1161,12 +1161,12 @@ Grok's review of the change found one defect, now fixed. A submitted decode coun
   - draws with `MTLTextureUsageRenderTarget`;
   - sampling with `ShaderRead`.
 
-  A texture of a `CVMetalTextureCache` can only be read unless the client asks for more, yet a blit may write it, as it is not framebuffer-only. At the usual widths a copy fills it. A drawable is framebuffer-only and takes a draw. A texture that neither a copy nor a draw can fill is refused at import, as is a framebuffer-only plane, since planes are copied.
+  A texture of a `CVMetalTextureCache` is not framebuffer-only, so a blit may write it whatever usage the client asks for with `kCVMetalTextureUsage`. On macOS its default usage is read, write and render target. At the usual widths a copy fills it. A drawable is framebuffer-only and takes a draw. A texture that neither a copy nor a draw can fill is refused at import, as is a framebuffer-only plane, since planes are copied.
 - In the core, a picture's target needs `RENDER_ATTACHMENT` only when a draw fills it. A target that takes a copy needs `COPY_DST` and rows of a multiple of 256 bytes, and nothing more.
 - A decode that does not wait takes only textures whose hazards Metal tracks, as D43's ordering rests on them. A `CVMetalTextureCache`'s are tracked; a heap's are not by default. The waiting decodes take any, as the wait orders the client's reads.
 - Not done: NV12, Cb and Cr in one `Rg8Unorm` plane, as `420v` pixel buffers have them. The BGRA picture and the three R8 planes are what the decoder gives.
 
-**Consequence.** `tests/metal.rs` makes textures as a `CVMetalTextureCache` does: shared storage, read only, or a render target where only a draw can fill them. It decodes into them, waiting and not, the picture at a width a copy takes and at one that needs the draw, and the planes. It reads them back through Metal and finds the decodes to CPU memory. It also checks what is refused:
+**Consequence.** `tests/metal.rs` makes textures as a `CVMetalTextureCache` does: shared storage, and the narrowest usage a client can ask for, read only, or a render target where only a draw can fill them. It decodes into them, waiting and not, the picture at a width a copy takes and at one that needs the draw, and the planes. It reads them back through Metal and finds the decodes to CPU memory. It also checks what is refused:
 - an untracked texture by a submit only;
 - the wrong size or pixel format;
 - a picture's texture that neither way can fill.
@@ -1174,3 +1174,22 @@ Grok's review of the change found one defect, now fixed. A submitted decode coun
 Grok argued the other side before the work. It kept the two functions and the usages read from the texture, and named the facts above about `CVMetalTextureCache` textures and drawables. It added the refusal of views, of memoryless textures and of framebuffer-only planes, and suggested leaving NV12 out.
 
 Grok's review of the change found no defect. It traced the reference taken at import to wgpu's release of it, and the device that the wrapper keeps alive. It checked the declared usages against wgpu-core's checks of copies and draws, and the browser's canvas, which keeps drawing. It also confirmed that the tests fail without the choice of a copy, the refusal of a draw without its usage, or the check of tracking.
+
+A review of the whole texture C API, before 0.11.0, read the four decisions together. It found no memory-safety or crash defect. It checked real `CVMetalTextureCache` textures on macOS with scratch programs:
+- by default their usage is read, write, render target and pixel format views, and they are tracked and shared;
+- they decode right at 192 and 200 pixels wide;
+- 5000 rounds of import, decode and destruction did not grow the process.
+
+It did find the contract text behind the code. Fixed:
+- The ordering rules were stated three ways. `EmberwaveTexture`'s documentation now sets out every case, and the decodes point to it:
+  - on emberwave's own queue, textures in turn;
+  - on the client's queue with a tracked texture, one texture, for the decodes that wait as well;
+  - an untracked texture only with the decodes that wait, in turn;
+  - other readers of the memory, such as a display layer, only after the GPU is done.
+- The README's pixel-buffer sample said that the submit could replace the waiting decode where it could not. The submit now has its own sample, which hands the buffer on in the completed handler of a command buffer that uses the texture. One that does not use it may run beside the decode and finish first.
+- `emberwave_texture_from_metal_plane` takes the plane before the Metal texture, as `emberwave_texture_create_plane` does. No release had it yet.
+- One Metal texture wrapped for two planes slipped past the check for three different textures, which compares wgpu's. The plane decodes now compare the Metal textures behind them.
+- The documentation now covers the newer functions:
+  - `emberwave_texture_destroy` and `emberwave_context_destroy` name the newer constructors;
+  - the refusals of each decode are listed in full, and the statuses described as returned;
+  - the `# Safety` sections of the functions that take a decoder ask that no other thread uses it.
