@@ -79,6 +79,15 @@
 // The PQ transfer function of SMPTE ST 2084, for high dynamic range.
 #define EMBERWAVE_TRANSFER_PQ 1
 
+// A texture of four unsigned normalised 8-bit channels, red first and alpha
+// 255: `MTLPixelFormatRGBA8Unorm` in Metal.
+#define EMBERWAVE_TEXTURE_RGBA8 0
+
+// A texture of four unsigned normalised 8-bit channels, blue first and alpha
+// 255: `MTLPixelFormatBGRA8Unorm` in Metal, the format of most display
+// surfaces, onto which a copy needs the same order.
+#define EMBERWAVE_TEXTURE_BGRA8 1
+
 // The result of a call.
 typedef enum EmberwaveStatus {
   // The call succeeded.
@@ -114,6 +123,10 @@ typedef struct EmberwaveDecoder EmberwaveDecoder;
 // Encodes the pictures of one stream on the GPU: one picture size and
 // chroma format.
 typedef struct EmberwaveEncoder EmberwaveEncoder;
+
+// A texture on a decoder's GPU device that `emberwave_decoder_decode_texture`
+// draws pictures into, for the caller's graphics API to read on the GPU.
+typedef struct EmberwaveTexture EmberwaveTexture;
 
 // What a stream says about its pictures.
 typedef struct EmberwaveStreamInfo {
@@ -393,6 +406,90 @@ enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decod
 enum EmberwaveStatus emberwave_decoder_decode_rgb(struct EmberwaveDecoder *decoder,
                                                   const struct EmberwaveColor *color,
                                                   struct EmberwavePlane rgb);
+
+// Creates a texture that `emberwave_decoder_decode_texture` draws the
+// pictures of `decoder` into, on the decoder's GPU device: the pictures'
+// size, in `format`, `EMBERWAVE_TEXTURE_RGBA8` or `EMBERWAVE_TEXTURE_BGRA8`,
+// which the GPU can sample and copy from but the CPU cannot read (Metal's
+// private storage). `emberwave_texture_metal` gives its Metal texture.
+// Decoders of the same picture size on the same context may share textures.
+//
+// # Safety
+//
+// `decoder` is a live decoder. `texture` points to where the new texture is
+// stored; it is set to `NULL` when the call fails.
+enum EmberwaveStatus emberwave_texture_create(const struct EmberwaveDecoder *decoder,
+                                              uint32_t format,
+                                              struct EmberwaveTexture **texture);
+
+// Destroys a texture.
+//
+// # Safety
+//
+// `texture` is `NULL`, or a texture from `emberwave_texture_create` that has
+// not been destroyed and that no other thread is using. A Metal texture of
+// it that the caller has not retained goes with it.
+void emberwave_texture_destroy(struct EmberwaveTexture *texture);
+
+// Decodes the frame received so far, converts it to RGB and draws it into
+// `texture` on the GPU, then waits for the GPU: when this returns, the
+// texture holds the picture, for the caller's graphics API to read on any
+// queue of the device. The picture never goes through CPU memory. Blocks
+// that did not arrive decode as zeros.
+//
+// `color` chooses the conversion as for `emberwave_decoder_decode_rgb`, and
+// with `NULL` follows the frame. Upstream's Metal encoder signals BT.709,
+// full range and centred chroma whatever the pictures are, so a caller that
+// knows better passes that, as the converted picture cannot be taken back.
+//
+// Nothing orders this call's writes after the caller's GPU work that still
+// reads the texture: passing a texture that a command buffer of the caller's
+// may still sample overwrites it under that work. Keep one texture for each
+// such command buffer and one to decode into, three with a display's
+// synchronisation and two frames in flight, and pass one whose readers have
+// completed. A texture of another context's device, or of another picture
+// size, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to
+// decode.
+//
+// # Safety
+//
+// `decoder` is a live decoder and `texture` a live texture that no other
+// thread is using, and `color` is `NULL` or points to an `EmberwaveColor`.
+enum EmberwaveStatus emberwave_decoder_decode_texture(struct EmberwaveDecoder *decoder,
+                                                      const struct EmberwaveColor *color,
+                                                      const struct EmberwaveTexture *texture);
+
+// The Metal texture of `texture`, an `id<MTLTexture>` in the format the
+// texture was made with, or `NULL` when its context does not run on Metal,
+// a Vulkan context on a Mac included, or `texture` is `NULL`.
+//
+// The pointer is borrowed: `texture` keeps it, and destroying `texture`
+// releases it. Take it with `(__bridge id<MTLTexture>)` in Objective-C, or
+// `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` in Swift,
+// never with a transfer of ownership, which would release emberwave's
+// reference. A command buffer that has encoded it keeps it until it
+// completes. Read it only once `emberwave_decoder_decode_texture` has
+// returned, and only on the device of `emberwave_context_metal_device`.
+//
+// # Safety
+//
+// `texture` is `NULL` or a live texture.
+void *emberwave_texture_metal(const struct EmberwaveTexture *texture);
+
+// The Metal device of `context`, an `id<MTLDevice>`, or `NULL` when the
+// context does not run on Metal or `context` is `NULL`. The textures of its
+// decoders are on this device, so the caller's Metal work that reads them
+// belongs on it too: make the caller's queue and resources on it, or check
+// that the caller's device is this one.
+//
+// The pointer is borrowed, as that of `emberwave_texture_metal`, and stays
+// valid while the context or any decoder, encoder or texture made on it is
+// alive.
+//
+// # Safety
+//
+// `context` is `NULL` or a live context.
+void *emberwave_context_metal_device(const struct EmberwaveContext *context);
 
 // Creates an encoder on `context` for pictures of `width` x `height` pixels
 // in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. Width and

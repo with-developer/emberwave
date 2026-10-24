@@ -19,7 +19,7 @@
 //!   `EMBERWAVE_STATUS_INTERNAL`. Destroy the object it happened in.
 
 use std::cell::RefCell;
-use std::ffi::{CString, c_char};
+use std::ffi::{CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use emberwave_core::bitstream::{
@@ -99,6 +99,14 @@ pub const EMBERWAVE_PRIMARIES_BT2020: u32 = 1;
 pub const EMBERWAVE_TRANSFER_SRGB: u32 = 0;
 /// The PQ transfer function of SMPTE ST 2084, for high dynamic range.
 pub const EMBERWAVE_TRANSFER_PQ: u32 = 1;
+
+/// A texture of four unsigned normalised 8-bit channels, red first and alpha
+/// 255: `MTLPixelFormatRGBA8Unorm` in Metal.
+pub const EMBERWAVE_TEXTURE_RGBA8: u32 = 0;
+/// A texture of four unsigned normalised 8-bit channels, blue first and alpha
+/// 255: `MTLPixelFormatBGRA8Unorm` in Metal, the format of most display
+/// surfaces, onto which a copy needs the same order.
+pub const EMBERWAVE_TEXTURE_BGRA8: u32 = 1;
 
 /// How `emberwave_context_create` chooses the GPU.
 #[repr(C)]
@@ -228,6 +236,15 @@ pub struct EmberwaveContext {
 /// Decodes the frames of one stream: one picture size and chroma format.
 pub struct EmberwaveDecoder {
     decoder: Decoder,
+}
+
+/// A texture on a decoder's GPU device that `emberwave_decoder_decode_texture`
+/// draws pictures into, for the caller's graphics API to read on the GPU.
+pub struct EmberwaveTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// The context whose device it is on, which decodes into it must use.
+    context_id: u64,
 }
 
 /// Encodes the pictures of one stream on the GPU: one picture size and
@@ -415,6 +432,28 @@ fn chroma_subsampling(chroma: u32) -> Result<ChromaSubsampling, Failure> {
 
 /// The error of creating a decoder or an encoder of the caller's size: an
 /// invalid size is the caller's numbers, not a stream's.
+/// The conversion to RGB that `color` asks for, or with `NULL` the one the
+/// frame's start of frame header signals (BT.709, video range and centred
+/// chroma while that header has not arrived).
+///
+/// # Safety
+///
+/// `color` is `NULL` or points to an `EmberwaveColor`.
+unsafe fn conversion(
+    decoder: &EmberwaveDecoder,
+    color: *const EmberwaveColor,
+) -> Result<ColorParams, Failure> {
+    // SAFETY: as the caller promises.
+    match unsafe { color.as_ref() } {
+        Some(color) => color_params(color),
+        None => Ok(decoder
+            .decoder
+            .start_of_frame()
+            .map(ColorParams::from_stream)
+            .unwrap_or_default()),
+    }
+}
+
 fn creation_failure(error: GpuError) -> Failure {
     match error {
         GpuError::Bitstream(BitstreamError::InvalidDimensions { .. }) => {
@@ -1009,14 +1048,7 @@ pub unsafe extern "C" fn emberwave_decoder_decode_rgb(
             // SAFETY: as the caller promises.
             let decoder = unsafe { live_mut(decoder) }?;
             // SAFETY: as the caller promises.
-            let params = match unsafe { color.as_ref() } {
-                Some(color) => color_params(color)?,
-                None => decoder
-                    .decoder
-                    .start_of_frame()
-                    .map(ColorParams::from_stream)
-                    .unwrap_or_default(),
-            };
+            let params = unsafe { conversion(decoder, color) }?;
             let layout = decoder.decoder.layout();
             let row_bytes = 3 * layout.width() as usize;
             check_target(&rgb, "rgb", row_bytes, layout.height() as usize)?;
@@ -1033,6 +1065,208 @@ pub unsafe extern "C" fn emberwave_decoder_decode_rgb(
         // SAFETY: as the caller promises; the body's borrow has ended.
         || unsafe { lost(decoder) },
     )
+}
+
+/// Creates a texture that `emberwave_decoder_decode_texture` draws the
+/// pictures of `decoder` into, on the decoder's GPU device: the pictures'
+/// size, in `format`, `EMBERWAVE_TEXTURE_RGBA8` or `EMBERWAVE_TEXTURE_BGRA8`,
+/// which the GPU can sample and copy from but the CPU cannot read (Metal's
+/// private storage). `emberwave_texture_metal` gives its Metal texture.
+/// Decoders of the same picture size on the same context may share textures.
+///
+/// # Safety
+///
+/// `decoder` is a live decoder. `texture` points to where the new texture is
+/// stored; it is set to `NULL` when the call fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_create(
+    decoder: *const EmberwaveDecoder,
+    format: u32,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live(decoder) }?;
+            let format = match format {
+                EMBERWAVE_TEXTURE_RGBA8 => wgpu::TextureFormat::Rgba8Unorm,
+                EMBERWAVE_TEXTURE_BGRA8 => wgpu::TextureFormat::Bgra8Unorm,
+                other => {
+                    return Err(Failure::argument(format!(
+                        "format is {other}, not EMBERWAVE_TEXTURE_RGBA8 or EMBERWAVE_TEXTURE_BGRA8"
+                    )));
+                }
+            };
+            let created = decoder.decoder.create_texture(format)?;
+            let view = created.create_view(&Default::default());
+            let boxed = Box::new(EmberwaveTexture {
+                texture: created,
+                view,
+                context_id: decoder.decoder.context_id(),
+            });
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(boxed)) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Destroys a texture.
+///
+/// # Safety
+///
+/// `texture` is `NULL`, or a texture from `emberwave_texture_create` that has
+/// not been destroyed and that no other thread is using. A Metal texture of
+/// it that the caller has not retained goes with it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_destroy(texture: *mut EmberwaveTexture) {
+    if !texture.is_null() {
+        // SAFETY: it came from Box::into_raw, as the caller promises.
+        let boxed = unsafe { Box::from_raw(texture) };
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+    }
+}
+
+/// Decodes the frame received so far, converts it to RGB and draws it into
+/// `texture` on the GPU, then waits for the GPU: when this returns, the
+/// texture holds the picture, for the caller's graphics API to read on any
+/// queue of the device. The picture never goes through CPU memory. Blocks
+/// that did not arrive decode as zeros.
+///
+/// `color` chooses the conversion as for `emberwave_decoder_decode_rgb`, and
+/// with `NULL` follows the frame. Upstream's Metal encoder signals BT.709,
+/// full range and centred chroma whatever the pictures are, so a caller that
+/// knows better passes that, as the converted picture cannot be taken back.
+///
+/// Nothing orders this call's writes after the caller's GPU work that still
+/// reads the texture: passing a texture that a command buffer of the caller's
+/// may still sample overwrites it under that work. Keep one texture for each
+/// such command buffer and one to decode into, three with a display's
+/// synchronisation and two frames in flight, and pass one whose readers have
+/// completed. A texture of another context's device, or of another picture
+/// size, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to
+/// decode.
+///
+/// # Safety
+///
+/// `decoder` is a live decoder and `texture` a live texture that no other
+/// thread is using, and `color` is `NULL` or points to an `EmberwaveColor`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_decode_texture(
+    decoder: *mut EmberwaveDecoder,
+    color: *const EmberwaveColor,
+    texture: *const EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            // SAFETY: as the caller promises.
+            let Some(texture) = (unsafe { texture.as_ref() }) else {
+                return Err(Failure::argument("texture is NULL"));
+            };
+            // Not wgpu's device equality, which devices of two contexts can
+            // pass (GpuContext::id).
+            if texture.context_id != decoder.decoder.context_id() {
+                return Err(Failure::argument(
+                    "the texture is on the GPU device of another context",
+                ));
+            }
+            // SAFETY: as the caller promises.
+            let params = unsafe { conversion(decoder, color) }?;
+            decoder
+                .decoder
+                .decode_assembled_to_texture(&params, &texture.view)?;
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// The Metal texture of `texture`, an `id<MTLTexture>` in the format the
+/// texture was made with, or `NULL` when its context does not run on Metal,
+/// a Vulkan context on a Mac included, or `texture` is `NULL`.
+///
+/// The pointer is borrowed: `texture` keeps it, and destroying `texture`
+/// releases it. Take it with `(__bridge id<MTLTexture>)` in Objective-C, or
+/// `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` in Swift,
+/// never with a transfer of ownership, which would release emberwave's
+/// reference. A command buffer that has encoded it keeps it until it
+/// completes. Read it only once `emberwave_decoder_decode_texture` has
+/// returned, and only on the device of `emberwave_context_metal_device`.
+///
+/// # Safety
+///
+/// `texture` is `NULL` or a live texture.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_metal(texture: *const EmberwaveTexture) -> *mut c_void {
+    // SAFETY: as the caller promises.
+    match unsafe { texture.as_ref() } {
+        Some(texture) => metal_texture(&texture.texture),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// The Metal device of `context`, an `id<MTLDevice>`, or `NULL` when the
+/// context does not run on Metal or `context` is `NULL`. The textures of its
+/// decoders are on this device, so the caller's Metal work that reads them
+/// belongs on it too: make the caller's queue and resources on it, or check
+/// that the caller's device is this one.
+///
+/// The pointer is borrowed, as that of `emberwave_texture_metal`, and stays
+/// valid while the context or any decoder, encoder or texture made on it is
+/// alive.
+///
+/// # Safety
+///
+/// `context` is `NULL` or a live context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_context_metal_device(
+    context: *const EmberwaveContext,
+) -> *mut c_void {
+    // SAFETY: as the caller promises.
+    match unsafe { context.as_ref() } {
+        Some(context) => metal_device(context.context.device()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// The `id<MTLTexture>` behind `texture`, or `NULL` off Metal.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn metal_texture(texture: &wgpu::Texture) -> *mut c_void {
+    // SAFETY: only the handle is taken out, for the caller's graphics API,
+    // which reads the texture while no work of emberwave's writes it, as
+    // emberwave_decoder_decode_texture asks.
+    let hal = unsafe { texture.as_hal::<wgpu::hal::api::Metal>() };
+    hal.map_or(std::ptr::null_mut(), |hal| {
+        std::ptr::from_ref(hal.raw_handle()).cast_mut().cast()
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn metal_texture(_texture: &wgpu::Texture) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// The `id<MTLDevice>` behind `device`, or `NULL` off Metal.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn metal_device(device: &wgpu::Device) -> *mut c_void {
+    // SAFETY: only the handle is taken out, for the caller's graphics API to
+    // make its own objects on.
+    let hal = unsafe { device.as_hal::<wgpu::hal::api::Metal>() };
+    hal.map_or(std::ptr::null_mut(), |hal| {
+        std::ptr::from_ref(&**hal.raw_device()).cast_mut().cast()
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn metal_device(_device: &wgpu::Device) -> *mut c_void {
+    std::ptr::null_mut()
 }
 
 /// Creates an encoder on `context` for pictures of `width` x `height` pixels

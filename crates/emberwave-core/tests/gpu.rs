@@ -299,6 +299,163 @@ fn the_rows_handed_out_are_those_of_the_decoded_frame() {
     }
 }
 
+/// The pixels of a 2D texture of 4-byte texels, row after row, read back
+/// through a buffer whose rows are padded to 256 bytes as copies need.
+fn read_texture(context: &GpuContext, texture: &wgpu::Texture) -> Vec<u8> {
+    let (width, height) = (texture.width(), texture.height());
+    let row = width * 4;
+    let padded =
+        row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let device = context.device();
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("texture readback"),
+        size: u64::from(padded * height),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        texture.size(),
+    );
+    context.queue().submit([encoder.finish()]);
+    let slice = buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |result| result.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let mapped = slice.get_mapped_range().expect("mapped range");
+    mapped
+        .chunks(padded as usize)
+        .flat_map(|line| line[..row as usize].to_vec())
+        .collect()
+}
+
+/// RGB pixels as RGBA, alpha 255, or as BGRA with `bgra`.
+fn with_alpha(rgb: &[u8], bgra: bool) -> Vec<u8> {
+    rgb.chunks_exact(3)
+        .flat_map(|p| {
+            if bgra {
+                [p[2], p[1], p[0], 255]
+            } else {
+                [p[0], p[1], p[2], 255]
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_picture_drawn_into_a_texture_is_the_rgb_picture() {
+    let context = gpu_or_return!();
+    let color = ColorParams::default();
+    for name in ["gradient_200x120_420", "noise_131x67_444"] {
+        let (layout, frames) = vector_frames(name);
+        let mut decoder = decoder_for(context, &layout);
+
+        // Into a texture of the decoder's, waiting for the GPU.
+        let rgb = decoder.decode_rgb(&frames[0], &color).expect("RGB decode");
+        let texture = decoder
+            .create_texture(wgpu::TextureFormat::Rgba8Unorm)
+            .expect("texture");
+        let view = texture.create_view(&Default::default());
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        decoder
+            .decode_assembled_to_texture(&color, &view)
+            .expect("decode into a texture");
+        assert_eq!(
+            read_texture(context, &texture),
+            with_alpha(&rgb.data, false),
+            "{name}: RGBA"
+        );
+
+        // Into a BGRA texture of the caller's, recorded into its encoder.
+        let rgb = decoder.decode_rgb(&frames[1], &color).expect("RGB decode");
+        let bgra = context.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("caller's texture"),
+            size: texture.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut encoder = context.device().create_command_encoder(&Default::default());
+        decoder
+            .encode_rgb_to_texture(
+                &frames[1],
+                &color,
+                &bgra.create_view(&Default::default()),
+                &mut encoder,
+            )
+            .expect("recorded decode into a texture");
+        context.queue().submit([encoder.finish()]);
+        assert_eq!(
+            read_texture(context, &bgra),
+            with_alpha(&rgb.data, true),
+            "{name}: BGRA"
+        );
+    }
+}
+
+#[test]
+fn only_a_texture_the_picture_fits_takes_it() {
+    let context = gpu_or_return!();
+    let color = ColorParams::default();
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(context, &layout);
+    let frame = decoder.decode(&frames[0]).expect("decode");
+    let make = |width, height, format, usage| {
+        context.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("unsuitable"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        })
+    };
+    let target = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    let unsuitable = [
+        make(199, 120, wgpu::TextureFormat::Rgba8Unorm, target),
+        make(200, 120, wgpu::TextureFormat::R8Unorm, target),
+        make(200, 120, wgpu::TextureFormat::Rgba8UnormSrgb, target),
+        make(
+            200,
+            120,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        ),
+    ];
+    for texture in &unsuitable {
+        let view = texture.create_view(&Default::default());
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        let outcome = decoder.decode_assembled_to_texture(&color, &view);
+        assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+        // The frame is still there to decode.
+        assert_eq!(decoder.decode_assembled().expect("decode"), frame);
+        let mut encoder = context.device().create_command_encoder(&Default::default());
+        let outcome = decoder.encode_rgb_to_texture(&frames[0], &color, &view, &mut encoder);
+        assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+    }
+}
+
 #[test]
 fn a_panic_while_rows_are_handed_out_leaves_the_decoder_usable() {
     let context = gpu_or_return!();

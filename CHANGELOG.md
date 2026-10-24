@@ -2,6 +2,21 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Pictures on the GPU for Metal clients (decision D40, [#27](https://github.com/with-developer/emberwave/issues/27)).
+  - `emberwave_texture_create` makes a texture of the picture's size, RGBA or BGRA, on the decoder's device.
+  - `emberwave_decoder_decode_texture` draws the RGB picture into it and waits.
+  - `emberwave_texture_metal` and `emberwave_context_metal_device` give the `id<MTLTexture>` and `id<MTLDevice>` behind them.
+  - On an Apple M3 Max a 4K frame takes 1.5 ms that way, against 2.7 ms to RGB in CPU memory.
+  - In Rust, `Decoder::encode_rgb_to_texture`, `decode_assembled_to_texture` and `create_texture` draw into a wgpu texture, and `GpuContext::id` tells contexts apart.
+
+### Changed
+
+- The browser player draws its canvas through `Decoder::encode_rgb_to_texture`, the same pass as the C API's textures.
+
 ## [0.8.0] - 2026-10-24
 
 Faster native clients: a decoded picture reaches the CPU in a third of the time, through the C API and the command line tool, and pictures in textures encode faster. Also fixes from a review of the browser pages, which now hold a file once, survive a lost GPU and refuse files that would ask for gigabytes.

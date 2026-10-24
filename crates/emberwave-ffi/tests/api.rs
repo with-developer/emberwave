@@ -543,3 +543,118 @@ fn a_decoder_outlives_its_context() {
         emberwave_decoder_destroy(decoder);
     }
 }
+
+/// Whether `context` runs on Metal, as its adapter's name says.
+fn on_metal(context: *const EmberwaveContext) -> bool {
+    // SAFETY: a live context, whose adapter name is a C string it keeps.
+    unsafe { CStr::from_ptr(emberwave_context_adapter(context)) }
+        .to_string_lossy()
+        .ends_with("(Metal)")
+}
+
+#[test]
+fn a_picture_reaches_a_texture_and_its_metal_handle() {
+    let Some(context) = context() else {
+        return;
+    };
+    let bytes = testdata("gradient_200x120_420.pwv1");
+    let frame = frames(&bytes)[0];
+    let decoder = decoder_for(context, &bytes);
+    let mut texture = ptr::null_mut();
+    // SAFETY: a live context, decoder and texture, and pointers to store
+    // results in.
+    unsafe {
+        assert_eq!(
+            emberwave_texture_create(decoder, EMBERWAVE_TEXTURE_RGBA8, &mut texture),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_decode_texture(decoder, ptr::null(), texture),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+
+        // Metal handles exactly when the context runs on Metal.
+        let metal = on_metal(context);
+        assert_eq!(!emberwave_texture_metal(texture).is_null(), metal);
+        assert_eq!(!emberwave_context_metal_device(context).is_null(), metal);
+        assert!(emberwave_texture_metal(ptr::null()).is_null());
+        assert!(emberwave_context_metal_device(ptr::null()).is_null());
+
+        emberwave_texture_destroy(texture);
+        emberwave_texture_destroy(ptr::null_mut());
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}
+
+#[test]
+fn a_texture_that_does_not_fit_is_refused_before_the_frame_is_used() {
+    let Some(context) = context() else {
+        return;
+    };
+    let Some(other_context) = crate::context() else {
+        return;
+    };
+    let gradient = testdata("gradient_200x120_420.pwv1");
+    let solid = testdata("solid_160x96_420.pwv1");
+    let frame = frames(&gradient)[0];
+    let decoder = decoder_for(context, &gradient);
+    let small = decoder_for(context, &solid);
+    let elsewhere = decoder_for(other_context, &gradient);
+    let texture = |decoder| {
+        let mut texture = ptr::null_mut();
+        // SAFETY: a live decoder and a pointer to store the texture in.
+        let status =
+            unsafe { emberwave_texture_create(decoder, EMBERWAVE_TEXTURE_RGBA8, &mut texture) };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        texture
+    };
+    let (fits, too_small, other_device) = (texture(decoder), texture(small), texture(elsewhere));
+    // SAFETY: live decoders and textures, and NULL where the test means it.
+    unsafe {
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        for (texture, complaint) in [
+            (too_small, "160x96"),
+            (other_device, "another context"),
+            (ptr::null_mut(), "texture is NULL"),
+        ] {
+            assert_eq!(
+                emberwave_decoder_decode_texture(decoder, ptr::null(), texture),
+                EmberwaveStatus::InvalidArgument
+            );
+            assert!(last_error().contains(complaint), "{}", last_error());
+        }
+        assert_eq!(
+            emberwave_decoder_decode_texture(ptr::null_mut(), ptr::null(), fits),
+            EmberwaveStatus::InvalidArgument
+        );
+
+        // The frame is still there to decode.
+        assert!(emberwave_decoder_is_ready(decoder, false));
+        assert_eq!(
+            emberwave_decoder_decode_texture(decoder, ptr::null(), fits),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        for texture in [fits, too_small, other_device] {
+            emberwave_texture_destroy(texture);
+        }
+        for decoder in [decoder, small, elsewhere] {
+            emberwave_decoder_destroy(decoder);
+        }
+        emberwave_context_destroy(context);
+        emberwave_context_destroy(other_context);
+    }
+}

@@ -235,6 +235,77 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// The render pipeline of `draw.wgsl` for targets of one format, with its
+/// bind group layout: the RGBA words and the picture's size.
+#[derive(Debug)]
+pub(crate) struct DrawPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub layout: wgpu::BindGroupLayout,
+    pub format: wgpu::TextureFormat,
+}
+
+impl DrawPipeline {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> Result<Self, GpuError> {
+        let fragment = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        with_error_scope(device, || {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("draw"),
+                source: wgpu::ShaderSource::Wgsl(shader_sources::DRAW.into()),
+            });
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("draw"),
+                entries: &[
+                    fragment(0, wgpu::BufferBindingType::Storage { read_only: true }),
+                    fragment(1, wgpu::BufferBindingType::Uniform),
+                ],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("draw"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("draw"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(format.into())],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            Self {
+                pipeline,
+                layout,
+                format,
+            }
+        })
+    }
+}
+
 /// The pipeline of a shader whose entry point is `main`.
 fn create_stage(
     device: &wgpu::Device,

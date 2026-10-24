@@ -1,5 +1,6 @@
 //! Creating the wgpu device.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::GpuError;
@@ -110,9 +111,14 @@ fn required_limits(supported: &wgpu::Limits, strict_webgpu: bool) -> wgpu::Limit
 #[cfg(not(target_arch = "wasm32"))]
 static CREATING: Mutex<()> = Mutex::new(());
 
+/// The id of the next context made (see [`GpuContext::id`]).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 /// An adapter, a device and its queue.
 #[derive(Debug, Clone)]
 pub struct GpuContext {
+    /// Tells this context's device from those of other contexts.
+    id: u64,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -207,6 +213,7 @@ impl GpuContext {
             adapter,
             device,
             queue,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             timestamps,
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
@@ -219,6 +226,16 @@ impl GpuContext {
     /// create a new context.
     pub fn lost(&self) -> Option<String> {
         self.lost.lock().ok().and_then(|lost| lost.clone())
+    }
+
+    /// A number that no other context of the process has and that clones of
+    /// this one share, which tells whether two objects are on the same
+    /// device. Comparing `wgpu::Device`s cannot: every context makes its own
+    /// `wgpu::Instance`, devices of different instances can compare equal,
+    /// and an object of one instance used on another names whatever has its
+    /// id there.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The error of a call that failed on this context's device: the loss of

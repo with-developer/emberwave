@@ -142,3 +142,20 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         assert_eq!(found, variables, "{name}");
     }
 }
+
+#[test]
+fn the_draw_shader_validates_without_optional_capabilities() {
+    let module = validate("draw", shader_sources::DRAW);
+    let stages: Vec<(&str, naga::ShaderStage)> = module
+        .entry_points
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.stage))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            ("vs", naga::ShaderStage::Vertex),
+            ("fs", naga::ShaderStage::Fragment)
+        ]
+    );
+}
