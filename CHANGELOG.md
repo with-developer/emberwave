@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.0] - 2026-10-24
+
+Pictures straight into Metal textures for iPhone, iPad and Mac apps, without a trip through CPU memory, and an iPhone and iPad app that times emberwave on the device's own GPU.
 
 ### Added
 
