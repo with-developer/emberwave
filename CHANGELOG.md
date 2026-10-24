@@ -2,6 +2,12 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- The iPhone and iPad benchmark app also times decoding into Y, Cb and Cr textures and on the app's own queue, and checks both through Metal: the planes against those decoded to memory, and a decode on the app's queue against the RGB decode, read by the app's next command buffer without a wait. CI runs the checks in an iOS Simulator.
+
 ## [0.10.0] - 2026-10-24
 
 More for Metal clients: the Y, Cb and Cr planes in textures, the fastest way to the GPU; the RGB picture into textures with a copy rather than a draw; and decoding on the client's own queue, which needs no wait and one texture.

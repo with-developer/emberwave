@@ -36,7 +36,7 @@ private func autorun() {
         for size in pictureSizes {
             results.append(try emberwave.run(size, plan) { print($0) })
         }
-        let check = try emberwave.checkTexture()
+        let check = try emberwave.checkTextures()
         print(makeReport(emberwave, plan, results, check: check))
         fflush(stdout)
         exit(0)
