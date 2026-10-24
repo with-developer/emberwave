@@ -737,7 +737,7 @@ fn into_app_textures(
                 );
                 let mut texture = ptr::null_mut();
                 assert_eq!(
-                    emberwave_texture_from_metal_plane(decoder, raw(&metal), plane, &mut texture),
+                    emberwave_texture_from_metal_plane(decoder, plane, raw(&metal), &mut texture),
                     EmberwaveStatus::Ok,
                     "{}",
                     last_error()
@@ -754,6 +754,49 @@ fn into_app_textures(
         );
         for ((metal, _), plane) in planes.iter().zip(&expected[0].1) {
             assert!(read(device, metal) == *plane, "a plane");
+        }
+        let shared = app_texture(
+            device,
+            MTLPixelFormat::R8Unorm,
+            sizes[1],
+            MTLTextureUsage::ShaderRead,
+            false,
+        );
+        let twice = [EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+            let mut texture = ptr::null_mut();
+            assert_eq!(
+                emberwave_texture_from_metal_plane(decoder, plane, raw(&shared), &mut texture),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            texture
+        });
+        push(frames[0]);
+        assert_eq!(
+            emberwave_decoder_decode_plane_textures(decoder, planes[0].1, twice[0], twice[1]),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("same Metal texture"),
+            "{}",
+            last_error()
+        );
+        assert_eq!(
+            emberwave_decoder_submit_plane_textures(decoder, planes[0].1, twice[0], twice[1]),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("same Metal texture"),
+            "{}",
+            last_error()
+        );
+        assert!(
+            emberwave_decoder_is_ready(decoder, false),
+            "the frame is still there"
+        );
+        for texture in twice {
+            emberwave_texture_destroy(texture);
         }
 
         // A texture Metal does not track: a waiting decode takes it, a
@@ -798,8 +841,8 @@ fn into_app_textures(
         assert_eq!(
             emberwave_texture_from_metal_plane(
                 decoder,
-                raw(&picture),
                 EMBERWAVE_PLANE_Y,
+                raw(&picture),
                 &mut refused
             ),
             EmberwaveStatus::InvalidArgument

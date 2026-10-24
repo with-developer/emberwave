@@ -88,21 +88,25 @@
 // surfaces, onto which a copy needs the same order.
 #define EMBERWAVE_TEXTURE_BGRA8 1
 
-// The luma plane, for `emberwave_texture_create_plane`.
+// The luma plane, for `emberwave_texture_create_plane` and
+// `emberwave_texture_from_metal_plane`.
 #define EMBERWAVE_PLANE_Y 0
 
-// The blue-difference chroma plane, for `emberwave_texture_create_plane`.
+// The blue-difference chroma plane, for `emberwave_texture_create_plane` and
+// `emberwave_texture_from_metal_plane`.
 #define EMBERWAVE_PLANE_CB 1
 
-// The red-difference chroma plane, for `emberwave_texture_create_plane`.
+// The red-difference chroma plane, for `emberwave_texture_create_plane` and
+// `emberwave_texture_from_metal_plane`.
 #define EMBERWAVE_PLANE_CR 2
 
 // The result of a call.
 typedef enum EmberwaveStatus {
   // The call succeeded.
   EMBERWAVE_STATUS_OK = 0,
-  // A pointer was `NULL`, a value out of range, or an output buffer too
-  // small.
+  // A pointer was `NULL`, a value out of range, an output buffer too
+  // small, or an object that does not fit the call, such as a texture of
+  // another device, size or kind.
   EMBERWAVE_STATUS_INVALID_ARGUMENT = 1,
   // The data is not a PyroWave stream this decoder can take: malformed, of
   // another picture size or chroma format, or not a start of frame header
@@ -133,10 +137,41 @@ typedef struct EmberwaveDecoder EmberwaveDecoder;
 // chroma format.
 typedef struct EmberwaveEncoder EmberwaveEncoder;
 
-// A texture on a decoder's GPU device that `emberwave_decoder_decode_texture`
-// draws pictures into, or into which `emberwave_decoder_decode_plane_textures`
-// copies one plane of them, for the caller's graphics API to read on the
-// GPU.
+// A texture on a decoder's GPU device that the decodes into textures fill
+// with the picture, `emberwave_decoder_decode_texture` and
+// `emberwave_decoder_submit_texture`, or with one of its planes,
+// `emberwave_decoder_decode_plane_textures` and
+// `emberwave_decoder_submit_plane_textures`, for the caller's graphics API
+// to read on the GPU. emberwave makes it (`emberwave_texture_create`,
+// `emberwave_texture_create_plane`), or wraps a Metal texture of the
+// caller's (`emberwave_texture_from_metal`,
+// `emberwave_texture_from_metal_plane`).
+//
+// How the decodes and the caller's reads of a texture are ordered:
+// - On a context of `emberwave_context_create`, emberwave works on a queue
+//   of its own. A decode that waits returns once the GPU has written the
+//   texture, so the caller's work committed afterwards, on any queue of the
+//   device, reads the picture. Nothing orders the next decode after the
+//   caller's work that may still read the texture: keep a texture for each
+//   command buffer of the caller's that may still read one, and one to
+//   decode into, three with a display's synchronisation and two frames in
+//   flight, and decode only into one whose readers have completed.
+// - On a context of `emberwave_context_create_metal`, emberwave works on the
+//   caller's queue, and for a texture whose hazards Metal tracks the queue
+//   orders both ways, for the decodes that wait and those that do not: the
+//   caller's command buffers committed to it after the call read the
+//   picture, and a decode waits for those committed before it. One texture
+//   takes every frame (decision D43).
+// - A texture whose hazards Metal does not track, as a caller's from a heap
+//   usually is, is ordered by neither: only the decodes that wait take it,
+//   and with textures in turn, as on a context of emberwave's own queue.
+// - The queue orders only command buffers that use the texture: one that
+//   does not may run beside the decode and finish first. Whatever else reads
+//   the memory, such as an `AVSampleBufferDisplayLayer` given the pixel
+//   buffer of a texture, or the CPU, waits until the GPU has written it:
+//   until a decode that waits returns, or until a command buffer that uses
+//   the texture, committed to the queue after a decode that does not wait,
+//   has completed.
 typedef struct EmberwaveTexture EmberwaveTexture;
 
 // What a stream says about its pictures.
@@ -308,7 +343,8 @@ enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptio
 // the command buffers the caller commits to the queue after such a call
 // after the decode, and a decode after the command buffers committed before
 // it, for the textures they share (decision D43). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+// `NULL`.
 //
 // The queue is shared:
 // - Commit the command buffers that read the textures after the call that
@@ -334,8 +370,9 @@ enum EmberwaveStatus emberwave_context_create_metal(void *device,
 //
 // # Safety
 //
-// `context` is `NULL`, or a context from `emberwave_context_create` that
-// has not been destroyed and that no other thread is using.
+// `context` is `NULL`, or a context from `emberwave_context_create` or
+// `emberwave_context_create_metal` that has not been destroyed and that no
+// other thread is using.
 void emberwave_context_destroy(struct EmberwaveContext *context);
 
 // The name and backend of the context's GPU, such as
@@ -375,7 +412,8 @@ void emberwave_decoder_destroy(struct EmberwaveDecoder *decoder);
 //
 // # Safety
 //
-// `decoder` is a live decoder, and `info` points to an `EmberwaveFrameInfo`
+// `decoder` is a live decoder that no other thread is using, and `info`
+// points to an `EmberwaveFrameInfo`
 // to fill in.
 enum EmberwaveStatus emberwave_decoder_info(const struct EmberwaveDecoder *decoder,
                                             struct EmberwaveFrameInfo *info);
@@ -457,8 +495,9 @@ enum EmberwaveStatus emberwave_decoder_decode_rgb(struct EmberwaveDecoder *decod
 //
 // # Safety
 //
-// `decoder` is a live decoder. `texture` points to where the new texture is
-// stored; it is set to `NULL` when the call fails.
+// `decoder` is a live decoder that no other thread is using. `texture`
+// points to where the new texture is stored; it is set to `NULL` when the
+// call fails.
 enum EmberwaveStatus emberwave_texture_create(const struct EmberwaveDecoder *decoder,
                                               uint32_t format,
                                               struct EmberwaveTexture **texture);
@@ -475,8 +514,9 @@ enum EmberwaveStatus emberwave_texture_create(const struct EmberwaveDecoder *dec
 //
 // # Safety
 //
-// `decoder` is a live decoder. `texture` points to where the new texture is
-// stored; it is set to `NULL` when the call fails.
+// `decoder` is a live decoder that no other thread is using. `texture`
+// points to where the new texture is stored; it is set to `NULL` when the
+// call fails.
 enum EmberwaveStatus emberwave_texture_create_plane(const struct EmberwaveDecoder *decoder,
                                                     uint32_t plane,
                                                     struct EmberwaveTexture **texture);
@@ -486,7 +526,8 @@ enum EmberwaveStatus emberwave_texture_create_plane(const struct EmberwaveDecode
 // `emberwave_texture_create`'s: a texture of a `CVPixelBuffer` from a
 // `CVMetalTextureCache`, to hand to an `AVSampleBufferDisplayLayer`, one the
 // caller made, or a drawable (decision D44). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+// `NULL`.
 //
 // The texture is on the device of the decoder's context
 // (`emberwave_context_metal_device`), 2D, of one level, layer and sample,
@@ -495,21 +536,25 @@ enum EmberwaveStatus emberwave_texture_create_plane(const struct EmberwaveDecode
 // the picture into it when its width is a multiple of 64 pixels and it is
 // not framebuffer-only, as a texture of a `CVPixelBuffer` is not; otherwise
 // it draws it, which needs `MTLTextureUsageRenderTarget`. A texture that
-// neither can fill gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`. So does one
-// that is not right, and `texture` is then `NULL`.
+// neither can fill gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and so does one
+// that is not right; `texture` is then `NULL`. On a context that does not
+// run on Metal, a Vulkan context on a Mac included, no texture is on the
+// context's Metal device.
 //
 // emberwave keeps a reference to `metal` until the texture is destroyed.
-// Keep what the texture comes from, such as the `CVMetalTextureRef`, alive
-// until the GPU work that writes it is done: after a waiting decode has
-// returned, or once a command buffer committed after
-// `emberwave_decoder_submit_texture` has completed. That function takes only
-// textures whose hazards Metal tracks, which a texture of a heap's usually
-// is not; the decodes that wait take any.
+// Keep what the texture comes from, such as the `CVMetalTextureRef`, until
+// the GPU has written the picture, and hand it to other readers, such as an
+// `AVSampleBufferDisplayLayer`, only then: after a decode that waits has
+// returned, or once a command buffer that uses the texture, committed to
+// the context's queue after a decode that does not wait, has completed. A texture whose hazards
+// Metal does not track, as a heap's usually is not, takes only the decodes
+// that wait, with textures in turn (see `EmberwaveTexture`).
 //
 // # Safety
 //
-// `decoder` is a live decoder, and `metal` is `NULL` or an
-// `id<MTLTexture>`. `texture` points to where the new texture is stored.
+// `decoder` is a live decoder that no other thread is using, and `metal` is
+// `NULL` or an `id<MTLTexture>`. `texture` points to where the new texture is
+// stored.
 enum EmberwaveStatus emberwave_texture_from_metal(const struct EmberwaveDecoder *decoder,
                                                   void *metal,
                                                   struct EmberwaveTexture **texture);
@@ -519,24 +564,27 @@ enum EmberwaveStatus emberwave_texture_from_metal(const struct EmberwaveDecoder 
 // one: `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
 // `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_metal`, but the
 // texture is `MTLPixelFormatR8Unorm` of the plane's size, and as a decode
-// copies a plane, not framebuffer-only.
+// copies a plane, not framebuffer-only. A Metal texture can be wrapped for
+// more than one plane, but a decode refuses it in two of them.
 //
 // # Safety
 //
 // As for `emberwave_texture_from_metal`.
 enum EmberwaveStatus emberwave_texture_from_metal_plane(const struct EmberwaveDecoder *decoder,
-                                                        void *metal,
                                                         uint32_t plane,
+                                                        void *metal,
                                                         struct EmberwaveTexture **texture);
 
 // Destroys a texture.
 //
 // # Safety
 //
-// `texture` is `NULL`, or a texture from `emberwave_texture_create` or
-// `emberwave_texture_create_plane` that has not been destroyed and that no
-// other thread is using. A Metal texture of it that the caller has not
-// retained goes with it.
+// `texture` is `NULL`, or a texture from `emberwave_texture_create`,
+// `emberwave_texture_create_plane`, `emberwave_texture_from_metal` or
+// `emberwave_texture_from_metal_plane` that has not been destroyed and that
+// no other thread is using. A Metal texture of one emberwave made goes with
+// it unless the caller retained it; of one that wraps a texture of the
+// caller's, only emberwave's reference goes.
 void emberwave_texture_destroy(struct EmberwaveTexture *texture);
 
 // Decodes the frame received so far, converts it to RGB and draws it into
@@ -551,13 +599,17 @@ void emberwave_texture_destroy(struct EmberwaveTexture *texture);
 // knows better passes that, as the converted picture cannot be taken back.
 //
 // The call does not wait for the caller's GPU work that still reads the
-// texture, and nothing in this interface orders its writes after that work;
-// Metal may, by stalling the decode, or it may not. Keep one texture for
-// each command buffer of the caller's that may still sample one and one to
-// decode into, three with a display's synchronisation and two frames in
-// flight, and pass one whose readers have completed. A texture of another
-// context's device, or of another picture size, gives
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode.
+// texture. Whether something orders the decode after that work, and so how
+// many textures the caller keeps in turn, depends on the context and the
+// texture: see `EmberwaveTexture`. In short, on a context of
+// `emberwave_context_create` keep three, and on one of
+// `emberwave_context_create_metal` one tracked texture does.
+//
+// `texture` is a texture of the picture from `emberwave_texture_create` or
+// `emberwave_texture_from_metal`, on a decoder of the same context and
+// picture size. `NULL`, a texture of a plane, of another context's device or
+// of another picture size gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` and
+// leaves the frame to decode.
 //
 // # Safety
 //
@@ -569,14 +621,22 @@ enum EmberwaveStatus emberwave_decoder_decode_texture(struct EmberwaveDecoder *d
 
 // Decodes the frame received so far into `texture`, as
 // `emberwave_decoder_decode_texture` does, but returns once the work is on
-// the queue, without waiting for it. Only for a decoder whose context runs
-// on the caller's own queue (`emberwave_context_create_metal`), where the
-// queue orders the work: the caller's command buffers committed to it after
-// this call returns see the picture, and the decode waits for those
-// committed before it that still read the texture. One texture can then
-// take every frame. A decoder of another context gives
+// the queue, without waiting for it. Only for a decoder whose context was
+// made by `emberwave_context_create_metal`, on the caller's own queue, and a
+// texture whose hazards Metal tracks: the queue orders the work then. The
+// caller's command buffers committed to it after this call returns see the
+// picture, and the decode waits for those committed before it that still
+// read the texture, so one texture takes every frame (see
+// `EmberwaveTexture`). A decoder of a context of `emberwave_context_create`,
+// or a texture Metal does not track, gives
 // `EMBERWAVE_STATUS_INVALID_ARGUMENT`, as nothing there would order the
 // caller's reads after the decode.
+//
+// The queue orders only command buffers that use the texture. Hand the
+// picture to anything else that reads its memory, such as an
+// `AVSampleBufferDisplayLayer` given the pixel buffer of the texture, or the
+// CPU, only once a command buffer that uses the texture, committed to the
+// queue after this call, has completed.
 //
 // The frame goes to the GPU through memory wgpu allocates for it, which a
 // waiting decode does without. A failure that the GPU reports later, such
@@ -591,8 +651,9 @@ enum EmberwaveStatus emberwave_decoder_submit_texture(struct EmberwaveDecoder *d
 
 // Decodes the frame received so far into the plane textures `y`, `cb` and
 // `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
-// the work is on the queue, as `emberwave_decoder_submit_texture` does, and
-// only for a decoder on the caller's own queue.
+// the work is on the queue, as `emberwave_decoder_submit_texture` does: only
+// for a decoder whose context was made by `emberwave_context_create_metal`,
+// and textures whose hazards Metal tracks.
 //
 // # Safety
 //
@@ -615,14 +676,15 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures(struct EmberwaveDec
 // The planes never go through CPU memory. Blocks that did not arrive decode
 // as zeros.
 //
-// Each texture is one that `emberwave_texture_create_plane` made for that
-// plane, on a decoder of the same context, picture size and chroma format.
+// Each texture is one for that plane, from `emberwave_texture_create_plane`
+// or `emberwave_texture_from_metal_plane`, on a decoder of the same context,
+// picture size and chroma format, and no Metal texture serves two planes.
 // Another, a texture of the RGB picture included, gives
 // `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode. As
 // with `emberwave_decoder_decode_texture`, the call does not wait for the
-// caller's GPU work that still reads the textures: keep a set of three for
-// each command buffer of the caller's that may still sample one, and one to
-// decode into.
+// caller's GPU work that still reads the textures, and how many sets of
+// three to keep in turn depends on the context and the textures: see
+// `EmberwaveTexture`.
 //
 // # Safety
 //
@@ -642,8 +704,9 @@ enum EmberwaveStatus emberwave_decoder_decode_plane_textures(struct EmberwaveDec
 // `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` in Swift,
 // never with a transfer of ownership, which would release emberwave's
 // reference. A command buffer that has encoded it keeps it until it
-// completes. Read it only once `emberwave_decoder_decode_texture` or
-// `emberwave_decoder_decode_plane_textures` has returned, and only on the
+// completes. Read it only once a decode into it has returned, and after
+// one that does not wait only in command buffers committed afterwards to
+// the context's queue (see `EmberwaveTexture`), and only on the
 // device of `emberwave_context_metal_device`.
 //
 // # Safety

@@ -11,6 +11,8 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
   - A copy fills a texture that is not framebuffer-only, as a `CVMetalTextureCache`'s is not, at a width of a multiple of 64 pixels. A draw fills a render target.
   - The decodes that do not wait take only textures whose hazards Metal tracks.
   - In Rust, a picture's target needs `RENDER_ATTACHMENT` only where a draw fills it.
+  - The plane decodes refuse one Metal texture wrapped for two planes.
+- The C API's documentation sets out in one place, under `EmberwaveTexture`, how the decodes and the caller's reads of a texture are ordered on each kind of context, and how many textures to keep in turn.
 
 ### Changed
 

@@ -156,7 +156,7 @@ In Swift, `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` take
 
 - **Formats.** `EMBERWAVE_TEXTURE_RGBA8` or `EMBERWAVE_TEXTURE_BGRA8`, unsigned normalised 8 bits per channel: `MTLPixelFormatRGBA8Unorm` or `MTLPixelFormatBGRA8Unorm`. A copy onto a display's drawable, which is BGRA, takes a BGRA texture. The storage is private, so only the GPU reads it.
 - **Device.** The textures are on the device of `emberwave_context_metal_device`. Make the queue and the resources that read them on that device. On iPhones, iPads and Macs with Apple silicon, the libraries' systems, that is the system's only GPU, `MTLCreateSystemDefaultDevice()`.
-- **Ordering.** `emberwave_decoder_decode_texture` returns once the GPU has drawn the picture, so work the client commits afterwards on any queue of the device sees it. Nothing orders the next decode after the client's work that still reads a texture, so the client keeps one texture for each command buffer that may still sample one and one to decode into, three with the display's synchronisation and two frames in flight, and decodes only into one whose readers have completed.
+- **Ordering.** `emberwave_decoder_decode_texture` returns once the GPU has drawn the picture, so work the client commits afterwards on any queue of the device sees it. On a context of `emberwave_context_create`, nothing orders the next decode after the client's work that still reads a texture. The client keeps one texture for each command buffer that may still sample one and one to decode into, three with the display's synchronisation and two frames in flight, and decodes only into one whose readers have completed. On a context of the client's own queue one texture does (below). The header's `EmberwaveTexture` sets out all the cases.
 - **Pointers.** The Metal pointers are borrowed, `__bridge` without a transfer. A texture keeps its `id<MTLTexture>` until it is destroyed, and a context's device stays while the context or anything made on it lives. They are `NULL` off Metal, as for a Vulkan context on a Mac.
 - **Colours.** As for `emberwave_decoder_decode_rgb`: `NULL` follows the frame, and upstream's Metal encoder signals BT.709, full range and centred chroma whatever the pictures are.
 
@@ -219,15 +219,35 @@ CVMetalTextureCacheCreateTextureFromImage(NULL, cache, pixelBuffer, NULL, MTLPix
                                           width, height, 0, &image);
 EmberwaveTexture *texture;
 emberwave_texture_from_metal(decoder, (__bridge void *)CVMetalTextureGetTexture(image), &texture);
-emberwave_decoder_decode_texture(decoder, NULL, texture);   /* or the submit, on the client's queue */
+emberwave_decoder_decode_texture(decoder, NULL, texture);   /* returns once the GPU is done */
 emberwave_texture_destroy(texture);
 CFRelease(image);
 /* ... the pixel buffer holds the picture: enqueue it on the display layer */
 ```
 
+For a pixel buffer that goes to a display layer, the decode that waits is the simple way. The display layer is not on the queue, so the submit gains nothing there unless the client queues GPU work of its own behind the decode. With `emberwave_decoder_submit_texture` the call returns before the GPU has written the pixel buffer. The queue orders only command buffers that use the texture: one that does not use it may run beside the decode and finish first. Commit one that uses it, such as the client's own pass over the texture or a copy of one pixel from it. In its completed handler, release the `CVMetalTextureRef` and enqueue the pixel buffer:
+
+```objc
+emberwave_decoder_submit_texture(decoder, NULL, texture);
+id<MTLTexture> metal = CVMetalTextureGetTexture(image);
+id<MTLCommandBuffer> commands = [queue commandBuffer];   /* the same queue, after the call */
+id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+[blit copyFromTexture:metal sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+           sourceSize:MTLSizeMake(1, 1, 1) toBuffer:pixel destinationOffset:0
+       destinationBytesPerRow:4 destinationBytesPerImage:4];   /* uses the texture: after the decode */
+[blit endEncoding];
+[commands addCompletedHandler:^(id<MTLCommandBuffer> done) {
+    CFRelease(image);
+    /* the pixel buffer holds the picture: enqueue it on the display layer */
+}];
+[commands commit];
+emberwave_texture_destroy(texture);   /* the work on the GPU keeps what it uses */
+```
+
 - **The texture** is on the device of the decoder's context, 2D, of one level, layer and sample, of the picture's size, and BGRA8 or RGBA8, or R8 of a plane's size for `emberwave_texture_from_metal_plane`. A texture of a `CVPixelBuffer` is a texture of its own, not a view.
-- **Copy or draw.** A copy fills the texture when its width is a multiple of 64 pixels, as at 720p, 1080p, 1440p and 4K, and it is not framebuffer-only. A texture of a `CVMetalTextureCache` is not framebuffer-only, though it can only be read unless `kCVMetalTextureUsage` says otherwise. Other textures take a draw, which needs `MTLTextureUsageRenderTarget`, as a drawable has it. A texture that neither can fill is refused, as is one of the wrong device, format or size.
-- **Lifetime.** emberwave keeps a reference to the `MTLTexture` until the texture is destroyed. Keep the `CVMetalTextureRef` until the GPU has written the picture: until a waiting decode returns, or until a command buffer committed after a submit has completed.
+- **Copy or draw.** A copy fills the texture when its width is a multiple of 64 pixels, as at 720p, 1080p, 1440p and 4K, and it is not framebuffer-only. A texture of a `CVMetalTextureCache` is not framebuffer-only, so a copy fills it whatever usage `kCVMetalTextureUsage` asks for; on a Mac it is also a render target by default. Other textures take a draw, which needs `MTLTextureUsageRenderTarget`, as a drawable has it. A texture that neither can fill is refused, as is one of the wrong device, format or size.
+- **Lifetime.** emberwave keeps a reference to the `MTLTexture` until the texture is destroyed. Keep the `CVMetalTextureRef`, and hand the pixel buffer to anything else, only once the GPU has written the picture: once a waiting decode has returned, or once a command buffer that uses the texture, committed after a submit, has completed.
+- **Planes.** `emberwave_texture_from_metal_plane(decoder, plane, metal, &texture)` wraps an R8 texture for one plane. A Metal texture wrapped for two planes is refused by the decode.
 - **Hazards.** A submit takes only textures whose hazards Metal tracks, as it does for those of a `CVMetalTextureCache`. A heap's textures are usually untracked; the waiting decodes take those too.
 
 Vulkan and Direct3D 12 handles are not part of the interface yet.

@@ -885,7 +885,7 @@ fn metal_textures_of_the_callers_own_need_metal() {
         );
         assert!(texture.is_null());
         assert_eq!(
-            emberwave_texture_from_metal_plane(decoder, ptr::null_mut(), 3, &mut texture),
+            emberwave_texture_from_metal_plane(decoder, 3, ptr::null_mut(), &mut texture),
             EmberwaveStatus::InvalidArgument
         );
         assert!(last_error().contains("plane is 3"), "{}", last_error());
