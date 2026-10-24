@@ -361,7 +361,8 @@ void emberwave_decoder_clear(struct EmberwaveDecoder *decoder);
 // Decodes the frame received so far and writes its Y, Cb and Cr planes, 8
 // bits per sample in the range the stream uses. Blocks that did not arrive
 // decode as zeros, so call it when `emberwave_decoder_is_ready` says so.
-// Waits for the GPU.
+// Waits for the GPU. The rows go from the GPU's memory straight to the
+// planes, so a call that fails may have written some of them.
 //
 // # Safety
 //
@@ -381,7 +382,8 @@ enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decod
 // arrived). Upstream's Metal encoder signals BT.709, full range and centred
 // chroma in every frame, whatever the pictures are, so a caller that knows
 // better, such as from the header of a PWV1 file, passes that. Waits for the
-// GPU.
+// GPU. The rows go from the GPU's memory straight to `rgb`, so a call that
+// fails may have written some of them.
 //
 // # Safety
 //

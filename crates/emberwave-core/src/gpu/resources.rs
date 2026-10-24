@@ -118,6 +118,18 @@ pub(crate) fn read_back(
     buffer: &wgpu::Buffer,
     bytes: u64,
 ) -> Result<Vec<u8>, GpuError> {
+    read_back_with(device, buffer, bytes, <[u8]>::to_vec)
+}
+
+/// Waits for the GPU, maps a mappable buffer's first `bytes` bytes and hands
+/// them to `consume`, which can take what it needs without a copy of the
+/// whole. The buffer is unmapped afterwards, also when `consume` panics.
+pub(crate) fn read_back_with<T>(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    bytes: u64,
+    consume: impl FnOnce(&[u8]) -> T,
+) -> Result<T, GpuError> {
     // Mapping and unmapping report errors through the error scopes like the
     // other calls. Waiting cannot: wgpu treats a device error while polling as
     // fatal (decision D22).
@@ -137,13 +149,36 @@ pub(crate) fn read_back(
             .map_err(|error| GpuError::Readback(error.to_string()))?
             .map_err(|error| GpuError::Readback(error.to_string()))?;
 
-        let data = slice
+        let view = slice
             .get_mapped_range()
-            .map_err(|error| GpuError::Readback(error.to_string()))?
-            .to_vec();
-        buffer.unmap();
-        Ok(data)
+            .map_err(|error| GpuError::Readback(error.to_string()))?;
+        let mapped = Mapped {
+            view: Some(view),
+            buffer,
+        };
+        Ok(consume(mapped.bytes()))
     })?
+}
+
+/// A mapped range of a buffer. Dropping it, in the error scope of the read
+/// and during a panic too, lets go of the range and then unmaps the buffer,
+/// which must not be unmapped while it is not mapped: that is an error.
+struct Mapped<'a> {
+    view: Option<wgpu::BufferView>,
+    buffer: &'a wgpu::Buffer,
+}
+
+impl Mapped<'_> {
+    fn bytes(&self) -> &[u8] {
+        self.view.as_deref().unwrap_or_default()
+    }
+}
+
+impl Drop for Mapped<'_> {
+    fn drop(&mut self) {
+        self.view = None;
+        self.buffer.unmap();
+    }
 }
 
 /// Timestamp queries at the boundaries of compute passes: a beginning and an

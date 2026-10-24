@@ -231,6 +231,106 @@ fn a_decoder_can_be_reused_and_gives_the_same_frame_every_time() {
 }
 
 #[test]
+fn the_rows_handed_out_are_those_of_the_decoded_frame() {
+    let context = gpu_or_return!();
+    let color = ColorParams::default();
+
+    // Rows whose width is not a multiple of four are padded to whole words
+    // in the GPU's memory: in 4:4:4 at 131x67, and in the 98-sample chroma
+    // rows of a 196x70 picture in 4:2:0.
+    let mut cases: Vec<(String, FrameLayout, Vec<u8>)> =
+        ["gradient_200x120_420", "noise_131x67_444"]
+            .into_iter()
+            .map(|name| {
+                let (layout, frames) = vector_frames(name);
+                (name.to_owned(), layout, frames[0].clone())
+            })
+            .collect();
+    let layout = FrameLayout::new(196, 70, ChromaSubsampling::Yuv420).unwrap();
+    let frame = synthetic_frame(&layout, 0x5EED_0196, false);
+    cases.push(("synthetic 196x70 4:2:0".to_owned(), layout, frame));
+
+    for (name, layout, bytes) in &cases {
+        let mut decoder = decoder_for(context, layout);
+        let frame = decoder.decode(bytes).expect("decode");
+        let rgb = decoder.decode_rgb(bytes, &color).expect("RGB decode");
+
+        // The frame was decoded already: forget it, or it would be ignored.
+        decoder.clear();
+        decoder.push_packet(bytes).expect("packet");
+        let mut planes: [Vec<u8>; 3] = Default::default();
+        let mut next = [0u32; 3];
+        decoder
+            .decode_assembled_rows(|component, row, samples| {
+                let i = component.index();
+                assert_eq!(row, next[i], "{name}: rows of plane {i} in order");
+                assert_eq!(samples.len(), frame.planes[i].width as usize);
+                next[i] += 1;
+                planes[i].extend_from_slice(samples);
+            })
+            .expect("rows");
+        // The frame takes its rows from the same place, so the CPU decoder
+        // checks them as well: the GPU rounds as it does, within one level.
+        let cpu_frame = cpu::decode_frame(&assembled(layout, bytes).frame()).unwrap();
+        for (i, plane) in frame.planes.iter().enumerate() {
+            assert_eq!(next[i], plane.height, "{name}: rows of plane {i}");
+            assert_eq!(planes[i], plane.data, "{name}: plane {i}");
+            let expected = cpu_frame.planes[i].to_unorm8();
+            assert!(
+                max_abs_diff(&expected, &planes[i]) <= 1,
+                "{name}: plane {i}"
+            );
+        }
+
+        decoder.clear();
+        decoder.push_packet(bytes).expect("packet");
+        let mut pixels = Vec::new();
+        let mut next = 0;
+        decoder
+            .decode_assembled_rgb_rows(&color, |row, line| {
+                assert_eq!(row, next, "{name}: RGB rows in order");
+                assert_eq!(line.len(), 3 * rgb.width as usize);
+                next += 1;
+                pixels.extend_from_slice(line);
+            })
+            .expect("RGB rows");
+        assert_eq!(next, rgb.height, "{name}: RGB rows");
+        assert_eq!(pixels, rgb.data, "{name}: RGB");
+    }
+}
+
+#[test]
+fn a_panic_while_rows_are_handed_out_leaves_the_decoder_usable() {
+    let context = gpu_or_return!();
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(context, &layout);
+    let frame = decoder.decode(&frames[0]).expect("decode");
+    let color = ColorParams::default();
+    let rgb = decoder.decode_rgb(&frames[0], &color).expect("RGB decode");
+
+    // The read-back buffers are mapped while the rows are handed out. A
+    // buffer left mapped would make the next decode fail.
+    for round in 0..2 {
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if round == 0 {
+                decoder.decode_assembled_rows(|_, _, _| panic!("a row that cannot be taken"))
+            } else {
+                decoder
+                    .decode_assembled_rgb_rows(&color, |_, _| panic!("a row that cannot be taken"))
+            }
+        }));
+        assert!(outcome.is_err(), "the panic goes on to the caller");
+        assert_eq!(decoder.decode(&frames[0]).expect("decode"), frame);
+        assert_eq!(
+            decoder.decode_rgb(&frames[0], &color).expect("RGB decode"),
+            rgb
+        );
+    }
+}
+
+#[test]
 fn an_empty_frame_decodes_to_mid_grey() {
     let context = gpu_or_return!();
     let layout = FrameLayout::new(160, 96, ChromaSubsampling::Yuv420).unwrap();
@@ -760,6 +860,24 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
         );
     }
     assert!(context.lost().is_some());
+
+    // The row methods fail alike, without a row. The loss is on record by
+    // now, so they fail before any work; a loss found in the wait for the
+    // frame is the unit test `no_row_is_handed_out_once_the_device_is_lost`.
+    let mut rows = 0;
+    decoder.clear();
+    decoder.push_packet(&frames[0]).expect("packet");
+    let outcome = decoder.decode_assembled_rows(|_, _, _| rows += 1);
+    assert!(
+        matches!(outcome, Err(GpuError::DeviceLost(_))),
+        "{outcome:?}"
+    );
+    let outcome = decoder.decode_assembled_rgb_rows(&color, |_, _| rows += 1);
+    assert!(
+        matches!(outcome, Err(GpuError::DeviceLost(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(rows, 0);
 }
 
 /// The leak check of milestone M5: 1000 frames of a 4K stream, decoded in
