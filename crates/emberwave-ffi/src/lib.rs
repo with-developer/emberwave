@@ -108,6 +108,13 @@ pub const EMBERWAVE_TEXTURE_RGBA8: u32 = 0;
 /// surfaces, onto which a copy needs the same order.
 pub const EMBERWAVE_TEXTURE_BGRA8: u32 = 1;
 
+/// The luma plane, for `emberwave_texture_create_plane`.
+pub const EMBERWAVE_PLANE_Y: u32 = 0;
+/// The blue-difference chroma plane, for `emberwave_texture_create_plane`.
+pub const EMBERWAVE_PLANE_CB: u32 = 1;
+/// The red-difference chroma plane, for `emberwave_texture_create_plane`.
+pub const EMBERWAVE_PLANE_CR: u32 = 2;
+
 /// How `emberwave_context_create` chooses the GPU.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -239,12 +246,34 @@ pub struct EmberwaveDecoder {
 }
 
 /// A texture on a decoder's GPU device that `emberwave_decoder_decode_texture`
-/// draws pictures into, for the caller's graphics API to read on the GPU.
+/// draws pictures into, or into which `emberwave_decoder_decode_plane_textures`
+/// copies one plane of them, for the caller's graphics API to read on the
+/// GPU.
 pub struct EmberwaveTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     /// The context whose device it is on, which decodes into it must use.
     context_id: u64,
+    /// The plane the texture is for, or `None` for the RGB picture. A plane
+    /// of 4:4:4 has the size of the others, so only this tells them apart.
+    plane: Option<Component>,
+}
+
+impl EmberwaveTexture {
+    /// A new texture of `decoder`'s, for `plane` or for the RGB picture.
+    fn boxed(
+        decoder: &EmberwaveDecoder,
+        texture: wgpu::Texture,
+        plane: Option<Component>,
+    ) -> *mut Self {
+        let view = texture.create_view(&Default::default());
+        Box::into_raw(Box::new(Self {
+            texture,
+            view,
+            context_id: decoder.decoder.context_id(),
+            plane,
+        }))
+    }
 }
 
 /// Encodes the pictures of one stream on the GPU: one picture size and
@@ -1100,14 +1129,55 @@ pub unsafe extern "C" fn emberwave_texture_create(
                 }
             };
             let created = decoder.decoder.create_texture(format)?;
-            let view = created.create_view(&Default::default());
-            let boxed = Box::new(EmberwaveTexture {
-                texture: created,
-                view,
-                context_id: decoder.decoder.context_id(),
-            });
             // SAFETY: checked by the first output() above.
-            unsafe { texture.write(Box::into_raw(boxed)) };
+            unsafe { texture.write(EmberwaveTexture::boxed(decoder, created, None)) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Creates a texture that `emberwave_decoder_decode_plane_textures` copies one
+/// plane of the pictures of `decoder` into, on the decoder's GPU device:
+/// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+/// `EMBERWAVE_PLANE_CR`, and the texture is for that plane only, of its size
+/// as `emberwave_decoder_info` gives it, in one unsigned normalised 8-bit
+/// channel (`MTLPixelFormatR8Unorm` in Metal), which the GPU can sample and
+/// copy from but the CPU cannot read. `emberwave_texture_metal` gives its
+/// Metal texture. Decoders of the same picture size and chroma format on the
+/// same context may share textures.
+///
+/// # Safety
+///
+/// `decoder` is a live decoder. `texture` points to where the new texture is
+/// stored; it is set to `NULL` when the call fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_create_plane(
+    decoder: *const EmberwaveDecoder,
+    plane: u32,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live(decoder) }?;
+            let component = match plane {
+                EMBERWAVE_PLANE_Y => Component::Y,
+                EMBERWAVE_PLANE_CB => Component::Cb,
+                EMBERWAVE_PLANE_CR => Component::Cr,
+                other => {
+                    return Err(Failure::argument(format!(
+                        "plane is {other}, not EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB or \
+                         EMBERWAVE_PLANE_CR"
+                    )));
+                }
+            };
+            let created = decoder.decoder.create_plane_texture(component)?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(EmberwaveTexture::boxed(decoder, created, Some(component))) };
             Ok(())
         },
         // SAFETY: as the caller promises.
@@ -1119,9 +1189,10 @@ pub unsafe extern "C" fn emberwave_texture_create(
 ///
 /// # Safety
 ///
-/// `texture` is `NULL`, or a texture from `emberwave_texture_create` that has
-/// not been destroyed and that no other thread is using. A Metal texture of
-/// it that the caller has not retained goes with it.
+/// `texture` is `NULL`, or a texture from `emberwave_texture_create` or
+/// `emberwave_texture_create_plane` that has not been destroyed and that no
+/// other thread is using. A Metal texture of it that the caller has not
+/// retained goes with it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_texture_destroy(texture: *mut EmberwaveTexture) {
     if !texture.is_null() {
@@ -1176,6 +1247,12 @@ pub unsafe extern "C" fn emberwave_decoder_decode_texture(
                     "the texture is on the GPU device of another context",
                 ));
             }
+            if let Some(plane) = texture.plane {
+                return Err(Failure::argument(format!(
+                    "the texture is for the {plane:?} plane, which \
+                     emberwave_decoder_decode_plane_textures fills"
+                )));
+            }
             // SAFETY: as the caller promises.
             let params = unsafe { conversion(decoder, color) }?;
             decoder
@@ -1188,6 +1265,93 @@ pub unsafe extern "C" fn emberwave_decoder_decode_texture(
     )
 }
 
+/// Decodes the frame received so far and copies its Y, Cb and Cr planes into
+/// `y`, `cb` and `cr` on the GPU, then waits for the GPU: when this returns,
+/// the textures hold the planes, for the caller's graphics API to read on any
+/// queue of the device. They hold the samples of the stream, as
+/// `emberwave_decoder_decode_yuv` writes them, which the caller converts to
+/// colours itself, with the matrix, range and chroma siting the stream
+/// signals (`emberwave_probe_packet`) or that it knows better. In 4:2:0 a
+/// chroma sample sits vertically halfway between two rows of luma, and
+/// horizontally halfway between two luma samples with
+/// `EMBERWAVE_SITING_CENTER`, on the left one with `EMBERWAVE_SITING_LEFT`.
+/// The planes never go through CPU memory. Blocks that did not arrive decode
+/// as zeros.
+///
+/// Each texture is one that `emberwave_texture_create_plane` made for that
+/// plane, on a decoder of the same context, picture size and chroma format.
+/// Another, a texture of the RGB picture included, gives
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode. As
+/// with `emberwave_decoder_decode_texture`, the call does not wait for the
+/// caller's GPU work that still reads the textures: keep a set of three for
+/// each command buffer of the caller's that may still sample one, and one to
+/// decode into.
+///
+/// # Safety
+///
+/// `decoder` is a live decoder that no other thread is using, and `y`, `cb`
+/// and `cr` are live textures.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_decode_plane_textures(
+    decoder: *mut EmberwaveDecoder,
+    y: *const EmberwaveTexture,
+    cb: *const EmberwaveTexture,
+    cr: *const EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            let context_id = decoder.decoder.context_id();
+            // SAFETY: as the caller promises.
+            let targets = unsafe {
+                [
+                    plane_view(y, Component::Y, "y", context_id)?,
+                    plane_view(cb, Component::Cb, "cb", context_id)?,
+                    plane_view(cr, Component::Cr, "cr", context_id)?,
+                ]
+            };
+            decoder
+                .decoder
+                .decode_assembled_to_plane_textures(targets)?;
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// The view of `texture`, the argument `name`, unless it is `NULL`, on the
+/// device of another context than `context_id`'s, or not for `plane`.
+///
+/// # Safety
+///
+/// `texture` is `NULL` or a live texture, which outlives the view.
+unsafe fn plane_view<'a>(
+    texture: *const EmberwaveTexture,
+    plane: Component,
+    name: &str,
+    context_id: u64,
+) -> Result<&'a wgpu::TextureView, Failure> {
+    // SAFETY: as the caller promises.
+    let Some(texture) = (unsafe { texture.as_ref() }) else {
+        return Err(Failure::argument(format!("{name} is NULL")));
+    };
+    // Not wgpu's device equality, which devices of two contexts can pass
+    // (GpuContext::id).
+    if texture.context_id != context_id {
+        return Err(Failure::argument(format!(
+            "{name} is on the GPU device of another context"
+        )));
+    }
+    if texture.plane != Some(plane) {
+        return Err(Failure::argument(format!(
+            "{name} is not a texture for the {plane:?} plane"
+        )));
+    }
+    Ok(&texture.view)
+}
+
 /// The Metal texture of `texture`, an `id<MTLTexture>` in the format the
 /// texture was made with, or `NULL` when its context does not run on Metal,
 /// a Vulkan context on a Mac included, or `texture` is `NULL`.
@@ -1197,8 +1361,9 @@ pub unsafe extern "C" fn emberwave_decoder_decode_texture(
 /// `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` in Swift,
 /// never with a transfer of ownership, which would release emberwave's
 /// reference. A command buffer that has encoded it keeps it until it
-/// completes. Read it only once `emberwave_decoder_decode_texture` has
-/// returned, and only on the device of `emberwave_context_metal_device`.
+/// completes. Read it only once `emberwave_decoder_decode_texture` or
+/// `emberwave_decoder_decode_plane_textures` has returned, and only on the
+/// device of `emberwave_context_metal_device`.
 ///
 /// # Safety
 ///

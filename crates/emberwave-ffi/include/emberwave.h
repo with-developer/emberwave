@@ -88,6 +88,15 @@
 // surfaces, onto which a copy needs the same order.
 #define EMBERWAVE_TEXTURE_BGRA8 1
 
+// The luma plane, for `emberwave_texture_create_plane`.
+#define EMBERWAVE_PLANE_Y 0
+
+// The blue-difference chroma plane, for `emberwave_texture_create_plane`.
+#define EMBERWAVE_PLANE_CB 1
+
+// The red-difference chroma plane, for `emberwave_texture_create_plane`.
+#define EMBERWAVE_PLANE_CR 2
+
 // The result of a call.
 typedef enum EmberwaveStatus {
   // The call succeeded.
@@ -125,7 +134,9 @@ typedef struct EmberwaveDecoder EmberwaveDecoder;
 typedef struct EmberwaveEncoder EmberwaveEncoder;
 
 // A texture on a decoder's GPU device that `emberwave_decoder_decode_texture`
-// draws pictures into, for the caller's graphics API to read on the GPU.
+// draws pictures into, or into which `emberwave_decoder_decode_plane_textures`
+// copies one plane of them, for the caller's graphics API to read on the
+// GPU.
 typedef struct EmberwaveTexture EmberwaveTexture;
 
 // What a stream says about its pictures.
@@ -422,13 +433,32 @@ enum EmberwaveStatus emberwave_texture_create(const struct EmberwaveDecoder *dec
                                               uint32_t format,
                                               struct EmberwaveTexture **texture);
 
+// Creates a texture that `emberwave_decoder_decode_plane_textures` copies one
+// plane of the pictures of `decoder` into, on the decoder's GPU device:
+// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+// `EMBERWAVE_PLANE_CR`, and the texture is for that plane only, of its size
+// as `emberwave_decoder_info` gives it, in one unsigned normalised 8-bit
+// channel (`MTLPixelFormatR8Unorm` in Metal), which the GPU can sample and
+// copy from but the CPU cannot read. `emberwave_texture_metal` gives its
+// Metal texture. Decoders of the same picture size and chroma format on the
+// same context may share textures.
+//
+// # Safety
+//
+// `decoder` is a live decoder. `texture` points to where the new texture is
+// stored; it is set to `NULL` when the call fails.
+enum EmberwaveStatus emberwave_texture_create_plane(const struct EmberwaveDecoder *decoder,
+                                                    uint32_t plane,
+                                                    struct EmberwaveTexture **texture);
+
 // Destroys a texture.
 //
 // # Safety
 //
-// `texture` is `NULL`, or a texture from `emberwave_texture_create` that has
-// not been destroyed and that no other thread is using. A Metal texture of
-// it that the caller has not retained goes with it.
+// `texture` is `NULL`, or a texture from `emberwave_texture_create` or
+// `emberwave_texture_create_plane` that has not been destroyed and that no
+// other thread is using. A Metal texture of it that the caller has not
+// retained goes with it.
 void emberwave_texture_destroy(struct EmberwaveTexture *texture);
 
 // Decodes the frame received so far, converts it to RGB and draws it into
@@ -459,6 +489,37 @@ enum EmberwaveStatus emberwave_decoder_decode_texture(struct EmberwaveDecoder *d
                                                       const struct EmberwaveColor *color,
                                                       const struct EmberwaveTexture *texture);
 
+// Decodes the frame received so far and copies its Y, Cb and Cr planes into
+// `y`, `cb` and `cr` on the GPU, then waits for the GPU: when this returns,
+// the textures hold the planes, for the caller's graphics API to read on any
+// queue of the device. They hold the samples of the stream, as
+// `emberwave_decoder_decode_yuv` writes them, which the caller converts to
+// colours itself, with the matrix, range and chroma siting the stream
+// signals (`emberwave_probe_packet`) or that it knows better. In 4:2:0 a
+// chroma sample sits vertically halfway between two rows of luma, and
+// horizontally halfway between two luma samples with
+// `EMBERWAVE_SITING_CENTER`, on the left one with `EMBERWAVE_SITING_LEFT`.
+// The planes never go through CPU memory. Blocks that did not arrive decode
+// as zeros.
+//
+// Each texture is one that `emberwave_texture_create_plane` made for that
+// plane, on a decoder of the same context, picture size and chroma format.
+// Another, a texture of the RGB picture included, gives
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode. As
+// with `emberwave_decoder_decode_texture`, the call does not wait for the
+// caller's GPU work that still reads the textures: keep a set of three for
+// each command buffer of the caller's that may still sample one, and one to
+// decode into.
+//
+// # Safety
+//
+// `decoder` is a live decoder that no other thread is using, and `y`, `cb`
+// and `cr` are live textures.
+enum EmberwaveStatus emberwave_decoder_decode_plane_textures(struct EmberwaveDecoder *decoder,
+                                                             const struct EmberwaveTexture *y,
+                                                             const struct EmberwaveTexture *cb,
+                                                             const struct EmberwaveTexture *cr);
+
 // The Metal texture of `texture`, an `id<MTLTexture>` in the format the
 // texture was made with, or `NULL` when its context does not run on Metal,
 // a Vulkan context on a Mac included, or `texture` is `NULL`.
@@ -468,8 +529,9 @@ enum EmberwaveStatus emberwave_decoder_decode_texture(struct EmberwaveDecoder *d
 // `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` in Swift,
 // never with a transfer of ownership, which would release emberwave's
 // reference. A command buffer that has encoded it keeps it until it
-// completes. Read it only once `emberwave_decoder_decode_texture` has
-// returned, and only on the device of `emberwave_context_metal_device`.
+// completes. Read it only once `emberwave_decoder_decode_texture` or
+// `emberwave_decoder_decode_plane_textures` has returned, and only on the
+// device of `emberwave_context_metal_device`.
 //
 // # Safety
 //

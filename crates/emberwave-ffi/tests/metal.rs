@@ -1,7 +1,7 @@
 //! The C API's textures read through Metal itself, as an app on macOS or iOS
 //! reads them: the `id<MTLTexture>` and `id<MTLDevice>` it hands out, a copy
-//! on a command queue of the app's own, and the pixels against the RGB the C
-//! API gives in CPU memory.
+//! on a command queue of the app's own, and the pixels against the RGB, or
+//! the planes, the C API gives in CPU memory.
 
 #![cfg(target_os = "macos")]
 
@@ -39,7 +39,12 @@ fn read(
     texture: &ProtocolObject<dyn MTLTexture>,
 ) -> Vec<u8> {
     let (width, height) = (texture.width(), texture.height());
-    let row = width * 4;
+    let texel = if texture.pixelFormat() == MTLPixelFormat::R8Unorm {
+        1
+    } else {
+        4
+    };
+    let row = width * texel;
     let buffer = device
         .newBufferWithLength_options(row * height, MTLResourceOptions::StorageModeShared)
         .expect("a buffer");
@@ -173,5 +178,132 @@ fn an_app_reads_the_picture_from_the_metal_texture() {
         }
         emberwave_decoder_destroy(decoder);
         emberwave_context_destroy(context);
+    }
+}
+
+#[test]
+fn an_app_reads_the_planes_from_the_metal_textures() {
+    let mut context = ptr::null_mut();
+    // SAFETY: NULL options and a pointer to store the context in.
+    if unsafe { emberwave_context_create(ptr::null(), &mut context) } != EmberwaveStatus::Ok {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no GPU: {}",
+            last_error()
+        );
+        return;
+    }
+    // SAFETY: a live context.
+    let device = unsafe { emberwave_context_metal_device(context) };
+    if device.is_null() {
+        // Another backend, which EMBERWAVE_BACKEND can choose on a Mac.
+        // SAFETY: a live context.
+        unsafe { emberwave_context_destroy(context) };
+        return;
+    }
+    // SAFETY: an id<MTLDevice>, which the context keeps.
+    let device: &ProtocolObject<dyn MTLDevice> = unsafe { &*device.cast() };
+    // 4:2:0, where the chroma textures are half the size of the luma's, and
+    // 4:4:4, where only their contents tell the planes apart.
+    for name in ["gradient_200x120_420.pwv1", "noise_131x67_444.pwv1"] {
+        read_planes(context, device, &testdata(name));
+    }
+    // SAFETY: a live context.
+    unsafe { emberwave_context_destroy(context) };
+}
+
+/// Decodes the first frame of the PWV1 file `bytes` into plane textures and
+/// checks them, read through Metal, against the planes in CPU memory.
+fn read_planes(
+    context: *mut EmberwaveContext,
+    device: &ProtocolObject<dyn MTLDevice>,
+    bytes: &[u8],
+) {
+    let frame = Pwv1File::parse(bytes)
+        .unwrap()
+        .frames()
+        .next()
+        .unwrap()
+        .unwrap();
+    // SAFETY: live objects, buffers of the sizes passed, and pointers to store
+    // results in; the Metal pointers are borrowed while their objects live.
+    unsafe {
+        let mut stream = EmberwaveStreamInfo::default();
+        assert_eq!(
+            emberwave_probe_pwv1(bytes.as_ptr(), bytes.len(), &mut stream),
+            EmberwaveStatus::Ok
+        );
+        let mut decoder = ptr::null_mut();
+        assert_eq!(
+            emberwave_decoder_create(
+                context,
+                stream.width,
+                stream.height,
+                stream.chroma,
+                &mut decoder
+            ),
+            EmberwaveStatus::Ok
+        );
+        let mut info = EmberwaveFrameInfo::default();
+        assert_eq!(
+            emberwave_decoder_info(decoder, &mut info),
+            EmberwaveStatus::Ok
+        );
+        let sizes = [
+            (info.width as usize, info.height as usize),
+            (info.chroma_width as usize, info.chroma_height as usize),
+            (info.chroma_width as usize, info.chroma_height as usize),
+        ];
+
+        // The planes in CPU memory, then the same frame into textures.
+        let mut planes = sizes.map(|(width, height)| vec![0u8; width * height]);
+        let [y, cb, cr] = planes.each_mut().map(|plane| plane.as_mut_ptr());
+        let target = |data, (width, _): (usize, usize)| EmberwavePlane {
+            data,
+            stride: width,
+        };
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_decode_yuv(
+                decoder,
+                target(y, sizes[0]),
+                target(cb, sizes[1]),
+                target(cr, sizes[2])
+            ),
+            EmberwaveStatus::Ok
+        );
+        let textures = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+            let mut texture = ptr::null_mut();
+            assert_eq!(
+                emberwave_texture_create_plane(decoder, plane, &mut texture),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            texture
+        });
+        assert_eq!(
+            emberwave_decoder_decode_plane_textures(decoder, textures[0], textures[1], textures[2]),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+
+        for ((texture, plane), size) in textures.into_iter().zip(&planes).zip(sizes) {
+            let metal: &ProtocolObject<dyn MTLTexture> = &*emberwave_texture_metal(texture).cast();
+            assert_eq!((metal.width(), metal.height()), size);
+            assert_eq!(metal.pixelFormat(), MTLPixelFormat::R8Unorm);
+            let on: Retained<ProtocolObject<dyn MTLDevice>> = metal.device();
+            assert!(
+                ptr::eq(&*on, device),
+                "the texture is on the context's device"
+            );
+            assert_eq!(&read(device, metal), plane);
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_decoder_destroy(decoder);
     }
 }

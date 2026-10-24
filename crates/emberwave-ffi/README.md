@@ -160,7 +160,25 @@ In Swift, `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` take
 - **Pointers.** The Metal pointers are borrowed, `__bridge` without a transfer. A texture keeps its `id<MTLTexture>` until it is destroyed, and a context's device stays while the context or anything made on it lives. They are `NULL` off Metal, as for a Vulkan context on a Mac.
 - **Colours.** As for `emberwave_decoder_decode_rgb`: `NULL` follows the frame, and upstream's Metal encoder signals BT.709, full range and centred chroma whatever the pictures are.
 
-Vulkan and Direct3D 12 handles, decoding without waiting, on the client's own device and queue or into its own textures, and the picture as Y, Cb and Cr planes are not part of the interface yet.
+A client that converts the colours itself, for high dynamic range, for its display, or for a stream that signals the wrong colours, takes the Y, Cb and Cr planes instead: three one-channel textures of the planes' sizes, chroma at half size in 4:2:0. They hold the samples of the stream, as `emberwave_decoder_decode_yuv` writes them, and are the fastest way to the GPU: on an Apple M3 Max a 4K frame takes 1.0 to 1.1 ms, and a 1080p frame 0.45 ms. In 4:2:0 they also take 1.5 bytes a pixel, where RGBA takes 4.
+
+```c
+EmberwaveTexture *planes[3][3];   /* Y, Cb, Cr, for each frame the display may still show */
+for (int i = 0; i < 3; i++) {
+    emberwave_texture_create_plane(decoder, EMBERWAVE_PLANE_Y, &planes[i][0]);
+    emberwave_texture_create_plane(decoder, EMBERWAVE_PLANE_CB, &planes[i][1]);
+    emberwave_texture_create_plane(decoder, EMBERWAVE_PLANE_CR, &planes[i][2]);
+}
+
+/* For every frame that is ready, into a set whose readers have completed: */
+emberwave_decoder_decode_plane_textures(decoder, planes[next][0], planes[next][1], planes[next][2]);
+id<MTLTexture> luma = (__bridge id<MTLTexture>)emberwave_texture_metal(planes[next][0]);
+/* ... and Cb and Cr: MTLPixelFormatR8Unorm, sampled by the client's own conversion */
+```
+
+A texture is for the plane it was made for, and a decode refuses textures passed in another order. The client converts with the matrix and range the stream signals (`emberwave_probe_packet`) or that it knows better. In 4:2:0 a chroma sample sits vertically halfway between two rows of luma, and horizontally halfway between two luma samples with `EMBERWAVE_SITING_CENTER`, on the left one with `EMBERWAVE_SITING_LEFT`. Device, ordering and pointers are as for the RGB texture.
+
+Vulkan and Direct3D 12 handles, decoding without waiting, and decoding on the client's own device and queue or into its own textures are not part of the interface yet.
 
 [`examples/ios`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/ios) is an iPhone and iPad app that does all of this in Swift: it times decoding into textures, decoding to planes and encoding on the device's GPU, and draws the last picture from its texture. Its README says how to run it on a phone.
 
@@ -170,7 +188,7 @@ Vulkan and Direct3D 12 handles, decoding without waiting, on the client's own de
 - **Objects.** `*_create` makes a context, a decoder or an encoder, `*_destroy` frees it, and destroying `NULL` does nothing. A decoder or an encoder may outlive its context. Contexts are created one at a time: calls from several threads wait for each other (decision D31).
 - **Threads.** A context may be used by several threads at once, for instance to create decoders and encoders. A decoder or an encoder may move between threads, but only one thread may use it at a time.
 - **Memory.** The decoder writes into memory the caller provides: planes with a stride of at least their width (`emberwave_decoder_info` gives the sizes), or RGB with a stride of at least three times the width. It checks the arguments before it decodes, so a bad one does not use up the frame.
-- **Waiting.** `emberwave_decoder_decode_yuv` and `emberwave_decoder_decode_rgb` wait for the GPU and copy the picture to the CPU. On an Apple M3 Max a 4K frame takes 1.2 ms to planes and 2.7 ms to RGB that way, against 0.9 and 1.2 ms when the picture stays on the GPU. A call that fails may have written some rows. `emberwave_decoder_decode_texture` waits as well, and leaves the picture on the GPU, in a texture for Metal (see [Pictures on the GPU: Metal](#pictures-on-the-gpu-metal)).
+- **Waiting.** `emberwave_decoder_decode_yuv` and `emberwave_decoder_decode_rgb` wait for the GPU and copy the picture to the CPU. On an Apple M3 Max a 4K frame takes 1.2 ms to planes and 2.7 ms to RGB that way, against 0.9 and 1.2 ms when the picture stays on the GPU. A call that fails may have written some rows. `emberwave_decoder_decode_texture` and `emberwave_decoder_decode_plane_textures` wait as well, and leave the picture on the GPU, in textures for Metal (see [Pictures on the GPU: Metal](#pictures-on-the-gpu-metal)).
 - **Panics.** A panic inside emberwave is caught and reported as `EMBERWAVE_STATUS_INTERNAL`; destroy the object it happened in.
 - **Packets.** `emberwave_decoder_push_packet` takes one packet or several back to back, in any order. Packets of a newer frame discard an unfinished older one; packets of older frames are ignored. `emberwave_decoder_is_ready` with `allow_partial_frame` accepts a frame whose coarse bands are complete, for a picture despite lost packets.
 - **Encoding.** `emberwave_encoder_encode` reads planes with a stride of at least their width (`emberwave_encoder_info` gives the sizes) and writes the frame, at most `budget` bytes, into a buffer of that many bytes the caller provides; it waits for the GPU. A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in `size`, and encodes nothing. The frame's sequence number, a three-bit counter from 1 that wraps around, advances only with frames that were encoded. `emberwave_frame_packets` splits a frame at its blocks; a block larger than the packet size gets a packet of its own.
