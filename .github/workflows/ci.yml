@@ -143,3 +143,7 @@ jobs:
       # vectors on this Mac and in an iOS Simulator; for devices they are
       # linked only.
       - run: scripts/check_xcframework.sh target/debug/emberwave-cli
+      # The iPhone benchmark app: built for iPhones, and run in an iOS
+      # Simulator with -autorun, where it also reads a texture of
+      # emberwave_decoder_decode_texture back through Metal.
+      - run: scripts/check_ios_app.sh

@@ -11,3 +11,6 @@
 
 # SwiftPM's build directory, if the Swift example is built in place
 /crates/emberwave-ffi/examples/swift/.build/
+
+# What Xcode keeps per user in the iPhone app's project
+xcuserdata/

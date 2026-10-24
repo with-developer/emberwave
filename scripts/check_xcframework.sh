@@ -30,6 +30,9 @@ XCFRAMEWORK=$ROOT/target/xcframework/Emberwave.xcframework
 BUILD=$ROOT/target/xcframework-check
 rm -rf target/xcframework-check
 
+# shellcheck source=simulator.sh
+source scripts/simulator.sh
+
 # The SDK and the target triple of a slice, at the oldest system its library
 # is for (see build_xcframework.sh).
 slice_sdk() {
@@ -119,25 +122,7 @@ for slice in "${slices[@]}"; do
             exercise on_mac "$BUILD/$slice"
             ;;
         ios-arm64-simulator)
-            device=$(xcrun simctl list devices booted --json |
-                jq -r '[.devices[][] | select(.name | startswith("iPhone"))][0].udid // empty')
-            if [ -z "$device" ]; then
-                device=$(xcrun simctl list devices available --json | jq -r '
-                    [.devices | to_entries[] | select(.key | contains("SimRuntime.iOS-"))
-                     | (.key | sub(".*iOS-"; "") | split("-") | map(tonumber)) as $version
-                     | .value[] | select(.name | startswith("iPhone"))
-                     | {udid, $version}]
-                    | sort_by(.version) | last | .udid // empty')
-                if [ -z "$device" ]; then
-                    echo "no iPhone simulator: install an iOS runtime in Xcode" >&2
-                    exit 1
-                fi
-                trap 'xcrun simctl shutdown "$device" || true' EXIT
-                xcrun simctl bootstatus "$device" -b
-            fi
-            echo "== in the simulator $(xcrun simctl list devices --json |
-                jq -r --arg udid "$device" '.devices | to_entries[] | .key as $runtime
-                    | .value[] | select(.udid == $udid) | "\(.name), \($runtime | sub(".*SimRuntime."; ""))"')"
+            use_simulator
             # A failure in the simulator must fail the check: the example
             # without arguments exits with 2.
             if on_simulator "$BUILD/$slice/emberwave_decode" 2> /dev/null; then

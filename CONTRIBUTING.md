@@ -30,6 +30,7 @@ cargo test --workspace
 | Encoder | `crates/emberwave-core/tests/encoder.rs`, `src/encode/` | The encoder makes the committed bytes again, its frames fit their budgets, and emberwave decodes them as upstream does |
 | GPU encoder | `crates/emberwave-core/tests/gpu_encoder.rs`, `src/gpu/encoder/tests.rs` | Each stage of the GPU encoder given the CPU encoder's input, against the CPU's output; whole frames against the committed vectors, on a real adapter; pictures in textures against the same pictures in CPU memory |
 | C example | `scripts/check_c_example.sh` | The C examples, built with CMake against the shared library: one decodes every vector, the other encodes two of the encoder's sources and decodes its packets again (CI runs it after the tests) |
+| iPhone app | `scripts/check_ios_app.sh` | The benchmark app of `examples/ios`, built for iPhones and for the iOS Simulator, where it runs a short benchmark and reads a texture of `emberwave_decoder_decode_texture` back through Metal (CI's macOS job `XCFramework`) |
 | XCFramework | `scripts/check_xcframework.sh` | The C examples and the Swift example, linked with each static library of the XCFramework, on the Mac and in an iOS Simulator, as `check_c_example.sh` runs them; for iPhones and iPads they are linked only (CI's macOS job `XCFramework`) |
 
 Environment variables:
