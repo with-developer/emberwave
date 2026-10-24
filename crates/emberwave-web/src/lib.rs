@@ -1,6 +1,7 @@
 //! emberwave in the browser: decodes PyroWave (`.pwv1`) files with WebGPU and
-//! draws them on a canvas. The page is in `web/`, and `scripts/build_web.sh`
-//! builds this crate for it.
+//! draws them on a canvas, and times the decoding on the browser's GPU
+//! ([`Bench`]). The pages are in `web/`, and `scripts/build_web.sh` builds
+//! this crate for them.
 //!
 //! Only the browser build has content. On other targets the crate is empty,
 //! so that the workspace builds everywhere.
@@ -13,6 +14,9 @@ use emberwave_core::bitstream::Pwv1File;
 use emberwave_core::color::ColorParams;
 use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions};
 use wasm_bindgen::prelude::*;
+
+mod bench;
+pub use bench::Bench;
 
 const BLIT_SHADER: &str = include_str!("blit.wgsl");
 

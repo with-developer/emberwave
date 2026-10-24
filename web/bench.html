@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>emberwave benchmark</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+  body { margin: 0 auto; padding: 16px; max-width: 900px; }
+  h1 { margin-block: 0 4px; }
+  button { font: inherit; padding: 6px 14px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; margin-block: 12px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 4px 10px; text-align: right; border-bottom: 1px solid #8884; }
+  th:first-child, td:first-child { text-align: left; }
+  pre { white-space: pre-wrap; background: #8881; padding: 10px; border-radius: 6px; }
+  .error { color: #d33; }
+</style>
+</head>
+<body>
+<h1>emberwave benchmark</h1>
+<p>Times the decoding of PyroWave video on this device's GPU, through WebGPU in this page: test streams at 1080p, 1440p and 4K, made here with emberwave's encoder, decoded frame after frame to RGB in GPU memory as the <a href="./">player</a> does. Nothing is uploaded. It takes about a minute; keep the page in front, and the device plugged in if it can be. The times are in milliseconds.</p>
+<p><button id="start">Start</button></p>
+<p id="status"></p>
+<div class="scroll">
+<table id="results" hidden>
+  <thead>
+    <tr><th>Picture</th><th>per frame, mean</th><th>median</th><th>99th percentile</th><th>CPU</th><th>frames</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+</div>
+<pre id="report" hidden></pre>
+<p><button id="copy" hidden>Copy the results</button></p>
+<script type="module" src="bench.js"></script>
+</body>
+</html>
