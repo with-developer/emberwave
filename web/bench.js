@@ -33,16 +33,21 @@ function paint() {
   return new Promise((resolve) => setTimeout(resolve, 50));
 }
 
-// The smallest step of performance.now(), which browsers coarsen.
+// The smallest step of performance.now(), which browsers coarsen: from up to
+// 200 steps, for about 50 ms, as each waits a step on a blocked page, and a
+// million readings at most for a step that does not come.
 function timerStep() {
   let smallest = Infinity;
-  for (let i = 0; i < 200; i++) {
+  const until = performance.now() + 50;
+  for (let i = 0; i < 200 && performance.now() < until; i++) {
     const a = performance.now();
-    let b = performance.now();
-    while (b === a) {
+    let b = a;
+    for (let spins = 0; b === a && spins < 1e6; spins++) {
       b = performance.now();
     }
-    smallest = Math.min(smallest, b - a);
+    if (b !== a) {
+      smallest = Math.min(smallest, b - a);
+    }
   }
   return smallest;
 }
@@ -74,6 +79,12 @@ async function measure(bench) {
   }
   // The mean from the whole run, which a coarse timer cannot spoil.
   const mean = (performance.now() - first) / FRAMES;
+  // A frame that raised a GPU error was not decoded. The browser reports
+  // errors as events of their own, which can come after the work is done:
+  // they get a moment, so that the last frames' count for this size.
+  await bench.work_done();
+  await paint();
+  bench.check();
   each.sort((a, b) => a - b);
   return {
     mean,
@@ -95,33 +106,54 @@ function row(cells) {
 
 async function run() {
   start.disabled = true;
-  // A phone that locks its screen halfway through stops the run.
-  let wakeLock = null;
-  try {
-    wakeLock = await navigator.wakeLock?.request("screen");
-  } catch {
-    // Without one, the run is still worth having.
-  }
   results.hidden = true;
   report.hidden = true;
   copy.hidden = true;
+  copy.textContent = "Copy the results";
   const body = results.querySelector("tbody");
   body.replaceChildren();
-
-  if (!navigator.gpu) {
-    say("This browser has no WebGPU.", true);
-    start.disabled = false;
-    return;
-  }
-  let bench;
+  // A page that goes to the background, or a phone that locks its screen,
+  // slows the frames down: such a run is marked.
+  let hidden = document.hidden;
+  const watch = () => {
+    hidden ||= document.hidden;
+  };
+  document.addEventListener("visibilitychange", watch);
+  let wakeLock = null;
+  let bench = null;
   try {
-    await init();
-    bench = await Bench.create();
-  } catch (error) {
-    say(`WebGPU did not start: ${error}`, true);
+    try {
+      wakeLock = await navigator.wakeLock?.request("screen");
+    } catch {
+      // Without one, the run is still worth having.
+    }
+    if (!navigator.gpu) {
+      say("This browser has no WebGPU.", true);
+      return;
+    }
+    try {
+      await init();
+      bench = await Bench.create();
+    } catch (error) {
+      say(`WebGPU did not start: ${error}`, true);
+      return;
+    }
+    await measureAll(bench, body, () => hidden);
+  } finally {
+    document.removeEventListener("visibilitychange", watch);
+    wakeLock?.release().catch(() => {});
     start.disabled = false;
-    return;
+    try {
+      bench?.free();
+    } catch {
+      // Its device goes with the page then.
+    }
   }
+}
+
+// Measures every size and shows the results. `wasHidden` says whether the
+// page has been hidden since the run began.
+async function measureAll(bench, body, wasHidden) {
   const step = timerStep();
   const lines = [
     `emberwave benchmark, ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC`,
@@ -155,14 +187,19 @@ async function run() {
       break;
     }
   }
-  if (!status.classList.contains("error")) {
+  if (wasHidden()) {
+    const warning = "The page was hidden during the run, which slows the frames down: " +
+      "run it again with the page in front.";
+    lines.push(`Not valid: ${warning}`);
+    if (!status.classList.contains("error")) {
+      say(warning, true);
+    }
+  } else if (!status.classList.contains("error")) {
     say("Done.");
   }
   report.textContent = lines.join("\n");
   report.hidden = false;
   copy.hidden = false;
-  start.disabled = false;
-  wakeLock?.release().catch(() => {});
 }
 
 start.addEventListener("click", run);

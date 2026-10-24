@@ -119,7 +119,8 @@ enum Read {
 /// Buffers of the colour conversion, created when it is first used.
 struct ColorResources {
     rgba: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    /// Made by the first decode that reads RGB back: a player never does.
+    readback: Option<wgpu::Buffer>,
     params: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
@@ -166,7 +167,9 @@ pub struct Decoder {
     upload: Option<FrameUpload>,
     pyramid: wgpu::Buffer,
     packed: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    /// Made by the first decode that reads the planes back: a player never
+    /// does, and the browser's never may.
+    readback: Option<wgpu::Buffer>,
 
     pipelines: Arc<Pipelines>,
 
@@ -237,12 +240,6 @@ impl Decoder {
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
             );
-            let readback = storage(
-                "readback",
-                buffers.packed_words * 4,
-                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            );
-
             let dequant_params_data = DequantParams::new(&layout, &buffers);
             let dequant_grid = dequant_params_data.grid();
             let dequant_params =
@@ -289,7 +286,7 @@ impl Decoder {
                 upload: None,
                 pyramid,
                 packed,
-                readback,
+                readback: None,
                 pipelines: Arc::clone(&pipelines),
                 dequant_params,
                 dequant_bind_group,
@@ -555,6 +552,21 @@ impl Decoder {
         }
         let prepare = assembled_in + prepare_start.elapsed();
 
+        self.make_readback(read)?;
+        // What the frame copies back and where to: the planes, or the RGBA
+        // words, into the buffer just made sure of.
+        let copy_back = match read {
+            Read::Nothing => None,
+            Read::Yuv => self
+                .readback
+                .as_ref()
+                .map(|target| (&self.packed, target, self.buffers.packed_words * 4)),
+            Read::Rgb => self.color.as_ref().and_then(|resources| {
+                let target = resources.readback.as_ref()?;
+                Some((&resources.rgba, target, resources.rgba.size()))
+            }),
+        };
+
         let queries = self.timestamps.as_ref().filter(|_| timed);
         let gpu_start = Instant::now();
         with_error_scope(&self.device, || {
@@ -582,25 +594,9 @@ impl Decoder {
                 );
             }
             self.encode_passes(&mut encoder, color.is_some(), queries);
-
-            match (read, self.color.as_ref()) {
-                (Read::Yuv, _) => encoder.copy_buffer_to_buffer(
-                    &self.packed,
-                    0,
-                    &self.readback,
-                    0,
-                    self.buffers.packed_words * 4,
-                ),
-                (Read::Rgb, Some(resources)) => encoder.copy_buffer_to_buffer(
-                    &resources.rgba,
-                    0,
-                    &resources.readback,
-                    0,
-                    resources.rgba.size(),
-                ),
-                _ => {}
+            if let Some((source, target, bytes)) = copy_back {
+                encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
             }
-
             self.queue.submit([encoder.finish()]);
         })?;
 
@@ -613,20 +609,9 @@ impl Decoder {
                 consume(bytes);
             }
         };
-        match (read, self.color.as_ref()) {
-            (Read::Yuv, _) => read_back_with(
-                &self.device,
-                &self.readback,
-                self.buffers.packed_words * 4,
-                &mut deliver,
-            )?,
-            (Read::Rgb, Some(resources)) => read_back_with(
-                &self.device,
-                &resources.readback,
-                resources.rgba.size(),
-                &mut deliver,
-            )?,
-            _ => {
+        match copy_back {
+            Some((_, target, bytes)) => read_back_with(&self.device, target, bytes, &mut deliver)?,
+            None => {
                 self.device
                     .poll(wgpu::PollType::wait_indefinitely())
                     .map_err(|error| GpuError::Readback(error.to_string()))?;
@@ -645,6 +630,34 @@ impl Decoder {
             gpu_wall,
             stages,
         })
+    }
+
+    /// Makes the buffer that `read` copies the picture back into, the first
+    /// time a decode needs it.
+    fn make_readback(&mut self, read: Read) -> Result<(), GpuError> {
+        let (slot, bytes, label) = match read {
+            Read::Nothing => return Ok(()),
+            Read::Yuv => (
+                &mut self.readback,
+                self.buffers.packed_words * 4,
+                "readback",
+            ),
+            Read::Rgb => match self.color.as_mut() {
+                Some(resources) => (
+                    &mut resources.readback,
+                    resources.rgba.size(),
+                    "rgba readback",
+                ),
+                None => return Ok(()),
+            },
+        };
+        if slot.is_none() {
+            let usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+            *slot = Some(with_error_scope(&self.device, || {
+                buffer(&self.device, label, bytes, usage)
+            })?);
+        }
+        Ok(())
     }
 
     /// Records the GPU stages of a frame into `encoder`: dequantisation, the
@@ -708,12 +721,6 @@ impl Decoder {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 });
-                let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("rgba readback"),
-                    size: bytes,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
                 let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("yuv2rgb params"),
                     size: std::mem::size_of::<YuvParams>() as u64,
@@ -731,7 +738,7 @@ impl Decoder {
                 });
                 ColorResources {
                     rgba,
-                    readback,
+                    readback: None,
                     params: params_buffer,
                     bind_group,
                     grid: params.grid(),
@@ -1013,13 +1020,14 @@ impl Drop for Decoder {
             &self.block_offsets,
             &self.pyramid,
             &self.packed,
-            &self.readback,
         ];
+        buffers.extend(&self.readback);
         if let Some(upload) = &self.upload {
             buffers.push(&upload.buffer);
         }
         if let Some(color) = &self.color {
-            buffers.extend([&color.rgba, &color.readback]);
+            buffers.push(&color.rgba);
+            buffers.extend(&color.readback);
         }
         for buffer in buffers {
             buffer.destroy();

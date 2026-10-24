@@ -13,6 +13,16 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 - Encoding from textures is faster (decision D38, [#40](https://github.com/with-developer/emberwave/issues/40)). The gather pass takes the texels four at a time with `textureGather`, where it loaded them one by one. On an Apple M3 Max a 4K frame from textures encodes in 1.71 ms instead of 1.80 ms.
 - Reading a decoded picture back to the CPU is much faster (decision D37, [#56](https://github.com/with-developer/emberwave/issues/56)): it comes straight out of the mapped buffer, and RGBA turns into RGB in a loop the compiler vectorises, where a copy per pixel took 4.5 ms at 4K. On an Apple M3 Max a 4K frame through the C API takes 2.7 ms to RGB instead of 7.6 ms, and 1.2 ms to planes instead of 1.6 ms; at 1080p 0.8 and 0.5 ms instead of 2.2 and 1.1 ms. `emberwave-cli decode` gains as much. A failed `emberwave_decoder_decode_yuv` or `_decode_rgb` may now have written some rows.
 
+### Fixed
+
+- The browser pages, from a review of them (decision D39):
+  - The benchmark page gave times for frames the GPU never decoded when the browser reported an error; it now fails that size with the error.
+  - The player held a file about twice in memory, and a file with millions of empty frames could panic the module, after which nothing worked until the page was reloaded. It now keeps one copy, refuses frames too short to decode, plays the frames before one that is cut off rather than nothing, and loads files of up to 1 GiB and pictures of up to 8192x4320 pixels' worth.
+  - After a lost GPU the next file gets a new device; after a panic the page asks to be reloaded.
+  - The benchmark frees its GPU device and wake lock however a run ends, marks a run during which the page was hidden, and no longer blocks for seconds on a coarse timer.
+  - Errors from the browser show their message without the JavaScript stack.
+- The decoder makes its read-back buffers only when a decode first reads back: a player, in a browser or natively, saves 43.5 MiB at 4K.
+
 ## [0.7.0] - 2026-10-24
 
 Apps on iPhones, iPads and Macs: the C library as an XCFramework that Swift imports, checked in an iOS Simulator, where contexts can now be created. Also a benchmark page for browsers, phones included, a faster CPU side of decoding, and fixes from a review of the command line tool.

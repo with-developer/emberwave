@@ -11,7 +11,11 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
+# Where cargo puts what it builds, however that is configured: an
+# environment variable or a cargo configuration file.
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps --manifest-path "$ROOT/Cargo.toml" |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+test -n "$TARGET_DIR"
 
 WANT=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3 }' "$ROOT/Cargo.lock")
 HAVE=$(wasm-bindgen --version 2>/dev/null | awk '{ print $2 }' || true)

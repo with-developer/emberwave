@@ -484,12 +484,16 @@ Nothing in a browser may block, so the player uses only the parts of the decoder
 - `GpuContext::from_adapter` creates the device on an adapter that can draw on the canvas. `GpuContext::new`, which blocks, does not exist in the browser build.
 - `Decoder::encode_rgb` records the decode and the colour conversion into the player's command encoder and returns. A render pass in the same encoder copies the RGBA words to the canvas (`blit.wgsl`: one triangle over the canvas, which has the size of the picture, so a fragment reads one word). One submission per frame, and the picture never leaves the GPU.
 - Error scopes cannot be waited for, so in the browser build `with_error_scope` just runs its work. The player catches what the browser reports instead (`on_uncaptured_error`) and shows the first error on the page with the next frame. Pictures wider or taller than the browser can draw (`max_texture_dimension_2d`, 8192 by default) are refused when the file is loaded.
-- The methods that read a frame back or time it wait for the GPU, and are not for the browser.
-- In a browser, dropping a wgpu buffer only lets go of the JavaScript object, and the GPU memory waits for the garbage collector. `Decoder` therefore destroys its large buffers when it is dropped, and the player drops the old stream before it loads the next file: about 140 MiB for a 4K stream.
+- The methods that read a frame back or time it wait for the GPU, and are not for the browser. The decoder makes its read-back buffers only when a decode first reads back, so the player has none: 43.5 MiB fewer at 4K.
+- In a browser, dropping a wgpu buffer only lets go of the JavaScript object, and the GPU memory waits for the garbage collector. `Decoder` therefore destroys its large buffers when it is dropped, and the player drops the old stream before it loads the next file: about 110 MiB for a 4K stream.
+- The player keeps one copy of the file in the module's memory and walks its frames in place. When it loads a file it reads the frames from the first up to one that is cut off, or shorter than the start of frame header every frame begins with; it plays those, and says why it does not play the rest. It loads files of up to 1 GiB and pictures of up to 8192x4320 pixels' worth (D39).
+- A lost device ends the stream, and the next file or sample gets a new player with a new device. A panic in the module leaves its objects in use, so the page then asks to be reloaded and disables its controls.
 
 The page paces frames by the stream's frame rate, keeping the remainder of each interval, so 25 frames per second play as 25 on a 60 Hz display. It shows the frames per second, the CPU time to record and submit a frame, and the time from submitting a frame until the browser reports the GPU done with it (`onSubmittedWorkDone`): decoding and drawing, plus the delay of the report, averaged over the frames reported each second. In headless Chrome 155 on an Apple M3 Max (2026-10-24) the 1080p benchmark stream took about 0.6 ms of CPU and 2.2 ms from submission to done, the 4K one about 1.2 and 3.8 ms, both playing at their 30 frames per second.
 
-`web/bench.html` times the decoding on the device it runs on, a phone included, with the code of `crates/emberwave-web/src/bench.rs`. It makes test streams at 1080p, 1440p and 4K, four pictures each of a synthetic scene encoded by the CPU encoder in the page at the budgets of the native benchmarks, then decodes them in turn on the player's path, to RGB in GPU memory, and waits for each frame through `onSubmittedWorkDone` before the next: 300 frames after at least 30 and a second of warm-up, as `emberwave-cli bench --output rgb` does natively. wgpu's callback for that has to be `Send`, which a JavaScript function is not, so it sets a flag and wakes a future that `wasm_bindgen_futures` turns into the page's promise. Browsers coarsen `performance.now()`, to a millisecond in some, so the mean comes from the time of the whole run and the median and 99th percentile, which are per frame, are as fine as the timer, whose step the report states. The times include what WebGPU adds over native wgpu: the browser's checks, its process boundary and the delay of the report.
+`web/bench.html` times the decoding on the device it runs on, a phone included, with the code of `crates/emberwave-web/src/bench.rs`. It makes test streams at 1080p, 1440p and 4K, four pictures each of a synthetic scene encoded by the CPU encoder in the page at the budgets of the native benchmarks, then decodes them in turn on the player's path, to RGB in GPU memory, and waits for each frame through `onSubmittedWorkDone` before the next: 300 frames after at least 30 and a second of warm-up, as `emberwave-cli bench --output rgb` does natively. wgpu's callback for that has to be `Send`, which a JavaScript function is not, so it sets a flag and wakes a future that `wasm_bindgen_futures` turns into the page's promise. Browsers coarsen `performance.now()`, to a millisecond in some, so the mean comes from the time of the whole run and the median and 99th percentile, which are per frame, are as fine as the timer, whose step the report states. The times include what WebGPU adds over native wgpu: the browser's checks, its process boundary and the delay of the report. A GPU error the browser reports during a size fails that size rather than give times for frames that were not decoded, a run during which the page was hidden is marked as not valid, and the benchmark lets go of its device when the run ends.
+
+CI builds the module as Pages does and instantiates it in Node (`scripts/check_web.mjs`), so that a module whose glue does not load fails a pull request rather than the published page.
 
 ## C API
 
@@ -955,3 +959,36 @@ The copy that remains, 25 MB at 4K, goes into the caller's memory. Doing without
 - Reading the textures in the transform's first level is not done. It would save at most the 0.04 ms the pass now costs, with a second transform pipeline. It would also load each texel about 1.5 times, as the 40x40 windows of neighbouring tiles overlap.
 
 **Consequence.** Measured alternately with the build before on the Apple M3 Max, 600 frames and three rounds: a 4K frame from textures encodes in 1.71 to 1.72 ms instead of 1.80 to 1.81 ms. The transform, gather included, takes 0.43 to 0.44 ms instead of 0.52 ms. At 1440p and 1080p the transform takes 0.21 and 0.12 to 0.14 ms instead of 0.24 and 0.14 to 0.15 ms, and the totals stay where they were. The encoder needs a sampler binding in the gather pass's layout.
+
+### 2026-10-24 — D39: The browser pages, from their review
+
+**Context.** A read-only review of the browser pages, with experiments in headless Chrome 155, found no high-severity problem. It found two medium ones:
+- The benchmark registered no handler for the GPU errors the browser reports. With a buffer made invalid, it gave times for frames that were never decoded.
+- The player copied every frame of a file into a vector of its own, so the module held the file about twice. A PWV1 header followed by 200 MB of zeros, 50 million empty frames, took 1.7 GiB of module memory. A little more overflowed a vector's capacity, which panicked; after that every call failed with "recursive use of an object" until the page was reloaded.
+
+The low ones:
+- A 36-byte file could ask for a 16384x16384 decoder, gigabytes of GPU memory.
+- A lost device or a panic left the page unusable without telling the user.
+- A file whose last frame is cut off played not at all.
+- The benchmark left its device and its screen wake lock behind on some paths.
+- It counted runs during which the page was hidden.
+- It could block a page with a coarse timer for seconds.
+- The decoder made read-back buffers the player never uses.
+
+**Decision.**
+- The player takes the file as it is handed over and walks its frames in place. A frame shorter than a start of frame header, 8 bytes, cannot decode, and ends the frames played, as a frame that is cut off does; a file without a playable frame is refused with the reason.
+- The player loads files of up to 1 GiB, which the page checks before it hands one over. It takes pictures of up to 8192x4320 pixels' worth, 35 megapixels, the size of DCI 8K. The format allows 16384x16384, but no video format in use is larger than 8K, and the cap keeps a few bytes from asking for gigabytes.
+- `Bench` records the first GPU error the browser reports, and a decode fails while one is recorded, as do the end of each size's frames. The page frees the `Bench`, and releases its wake lock, however the run ends; marks a run during which it was hidden; and gives the timer at most 50 ms to show its step.
+- A player whose device was lost is replaced for the next file. A WebAssembly `RuntimeError`, which is how a panic surfaces, or the "recursive use" error that follows one, stops the page with a request to reload it. Errors from the browser show their first line, not the JavaScript stack inside them.
+- The decoder makes its read-back buffers when a decode first reads back: 43.5 MiB of the 153 MiB of a 4K decoder are not made for a player, in a browser or natively.
+- CI builds the module and instantiates it in Node on every pull request; until now only the Pages workflow built it, after a merge.
+
+**Consequence.** In headless Chrome on the Apple M3 Max:
+- The 200 MB of zeros are refused in 31 ms, the module growing by the 190 MiB of the file itself.
+- Cut-off files play their whole frames.
+- 8192x8192 and 16384x16384 pictures are refused.
+- A 4K stream holds 109 MiB of GPU buffers instead of 153 MiB.
+- After `device.destroy()` the next sample plays on a new device.
+- The benchmark with the invalid buffer stops at 1080p with the browser's message.
+
+Picture sizes between 8192x4320 and 16384x16384 that the native decoder takes are refused in the browser.

@@ -22,6 +22,10 @@ use crate::{js_error, now_ms};
 pub struct Bench {
     context: GpuContext,
     stream: Option<BenchStream>,
+    /// The first GPU error the browser reported since the last check. Error
+    /// scopes cannot be waited for in a browser, so errors arrive here, and
+    /// a frame that raised one was not decoded: its time means nothing.
+    gpu_error: Arc<Mutex<Option<String>>>,
 }
 
 /// The frames of a test stream and the decoder for them.
@@ -52,10 +56,30 @@ impl Bench {
         let context = GpuContext::from_adapter(adapter, &GpuOptions::default())
             .await
             .map_err(js_error)?;
+        let gpu_error: Arc<Mutex<Option<String>>> = Arc::default();
+        let record = Arc::clone(&gpu_error);
+        context.device().on_uncaptured_error(Arc::new(move |error| {
+            let mut first = record.lock().unwrap_or_else(PoisonError::into_inner);
+            first.get_or_insert_with(|| error.to_string());
+        }));
         Ok(Self {
             context,
             stream: None,
+            gpu_error,
         })
+    }
+
+    /// An error if the GPU reported one since the last check: the frames
+    /// decoded since then were not, and their times mean nothing.
+    pub fn check(&self) -> Result<(), JsError> {
+        let mut first = self
+            .gpu_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match first.take() {
+            Some(error) => Err(js_error(format!("the GPU reported an error: {error}"))),
+            None => Ok(()),
+        }
     }
 
     /// The GPU in use. Browsers often keep its name to themselves.
@@ -108,6 +132,7 @@ impl Bench {
     /// player does, and submits it. Returns the milliseconds the CPU took;
     /// [`work_done`](Self::work_done) says when the GPU is done.
     pub fn decode_next(&mut self) -> Result<f64, JsError> {
+        self.check()?;
         let stream = self
             .stream
             .as_mut()

@@ -52,6 +52,23 @@ jobs:
       # The browser player, and the core as the browser sees it: no blocking
       # calls, no clock.
       - run: cargo clippy --target wasm32-unknown-unknown -p emberwave-web -p emberwave-core -- -D warnings
+      # wasm-bindgen-cli has to be the version of the wasm-bindgen crate in
+      # Cargo.lock, so the cache follows the lock file, as in pages.yml.
+      - name: Cache wasm-bindgen-cli
+        id: wasm-bindgen
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/wasm-bindgen*
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install wasm-bindgen-cli
+        if: steps.wasm-bindgen.outputs.cache-hit != 'true'
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3 }' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      # The pages' module, built as Pages builds it, must instantiate: a
+      # broken one would otherwise show only once it is published.
+      - run: scripts/build_web.sh
+      - run: node scripts/check_web.mjs
 
   build-test:
     name: build + test (${{ matrix.os }})

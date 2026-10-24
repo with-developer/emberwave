@@ -16,6 +16,11 @@ const info = document.getElementById("info");
 const stats = document.getElementById("stats");
 
 let player;
+// Set once the module failed for good: a panic in it leaves its objects in
+// use, so that every later call fails, until the page is loaded again.
+let broken = false;
+// While a player is made anew for one whose GPU was lost.
+let renewing = null;
 // Bumped for every file, so that the loop of the previous one stops.
 let generation = 0;
 // Bumped for every file asked for, so that only the last one asked for plays
@@ -29,12 +34,70 @@ function fail(message) {
   stats.textContent = "";
 }
 
-function play(bytes, name) {
+// Reports what went wrong with a file. A panic in the module, which
+// WebAssembly reports as a RuntimeError, stops the player for good; a lost
+// GPU only until the next file, which gets a new player.
+function failWith(name, error) {
+  if (error instanceof WebAssembly.RuntimeError ||
+      String(error).includes("recursive use of an object")) {
+    broken = true;
+    fail(`${name}: the player stopped working (${error}). Reload the page to start over.`);
+    for (const control of document.querySelectorAll("input, button")) {
+      control.disabled = true;
+    }
+    return;
+  }
+  if (player?.is_lost()) {
+    console.error(error);
+    fail(`${name}: the GPU device was lost. The next file or sample starts again on a new one.`);
+    return;
+  }
+  fail(`${name}: ${error}`);
+}
+
+// Makes a new player if the GPU of the one there is was lost, or if making
+// one failed before.
+async function renewIfLost() {
+  if (renewing) {
+    await renewing;
+  }
+  if (player && !player.is_lost()) {
+    return;
+  }
+  // The loop of the old file draws with the old player: it stops first.
+  generation += 1;
+  renewing = (async () => {
+    player?.free();
+    player = null;
+    player = await Player.create(canvas);
+  })();
+  try {
+    await renewing;
+  } finally {
+    renewing = null;
+  }
+}
+
+async function play(bytes, name) {
+  if (broken) {
+    return;
+  }
+  // Checked before the bytes are copied into the module's memory.
+  const most = Player.max_file_bytes();
+  if (bytes.byteLength > most) {
+    fail(`${name}: the file has ${Math.floor(bytes.byteLength / 2 ** 20)} MiB, ` +
+      `and the player loads at most ${most / 2 ** 20} MiB`);
+    return;
+  }
   let description;
   try {
+    await renewIfLost();
+    if (broken) {
+      return;
+    }
     description = player.load(new Uint8Array(bytes));
   } catch (error) {
-    fail(`${name}: ${error}`);
+    failWith(name, error);
     return;
   }
   // The canvas has the size of the picture, so that a pixel is a fragment.
@@ -67,7 +130,7 @@ function play(bytes, name) {
       try {
         cpu += player.draw_next();
       } catch (error) {
-        fail(`${name}: ${error}`);
+        failWith(name, error);
         return;
       }
       frames += 1;
@@ -88,6 +151,9 @@ function play(bytes, name) {
 
 // Reads a file the user chose and plays it, unless another was chosen since.
 async function playFile(file) {
+  if (broken) {
+    return;
+  }
   const mine = ++request;
   let bytes;
   try {
@@ -99,11 +165,14 @@ async function playFile(file) {
     return;
   }
   if (mine === request) {
-    play(bytes, file.name);
+    await play(bytes, file.name);
   }
 }
 
 async function playSample(name) {
+  if (broken) {
+    return;
+  }
   const mine = ++request;
   let bytes;
   try {
@@ -119,7 +188,7 @@ async function playSample(name) {
     return;
   }
   if (mine === request) {
-    play(bytes, name);
+    await play(bytes, name);
   }
 }
 

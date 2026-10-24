@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use emberwave_core::bitstream::Pwv1File;
+use emberwave_core::bitstream::{Pwv1File, consts, pwv1};
 use emberwave_core::color::ColorParams;
 use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions};
 use wasm_bindgen::prelude::*;
@@ -24,8 +24,21 @@ const BLIT_SHADER: &str = include_str!("blit.wgsl");
 /// unrelated pictures, shown at this pace.
 const DEFAULT_FRAME_RATE: f64 = 30.0;
 
+/// The largest file the player loads, 1 GiB. Its bytes stay in the module's
+/// memory while it plays, and a phone may not have more to spare.
+const MAX_FILE_BYTES: u32 = 1 << 30;
+
+/// The largest picture the player decodes, in pixels: DCI 8K, 8192x4320. The
+/// format allows 16384x16384, whose decoder takes gigabytes of GPU memory,
+/// and a file of a few bytes can ask for that.
+const MAX_PIXELS: u64 = 8192 * 4320;
+
+/// An error for the page: the first line of the message. An error from the
+/// browser formats as `JsValue(Error: ...)` followed by its stack.
 fn js_error(error: impl std::fmt::Display) -> JsError {
-    JsError::new(&error.to_string())
+    let text = error.to_string();
+    let first = text.lines().next().unwrap_or_default();
+    JsError::new(&first.replace("JsValue(", ""))
 }
 
 /// Milliseconds on the page's clock (`performance.now()`), or 0 without one.
@@ -57,7 +70,13 @@ struct GpuTimes {
 
 /// The stream being played.
 struct Stream {
-    frames: Vec<Vec<u8>>,
+    /// The file, whose frames are played in turn up to `end`.
+    file: Vec<u8>,
+    /// Where the frames end that can be played: the end of the file, or
+    /// where the first one starts that cannot.
+    end: usize,
+    /// Where the size of the next frame to play is.
+    next: usize,
     decoder: Decoder,
     color: ColorParams,
     width: u32,
@@ -65,7 +84,33 @@ struct Stream {
     frame_rate: f64,
     /// Binds the decoder's RGBA words for the blit, once they exist.
     bind_group: Option<wgpu::BindGroup>,
-    next: usize,
+}
+
+/// The frames of a file that can be played, in order: how many there are,
+/// where they end, and why the rest of the file cannot be played, if it
+/// cannot. A frame that is cut off, or too short for the start of frame
+/// header that every frame begins with, ends them, so that playing never
+/// meets a frame it cannot read.
+fn playable_frames(file: &Pwv1File<'_>) -> (usize, usize, Option<String>) {
+    let mut end = pwv1::HEADER_BYTES;
+    let mut count = 0;
+    for frame in file.frames() {
+        let reason = match frame {
+            Ok(frame) if frame.len() >= consts::HEADER_BYTES => {
+                count += 1;
+                end += 4 + frame.len();
+                continue;
+            }
+            Ok(frame) => format!(
+                "frame {} has {} bytes, fewer than a start of frame header",
+                count + 1,
+                frame.len()
+            ),
+            Err(error) => format!("frame {} is cut off ({error})", count + 1),
+        };
+        return (count, end, Some(reason));
+    }
+    (count, end, None)
 }
 
 /// Plays PyroWave files on a canvas.
@@ -175,17 +220,41 @@ impl Player {
         }
     }
 
+    /// Whether the GPU device was lost: a driver reset, or a GPU that went
+    /// away. A lost player does not come back; the page makes a new one.
+    pub fn is_lost(&self) -> bool {
+        self.context.lost().is_some()
+    }
+
+    /// The largest file [`load`](Self::load) takes, in bytes, for the page
+    /// to check before it hands one over.
+    pub fn max_file_bytes() -> u32 {
+        MAX_FILE_BYTES
+    }
+
     /// Loads a PWV1 file and sizes the canvas to its pictures. Returns a line
-    /// that describes the stream.
-    pub fn load(&mut self, bytes: &[u8]) -> Result<String, JsError> {
+    /// that describes the stream. The frames before one that is cut off or
+    /// malformed are played, and the line says why the rest are not.
+    pub fn load(&mut self, bytes: Vec<u8>) -> Result<String, JsError> {
         // The old stream goes first, whether or not the new one loads: its
         // frames and GPU memory are not needed while the new ones are made.
         self.stream = None;
         if let Ok(mut times) = self.gpu_times.lock() {
             *times = GpuTimes::default();
         }
+        // An error the old stream's work raised is not the new one's.
+        if let Ok(mut first) = self.gpu_error.lock() {
+            *first = None;
+        }
 
-        let file = Pwv1File::parse(bytes).map_err(js_error)?;
+        if bytes.len() > MAX_FILE_BYTES as usize {
+            return Err(JsError::new(&format!(
+                "the file has {} MiB, and the player loads at most {} MiB",
+                bytes.len() >> 20,
+                MAX_FILE_BYTES >> 20
+            )));
+        }
+        let file = Pwv1File::parse(&bytes).map_err(js_error)?;
         let header = *file.header();
         let stream = header.stream;
         let largest = self.context.device().limits().max_texture_dimension_2d;
@@ -195,13 +264,18 @@ impl Player {
                 stream.width, stream.height
             )));
         }
-        let frames = file
-            .frames()
-            .map(|frame| frame.map(<[u8]>::to_vec))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(js_error)?;
-        if frames.is_empty() {
-            return Err(JsError::new("the file has no frames"));
+        if u64::from(stream.width) * u64::from(stream.height) > MAX_PIXELS {
+            return Err(JsError::new(&format!(
+                "the pictures are {}x{}, and the player decodes at most {MAX_PIXELS} pixels, \
+                 those of 8192x4320",
+                stream.width, stream.height
+            )));
+        }
+        let (count, end, unplayable) = playable_frames(&file);
+        if count == 0 {
+            return Err(JsError::new(
+                unplayable.as_deref().unwrap_or("the file has no frames"),
+            ));
         }
 
         let decoder = Decoder::new(&self.context, stream.width, stream.height, stream.chroma)
@@ -226,22 +300,23 @@ impl Player {
         } else {
             DEFAULT_FRAME_RATE
         };
-        let description = format!(
-            "{}x{} {:?}, {} frames at {frame_rate:.2} fps",
-            stream.width,
-            stream.height,
-            stream.chroma,
-            frames.len()
+        let mut description = format!(
+            "{}x{} {:?}, {count} frames at {frame_rate:.2} fps",
+            stream.width, stream.height, stream.chroma,
         );
+        if let Some(reason) = unplayable {
+            description.push_str(&format!("; the rest of the file is not played: {reason}"));
+        }
         self.stream = Some(Stream {
-            frames,
+            file: bytes,
+            end,
+            next: pwv1::HEADER_BYTES,
             decoder,
             color: ColorParams::from_stream(&stream),
             width: stream.width,
             height: stream.height,
             frame_rate,
             bind_group: None,
-            next: 0,
         });
         Ok(description)
     }
@@ -295,11 +370,25 @@ impl Player {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
+        // load() found every frame up to `end` whole.
+        let frame = stream
+            .file
+            .get(stream.next..stream.next + 4)
+            .and_then(|size| size.try_into().ok())
+            .map(|size| stream.next + 4..stream.next + 4 + u32::from_le_bytes(size) as usize)
+            .and_then(|range| Some((stream.file.get(range.clone())?, range.end)));
+        let Some((frame, after)) = frame else {
+            return Err(JsError::new("the frames ran out"));
+        };
         stream
             .decoder
-            .encode_rgb(&stream.frames[stream.next], &stream.color, &mut encoder)
+            .encode_rgb(frame, &stream.color, &mut encoder)
             .map_err(js_error)?;
-        stream.next = (stream.next + 1) % stream.frames.len();
+        stream.next = if after >= stream.end {
+            pwv1::HEADER_BYTES
+        } else {
+            after
+        };
 
         if stream.bind_group.is_none() {
             let rgba = stream
