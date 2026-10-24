@@ -1,9 +1,10 @@
-//! The C API of emberwave: PyroWave decoding on the GPU for C, and for any
-//! language that can call C functions.
+//! The C API of emberwave: PyroWave decoding and encoding on the GPU for C,
+//! and for any language that can call C functions.
 //!
 //! `include/emberwave.h` is generated from this file by cbindgen, and
-//! `tests/header.rs` fails when it is out of date. `examples/c/decode.c`
-//! shows the API in use, and `README.md` how to build and link it.
+//! `tests/header.rs` fails when it is out of date. `examples/c/decode.c` and
+//! `examples/c/encode.c` show the API in use, and `README.md` how to build
+//! and link it.
 //!
 //! The conventions, which the header repeats:
 //!
@@ -11,8 +12,9 @@
 //!   [`emberwave_last_error`] describes it, on the thread that made the call.
 //! - Objects are opaque. `*_create` makes one, `*_destroy` frees it, and
 //!   destroying `NULL` does nothing.
-//! - A context may be used by several threads at once. A decoder may move
-//!   between threads, but only one thread may use it at a time.
+//! - A context may be used by several threads at once. A decoder or an
+//!   encoder may move between threads, but only one thread may use it at a
+//!   time.
 //! - A panic inside emberwave is caught and reported as
 //!   `EMBERWAVE_STATUS_INTERNAL`. Destroy the object it happened in.
 
@@ -21,11 +23,12 @@ use std::ffi::{CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use emberwave_core::bitstream::{
-    ChromaSiting, ChromaSubsampling, Component, Error as BitstreamError, Header, Pwv1Header,
-    SequenceHeader, YcbcrRange,
+    ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, Error as BitstreamError, Header,
+    Pwv1Header, SequenceHeader, TransferFunction, YcbcrRange, YcbcrTransform,
 };
 use emberwave_core::color::{ColorMatrix, ColorParams};
-use emberwave_core::gpu::{Decoder, GpuContext, GpuError, GpuOptions};
+use emberwave_core::encode::{self, EncodeError, Signalling};
+use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions};
 
 /// The result of a call.
 #[repr(C)]
@@ -87,6 +90,14 @@ pub const EMBERWAVE_RANGE_FULL: u32 = 1;
 pub const EMBERWAVE_SITING_CENTER: u32 = 0;
 /// 4:2:0 chroma sits on the left one of the two luma samples it covers.
 pub const EMBERWAVE_SITING_LEFT: u32 = 1;
+/// The primaries of sRGB and BT.709.
+pub const EMBERWAVE_PRIMARIES_SRGB: u32 = 0;
+/// The primaries of BT.2020.
+pub const EMBERWAVE_PRIMARIES_BT2020: u32 = 1;
+/// The sRGB transfer function, for standard dynamic range.
+pub const EMBERWAVE_TRANSFER_SRGB: u32 = 0;
+/// The PQ transfer function of SMPTE ST 2084, for high dynamic range.
+pub const EMBERWAVE_TRANSFER_PQ: u32 = 1;
 
 /// How `emberwave_context_create` chooses the GPU.
 #[repr(C)]
@@ -162,8 +173,52 @@ pub struct EmberwaveColor {
     pub chroma_siting: u32,
 }
 
-/// A GPU device, shared by the decoders created on it. Creating one compiles
-/// the shaders, so make one and keep it.
+/// What the frames of an encoder say about their colours, in every start of
+/// frame header. A decoder converts to RGB with the matrix, the range and the
+/// chroma siting; the primaries and the transfer function are for whatever
+/// shows the picture.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EmberwaveSignalling {
+    /// `EMBERWAVE_MATRIX_BT709` or `EMBERWAVE_MATRIX_BT2020`: the format
+    /// cannot signal BT.601.
+    pub matrix: u32,
+    /// An `EMBERWAVE_RANGE_*` value.
+    pub range: u32,
+    /// An `EMBERWAVE_SITING_*` value.
+    pub chroma_siting: u32,
+    /// An `EMBERWAVE_PRIMARIES_*` value.
+    pub primaries: u32,
+    /// An `EMBERWAVE_TRANSFER_*` value.
+    pub transfer: u32,
+    /// Zeros: room for what later versions may add.
+    pub reserved: [u32; 3],
+}
+
+/// One plane of a picture to encode, in the caller's memory.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EmberwaveSourcePlane {
+    /// The first byte of the first row.
+    pub data: *const u8,
+    /// Bytes from the start of one row to the start of the next: at least the
+    /// width of the plane.
+    pub stride: usize,
+}
+
+/// One packet of a frame: where it starts in the frame and how many bytes it
+/// has.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmberwavePacket {
+    /// Bytes before the packet in the frame.
+    pub offset: usize,
+    /// Bytes of the packet.
+    pub size: usize,
+}
+
+/// A GPU device, shared by the decoders and encoders created on it. Creating
+/// one compiles the shaders, so make one and keep it.
 pub struct EmberwaveContext {
     context: GpuContext,
     adapter: CString,
@@ -172,6 +227,12 @@ pub struct EmberwaveContext {
 /// Decodes the frames of one stream: one picture size and chroma format.
 pub struct EmberwaveDecoder {
     decoder: Decoder,
+}
+
+/// Encodes the pictures of one stream on the GPU: one picture size and
+/// chroma format.
+pub struct EmberwaveEncoder {
+    encoder: Encoder,
 }
 
 thread_local! {
@@ -317,6 +378,126 @@ unsafe fn live_mut<'a>(
 unsafe fn lost(decoder: *const EmberwaveDecoder) -> Option<String> {
     // SAFETY: as the caller promises.
     unsafe { decoder.as_ref() }.and_then(|decoder| decoder.decoder.lost())
+}
+
+/// The encoder `encoder` points to, for a call that changes it.
+///
+/// # Safety
+///
+/// `encoder` is `NULL` or a live encoder that no other thread is using.
+unsafe fn live_encoder<'a>(
+    encoder: *mut EmberwaveEncoder,
+) -> Result<&'a mut EmberwaveEncoder, Failure> {
+    // SAFETY: as the caller promises.
+    unsafe { encoder.as_mut() }.ok_or_else(|| Failure::argument("encoder is NULL"))
+}
+
+/// Why the device of the encoder `encoder` points to was lost, if it was.
+///
+/// # Safety
+///
+/// `encoder` is `NULL` or a live encoder.
+unsafe fn encoder_lost(encoder: *const EmberwaveEncoder) -> Option<String> {
+    // SAFETY: as the caller promises.
+    unsafe { encoder.as_ref() }.and_then(|encoder| encoder.encoder.lost())
+}
+
+/// The chroma format an `EMBERWAVE_CHROMA_*` value names.
+fn chroma_subsampling(chroma: u32) -> Result<ChromaSubsampling, Failure> {
+    match chroma {
+        EMBERWAVE_CHROMA_420 => Ok(ChromaSubsampling::Yuv420),
+        EMBERWAVE_CHROMA_444 => Ok(ChromaSubsampling::Yuv444),
+        other => Err(Failure::argument(format!("unknown chroma format {other}"))),
+    }
+}
+
+/// The error of creating a decoder or an encoder of the caller's size: an
+/// invalid size is the caller's numbers, not a stream's.
+fn creation_failure(error: GpuError) -> Failure {
+    match error {
+        GpuError::Bitstream(BitstreamError::InvalidDimensions { .. }) => {
+            Failure::argument(error.to_string())
+        }
+        other => other.into(),
+    }
+}
+
+fn signalling(value: &EmberwaveSignalling) -> Result<Signalling, Failure> {
+    if value.reserved != [0; 3] {
+        return Err(Failure::argument("signalling.reserved is not zero"));
+    }
+    Ok(Signalling {
+        color_primaries: match value.primaries {
+            EMBERWAVE_PRIMARIES_SRGB => ColorPrimaries::Srgb,
+            EMBERWAVE_PRIMARIES_BT2020 => ColorPrimaries::Bt2020,
+            other => return Err(Failure::argument(format!("unknown primaries {other}"))),
+        },
+        transfer_function: match value.transfer {
+            EMBERWAVE_TRANSFER_SRGB => TransferFunction::Srgb,
+            EMBERWAVE_TRANSFER_PQ => TransferFunction::Pq,
+            other => {
+                return Err(Failure::argument(format!(
+                    "unknown transfer function {other}"
+                )));
+            }
+        },
+        ycbcr_transform: match value.matrix {
+            EMBERWAVE_MATRIX_BT709 => YcbcrTransform::Bt709,
+            EMBERWAVE_MATRIX_BT2020 => YcbcrTransform::Bt2020,
+            EMBERWAVE_MATRIX_BT601 => {
+                return Err(Failure::argument(
+                    "the format cannot signal the BT.601 matrix",
+                ));
+            }
+            other => return Err(Failure::argument(format!("unknown matrix {other}"))),
+        },
+        ycbcr_range: match value.range {
+            EMBERWAVE_RANGE_LIMITED => YcbcrRange::Limited,
+            EMBERWAVE_RANGE_FULL => YcbcrRange::Full,
+            other => return Err(Failure::argument(format!("unknown range {other}"))),
+        },
+        chroma_siting: match value.chroma_siting {
+            EMBERWAVE_SITING_CENTER => ChromaSiting::Center,
+            EMBERWAVE_SITING_LEFT => ChromaSiting::Left,
+            other => return Err(Failure::argument(format!("unknown chroma siting {other}"))),
+        },
+    })
+}
+
+/// The bytes of a source plane of `rows` rows of `row_bytes` bytes, from the
+/// first byte of the first row to the last byte of the last.
+///
+/// # Safety
+///
+/// `source.data` is `NULL` or points to `stride * (rows - 1) + row_bytes`
+/// readable bytes that stay unchanged while the slice is used.
+unsafe fn source_plane<'a>(
+    source: &EmberwaveSourcePlane,
+    name: &str,
+    row_bytes: usize,
+    rows: usize,
+) -> Result<&'a [u8], Failure> {
+    if source.data.is_null() {
+        return Err(Failure::argument(format!("{name}.data is NULL")));
+    }
+    if source.stride < row_bytes {
+        return Err(Failure::argument(format!(
+            "{name}.stride is {}, less than the {row_bytes} bytes of a row",
+            source.stride
+        )));
+    }
+    let span = source
+        .stride
+        .checked_mul(rows.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_add(row_bytes))
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| {
+            Failure::argument(format!(
+                "{name} spans more memory than a pointer can address"
+            ))
+        })?;
+    // SAFETY: not NULL, not too large, and the caller promises the bytes.
+    Ok(unsafe { std::slice::from_raw_parts(source.data, span) })
 }
 
 fn chroma_code(chroma: ChromaSubsampling) -> u32 {
@@ -638,20 +819,9 @@ pub unsafe extern "C" fn emberwave_decoder_create(
         let Some(context) = (unsafe { context.as_ref() }) else {
             return Err(Failure::argument("context is NULL"));
         };
-        let chroma = match chroma {
-            EMBERWAVE_CHROMA_420 => ChromaSubsampling::Yuv420,
-            EMBERWAVE_CHROMA_444 => ChromaSubsampling::Yuv444,
-            other => return Err(Failure::argument(format!("unknown chroma format {other}"))),
-        };
-        let created = Decoder::new(&context.context, width, height, chroma).map_err(|error| {
-            match error {
-                // The caller's numbers, not a stream's.
-                GpuError::Bitstream(BitstreamError::InvalidDimensions { .. }) => {
-                    Failure::argument(error.to_string())
-                }
-                other => other.into(),
-            }
-        })?;
+        let chroma = chroma_subsampling(chroma)?;
+        let created =
+            Decoder::new(&context.context, width, height, chroma).map_err(creation_failure)?;
         let boxed = Box::new(EmberwaveDecoder { decoder: created });
         // SAFETY: checked by the first output() above.
         unsafe { decoder.write(Box::into_raw(boxed)) };
@@ -856,6 +1026,224 @@ pub unsafe extern "C" fn emberwave_decoder_decode_rgb(
     )
 }
 
+/// Creates an encoder on `context` for pictures of `width` x `height` pixels
+/// in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. Width and
+/// height are from 1 to 16384, and even for 4:2:0; other sizes give
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`. `signalling` is what the frames say
+/// about their colours; with `NULL`, BT.709, video range, centred chroma and
+/// the primaries and transfer function of sRGB. The GPU memory the encoder
+/// needs is allocated here, but for the frame's, which grows to the largest
+/// budget it is given.
+///
+/// # Safety
+///
+/// `context` is a live context, and `signalling` is `NULL` or points to an
+/// `EmberwaveSignalling`. `encoder` points to where the new encoder is
+/// stored; it is set to `NULL` when the call fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_encoder_create(
+    context: *const EmberwaveContext,
+    width: u32,
+    height: u32,
+    chroma: u32,
+    signalling: *const EmberwaveSignalling,
+    encoder: *mut *mut EmberwaveEncoder,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        unsafe { output(encoder, "encoder", std::ptr::null_mut()) }?;
+        // SAFETY: as the caller promises.
+        let Some(context) = (unsafe { context.as_ref() }) else {
+            return Err(Failure::argument("context is NULL"));
+        };
+        let chroma = chroma_subsampling(chroma)?;
+        // SAFETY: as the caller promises.
+        let signalling = match unsafe { signalling.as_ref() } {
+            Some(value) => self::signalling(value)?,
+            None => Signalling::default(),
+        };
+        let created = Encoder::new(&context.context, width, height, chroma, signalling)
+            .map_err(creation_failure)?;
+        let boxed = Box::new(EmberwaveEncoder { encoder: created });
+        // SAFETY: checked by the first output() above.
+        unsafe { encoder.write(Box::into_raw(boxed)) };
+        Ok(())
+    })
+}
+
+/// Destroys an encoder and frees its GPU memory.
+///
+/// # Safety
+///
+/// `encoder` is `NULL`, or an encoder from `emberwave_encoder_create` that
+/// has not been destroyed and that no other thread is using.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_encoder_destroy(encoder: *mut EmberwaveEncoder) {
+    if !encoder.is_null() {
+        // SAFETY: it came from Box::into_raw, as the caller promises.
+        let boxed = unsafe { Box::from_raw(encoder) };
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+    }
+}
+
+/// The sizes of the planes the encoder takes.
+///
+/// # Safety
+///
+/// `encoder` is a live encoder that no other thread is using, and `info`
+/// points to an `EmberwaveFrameInfo` to fill in.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_encoder_info(
+    encoder: *mut EmberwaveEncoder,
+    info: *mut EmberwaveFrameInfo,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        let layout = unsafe { live_encoder(encoder) }?.encoder.layout();
+        let (chroma_width, chroma_height) = layout.plane_size(Component::Cb);
+        let described = EmberwaveFrameInfo {
+            width: layout.width(),
+            height: layout.height(),
+            chroma: chroma_code(layout.chroma()),
+            chroma_width,
+            chroma_height,
+        };
+        // SAFETY: as the caller promises.
+        unsafe { output(info, "info", described) }
+    })
+}
+
+/// Encodes one picture into a frame of at most `budget` bytes, writes it to
+/// `frame` and stores its size in `*size`: a start of frame header and the
+/// coded blocks, which `emberwave_frame_packets` splits into packets for a
+/// decoder. The planes have the sizes of `emberwave_encoder_info`, each row
+/// `stride` bytes from the next, and the bytes between the rows are not
+/// read. A budget too small for even the smallest frame is
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
+/// `*size`; nothing is encoded then, and the next frame takes the sequence
+/// number this one would have had. Waits for the GPU.
+///
+/// # Safety
+///
+/// `encoder` is a live encoder that no other thread is using. Each plane's
+/// `data` points to `stride * (height - 1) + width` readable bytes. `frame`
+/// points to `budget` bytes that may be written and do not overlap the
+/// planes, and `size` to a `size_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_encoder_encode(
+    encoder: *mut EmberwaveEncoder,
+    y: EmberwaveSourcePlane,
+    cb: EmberwaveSourcePlane,
+    cr: EmberwaveSourcePlane,
+    frame: *mut u8,
+    budget: usize,
+    size: *mut usize,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(size, "size", 0) }?;
+            // SAFETY: as the caller promises.
+            let encoder = unsafe { live_encoder(encoder) }?;
+            if frame.is_null() && budget > 0 {
+                return Err(Failure::argument("frame is NULL"));
+            }
+            if budget > isize::MAX as usize {
+                return Err(Failure::argument("budget is too large"));
+            }
+            let layout = encoder.encoder.layout();
+            let sources = [
+                (y, Component::Y, "y"),
+                (cb, Component::Cb, "cb"),
+                (cr, Component::Cr, "cr"),
+            ];
+            let mut planes: [&[u8]; 3] = [&[]; 3];
+            let mut strides = [0; 3];
+            for (i, (source, component, name)) in sources.iter().enumerate() {
+                let (width, height) = layout.plane_size(*component);
+                // SAFETY: as the caller promises.
+                planes[i] = unsafe { source_plane(source, name, width as usize, height as usize) }?;
+                strides[i] = source.stride;
+            }
+            match encoder.encoder.encode_strided(planes, strides, budget) {
+                Ok(bytes) => {
+                    // SAFETY: a frame is at most `budget` bytes, which the
+                    // caller promises may be written.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), frame, bytes.len());
+                        size.write(bytes.len());
+                    }
+                    Ok(())
+                }
+                Err(GpuError::Encode(error @ EncodeError::BudgetTooSmall { minimum, .. })) => {
+                    // SAFETY: as the caller promises.
+                    unsafe { size.write(minimum) };
+                    Err(GpuError::Encode(error).into())
+                }
+                Err(error) => Err(error.into()),
+            }
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { encoder_lost(encoder) },
+    )
+}
+
+/// Splits a frame into packets of at most `max_packet_bytes` bytes, at the
+/// boundaries of its blocks, and stores how many in `*count`. With `packets`
+/// not `NULL`, also where each starts in the frame and its size, in order;
+/// with fewer than `*count` places there (`capacity`), nothing is written to
+/// `packets` and the result is `EMBERWAVE_STATUS_INVALID_ARGUMENT`. The first
+/// packet starts with the start of frame header. A block larger than
+/// `max_packet_bytes` gets a packet of its own, as does the rest of a frame
+/// from a malformed block on, so a packet can be larger. A decoder takes the
+/// packets in any order.
+///
+/// # Safety
+///
+/// `frame` points to `size` readable bytes (or is `NULL` with `size` 0),
+/// `packets` is `NULL` or points to `capacity` `EmberwavePacket`s that may be
+/// written, and `count` points to a `size_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_frame_packets(
+    frame: *const u8,
+    size: usize,
+    max_packet_bytes: usize,
+    packets: *mut EmberwavePacket,
+    capacity: usize,
+    count: *mut usize,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        unsafe { output(count, "count", 0) }?;
+        // SAFETY: as the caller promises.
+        let bytes = unsafe { input(frame, size) }?;
+        if max_packet_bytes == 0 {
+            return Err(Failure::argument("max_packet_bytes is 0"));
+        }
+        let split = encode::packets(bytes, max_packet_bytes);
+        // SAFETY: as the caller promises.
+        unsafe { count.write(split.len()) };
+        if packets.is_null() {
+            return Ok(());
+        }
+        if capacity < split.len() {
+            return Err(Failure::argument(format!(
+                "capacity is {capacity}, less than the {} packets of the frame",
+                split.len()
+            )));
+        }
+        for (i, packet) in split.iter().enumerate() {
+            let described = EmberwavePacket {
+                offset: packet.as_ptr() as usize - bytes.as_ptr() as usize,
+                size: packet.len(),
+            };
+            // SAFETY: i is below capacity, which the caller promises.
+            unsafe { packets.add(i).write(described) };
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,6 +1256,7 @@ mod tests {
         assert_send::<EmberwaveContext>();
         assert_sync::<EmberwaveContext>();
         assert_send::<EmberwaveDecoder>();
+        assert_send::<EmberwaveEncoder>();
     }
 
     #[test]
@@ -944,6 +1333,74 @@ mod tests {
         // SAFETY: both live, destroyed once.
         unsafe {
             emberwave_decoder_destroy(decoder);
+            emberwave_context_destroy(context);
+        }
+    }
+
+    #[test]
+    fn an_encoder_reports_a_lost_device_as_the_loss() {
+        let mut context = std::ptr::null_mut();
+        // SAFETY: NULL options and a pointer to store the context.
+        if unsafe { emberwave_context_create(std::ptr::null(), &mut context) }
+            != EmberwaveStatus::Ok
+        {
+            assert!(
+                std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+                "no GPU"
+            );
+            return;
+        }
+        let mut encoder = std::ptr::null_mut();
+        let create = |encoder: &mut *mut EmberwaveEncoder| {
+            // SAFETY: a live context, NULL signalling and a pointer to store
+            // the encoder.
+            unsafe {
+                emberwave_encoder_create(
+                    context,
+                    64,
+                    32,
+                    EMBERWAVE_CHROMA_420,
+                    std::ptr::null(),
+                    encoder,
+                )
+            }
+        };
+        assert_eq!(create(&mut encoder), EmberwaveStatus::Ok);
+        // SAFETY: a live context; the device is destroyed as wgpu does when
+        // a GPU goes away.
+        unsafe { (*context).context.device().destroy() };
+
+        let planes = [vec![128u8; 64 * 32], vec![128; 32 * 16], vec![128; 32 * 16]];
+        let source = |plane: &Vec<u8>, stride| EmberwaveSourcePlane {
+            data: plane.as_ptr(),
+            stride,
+        };
+        let mut frame = vec![0u8; 10_000];
+        let mut size = 0;
+        // SAFETY: a live encoder, planes of its sizes and a frame of 10_000
+        // bytes.
+        let status = unsafe {
+            emberwave_encoder_encode(
+                encoder,
+                source(&planes[0], 64),
+                source(&planes[1], 32),
+                source(&planes[2], 32),
+                frame.as_mut_ptr(),
+                frame.len(),
+                &mut size,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::DeviceLost);
+        // SAFETY: a live encoder.
+        assert!(unsafe { encoder_lost(encoder) }.is_some());
+        // So does making another encoder on the context.
+        let mut other = std::ptr::null_mut();
+        assert_eq!(create(&mut other), EmberwaveStatus::DeviceLost);
+        assert!(other.is_null());
+
+        // SAFETY: both live, destroyed once.
+        unsafe {
+            emberwave_encoder_destroy(encoder);
             emberwave_context_destroy(context);
         }
     }

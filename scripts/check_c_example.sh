@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Builds the C example of the C API (crates/emberwave-ffi/examples/c) with
-# CMake against the shared library, decodes every test vector with it and
-# compares the result with upstream's FP32 decode, at the 80 dB of decision
-# D9.
+# Builds the C examples of the C API (crates/emberwave-ffi/examples/c) with
+# CMake against the shared library, decodes every test vector with the
+# decoding example and compares the result with upstream's FP32 decode, at the
+# 80 dB of decision D9, and encodes the sources of two encoder vectors with the
+# encoding example, which decodes its packets again and fails below 40 dB.
 #
 # Usage: scripts/check_c_example.sh [CARGO_OUT_DIR]
 #
@@ -25,18 +26,21 @@ cmake -S crates/emberwave-ffi/examples/c -B "$BUILD" \
     -DEMBERWAVE_LIB_DIR="$CARGO_OUT" -DCMAKE_BUILD_TYPE=Debug
 cmake --build "$BUILD" --config Debug
 
-# Single-configuration generators put the program in the build directory,
+# Single-configuration generators put the programs in the build directory,
 # Visual Studio's in a directory per configuration.
-example=
-for candidate in "$BUILD/emberwave_decode" "$BUILD/Debug/emberwave_decode.exe"; do
-    if [ -x "$candidate" ]; then
-        example=$candidate
-    fi
-done
-if [ -z "$example" ]; then
-    echo "the example was not built in $BUILD" >&2
+program() {
+    local candidate
+    for candidate in "$BUILD/$1" "$BUILD/Debug/$1.exe"; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo "$1 was not built in $BUILD" >&2
     exit 1
-fi
+}
+example=$(program emberwave_decode)
+encoder=$(program emberwave_encode)
 cli=$CARGO_OUT/emberwave-cli
 if [ -x "$cli.exe" ]; then
     cli=$cli.exe
@@ -47,4 +51,9 @@ for vector in testdata/*.pwv1; do
     echo "== $name"
     "$example" "$vector" "$BUILD/$name.y4m"
     "$cli" compare "$BUILD/$name.y4m" "testdata/$name.ref-fp32.y4m" --min-psnr 80 | tail -n 1
+done
+
+for source in scene_200x120_420 scene_131x67_444; do
+    echo "== $source, encoded"
+    "$encoder" "testdata/encoder/$source.source.y4m" 20000 40 | tail -n 1
 done

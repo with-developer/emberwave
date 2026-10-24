@@ -22,7 +22,8 @@ use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES};
 use crate::bitstream::{ChromaSubsampling, Component, FrameLayout, SequenceHeader};
 use crate::encode::fdwt::sample_level;
 use crate::encode::{
-    EncodeError, Signalling, check_planes, next_sequence, start_of_frame, stream_header,
+    EncodeError, Signalling, check_planes, check_strided_planes, next_sequence, start_of_frame,
+    stream_header,
 };
 
 use super::context::GpuContext;
@@ -106,8 +107,9 @@ pub enum TexturePicture<'a> {
 /// Where a picture to encode is.
 #[derive(Clone, Copy)]
 enum Input<'a> {
-    /// In CPU memory: the Y, Cb and Cr samples.
-    Planes([&'a [u8]; 3]),
+    /// In CPU memory: the Y, Cb and Cr samples, with the bytes from one
+    /// row to the next if the rows are not back to back.
+    Planes([&'a [u8]; 3], Option<[usize; 3]>),
     /// In textures on the GPU.
     Textures(TexturePicture<'a>),
 }
@@ -422,7 +424,23 @@ impl Encoder {
     /// the budget is [`GpuError::Encode`]. It waits for the GPU, so it cannot
     /// run in a browser, where nothing may block.
     pub fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, GpuError> {
-        self.run_encode(Input::Planes(planes), budget, false)
+        self.run_encode(Input::Planes(planes, None), budget, false)
+            .map(|(frame, _)| frame)
+    }
+
+    /// Encodes like [`encode`](Self::encode) a picture whose rows are
+    /// `strides` bytes apart, as a screen capture or a decoder may leave
+    /// them: plane `i` holds at least `(height - 1) * strides[i] + width`
+    /// bytes at the sizes of [`FrameLayout::plane_size`], and the bytes
+    /// between the rows are not read. A stride below the width is
+    /// [`EncodeError::PlaneStride`].
+    pub fn encode_strided(
+        &mut self,
+        planes: [&[u8]; 3],
+        strides: [usize; 3],
+        budget: usize,
+    ) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(Input::Planes(planes, Some(strides)), budget, false)
             .map(|(frame, _)| frame)
     }
 
@@ -435,7 +453,7 @@ impl Encoder {
         planes: [&[u8]; 3],
         budget: usize,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
-        self.run_encode(Input::Planes(planes), budget, true)
+        self.run_encode(Input::Planes(planes, None), budget, true)
     }
 
     /// Encodes a picture that is in GPU memory already, as textures on the
@@ -490,8 +508,8 @@ impl Encoder {
         // The planes in the upload buffer, or a pass that gathers them from
         // the textures.
         let gather = match input {
-            Input::Planes(planes) => {
-                self.upload_planes(planes)?;
+            Input::Planes(planes, strides) => {
+                self.upload_planes(planes, strides)?;
                 None
             }
             Input::Textures(picture) => Some(self.gather_bind_group(picture)?),
@@ -684,8 +702,15 @@ impl Encoder {
     /// Writes the planes into the upload buffer, rows padded to whole words,
     /// or returns an error if they do not have the sizes of the pictures.
     /// [`encode_upload`](Self::encode_upload) records the copy to the GPU.
-    fn upload_planes(&mut self, planes: [&[u8]; 3]) -> Result<(), GpuError> {
-        check_planes(&self.layout, planes)?;
+    fn upload_planes(
+        &mut self,
+        planes: [&[u8]; 3],
+        strides: Option<[usize; 3]>,
+    ) -> Result<(), GpuError> {
+        match strides {
+            None => check_planes(&self.layout, planes)?,
+            Some(strides) => check_strided_planes(&self.layout, planes, strides)?,
+        }
         self.map_upload()?;
         let mut view = self
             .upload
@@ -695,15 +720,18 @@ impl Encoder {
         {
             for (component, plane) in Component::ALL.into_iter().zip(planes) {
                 let i = component.index();
-                let width = self.layout.plane_size(component).0 as usize;
+                let (width, height) = self.layout.plane_size(component);
+                let (width, height) = (width as usize, height as usize);
+                let source_stride = strides.map_or(width, |strides| strides[i]);
                 let stride = self.buffers.packed_strides[i] as usize * 4;
                 let start = self.buffers.packed_offsets[i] as usize * 4;
-                if width == stride {
-                    view.slice(start..start + plane.len())
-                        .copy_from_slice(plane);
+                if width == stride && source_stride == width {
+                    view.slice(start..start + width * height)
+                        .copy_from_slice(&plane[..width * height]);
                     continue;
                 }
-                for (row, samples) in plane.chunks_exact(width).enumerate() {
+                for row in 0..height {
+                    let samples = &plane[row * source_stride..][..width];
                     let at = start + row * stride;
                     view.slice(at..at + width).copy_from_slice(samples);
                     view.slice(at + width..at + stride).fill(0);

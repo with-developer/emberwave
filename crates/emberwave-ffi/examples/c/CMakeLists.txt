@@ -1,5 +1,6 @@
-# Builds the C example against the emberwave shared library that
-# `cargo build -p emberwave-ffi` makes.
+# Builds the C examples against the emberwave shared library that
+# `cargo build -p emberwave-ffi` makes: emberwave_decode (decode.c) and
+# emberwave_encode (encode.c).
 #
 #     cargo build --release -p emberwave-ffi
 #     cmake -S crates/emberwave-ffi/examples/c -B target/c-example -DEMBERWAVE_LIB_DIR=target/release
@@ -31,18 +32,24 @@ else()
         IMPORTED_LOCATION "${EMBERWAVE_LIB_DIR_ABSOLUTE}/libemberwave_ffi.so")
 endif()
 
-add_executable(emberwave_decode decode.c)
-target_link_libraries(emberwave_decode PRIVATE emberwave)
-# The header is included with -I rather than as a system header, so that the
-# warnings below check it too.
-set_target_properties(emberwave_decode PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
-if(MSVC)
-    target_compile_options(emberwave_decode PRIVATE /W4 /WX)
-    # fopen is standard C; MSVC would rather have fopen_s.
-    target_compile_definitions(emberwave_decode PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    target_compile_options(emberwave_decode PRIVATE -std=c99 -Wall -Wextra -Werror -pedantic)
-endif()
+foreach(example emberwave_decode emberwave_encode)
+    string(REPLACE "emberwave_" "" source ${example})
+    add_executable(${example} ${source}.c)
+    target_link_libraries(${example} PRIVATE emberwave)
+    # The header is included with -I rather than as a system header, so that
+    # the warnings below check it too.
+    set_target_properties(${example} PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    if(MSVC)
+        target_compile_options(${example} PRIVATE /W4 /WX)
+        # fopen and strtok are standard C; MSVC would rather have its _s
+        # versions.
+        target_compile_definitions(${example} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(${example} PRIVATE -std=c99 -Wall -Wextra -Werror -pedantic)
+        # log10, for the PSNR of encode.c.
+        target_link_libraries(${example} PRIVATE m)
+    endif()
+endforeach()
 
 # The library is found next to the executable on Windows, and through the
 # run path (the library's directory) elsewhere.
@@ -52,7 +59,8 @@ if(WIN32)
     add_custom_target(emberwave_dll ALL
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${EMBERWAVE_LIB_DIR_ABSOLUTE}/emberwave_ffi.dll" "$<TARGET_FILE_DIR:emberwave_decode>")
-    add_dependencies(emberwave_dll emberwave_decode)
+    add_dependencies(emberwave_dll emberwave_decode emberwave_encode)
 else()
-    set_target_properties(emberwave_decode PROPERTIES BUILD_RPATH "${EMBERWAVE_LIB_DIR_ABSOLUTE}")
+    set_target_properties(emberwave_decode emberwave_encode PROPERTIES
+        BUILD_RPATH "${EMBERWAVE_LIB_DIR_ABSOLUTE}")
 endif()

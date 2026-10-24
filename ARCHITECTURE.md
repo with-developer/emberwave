@@ -488,14 +488,15 @@ The page paces frames by the stream's frame rate, keeping the remainder of each 
 
 ## C API
 
-`crates/emberwave-ffi` is the decoder for C programs. It builds a shared library (and, for releases, a static one) with the functions of `include/emberwave.h`, which cbindgen generates from `src/lib.rs`; `tests/header.rs` fails when the committed header falls behind the source. [`crates/emberwave-ffi/README.md`](crates/emberwave-ffi/README.md) is the guide for C programmers. The objects are those of the Rust API:
+`crates/emberwave-ffi` is the decoder and the GPU encoder for C programs. It builds a shared library (and, for releases, a static one) with the functions of `include/emberwave.h`, which cbindgen generates from `src/lib.rs`; `tests/header.rs` fails when the committed header falls behind the source. [`crates/emberwave-ffi/README.md`](crates/emberwave-ffi/README.md) is the guide for C programmers. The objects are those of the Rust API:
 
 | C | Rust | Role |
 |---|---|---|
-| `EmberwaveContext` | `GpuContext` | A GPU device and the compiled shaders, shared by its decoders |
+| `EmberwaveContext` | `GpuContext` | A GPU device and the compiled shaders, shared by its decoders and encoders |
 | `EmberwaveDecoder` | `Decoder` | Assembles the packets of one stream and decodes its frames |
+| `EmberwaveEncoder` | `gpu::Encoder` | Encodes the pictures of one stream into frames within a byte budget |
 
-A decoder holds the device it was made on, so it may outlive its context. The functions:
+A decoder or an encoder holds the device it was made on, so it may outlive its context. The functions:
 
 | Function | What it does |
 |---|---|
@@ -504,6 +505,9 @@ A decoder holds the device it was made on, so it may outlive its context. The fu
 | `emberwave_decoder_create`, `_destroy`, `_info` | One decoder per picture size and chroma format; the sizes of its planes |
 | `emberwave_decoder_push_packet`, `_is_ready`, `_clear` | Feed packets as they arrive; ask whether the frame, or enough of it, is there |
 | `emberwave_decoder_decode_yuv`, `_decode_rgb` | Decode and copy the planes, or RGB, into the caller's memory, row by row with the caller's strides |
+| `emberwave_encoder_create`, `_destroy`, `_info` | One encoder per picture size and chroma format, with the colours its frames signal; the sizes of its planes |
+| `emberwave_encoder_encode` | Encode planes from the caller's memory, with the caller's strides, into a frame of at most the budget, written into the caller's buffer of that size |
+| `emberwave_frame_packets` | Where a frame splits into packets of a given size, at its blocks |
 | `emberwave_version`, `emberwave_last_error` | The version, and the message of the last failure on the calling thread |
 
 Every function returns a status, or a value that cannot fail. A Rust panic is caught at the boundary, because unwinding into C is not allowed, and becomes `EMBERWAVE_STATUS_INTERNAL`, or `EMBERWAVE_STATUS_DEVICE_LOST` when the device is lost: wgpu panics when the device fails while it is waited for (D22), after recording the loss. Arguments are checked before the frame is used: a `NULL` pointer, a stride shorter than a row, a picture size the format cannot have or an unknown constant is `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and the frame can still be decoded with correct ones. What the caller passes in is a plain integer, never a Rust enum, so no value from C can be an invalid one.
@@ -848,3 +852,17 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 - The bind group of a picture's textures is made for each frame and dropped with it, rather than cached: a cache would keep the caller's textures alive, and making one costs microseconds.
 
 **Consequence.** In the benchmarks on the Apple M3 Max (`BENCHMARKS.md`, at commit `991f541`) the CPU's part of a 4K encode falls from 0.23 to 0.02 ms, and the transform, the gather included, takes 0.52 instead of 0.40 ms: the gather costs more GPU time than the copy from the upload buffer that it replaces. A 4K frame takes 1.80 ms from textures against 1.93 ms from CPU memory, 1.08 against 1.11 ms at 1440p, and 0.80 ms either way at 1080p. Footprints of 64x4 and 16x16 samples per workgroup, and a flat grid of words, did not make it faster; the loads of single 8-bit texels are the cost. Reading the textures in the transform's first level instead would save most of it (issue #40). A capture that would have to come back to CPU memory saves the read-back as well, which is not measured here.
+
+### 2026-10-24 — D33: The encoder in the C API
+
+**Context.** The C API had a decoder only, for clients; the encoder was Rust's alone, so a host written in C or C++ could not use it (issue #42). Upstream's Metal C API encodes planes with row strides or IOSurfaces, and its `pyrowave_encoder_packetize` writes the packets into a buffer the caller provides.
+
+**Decision.**
+- `emberwave_encoder_encode` writes the frame into a buffer of `budget` bytes that the caller provides, as the decoder writes pictures into the caller's memory: a frame never exceeds its budget, so that buffer always suffices, and the bytes stay the caller's while they are being sent. An encoder-owned buffer, valid until the next call, would be overwritten by a retry with a smaller budget while the previous frame is still in flight.
+- A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT`, with the smallest frame's size in the size out-parameter, so a host can retry without parsing the message. Nothing is encoded then, and the sequence number does not move.
+- The planes come with their strides, which the GPU encoder takes itself (`Encoder::encode_strided`): its upload copies row by row already, so padded rows, as captures have them, are copied once rather than first packed by the C API.
+- `emberwave_frame_packets` splits a frame at its blocks into packets of at most a given size, as `encode::packets` does, and returns offsets and sizes into the frame; with no array it counts. It is apart from the encoder, so it works on frames from files as well.
+- `EmberwaveSignalling` carries all five fields of the start of frame header, primaries and transfer function included, with three reserved words that must be zero, so that the struct can grow without a new one. BT.601 is refused: the format has no code for it. A zeroed struct is therefore an error, and `NULL` is the default (BT.709, video range, centred chroma, sRGB).
+- Only the GPU encoder: the context is a GPU context. Pictures in GPU memory (`encode_textures`) need handles of the caller's graphics API and wait for #27.
+
+**Consequence.** `examples/c/encode.c` encodes a Y4M file, splits each frame into packets of 1,200 bytes, decodes them with the C decoder, last packet first, and checks the PSNR; CI runs it on Linux, macOS and Windows. Frames through the C API are the bytes of the Rust encoder, with tight or padded rows.
