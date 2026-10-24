@@ -235,16 +235,29 @@ fn the_rows_handed_out_are_those_of_the_decoded_frame() {
     let context = gpu_or_return!();
     let color = ColorParams::default();
 
-    // Odd sizes in 4:2:0 and in 4:4:4.
-    for name in ["gradient_200x120_420", "noise_131x67_444"] {
-        let (layout, frames) = vector_frames(name);
-        let mut decoder = decoder_for(context, &layout);
-        let frame = decoder.decode(&frames[0]).expect("decode");
-        let rgb = decoder.decode_rgb(&frames[0], &color).expect("RGB decode");
+    // Rows whose width is not a multiple of four are padded to whole words
+    // in the GPU's memory: in 4:4:4 at 131x67, and in the 98-sample chroma
+    // rows of a 196x70 picture in 4:2:0.
+    let mut cases: Vec<(String, FrameLayout, Vec<u8>)> =
+        ["gradient_200x120_420", "noise_131x67_444"]
+            .into_iter()
+            .map(|name| {
+                let (layout, frames) = vector_frames(name);
+                (name.to_owned(), layout, frames[0].clone())
+            })
+            .collect();
+    let layout = FrameLayout::new(196, 70, ChromaSubsampling::Yuv420).unwrap();
+    let frame = synthetic_frame(&layout, 0x5EED_0196, false);
+    cases.push(("synthetic 196x70 4:2:0".to_owned(), layout, frame));
+
+    for (name, layout, bytes) in &cases {
+        let mut decoder = decoder_for(context, layout);
+        let frame = decoder.decode(bytes).expect("decode");
+        let rgb = decoder.decode_rgb(bytes, &color).expect("RGB decode");
 
         // The frame was decoded already: forget it, or it would be ignored.
         decoder.clear();
-        decoder.push_packet(&frames[0]).expect("packet");
+        decoder.push_packet(bytes).expect("packet");
         let mut planes: [Vec<u8>; 3] = Default::default();
         let mut next = [0u32; 3];
         decoder
@@ -256,13 +269,21 @@ fn the_rows_handed_out_are_those_of_the_decoded_frame() {
                 planes[i].extend_from_slice(samples);
             })
             .expect("rows");
+        // The frame takes its rows from the same place, so the CPU decoder
+        // checks them as well: the GPU rounds as it does, within one level.
+        let cpu_frame = cpu::decode_frame(&assembled(layout, bytes).frame()).unwrap();
         for (i, plane) in frame.planes.iter().enumerate() {
             assert_eq!(next[i], plane.height, "{name}: rows of plane {i}");
             assert_eq!(planes[i], plane.data, "{name}: plane {i}");
+            let expected = cpu_frame.planes[i].to_unorm8();
+            assert!(
+                max_abs_diff(&expected, &planes[i]) <= 1,
+                "{name}: plane {i}"
+            );
         }
 
         decoder.clear();
-        decoder.push_packet(&frames[0]).expect("packet");
+        decoder.push_packet(bytes).expect("packet");
         let mut pixels = Vec::new();
         let mut next = 0;
         decoder
@@ -840,7 +861,9 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
     }
     assert!(context.lost().is_some());
 
-    // No row of a lost device's frame is handed out.
+    // The row methods fail alike, without a row. The loss is on record by
+    // now, so they fail before any work; a loss found in the wait for the
+    // frame is the unit test `no_row_is_handed_out_once_the_device_is_lost`.
     let mut rows = 0;
     decoder.clear();
     decoder.push_packet(&frames[0]).expect("packet");

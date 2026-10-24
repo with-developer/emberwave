@@ -1205,6 +1205,43 @@ mod tests {
     }
 
     #[test]
+    fn no_row_is_handed_out_once_the_device_is_lost() {
+        // A context of its own, whose record of a loss is written by hand.
+        if test_context().is_none() {
+            return;
+        }
+        let context = GpuContext::new(&crate::gpu::GpuOptions::default()).expect("a context");
+        let chroma = ChromaSubsampling::Yuv420;
+        let mut decoder = Decoder::new(&context, 64, 32, chroma).unwrap();
+        decoder
+            .assemble_complete(&empty_frame(64, 32, chroma))
+            .unwrap();
+
+        // As the callback of a device lost while the frame is on the GPU
+        // writes it during the wait. run_gpu_on_device does not look before
+        // the work, so only the check after the wait can hold the rows back.
+        *context.lost_record().lock().unwrap() = Some("lost during the frame".to_owned());
+        let mut handed_out = 0;
+        for read in [Read::Yuv, Read::Rgb] {
+            let color = (read == Read::Rgb).then(ColorParams::default);
+            decoder
+                .run_gpu_on_device(color.as_ref(), read, false, Duration::ZERO, &mut |_| {
+                    handed_out += 1;
+                })
+                .expect("the work itself succeeds");
+        }
+        assert_eq!(handed_out, 0);
+
+        // And the methods report the loss.
+        let outcome = decoder.decode_assembled_rows(|_, _, _| handed_out += 1);
+        assert!(
+            matches!(outcome, Err(GpuError::DeviceLost(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(handed_out, 0);
+    }
+
+    #[test]
     fn rgba_to_rgb_drops_alpha_until_either_side_runs_out() {
         let rgba: Vec<u8> = (0..4 * 37).map(|i| (i * 7 + 3) as u8).collect();
         let expected: Vec<u8> = rgba
