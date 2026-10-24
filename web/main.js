@@ -55,16 +55,20 @@ function failWith(name, error) {
   fail(`${name}: ${error}`);
 }
 
-// Makes a new player if the GPU of the one there is was lost.
+// Makes a new player if the GPU of the one there is was lost, or if making
+// one failed before.
 async function renewIfLost() {
   if (renewing) {
     await renewing;
   }
-  if (!player.is_lost()) {
+  if (player && !player.is_lost()) {
     return;
   }
+  // The loop of the old file draws with the old player: it stops first.
+  generation += 1;
   renewing = (async () => {
-    player.free();
+    player?.free();
+    player = null;
     player = await Player.create(canvas);
   })();
   try {
@@ -88,6 +92,9 @@ async function play(bytes, name) {
   let description;
   try {
     await renewIfLost();
+    if (broken) {
+      return;
+    }
     description = player.load(new Uint8Array(bytes));
   } catch (error) {
     failWith(name, error);

@@ -34,17 +34,20 @@ function paint() {
 }
 
 // The smallest step of performance.now(), which browsers coarsen: from up to
-// 200 steps, for 50 ms at most, as each waits a step on a blocked page.
+// 200 steps, for about 50 ms, as each waits a step on a blocked page, and a
+// million readings at most for a step that does not come.
 function timerStep() {
   let smallest = Infinity;
   const until = performance.now() + 50;
   for (let i = 0; i < 200 && performance.now() < until; i++) {
     const a = performance.now();
-    let b = performance.now();
-    while (b === a) {
+    let b = a;
+    for (let spins = 0; b === a && spins < 1e6; spins++) {
       b = performance.now();
     }
-    smallest = Math.min(smallest, b - a);
+    if (b !== a) {
+      smallest = Math.min(smallest, b - a);
+    }
   }
   return smallest;
 }
@@ -76,7 +79,11 @@ async function measure(bench) {
   }
   // The mean from the whole run, which a coarse timer cannot spoil.
   const mean = (performance.now() - first) / FRAMES;
-  // A frame that raised a GPU error was not decoded.
+  // A frame that raised a GPU error was not decoded. The browser reports
+  // errors as events of their own, which can come after the work is done:
+  // they get a moment, so that the last frames' count for this size.
+  await bench.work_done();
+  await paint();
   bench.check();
   each.sort((a, b) => a - b);
   return {
@@ -107,7 +114,7 @@ async function run() {
   body.replaceChildren();
   // A page that goes to the background, or a phone that locks its screen,
   // slows the frames down: such a run is marked.
-  let hidden = false;
+  let hidden = document.hidden;
   const watch = () => {
     hidden ||= document.hidden;
   };
@@ -134,9 +141,13 @@ async function run() {
     await measureAll(bench, body, () => hidden);
   } finally {
     document.removeEventListener("visibilitychange", watch);
-    bench?.free();
     wakeLock?.release().catch(() => {});
     start.disabled = false;
+    try {
+      bench?.free();
+    } catch {
+      // Its device goes with the page then.
+    }
   }
 }
 
