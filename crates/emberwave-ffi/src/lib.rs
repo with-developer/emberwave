@@ -622,27 +622,24 @@ fn check_target(
     Ok(())
 }
 
-/// Copies tightly packed rows of `row_bytes` bytes into `target`.
+/// Copies `line` into row `row` of `target`, through a pointer rather than a
+/// slice: the caller's memory may be uninitialised, which a `&mut [u8]` must
+/// not refer to.
 ///
 /// # Safety
 ///
-/// `target` passed [`check_target`] for `source.len() / row_bytes` rows of
-/// `row_bytes` bytes, and the memory it describes may be written and does not
-/// overlap `source`.
-unsafe fn copy_rows(source: &[u8], row_bytes: usize, target: &EmberwavePlane) {
-    if row_bytes == 0 {
-        return;
-    }
-    for (row, line) in source.chunks_exact(row_bytes).enumerate() {
-        // SAFETY: the row lies within the span check_target accepted, which
-        // the caller promises may be written.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                line.as_ptr(),
-                target.data.add(row * target.stride),
-                row_bytes,
-            );
-        }
+/// `target` passed [`check_target`] for rows of `line.len()` bytes and more
+/// than `row` rows, and the memory it describes may be written and does not
+/// overlap `line`.
+unsafe fn copy_row(line: &[u8], row: usize, target: &EmberwavePlane) {
+    // SAFETY: the row lies within the span check_target accepted, which the
+    // caller promises may be written.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            line.as_ptr(),
+            target.data.add(row * target.stride),
+            line.len(),
+        );
     }
 }
 
@@ -938,7 +935,8 @@ pub unsafe extern "C" fn emberwave_decoder_clear(decoder: *mut EmberwaveDecoder)
 /// Decodes the frame received so far and writes its Y, Cb and Cr planes, 8
 /// bits per sample in the range the stream uses. Blocks that did not arrive
 /// decode as zeros, so call it when `emberwave_decoder_is_ready` says so.
-/// Waits for the GPU.
+/// Waits for the GPU. The rows go from the GPU's memory straight to the
+/// planes, so a call that fails may have written some of them.
 ///
 /// # Safety
 ///
@@ -969,12 +967,15 @@ pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
                 let (width, height) = layout.plane_size(*component);
                 check_target(target, name, width as usize, height as usize)?;
             }
-            let frame = decoder.decoder.decode_assembled()?;
-            for (plane, (target, _, _)) in frame.planes.iter().zip(&targets) {
-                // SAFETY: checked above for the plane's size, and the caller
-                // promises the memory.
-                unsafe { copy_rows(&plane.data, plane.width as usize, target) };
-            }
+            decoder
+                .decoder
+                .decode_assembled_rows(|component, row, samples| {
+                    let target = &targets[component.index()].0;
+                    // SAFETY: the row is one of the plane's, as wide as the
+                    // plane, so it lies within the span check_target accepted
+                    // above, which the caller promises may be written.
+                    unsafe { copy_row(samples, row as usize, target) };
+                })?;
             Ok(())
         },
         // SAFETY: as the caller promises; the body's borrow has ended.
@@ -989,7 +990,8 @@ pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
 /// arrived). Upstream's Metal encoder signals BT.709, full range and centred
 /// chroma in every frame, whatever the pictures are, so a caller that knows
 /// better, such as from the header of a PWV1 file, passes that. Waits for the
-/// GPU.
+/// GPU. The rows go from the GPU's memory straight to `rgb`, so a call that
+/// fails may have written some of them.
 ///
 /// # Safety
 ///
@@ -1018,9 +1020,14 @@ pub unsafe extern "C" fn emberwave_decoder_decode_rgb(
             let layout = decoder.decoder.layout();
             let row_bytes = 3 * layout.width() as usize;
             check_target(&rgb, "rgb", row_bytes, layout.height() as usize)?;
-            let frame = decoder.decoder.decode_assembled_rgb(&params)?;
-            // SAFETY: checked above, and the caller promises the memory.
-            unsafe { copy_rows(&frame.data, row_bytes, &rgb) };
+            decoder
+                .decoder
+                .decode_assembled_rgb_rows(&params, |row, pixels| {
+                    // SAFETY: the row is one of the picture's, of row_bytes
+                    // bytes, so it lies within the span check_target accepted
+                    // above, which the caller promises may be written.
+                    unsafe { copy_row(pixels, row as usize, &rgb) };
+                })?;
             Ok(())
         },
         // SAFETY: as the caller promises; the body's borrow has ended.
