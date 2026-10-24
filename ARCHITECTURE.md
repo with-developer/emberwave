@@ -422,6 +422,8 @@ The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: n
 - `tests/gpu.rs` and `tests/gpu_encoder.rs` create a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decode a vector on it, and encode pictures on it.
 - The rounding rule of the last level is checked on the real backend against the CPU's, on inputs that are exact ties: a unit test of `gpu::decoder` cuts `to_unorm8` out of `idwt.wgsl` and runs it.
 
+Outside those tests a context asks for the default limits with two exceptions. Buffers and textures may be as large as the adapter allows. No limit goes beyond the adapter's, since some adapters fall short of a default the shaders do not need. Metal gives the iOS Simulator, and Apple GPUs before the A11, 15 inter-stage variables, one fewer than WebGPU's default, and the shaders use none (D36).
+
 What upstream uses and what replaces it:
 
 | Upstream (Vulkan) | emberwave (WGSL) |
@@ -516,6 +518,8 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 Every function returns a status, or a value that cannot fail. A Rust panic is caught at the boundary, because unwinding into C is not allowed, and becomes `EMBERWAVE_STATUS_INTERNAL`, or `EMBERWAVE_STATUS_DEVICE_LOST` when the device is lost: wgpu panics when the device fails while it is waited for (D22), after recording the loss. Arguments are checked before the frame is used: a `NULL` pointer, a stride shorter than a row, a picture size the format cannot have or an unknown constant is `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and the frame can still be decoded with correct ones. What the caller passes in is a plain integer, never a Rust enum, so no value from C can be an invalid one.
 
 `unsafe` code lives in this crate only. It has its own lint table instead of the workspace's `forbid`: every unsafe operation sits in an `unsafe` block of its own with a comment saying why it is sound, and every public function documents what the caller must guarantee.
+
+For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
 The C API copies the picture to the CPU, which costs more than decoding it: a 4K frame to RGB takes 7.5 ms with the copy and 1.4 ms without (`BENCHMARKS.md`). Handing the picture to the caller's graphics API on the GPU would need the Vulkan, Metal or Direct3D 12 object behind a wgpu buffer and a way for each API to import it; that is left for later.
 
@@ -881,3 +885,33 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 
 **Consequence.** Measured alternately with the build before, three rounds of 600 frames each: a 4K frame decodes to planes in 0.87 to 0.91 ms instead of 1.05 to 1.07 ms, and to RGB in 1.20 to 1.21 ms instead of 1.34 to 1.40 ms; the CPU's part falls from 0.23 to 0.08 ms. At 1440p the planes take 0.50 to 0.54 ms instead of 0.61 to 0.63, at 1080p 0.39 ms instead of 0.46 to 0.51 in two rounds of three (the third had a slower GPU, after as before). A decoder keeps a second buffer of the payload's size, 1.2 MB at 4K.
 
+### 2026-10-24 — D35: The C library for iPhone, iPad and Mac apps, as an XCFramework
+
+**Context.** iPhones decode PyroWave in Safari through WebGPU (`BENCHMARKS.md`). A native app needs the C library in a form Xcode links, and the releases had it for macOS only (issue #52). The development Mac had neither Rust's standard library for iOS nor an iOS Simulator runtime, and an app for an iPhone has to be signed by its developer. GitHub's macOS runners have Xcode and iOS Simulator runtimes.
+
+**Decision.**
+- `scripts/build_xcframework.sh` builds the C library as static libraries, one per slice, and bundles them with `xcodebuild -create-xcframework` into `Emberwave.xcframework`:
+
+  | Slice | Rust target | Oldest system |
+  |---|---|---|
+  | `ios-arm64`, iPhones and iPads | `aarch64-apple-ios` | iOS 12, the oldest Xcode 26 builds for |
+  | `ios-arm64-simulator`, the iOS Simulator on Apple silicon | `aarch64-apple-ios-sim` | iOS 14, the first Simulator on Apple silicon |
+  | `macos-arm64`, Macs with Apple silicon | `aarch64-apple-darwin` | macOS 11, the first on Apple silicon |
+
+  wgpu checks at run time for what newer systems add, so the old deployment targets cost nothing.
+- Static libraries only. A dynamic library in an iOS app has to be a framework bundle, embedded and signed. A static library needs none of that, and the linker drops what the app does not call.
+- No Intel slices. The Simulator on Intel Macs and Intel Macs themselves would each add a build, for machines Apple no longer sells.
+- The header sits in `Headers/Emberwave/` with a module map. Swift imports the module `Emberwave`, and C includes `<Emberwave/emberwave.h>`. Xcode copies the headers of every static XCFramework of an app into one directory, where module maps at the top would collide. The bundle takes the module's name, as XCFrameworks do and as a SwiftPM binary target named `Emberwave` expects.
+- `examples/swift` is `decode.c` in Swift, a SwiftPM package that names the XCFramework as a binary target and the system libraries in its linker settings. Those are the same for all three slices: Metal, QuartzCore, CoreGraphics, Foundation, CoreFoundation, `libiconv` and `libobjc`.
+- CI's macOS job `XCFramework` builds it and runs `scripts/check_xcframework.sh`. That script builds the C examples and the Swift example against each library, linked statically with the system libraries rustc names. On the Mac and in an iOS Simulator, the decoding examples decode every test vector, which `emberwave-cli` compares with upstream's FP32 decode at 80 dB (D9), and the encoding example encodes two sources. For devices the examples are only linked. A failing program in the Simulator must fail the check, and the script makes sure that it does.
+- Releases carry it as `emberwave-ffi-VERSION-xcframework.zip`, with the system libraries of each slice, the FFI README, the licence and the changelog.
+
+**Consequence.** An app adds one XCFramework and a few system frameworks, and calls the C API from C, Objective-C or Swift. The first run in the Simulator found that no context could be created there (D36). With that fixed, the C and Swift examples decoded every vector in the Simulator ("Apple iOS simulator GPU", an iPhone 17 on iOS 26.5) to the PSNR they reach on the runner's Mac, from 86.28 dB to bit-exact, and encoded both sources. The job takes about 11 minutes, 2 to 3 of them booting the Simulator. Nothing has run on an iPhone's own GPU through the XCFramework yet: the Simulator uses the Mac's GPU. Sharing the picture with the app's Metal code on the GPU is still issue #27.
+
+### 2026-10-24 — D36: Limits: the defaults, or less where the adapter has less
+
+**Context.** A context asked for WebGPU's default limits, with the adapter's buffer and texture sizes (D32). In the iOS Simulator, an iPhone 17 on iOS 26.5, every context failed: "Limit 'max_inter_stage_shader_variables' value 16 is better than allowed 15" (issue #54). wgpu's Metal backend gives 31 inter-stage variables to Apple GPUs of the Apple4 family (the A11 and later), 30 to Macs' other GPUs, and 15 to everything else: the Simulator and the A7 to A10, which iOS 12 to 15 run on.
+
+**Decision.** A context asks for the default limits, or the adapter's limit where that is lower (`Limits::or_worse_values_from`). For limits that are minimums, such as alignments, that means the adapter's where it is larger. Buffers and textures stay as large as the adapter allows. `strict_webgpu` asks for the defaults exactly, as the portability tests need. A unit test checks the limits a context asks for without a GPU.
+
+**Consequence.** The compute shaders have no inter-stage variables, and the browser player's draw passes none besides the position. An adapter short of a limit the shaders do need now fails where the pipelines are made, naming that limit, rather than when the device is. Adapters that meet the defaults get exactly the device they got before.
