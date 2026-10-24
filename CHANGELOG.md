@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.11.0] - 2026-10-24
+
+Decoding into the Metal client's own textures, such as the texture of a `CVPixelBuffer` for an `AVSampleBufferDisplayLayer`, a C API whose documentation sets out how decodes and the client's reads are ordered, and an iPhone and iPad benchmark app that times and checks every way into textures.
 
 ### Added
 
