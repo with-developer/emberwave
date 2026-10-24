@@ -25,6 +25,8 @@ You need a Mac with Xcode, an Apple ID and a cable or the same Wi-Fi as the phon
 5. **Run** (Command-R). The scheme builds the Release configuration with Metal's API validation off, so that the timings are those of the app as it would ship. With a free account, the first start asks you to trust the developer: *Settings > General > VPN & Device Management*.
 6. **Benchmark.** In the app, tap *Run* and wait about a minute with the app in front; the screen stays on meanwhile. Then *Copy the results*.
 
+The project builds for iPhones and iPads, and for the iOS Simulator on Macs with Apple silicon only: the XCFramework has no library for the Simulator on Intel Macs.
+
 For steadier numbers, let the phone cool down first, close other apps, and keep it plugged in; the report gives the thermal state at the end. Stopping the app in Xcode and starting it again from the home screen leaves the debugger out.
 
 ## In CI
