@@ -860,3 +860,37 @@ fn a_metal_context_needs_a_device_and_a_queue() {
         assert!(context.is_null());
     }
 }
+
+#[test]
+fn metal_textures_of_the_callers_own_need_metal() {
+    let Some(context) = context() else {
+        return;
+    };
+    let bytes = testdata("gradient_200x120_420.pwv1");
+    let decoder = decoder_for(context, &bytes);
+    let mut texture = ptr::null_mut();
+    // SAFETY: a live context and decoder, NULL where the test means it, and a
+    // pointer to store the texture in.
+    unsafe {
+        // On Apple systems a NULL texture is refused; elsewhere there is no
+        // Metal, and the pointer is not even looked at.
+        let expected = if cfg!(any(target_os = "macos", target_os = "ios")) {
+            EmberwaveStatus::InvalidArgument
+        } else {
+            EmberwaveStatus::NoGpu
+        };
+        assert_eq!(
+            emberwave_texture_from_metal(decoder, ptr::null_mut(), &mut texture),
+            expected
+        );
+        assert!(texture.is_null());
+        assert_eq!(
+            emberwave_texture_from_metal_plane(decoder, ptr::null_mut(), 3, &mut texture),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(last_error().contains("plane is 3"), "{}", last_error());
+        assert!(texture.is_null());
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}

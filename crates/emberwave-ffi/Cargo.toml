@@ -18,14 +18,19 @@ emberwave-core.workspace = true
 wgpu.workspace = true
 
 # A context on the caller's own Metal device and queue
-# (emberwave_context_create_metal). wgpu uses these crates on Apple systems
+# (emberwave_context_create_metal), and the caller's own textures
+# (emberwave_texture_from_metal). wgpu uses these crates on Apple systems
 # already, and the core uses pollster.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2 = "0.6"
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
+    "MTLAllocation",
     "MTLCommandQueue",
     "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
 ] }
 pollster.workspace = true
 

@@ -203,7 +203,34 @@ id<MTLCommandBuffer> commands = [queue commandBuffer];       /* the same queue, 
 
 On a context of `emberwave_context_create` the submit functions refuse to work, as nothing there orders the reads.
 
-Vulkan and Direct3D 12 handles, and decoding into textures of the client's own, such as a drawable's or an IOSurface's, are not part of the interface yet.
+### Into the client's own textures
+
+`emberwave_texture_from_metal` wraps a texture of the client's own, so that any decode above fills it (decision D44). The usual one belongs to a `CVPixelBuffer`, to hand to an `AVSampleBufferDisplayLayer`:
+
+```objc
+/* Once: a cache on the context's device, and BGRA pixel buffers of the picture's size,
+   from a pool made with kCVPixelBufferMetalCompatibilityKey. */
+CVMetalTextureCacheRef cache;
+CVMetalTextureCacheCreate(NULL, NULL, device, NULL, &cache);
+
+/* For every frame that is ready, into a free pixel buffer: */
+CVMetalTextureRef image;
+CVMetalTextureCacheCreateTextureFromImage(NULL, cache, pixelBuffer, NULL, MTLPixelFormatBGRA8Unorm,
+                                          width, height, 0, &image);
+EmberwaveTexture *texture;
+emberwave_texture_from_metal(decoder, (__bridge void *)CVMetalTextureGetTexture(image), &texture);
+emberwave_decoder_decode_texture(decoder, NULL, texture);   /* or the submit, on the client's queue */
+emberwave_texture_destroy(texture);
+CFRelease(image);
+/* ... the pixel buffer holds the picture: enqueue it on the display layer */
+```
+
+- **The texture** is on the device of the decoder's context, 2D, of one level, layer and sample, of the picture's size, and BGRA8 or RGBA8, or R8 of a plane's size for `emberwave_texture_from_metal_plane`. A texture of a `CVPixelBuffer` is a texture of its own, not a view.
+- **Copy or draw.** A copy fills the texture when its width is a multiple of 64 pixels, as at 720p, 1080p, 1440p and 4K, and it is not framebuffer-only. A texture of a `CVMetalTextureCache` is not framebuffer-only, though it can only be read unless `kCVMetalTextureUsage` says otherwise. Other textures take a draw, which needs `MTLTextureUsageRenderTarget`, as a drawable has it. A texture that neither can fill is refused, as is one of the wrong device, format or size.
+- **Lifetime.** emberwave keeps a reference to the `MTLTexture` until the texture is destroyed. Keep the `CVMetalTextureRef` until the GPU has written the picture: until a waiting decode returns, or until a command buffer committed after a submit has completed.
+- **Hazards.** A submit takes only textures whose hazards Metal tracks, as it does for those of a `CVMetalTextureCache`. A heap's textures are usually untracked; the waiting decodes take those too.
+
+Vulkan and Direct3D 12 handles are not part of the interface yet.
 
 [`examples/ios`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/ios) is an iPhone and iPad app that does all of this in Swift: it times decoding into textures, decoding to planes and encoding on the device's GPU, and draws the last picture from its texture. Its README says how to run it on a phone.
 
