@@ -521,7 +521,7 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 
 For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
-The C API copies the picture to the CPU, which costs more than decoding it: a 4K frame to RGB takes 7.5 ms with the copy and 1.4 ms without (`BENCHMARKS.md`). Handing the picture to the caller's graphics API on the GPU would need the Vulkan, Metal or Direct3D 12 object behind a wgpu buffer and a way for each API to import it; that is left for later.
+The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). Handing the picture to the caller's graphics API on the GPU would need the Vulkan, Metal or Direct3D 12 object behind a wgpu buffer and a way for each API to import it; that is left for later.
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
 
@@ -915,3 +915,31 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 **Decision.** A context asks for the default limits, or the adapter's limit where that is lower (`Limits::or_worse_values_from`). For limits that are minimums, such as alignments, that means the adapter's where it is larger. Buffers and textures stay as large as the adapter allows. `strict_webgpu` asks for the defaults exactly, as the portability tests need. A unit test checks the limits a context asks for without a GPU.
 
 **Consequence.** The compute shaders have no inter-stage variables, and the browser player's draw passes none besides the position. An adapter short of a limit the shaders do need now fails where the pipelines are made, naming that limit, rather than when the device is. Adapters that meet the defaults get exactly the device they got before.
+
+### 2026-10-24 — D37: Pictures read back straight from the mapped buffer
+
+**Context.** A 4K frame decoded to RGB and copied to the CPU took 7.2 ms in `emberwave-cli` and 7.6 ms through the C API. Left in GPU memory it takes 1.2 ms (issue #56). Three copies made the difference:
+- The mapped RGBA, 33 MB, was copied into a new vector.
+- A copy per pixel turned that into RGB in another vector, 4.5 ms on its own.
+- The C API copied the result into the caller's memory row by row.
+
+Every native client waits for the C API's decode until the picture can stay on the GPU (#27).
+
+**Decision.**
+- `read_back_with` hands the mapped bytes to a closure. A guard unmaps the buffer afterwards, inside the read's error scope, also when the closure panics. Unmapping a buffer that is not mapped is an error, so the guard exists only once the range is mapped.
+- RGBA turns into RGB in a loop over chunks of three and four bytes, which the compiler vectorises: 0.5 ms for a 4K frame in a micro-benchmark on the M3 Max, where the copy per pixel took 4.5 ms. The core forbids `unsafe`, so it has no SIMD intrinsics.
+- `Decoder::decode_assembled_rows` and `decode_assembled_rgb_rows` hand out the picture a row at a time from that memory; RGB rows are converted into one reused row. The C API copies each row through a pointer. The caller's memory may be uninitialised, and a `&mut [u8]` must not refer to such memory, so the core's API takes no slice of it.
+- Rows go out only if the device was not lost when the frame was waited for. The wait polls the device, and the poll records a loss. A loss noticed after the rows went out still fails the call. The C API's documentation says that such a call may leave some rows written.
+- `decode_assembled` and `decode_assembled_rgb` fill their new frames from the mapped memory directly.
+
+**Consequence.** Measured alternately with the build before on the Apple M3 Max, 300 frames and two rounds:
+
+| | Before | After |
+|---|---|---|
+| C API, 4K to RGB | 7.64 to 7.65 ms | 2.62 to 2.71 ms |
+| C API, 4K to planes | 1.57 to 1.59 ms | 1.16 to 1.18 ms |
+| C API, 1080p to RGB | 2.25 ms | 0.84 ms |
+| C API, 1080p to planes | 1.10 ms | 0.49 ms |
+| `emberwave-cli`, 4K to RGB in CPU memory | 7.13 to 7.20 ms | 2.14 to 2.27 ms |
+
+The copy that remains, 25 MB at 4K, goes into the caller's memory. Doing without it is the work of #27.

@@ -2,6 +2,16 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `Decoder::decode_assembled_rows` and `Decoder::decode_assembled_rgb_rows` hand the decoded picture to a closure row by row, straight from the memory the GPU wrote, so that a caller can put it where it wants it with one copy.
+
+### Changed
+
+- Reading a decoded picture back to the CPU is much faster (decision D37, [#56](https://github.com/with-developer/emberwave/issues/56)): it comes straight out of the mapped buffer, and RGBA turns into RGB in a loop the compiler vectorises, where a copy per pixel took 4.5 ms at 4K. On an Apple M3 Max a 4K frame through the C API takes 2.7 ms to RGB instead of 7.6 ms, and 1.2 ms to planes instead of 1.6 ms; at 1080p 0.8 and 0.5 ms instead of 2.2 and 1.1 ms. `emberwave-cli decode` gains as much. A failed `emberwave_decoder_decode_yuv` or `_decode_rgb` may now have written some rows.
+
 ## [0.7.0] - 2026-10-24
 
 Apps on iPhones, iPads and Macs: the C library as an XCFramework that Swift imports, checked in an iOS Simulator, where contexts can now be created. Also a benchmark page for browsers, phones included, a faster CPU side of decoding, and fixes from a review of the command line tool.
