@@ -32,6 +32,7 @@ struct MetalView: UIViewRepresentable {
 
     /// Draws the picture as a quad that keeps its aspect ratio.
     final class Renderer: NSObject, MTKViewDelegate {
+        // Not `quad`: Metal's standard library reserves the name.
         private static let shaders = """
             #include <metal_stdlib>
             using namespace metal;
@@ -41,7 +42,7 @@ struct MetalView: UIViewRepresentable {
                 float2 uv;
             };
 
-            vertex Corner quad(uint index [[vertex_id]], constant float2 &scale [[buffer(0)]]) {
+            vertex Corner corners(uint index [[vertex_id]], constant float2 &scale [[buffer(0)]]) {
                 float2 uv = float2(index & 1, index >> 1);
                 Corner corner;
                 corner.position = float4((uv * 2 - 1) * float2(1, -1) * scale, 0, 1);
@@ -49,11 +50,28 @@ struct MetalView: UIViewRepresentable {
                 return corner;
             }
 
-            fragment float4 picture(Corner in [[stage_in]], texture2d<float> picture [[texture(0)]]) {
-                constexpr sampler linear(filter::linear);
-                return picture.sample(linear, in.uv);
+            fragment float4 shade(Corner in [[stage_in]], texture2d<float> picture [[texture(0)]]) {
+                constexpr sampler bilinear(filter::linear);
+                return picture.sample(bilinear, in.uv);
             }
             """
+
+        /// The pipeline that draws the picture. -autorun makes it too, since
+        /// the screen would only show nothing if it failed: a pipeline without
+        /// its functions is an assertion in Metal, not an error.
+        static func makePipeline(device: MTLDevice) throws -> MTLRenderPipelineState {
+            let library = try device.makeLibrary(source: shaders, options: nil)
+            let descriptor = MTLRenderPipelineDescriptor()
+            guard let vertex = library.makeFunction(name: "corners"),
+                let fragment = library.makeFunction(name: "shade")
+            else {
+                throw EmberwaveFailure(description: "the screen's shaders have no corners or shade")
+            }
+            descriptor.vertexFunction = vertex
+            descriptor.fragmentFunction = fragment
+            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            return try device.makeRenderPipelineState(descriptor: descriptor)
+        }
 
         var picture: MTLTexture?
         private let queue: MTLCommandQueue?
@@ -61,13 +79,7 @@ struct MetalView: UIViewRepresentable {
 
         init(device: MTLDevice) {
             queue = device.makeCommandQueue()
-            let descriptor = MTLRenderPipelineDescriptor()
-            if let library = try? device.makeLibrary(source: Self.shaders, options: nil) {
-                descriptor.vertexFunction = library.makeFunction(name: "quad")
-                descriptor.fragmentFunction = library.makeFunction(name: "picture")
-            }
-            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-            pipeline = try? device.makeRenderPipelineState(descriptor: descriptor)
+            pipeline = try? Self.makePipeline(device: device)
         }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {

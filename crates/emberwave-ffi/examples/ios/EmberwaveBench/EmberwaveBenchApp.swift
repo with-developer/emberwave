@@ -27,6 +27,10 @@ struct EmberwaveBenchApp: App {
 private func autorun() {
     do {
         let emberwave = try Emberwave()
+        guard let device = emberwave.device else {
+            throw EmberwaveFailure(description: "the context has no Metal device")
+        }
+        _ = try MetalView.Renderer.makePipeline(device: device)
         let plan = Plan(pictures: 2, frames: 60, warmupFrames: 10, warmupMs: 200)
         var results: [SizeResult] = []
         for size in pictureSizes {
