@@ -129,6 +129,7 @@ impl EncoderPipelines {
                         texture_entry(2),
                         texture_entry(3),
                         texture_entry(4),
+                        sampler_entry(5),
                     ],
                 ),
                 fdwt: create_stage(
@@ -208,7 +209,8 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// A 2D texture of floats that is read with `textureLoad`, filterable or not.
+/// A 2D texture of floats, filterable or not, which `gather.wgsl` reads with
+/// `textureGather` through a sampler that does not filter.
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -218,6 +220,17 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },
+        count: None,
+    }
+}
+
+/// A sampler that does not filter, for `textureGather`, which takes texels as
+/// they are.
+fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
         count: None,
     }
 }

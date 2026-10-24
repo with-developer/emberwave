@@ -416,7 +416,7 @@ The wall-clock time exceeds the sum of the stages, because submitting work and n
 
 ### Portability
 
-The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder reads pictures in textures as sampled `r8unorm` and `rg8unorm` textures with `textureLoad`, which WebGPU has without any feature. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account:
+The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder reads pictures in textures as sampled `r8unorm` and `rg8unorm` textures with `textureGather` and a non-filtering sampler, which WebGPU has without any feature. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account:
 
 - `tests/shaders.rs` validates the WGSL of every shader with naga using an empty capability set, without a GPU, and checks the entry points, the workgroup sizes and memory.
 - `tests/gpu.rs` and `tests/gpu_encoder.rs` create a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decode a vector on it, and encode pictures on it.
@@ -437,7 +437,7 @@ What upstream uses and what replaces it:
 | Hardware bilinear filtering of the chroma textures (viewer) | Integer taps and weights in the shader |
 | Subgroup operations in the encoder's quantisation and rate control | Workgroup memory, a histogram with 32-bit atomics and prefix sums in workgroup memory |
 | 8-bit stores of the encoder's block bytes | Bytes ORed into words of workgroup memory with atomics, then copied out |
-| The encoder's IOSurface input: three R8 surfaces, or NV12 with its chroma plane bound twice under two swizzles | Texture views, R8 or R8 and Rg8, packed into the planes by a dispatch of their own ahead of the transform's; a uniform picks the channel, as WGSL has no swizzled views |
+| The encoder's IOSurface input: three R8 surfaces, or NV12 with its chroma plane bound twice under two swizzles | Texture views, R8 or R8 and Rg8, packed into the planes by a dispatch of their own ahead of the transform's, 2x2 texels per `textureGather`; a uniform picks the channel, as WGSL has no swizzled views |
 
 ### Verification
 
@@ -943,3 +943,15 @@ Every native client waits for the C API's decode until the picture can stay on t
 | `emberwave-cli`, 4K to RGB in CPU memory | 7.13 to 7.20 ms | 2.14 to 2.27 ms |
 
 The copy that remains, 25 MB at 4K, goes into the caller's memory. Doing without it is the work of #27.
+
+### 2026-10-24 — D38: The gather pass reads texels four at a time
+
+**Context.** A picture in textures reaches the transform through `gather.wgsl`, which packs it into the planes buffer (D32). At 4K the pass cost about 0.13 ms of the transform's 0.52 ms, more than the copy from the upload buffer it replaces. Other workgroup shapes did not help: the cost was the single 8-bit texel loads, one per sample. Issue #40 proposed reading the textures in the transform's first level instead, with `textureGather` as an alternative.
+
+**Decision.**
+- Each invocation of the gather pass writes one word in each of two rows. It takes the eight samples with two `textureGather` calls, 2x2 texels each, where four `textureLoad` calls gave one word.
+- The gather happens at the corner the four texels share. Those coordinates are half a texel from every texel centre, so rounding cannot pick other texels. The bytes come out as before: the test that compares the planes buffer word for word with the CPU's upload, for every byte value, passes unchanged.
+- The sampler is nearest and clamped to the edge, made once per encoder. Texels past the edge of a texture repeat the edge, and the samples there are masked to the zeros of the padding as before.
+- Reading the textures in the transform's first level is not done. It would save at most the 0.04 ms the pass now costs, with a second transform pipeline. It would also load each texel about 1.5 times, as the 40x40 windows of neighbouring tiles overlap.
+
+**Consequence.** Measured alternately with the build before on the Apple M3 Max, 600 frames and three rounds: a 4K frame from textures encodes in 1.71 to 1.72 ms instead of 1.80 to 1.81 ms. The transform, gather included, takes 0.43 to 0.44 ms instead of 0.52 ms. At 1440p and 1080p the transform takes 0.21 and 0.12 to 0.14 ms instead of 0.24 and 0.14 to 0.15 ms, and the totals stay where they were. The encoder needs a sampler binding in the gather pass's layout.
