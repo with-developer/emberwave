@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (v0.6.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. The encoder runs on the CPU (`emberwave_core::encode`) and on the GPU (`emberwave_core::gpu`). `emberwave-cli` decodes and encodes files with them, `emberwave-web` plays them in a browser and `emberwave-ffi` offers the decoder and the GPU encoder to C. Decode and encode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
+> **Status (v0.7.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. The encoder runs on the CPU (`emberwave_core::encode`) and on the GPU (`emberwave_core::gpu`). `emberwave-cli` decodes and encodes files with them, `emberwave-web` plays them in a browser and `emberwave-ffi` offers the decoder and the GPU encoder to C, also as an XCFramework for iPhone, iPad and Mac apps. Decode and encode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
 
 ## Overview
 

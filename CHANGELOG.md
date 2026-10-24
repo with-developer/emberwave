@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] - 2026-10-24
+
+Apps on iPhones, iPads and Macs: the C library as an XCFramework that Swift imports, checked in an iOS Simulator, where contexts can now be created. Also a benchmark page for browsers, phones included, a faster CPU side of decoding, and fixes from a review of the command line tool.
 
 ### Added
 
