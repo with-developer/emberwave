@@ -8,7 +8,7 @@ import UIKit
 /// Runs the benchmark off the main thread and publishes what it does.
 @MainActor
 final class BenchModel: ObservableObject {
-    @Published var status = "Tap Run. It takes about two minutes; keep the app in front."
+    @Published var status = "Tap Run. It takes about five minutes; keep the app in front."
     @Published var report = ""
     @Published var running = false
     @Published var picture: MTLTexture?
@@ -20,7 +20,7 @@ final class BenchModel: ObservableObject {
     init() {
         do {
             emberwave = try Emberwave()
-            status = "GPU: \(emberwave?.adapter ?? "none"). Tap Run; it takes about two minutes."
+            status = "GPU: \(emberwave?.adapter ?? "none"). Tap Run; it takes about five minutes."
         } catch {
             emberwave = nil
             status = "No GPU: \(error)"
@@ -49,19 +49,22 @@ final class BenchModel: ObservableObject {
         Task.detached(priority: .userInitiated) {
             let plan = Plan()
             var results: [SizeResult] = []
+            var hevc: [HEVCOutcome] = []
             var outcome: String
             do {
                 for size in pictureSizes {
-                    let result = try emberwave.run(size, plan) { line in
+                    let (result, outcomes) = try emberwave.runSize(size, plan) { line in
                         Task { @MainActor in self.status = line }
                     }
                     results.append(result)
+                    hevc.append(contentsOf: outcomes)
                     await MainActor.run { self.picture = result.picture }
                 }
                 let check = try emberwave.checkTextures()
-                outcome = makeReport(emberwave, plan, results, check: check)
+                outcome = makeReport(emberwave, plan, results, hevc: hevc, check: check)
             } catch {
-                outcome = makeReport(emberwave, plan, results, check: "failed: \(error)")
+                outcome = makeReport(
+                    emberwave, plan, results, hevc: hevc, check: "failed: \(error)")
             }
             let finished = outcome
             await MainActor.run {

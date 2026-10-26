@@ -6,7 +6,10 @@
 - **decode into Y, Cb, Cr textures**: the same frames to their planes in three textures, for a player that converts the colours itself (`emberwave_decoder_decode_plane_textures`);
 - **decode on the app's queue**: the same frames into a texture on the app's own command queue, where the call does not wait (`emberwave_context_create_metal`, `emberwave_decoder_submit_texture`), timed until the app's next command buffer, a copy of one pixel standing in for its draw, has read the picture;
 - **decode to planes in memory**: the same frames to Y, Cb and Cr planes in CPU memory (`emberwave_decoder_decode_yuv`);
-- **encode from memory**: pictures in CPU memory to frames within the byte budget, on the GPU (`emberwave_encoder_encode`).
+- **encode from memory**: pictures in CPU memory to frames within the byte budget, on the GPU (`emberwave_encoder_encode`);
+- **HEVC through VideoToolbox**, for comparison, as a Moonlight client decodes a game stream today: the same pictures, encoded by the device's own encoder into a stream at Moonlight's default bit rate and at emberwave's bytes per frame, and decoded by its decoder into NV12 and BGRA textures.
+
+The decodes into textures, emberwave's and HEVC's, are timed one frame after the other, and also as a stream's frames arrive, 60 a second, with the device idle in between.
 
 It uses the pictures and budgets of the [browser benchmark](https://with-developer.github.io/emberwave/bench.html), 1080p, 1440p and 4K, so that the two compare: the browser's goes through WebGPU in Safari, this one through Metal directly. It shows the last decoded picture, drawn from the texture with the app's own Metal code. It also checks the textures, read back through Metal on queues of its own: the picture against the RGB decode, the planes against those decoded to memory, and a decode on the app's queue read by the app's next command buffer there.
 
@@ -31,7 +34,7 @@ Nothing is published: the app is signed for your own devices only.
 3. **Sign.** Select the project, the target `EmberwaveBench`, *Signing & Capabilities*, and choose your Apple ID under *Team* (a free *Personal Team* will do). If Xcode says the bundle identifier is taken, change `io.github.with-developer.emberwave-bench` to something of your own. Until the phone is connected, a Personal Team reports that it has no devices: the next step registers the phone.
 4. **The phone.** Connect it, trust the Mac on it, and turn on *Settings > Privacy & Security > Developer Mode* if Xcode asks for it (the phone restarts). Choose the phone as the run destination at the top of Xcode's window.
 5. **Run** (Command-R). The scheme builds the Release configuration with Metal's API validation off, so that the timings are those of the app as it would ship. With a free account, the first start asks you to trust the developer: *Settings > General > VPN & Device Management*.
-6. **Benchmark.** In the app, tap *Run* and wait about two minutes with the app in front; the screen stays on meanwhile. Then *Copy the results*.
+6. **Benchmark.** In the app, tap *Run* and wait about five minutes with the app in front; the screen stays on meanwhile. Then *Copy the results*.
 
 **If Xcode keeps asking to unlock the phone.** Xcode's run needs the phone's developer services. It may keep saying "iPhone needs to be unlocked to enable development services" although the phone is unlocked. Installing the app does not need those services. You can build and install it from a terminal at the root of the repository, then start it from the home screen, which also leaves the debugger out:
 
@@ -51,6 +54,10 @@ The project builds for iPhones and iPads, and for the iOS Simulator on Macs with
 
 For steadier numbers, let the phone cool down first, close other apps, keep it plugged in, and leave Low Power Mode off, which slows the GPU down; the report gives the thermal state at the end and whether Low Power Mode was on. A run during which the app left the front, where iOS stops or slows its GPU work, is marked not valid. Stopping the app in Xcode and starting it again from the home screen leaves the debugger out.
 
+## On a Mac
+
+`scripts/bench_app_on_mac.sh` makes the same measurements on a Mac, by the app's own code: it builds `EmberwaveBenchMac`, a command-line front-end, against the XCFramework's library for the Mac, and prints the app's report. The progress goes to the standard error. It needs the XCFramework built by `scripts/build_xcframework.sh`, which has the library for the Mac.
+
 ## In CI
 
-`scripts/check_ios_app.sh` builds the app for iPhones, which checks that it links, and for the iOS Simulator, where it runs it with `-autorun`: a shorter benchmark of every size and the three checks, printed to the log. CI runs it on a macOS runner after the XCFramework is built (see the CI job `XCFramework`).
+`scripts/check_ios_app.sh` builds the app for iPhones, which checks that it links, and for the iOS Simulator, where it runs it with `-autorun`: a shorter benchmark of every size and the three checks, printed to the log. `scripts/bench_app_on_mac.sh -autorun` does the same on the Mac. A device without an HEVC encoder or decoder, as a simulator or a virtual machine may be, reports that and still passes. CI runs both on a macOS runner after the XCFramework is built (see the CI job `XCFramework`).
