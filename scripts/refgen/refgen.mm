@@ -17,13 +17,18 @@
 // format, frame rate and range come from its header. Together they let
 // emberwave's encoder and upstream's encode the same pictures.
 //   refgen decode IN.pwv1 OUT.y4m [--bit-depth 8|16]
-//   refgen bench IN.pwv1 [--frames N] [--warmup N] [--warmup-seconds S] [--json]
+//   refgen bench IN.pwv1 [--frames N] [--warmup N] [--warmup-seconds S] [--fps F]
+//                 [--json]
 //   refgen bench-encode IN.y4m --bytes-per-frame B [--frames N] [--warmup N]
 //                 [--warmup-seconds S] [--json]
 //
 // bench times upstream's decoder the way `emberwave-cli bench --output yuv`
 // times emberwave's: planes left in GPU memory, the same warm-up rule, the
 // same statistics and the same output, so the two can be put side by side.
+// With --fps it hands over F frames a second, as a stream's arrive, the
+// warm-up's too, and sleeps in between until a timer without leeway wakes it,
+// as the benchmark app's FrameClock does (BENCHMARKS.md, "Against HEVC on the
+// same device").
 // bench-encode times upstream's encoder the way `emberwave-cli bench-encode`
 // times emberwave's: from the planes in CPU memory to the frame's packet in
 // CPU memory, the video's frames, read into memory first, in turn.
@@ -733,6 +738,49 @@ struct Series
 	std::vector<double> samples;
 };
 
+// Waits for the frames of a stream, `fps` a second, on time: a timer without
+// leeway wakes the thread, where a sleep would wake it milliseconds late. A
+// frame that took longer than a period makes the next one due at once.
+class FrameClock
+{
+public:
+	explicit FrameClock(double fps)
+	    : period(std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / fps))),
+	      timers(dispatch_queue_create("frame clock", DISPATCH_QUEUE_SERIAL))
+	{
+	}
+
+	void wait()
+	{
+		const Clock::time_point now = Clock::now();
+		if (!started)
+		{
+			started = true;
+			due = now;
+			return;
+		}
+		due = std::max(due + period, now);
+		const auto delay = std::chrono::duration_cast<std::chrono::nanoseconds>(due - now).count();
+		if (delay <= 0)
+			return;
+		dispatch_semaphore_t woken = dispatch_semaphore_create(0);
+		dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, timers);
+		dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, delay), DISPATCH_TIME_FOREVER, 0);
+		dispatch_source_set_event_handler(timer, ^{
+		  dispatch_semaphore_signal(woken);
+		});
+		dispatch_resume(timer);
+		dispatch_semaphore_wait(woken, DISPATCH_TIME_FOREVER);
+		dispatch_source_cancel(timer);
+	}
+
+private:
+	Clock::duration period;
+	dispatch_queue_t timers;
+	bool started = false;
+	Clock::time_point due;
+};
+
 struct Summary
 {
 	double mean, p50, p99, min, max;
@@ -773,11 +821,12 @@ std::string json_string(const std::string &text)
 int run_bench(int argc, char **argv)
 {
 	if (argc < 3)
-		fail("usage: refgen bench IN.pwv1 [--frames N] [--warmup N] [--warmup-seconds S] [--json]");
+		fail("usage: refgen bench IN.pwv1 [--frames N] [--warmup N] [--warmup-seconds S] [--fps F] [--json]");
 	const std::string in_path = argv[2];
 	long frames_to_measure = 0;
 	long warmup_frames = 10;
 	double warmup_seconds = 1.0;
+	double fps = 0.0;
 	bool json = false;
 	for (int i = 3; i < argc; i++)
 	{
@@ -788,6 +837,8 @@ int run_bench(int argc, char **argv)
 			warmup_frames = atol(argv[++i]);
 		else if (arg == "--warmup-seconds" && i + 1 < argc)
 			warmup_seconds = atof(argv[++i]);
+		else if (arg == "--fps" && i + 1 < argc)
+			fps = atof(argv[++i]);
 		else if (arg == "--json")
 			json = true;
 		else
@@ -795,6 +846,9 @@ int run_bench(int argc, char **argv)
 	}
 	if (warmup_frames < 0 || !(warmup_seconds >= 0.0 && warmup_seconds <= 3600.0))
 		fail("the warm-up must be at least 0 frames and between 0 and 3600 seconds");
+	// 0 is frame after frame, as without the option.
+	if (!(fps >= 0.0 && fps <= 1000.0))
+		fail("--fps must be between 0 and 1000");
 
 	File in = open_file(in_path, "rb");
 	const Stream stream = read_pwv1_header(in.get());
@@ -887,10 +941,17 @@ int run_bench(int argc, char **argv)
 		};
 
 		// Warm up for a number of frames and for a while, like emberwave-cli.
+		std::unique_ptr<FrameClock> clock;
+		if (fps > 0.0)
+			clock = std::make_unique<FrameClock>(fps);
 		size_t warmed = 0;
 		const Clock::time_point warmup_start = Clock::now();
 		while (warmed < size_t(warmup_frames) || ms_between(warmup_start, Clock::now()) < warmup_seconds * 1000.0)
+		{
+			if (clock)
+				clock->wait();
 			decode(warmed++);
+		}
 
 		Series total = { "total", {} };
 		Series prepare = { "cpu prepare", {} };
@@ -898,6 +959,8 @@ int run_bench(int argc, char **argv)
 		Series gpu = { "gpu (command buffer)", {} };
 		for (long i = 0; i < frames_to_measure; i++)
 		{
+			if (clock)
+				clock->wait();
 			const Times t = decode(size_t(i));
 			total.samples.push_back(t.prepare + t.wall);
 			prepare.samples.push_back(t.prepare);
@@ -907,10 +970,14 @@ int run_bench(int argc, char **argv)
 
 		const char *precision = getenv("PYROWAVE_PRECISION");
 		const std::string adapter = mtl_device.name.UTF8String;
+		char paced[64] = "";
+		if (fps > 0.0)
+			snprintf(paced, sizeof(paced), ", %g frames a second", fps);
 		const std::string description = std::to_string(stream.width) + "x" + std::to_string(stream.height) +
 		                                (stream.chroma_444 ? " 4:4:4" : " 4:2:0") +
 		                                ", decoded by upstream's Metal decoder (PYROWAVE_PRECISION=" +
-		                                (precision ? precision : "default") + ") to planes in GPU memory";
+		                                (precision ? precision : "default") + ") to planes in GPU memory" +
+		                                paced;
 		const Series *all[] = { &total, &prepare, &wall, &gpu };
 
 		if (json)
