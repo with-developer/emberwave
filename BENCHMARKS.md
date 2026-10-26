@@ -229,7 +229,7 @@ Two more runs with `EMBERWAVE_BENCH_SPIN=1`, at 60 frames a second, the CPU awak
   - at FP16, its default: 1.42 to 1.44 ms at 1080p against 0.37 to 0.38 ms frame after frame, and 1.96 to 2.04 ms at 4K against 0.54 to 0.57 ms;
   - at FP32: 1.47 to 1.48 ms against 0.38 to 0.39 ms at 1080p, and 2.31 to 2.63 ms against 0.82 ms at 4K.
 
-  That is 2.8 to 3.9 times as long, and its GPU time grows 2.1 to 3.2 times. The slowdown belongs to wavelet decoding on this GPU at this cadence, not to emberwave.
+  That is 2.8 to 3.9 times as long, and its GPU time grows 2.1 to 3.2 times. The slowdown belongs to wavelet decoding on this GPU at this cadence, not to emberwave. On the same streams at that cadence, emberwave's decodes into textures still took 1.3 to 1.5 times as long as upstream's at FP32, more than frame after frame (issue #86).
 - **What a client sees.** A client draws every display refresh, and its network threads wake between frames, so it lies between these cadences. On this Mac, emberwave's decoding is quicker than HEVC's only when the GPU is kept busy. Issue #81 is to time decodes within a client's display loop.
 - **HEVC's decoding grows with the bytes.** At emberwave's bytes per frame it took 2.4 to 4.7 times as long as at Moonlight's rates, 12.3 to 12.7 ms at 4K. Raising HEVC's bit rate costs the client time.
 - **After a loss**, an HEVC client needs a keyframe: 600 to 730 kB at 4K, which took 5.6 to 7.8 ms to decode. Every PyroWave frame is one.
