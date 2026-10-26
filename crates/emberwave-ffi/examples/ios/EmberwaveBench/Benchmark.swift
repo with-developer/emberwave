@@ -3,7 +3,9 @@
 // Y, Cb and Cr textures, on the app's own queue, and to planes in CPU memory.
 // Each frame is timed from handing over its bytes until the call returns with
 // the GPU done, or, on the app's queue, where the call does not wait, until a
-// command buffer of the app's that reads the picture has completed.
+// command buffer of the app's that reads the picture has completed. The frames
+// follow each other at once, and for the textures also as a stream's arrive,
+// 60 a second, with the GPU idle in between.
 
 import Emberwave
 import Foundation
@@ -27,7 +29,9 @@ func now() -> Double {
 }
 
 /// Mean, median and 99th percentile (nearest rank) of per-frame times in
-/// milliseconds, the mean from the time of the whole run.
+/// milliseconds, the mean from the time of the whole run, or from the frames'
+/// own times where the run also waits between them or does more than time
+/// them.
 struct Stats: CustomStringConvertible {
     let mean: Double
     let median: Double
@@ -76,6 +80,101 @@ struct Plan {
     var warmupMs = 1000.0
 }
 
+extension Plan {
+    /// The short run of CI, which checks that everything works.
+    static let short = Plan(pictures: 2, frames: 60, warmupFrames: 10, warmupMs: 200)
+}
+
+/// Waits for the frames of a stream, `streamFrameRate` a second, on time: a
+/// timer without leeway wakes the thread, as a frame's arrival would, where a
+/// sleep would wake it milliseconds late. A frame that took longer than a
+/// period makes the next one due at once. With the environment variable
+/// `EMBERWAVE_BENCH_SPIN=1`, the thread spins instead of sleeping, which
+/// keeps the CPU awake between frames: it tells the GPU's part of a paced
+/// frame's time from the CPU's.
+struct FrameClock {
+    /// When the frame now under way was due.
+    private var due: Double?
+    private static let timers = DispatchQueue(label: "frame clock", qos: .userInteractive)
+    static let spins = ProcessInfo.processInfo.environment["EMBERWAVE_BENCH_SPIN"] == "1"
+
+    mutating func wait() {
+        guard let previous = due else {
+            due = now()
+            return
+        }
+        let next = max(previous + 1000 / Double(streamFrameRate), now())
+        due = next
+        let delay = next - now()
+        guard delay > 0 else {
+            return
+        }
+        if FrameClock.spins {
+            while now() < next {}
+            return
+        }
+        let woken = DispatchSemaphore(value: 0)
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: FrameClock.timers)
+        timer.schedule(deadline: .now() + .nanoseconds(Int(delay * 1e6)), leeway: .nanoseconds(0))
+        timer.setEventHandler { woken.signal() }
+        timer.resume()
+        woken.wait()
+        timer.cancel()
+    }
+}
+
+/// Times `step` with 0, 1, 2 and so on: first a warm-up, then `plan.frames`
+/// frames, one after the other, or with `paced` as a stream's frames arrive,
+/// the warm-up too.
+func time(_ plan: Plan, paced: Bool = false, _ step: (Int) throws -> Void) throws -> Stats {
+    var clock = FrameClock()
+    let warm = now()
+    var index = 0
+    while index < plan.warmupFrames || now() - warm < plan.warmupMs {
+        if paced {
+            clock.wait()
+        }
+        try step(index)
+        index += 1
+    }
+    var times: [Double] = []
+    let first = now()
+    for offset in 0..<plan.frames {
+        if paced {
+            clock.wait()
+        }
+        let start = now()
+        try step(index + offset)
+        times.append(now() - start)
+    }
+    // Paced, the run is mostly waiting.
+    return Stats(times, total: paced ? times.reduce(0, +) : now() - first)
+}
+
+/// The pictures of `size` that emberwave and HEVC are timed on, taken in turn.
+func makePictures(_ size: PictureSize, _ plan: Plan) -> [[[UInt8]]] {
+    (0..<plan.pictures).map { scene(width: size.width, height: size.height, index: $0) }
+}
+
+extension Emberwave {
+    /// Times emberwave, then HEVC at each of its bit rates, on the pictures of
+    /// `size`.
+    func runSize(_ size: PictureSize, _ plan: Plan, progress: (String) -> Void) throws
+        -> (SizeResult, [HEVCOutcome])
+    {
+        progress("\(size.name): making \(plan.pictures) test pictures")
+        let pictures = makePictures(size, plan)
+        let result = try run(size, plan, pictures, progress: progress)
+        var hevc: [HEVCOutcome] = []
+        if let device {
+            for rate in hevcRates(size) {
+                hevc.append(runHEVC(size, rate, pictures, plan, device: device, progress: progress))
+            }
+        }
+        return (result, hevc)
+    }
+}
+
 /// What one picture size gave.
 struct SizeResult {
     let size: PictureSize
@@ -86,6 +185,12 @@ struct SizeResult {
     let appQueue: Stats?
     let planes: Stats
     let encode: Stats
+    /// Into a Metal texture and into Y, Cb and Cr textures, as a stream's
+    /// frames arrive.
+    let pacedTexture: Stats
+    let pacedPlaneTextures: Stats
+    /// The thermal state when this size was done.
+    let thermal: String
     /// The last picture, decoded once more into a texture the app keeps.
     let picture: MTLTexture?
 }
@@ -143,33 +248,12 @@ final class Emberwave {
         emberwave_context_destroy(context)
     }
 
-    /// Times `step` with 0, 1, 2 and so on: first a warm-up, then
-    /// `plan.frames` frames.
-    private func time(_ plan: Plan, _ step: (Int) throws -> Void) throws -> Stats {
-        let warm = now()
-        var index = 0
-        while index < plan.warmupFrames || now() - warm < plan.warmupMs {
-            try step(index)
-            index += 1
-        }
-        var times: [Double] = []
-        let first = now()
-        for offset in 0..<plan.frames {
-            let start = now()
-            try step(index + offset)
-            times.append(now() - start)
-        }
-        return Stats(times, total: now() - first)
-    }
-
-    /// Makes the pictures of `size`, encodes them on the GPU within its
-    /// budget, and times the encoding and the decoding of the frames, into
-    /// textures and to planes in CPU memory.
-    func run(_ size: PictureSize, _ plan: Plan, progress: (String) -> Void) throws -> SizeResult {
-        progress("\(size.name): making \(plan.pictures) test pictures")
-        let pictures = (0..<plan.pictures).map {
-            scene(width: size.width, height: size.height, index: $0)
-        }
+    /// Encodes `pictures`, of `size`, on the GPU within its budget, and times
+    /// the encoding and the decoding of the frames, into textures and to
+    /// planes in CPU memory.
+    func run(
+        _ size: PictureSize, _ plan: Plan, _ pictures: [[[UInt8]]], progress: (String) -> Void
+    ) throws -> SizeResult {
         let (width, height) = (UInt32(size.width), UInt32(size.height))
         let chroma = UInt32(EMBERWAVE_CHROMA_420)
 
@@ -237,13 +321,14 @@ final class Emberwave {
                 "emberwave_texture_create")
             textures.append(texture)
         }
-        progress("\(size.name): decoding into textures")
-        let textureTimes = try time(plan) { index in
+        func decodeTexture(_ index: Int) throws {
             try push(index)
             try check(
                 emberwave_decoder_decode_texture(decoder, nil, textures[index % textures.count]),
                 "emberwave_decoder_decode_texture")
         }
+        progress("\(size.name): decoding into textures")
+        let textureTimes = try time(plan, decodeTexture)
 
         // Y, Cb and Cr, three sets in turn as well.
         var planeSets: [[OpaquePointer?]] = []
@@ -263,14 +348,18 @@ final class Emberwave {
             }
             planeSets.append(set)
         }
-        progress("\(size.name): decoding into Y, Cb and Cr textures")
-        let planeTextureTimes = try time(plan) { index in
+        func decodePlaneTextures(_ index: Int) throws {
             try push(index)
             let set = planeSets[index % planeSets.count]
             try check(
                 emberwave_decoder_decode_plane_textures(decoder, set[0], set[1], set[2]),
                 "emberwave_decoder_decode_plane_textures")
         }
+        progress("\(size.name): decoding into Y, Cb and Cr textures")
+        let planeTextureTimes = try time(plan, decodePlaneTextures)
+        progress("\(size.name): decoding into textures, 60 frames a second")
+        let pacedTextureTimes = try time(plan, paced: true, decodeTexture)
+        let pacedPlaneTextureTimes = try time(plan, paced: true, decodePlaneTextures)
 
         progress("\(size.name): decoding on the app's queue")
         let appQueueTimes = try timeOnAppQueue(size, plan, frames)
@@ -322,6 +411,9 @@ final class Emberwave {
             appQueue: appQueueTimes,
             planes: planeTimes,
             encode: encodeTimes,
+            pacedTexture: pacedTextureTimes,
+            pacedPlaneTextures: pacedPlaneTextureTimes,
+            thermal: thermalState(),
             picture: picture)
     }
 
@@ -626,51 +718,84 @@ func deviceDescription() -> String {
     if let simulated = environment["SIMULATOR_MODEL_IDENTIFIER"] {
         return "\(simulated) (simulator)"
     }
-    var system = utsname()
-    uname(&system)
-    return withUnsafeBytes(of: &system.machine) { bytes in
-        String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+    #if os(macOS)
+        // The model, such as Mac15,8: a Mac's uname names only the architecture.
+        var length = 0
+        sysctlbyname("hw.model", nil, &length, nil, 0)
+        var model = [CChar](repeating: 0, count: max(length, 1))
+        sysctlbyname("hw.model", &model, &length, nil, 0)
+        return String(cString: model)
+    #else
+        var system = utsname()
+        uname(&system)
+        return withUnsafeBytes(of: &system.machine) { bytes in
+            String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+        }
+    #endif
+}
+
+/// The device's thermal state, for the report.
+func thermalState() -> String {
+    switch ProcessInfo.processInfo.thermalState {
+    case .nominal: return "nominal"
+    case .fair: return "fair"
+    case .serious: return "serious"
+    case .critical: return "critical"
+    @unknown default: return "unknown"
     }
 }
 
-/// The report of a run, for the screen and to copy.
-func makeReport(_ emberwave: Emberwave, _ plan: Plan, _ results: [SizeResult], check: String)
-    -> String
-{
+/// A line of the report: what was timed, and its numbers in a column.
+func row(_ what: String, _ numbers: CustomStringConvertible, indent: Int = 2) -> String {
+    let label = String(repeating: " ", count: indent) + what
+    return label.padding(toLength: max(label.count + 1, 34), withPad: " ", startingAt: 0)
+        + "\(numbers)"
+}
+
+/// The report of a run, for the screen and to copy: emberwave's results for
+/// each size, followed by HEVC's of that size.
+func makeReport(
+    _ emberwave: Emberwave, _ plan: Plan, _ results: [SizeResult], hevc: [HEVCOutcome],
+    check: String
+) -> String {
     let formatter = ISO8601DateFormatter()
-    let thermal: String
-    switch ProcessInfo.processInfo.thermalState {
-    case .nominal: thermal = "nominal"
-    case .fair: thermal = "fair"
-    case .serious: thermal = "serious"
-    case .critical: thermal = "critical"
-    @unknown default: thermal = "unknown"
-    }
     var lines = [
         "emberwave native benchmark, \(formatter.string(from: Date()))",
         "Device: \(deviceDescription()), \(ProcessInfo.processInfo.operatingSystemVersionString)",
         "GPU: \(emberwave.adapter); emberwave \(String(cString: emberwave_version()))",
         "\(plan.frames) frames after at least \(plan.warmupFrames) and \(Int(plan.warmupMs)) ms of warm-up, "
-            + "\(plan.pictures) pictures in turn; thermal state at the end: \(thermal); "
+            + "\(plan.pictures) pictures in turn; thermal state at the end: \(thermalState()); "
             + "Low Power Mode: \(ProcessInfo.processInfo.isLowPowerModeEnabled ? "on" : "off")",
         "Per frame (ms): mean / median / 99th percentile, until the call returns with the GPU "
             + "done; on the app's queue, where the call does not wait, until the app's next "
-            + "command buffer has read the picture",
+            + "command buffer has read the picture; for HEVC, until VideoToolbox has handed over "
+            + "the picture, in Metal textures, or the frame, and the mean of those times. One "
+            + "frame after the other, or as a stream's frames arrive, 60 a second"
+            + (FrameClock.spins ? ", the thread spinning in between" : ""),
     ]
     for result in results {
         // Rounded, as the browser's report rounds them.
         let kilobytes = Int((Double(result.bytesPerFrame) / 1000).rounded())
-        lines.append("\(result.size.name) (\(kilobytes) kB a frame):")
-        lines.append("  decode into a Metal texture     \(result.texture)")
-        lines.append("  decode into Y, Cb, Cr textures  \(result.planeTextures)")
+        lines.append(
+            "\(result.size.name) (\(kilobytes) kB a frame), thermal state \(result.thermal):")
+        lines.append(row("decode into a Metal texture", result.texture))
+        lines.append(row("decode into Y, Cb, Cr textures", result.planeTextures))
         if let appQueue = result.appQueue {
-            lines.append("  decode on the app's queue       \(appQueue)")
+            lines.append(row("decode on the app's queue", appQueue))
         } else {
             lines.append(
-                "  decode on the app's queue       not measured (\(emberwave.appContextFailure ?? "?"))")
+                row(
+                    "decode on the app's queue",
+                    "not measured (\(emberwave.appContextFailure ?? "?"))"))
         }
-        lines.append("  decode to planes in memory      \(result.planes)")
-        lines.append("  encode from memory              \(result.encode)")
+        lines.append(row("decode to planes in memory", result.planes))
+        lines.append(row("encode from memory", result.encode))
+        lines.append("  60 frames a second:")
+        lines.append(row("decode into a Metal texture", result.pacedTexture, indent: 4))
+        lines.append(row("decode into Y, Cb, Cr textures", result.pacedPlaneTextures, indent: 4))
+        for outcome in hevc where outcome.size.name == result.size.name {
+            lines.append(contentsOf: outcome.lines)
+        }
     }
     lines.append(check)
     return lines.joined(separator: "\n")

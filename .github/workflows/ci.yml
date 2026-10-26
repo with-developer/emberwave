@@ -147,3 +147,6 @@ jobs:
       # Simulator with -autorun, where it also reads a texture of
       # emberwave_decoder_decode_texture back through Metal.
       - run: scripts/check_ios_app.sh
+      # The app's measurements on this Mac, emberwave's and HEVC's, by its
+      # own code built against the XCFramework's library for the Mac.
+      - run: scripts/bench_app_on_mac.sh -autorun

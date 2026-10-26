@@ -176,3 +176,64 @@ The 99th percentiles were within 10 % of the means.
 - **Memory.** The planes in CPU memory cost about what the plane textures do, as the phone's CPU and GPU share their memory.
 - **Upstream's decoder** has not been timed on the phone: `refgen` runs on macOS only.
 
+
+## Against HEVC on the same device
+
+A client would replace the HEVC decoder that Moonlight uses, so the benchmark app also times HEVC through VideoToolbox, the video encoder and decoder of Apple's devices, in the same run and on the same pictures as emberwave (issue #80, decision D45). On a Mac, `scripts/bench_app_on_mac.sh` makes the same measurements by the app's own code. So far it has run on the M3 Max; the iPhone's run is to come.
+
+- **The stream.** The device's own encoder encodes the four pictures in turn into one stream: HEVC Main, 8-bit 4:2:0, a keyframe and then 300 frames, each predicted from the one before, with keyframes only where asked for, as in a game stream. Its bit rate is Moonlight's default for the size at 60 frames per second, 20, 40 and 80 Mbit/s for 1080p, 1440p and 4K, and, apart, emberwave's bytes per frame, 192, 336 and 576 Mbit/s. Every picture has fresh grain, a hard case for prediction from the frame before, and the frames use the whole rate.
+- **Decoding** goes from the frame's bytes, as a client receives them, until VideoToolbox has handed over the picture, asynchronously as Moonlight has it, wrapped in Metal textures without a copy. NV12, a Y texture and one of Cb and Cr, compares with emberwave's Y, Cb and Cr textures: with both, the player converts the colours in its own draw, as Moonlight does with NV12. BGRA, converted by VideoToolbox, compares with emberwave's RGB texture. Keyframes are timed apart, the same one over and over: a stream has them only at its start and after a loss. HEVC's means are those of its frames' own times.
+- **Two cadences.** One frame after the other, as every other number in this file; and as a stream's frames arrive, 60 a second, the warm-up too. In between, the thread sleeps until a timer without leeway wakes it, as a frame's arrival would. With `EMBERWAVE_BENCH_SPIN=1` it spins instead, which keeps the CPU awake.
+- **Encoding** goes from the picture's planes in memory, copied into a pixel buffer of the encoder's, until the frame is out, one frame at a time, with the encoder at its fastest settings (D45).
+
+Measured on 2026-10-26 on the Apple M3 Max of the tables above, macOS 27.0.1, with an XCFramework built from the code of release 0.11.0, in three runs of `scripts/bench_app_on_mac.sh`. A fourth run was left out as a sign of other work on the Mac. Frame after frame, its decodes with emberwave into RGB at 1080p took 0.87 ms against 0.53 to 0.56 ms in every other run, and their median was 0.82 against 0.53 to 0.55 ms. Mean milliseconds per frame, the lowest and the highest of the three runs:
+
+| Decode | 1080p | 1440p | 4K |
+|---|---|---|---|
+| emberwave into Y, Cb and Cr textures | 0.42 to 0.43 | 0.56 | 1.00 to 1.01 |
+| HEVC at Moonlight's rate into NV12 textures | 0.96 to 1.51 | 1.96 to 2.19 | 2.64 to 3.38 |
+| emberwave into an RGB texture | 0.53 to 0.56 | 0.69 to 0.85 | 1.29 to 1.30 |
+| HEVC at Moonlight's rate into a BGRA texture | 1.80 to 2.56 | 3.27 to 3.38 | 6.61 to 7.01 |
+| *60 frames a second:* | | | |
+| emberwave into Y, Cb and Cr textures | 2.10 to 2.13 | 2.13 to 2.60 | 3.77 to 4.04 |
+| HEVC into NV12 textures | 1.91 to 1.97 | 2.40 to 2.58 | 3.71 to 3.85 |
+| emberwave into an RGB texture | 2.21 to 2.34 | 2.63 to 3.22 | 3.66 to 4.26 |
+| HEVC into a BGRA texture | 3.05 to 3.37 | 4.26 to 4.40 | 7.23 to 7.47 |
+| *Other HEVC frames:* | | | |
+| A keyframe, into NV12 textures | 2.22 to 3.16 | 3.48 to 4.69 | 5.64 to 7.78 |
+| At emberwave's bytes, into NV12 textures | 3.69 to 4.57 | 6.75 to 7.03 | 12.30 to 12.65 |
+
+| Encode | 1080p | 1440p | 4K |
+|---|---|---|---|
+| emberwave, on the GPU | 0.81 to 0.82 | 1.11 to 1.12 | 1.90 to 1.92 |
+| HEVC at Moonlight's rate | 4.05 to 4.40 | 5.72 to 6.25 | 12.76 to 13.00 |
+| HEVC at emberwave's bytes | 4.39 to 4.77 | 6.76 to 7.28 | 20.42 to 20.53 |
+
+At Moonlight's rates, HEVC's frames averaged 42, 82 to 83 and 165 to 166 kB. The largest were 97 to 102, 197 to 201 and 230 to 311 kB, and the keyframes 207, 387 to 390 and 601 to 727 kB. The encoder and the decoder were the hardware's.
+
+Run to run, emberwave's means frame after frame stayed within 6 %. The exception was a run with a few slow frames at 1440p: 0.85 against 0.69 to 0.70 ms into RGB, with a median of 0.71. HEVC's varied by up to 57 %. At 60 frames a second, emberwave's varied by up to 22 % and HEVC's by up to 11 %.
+
+Two more runs with `EMBERWAVE_BENCH_SPIN=1`, at 60 frames a second, the CPU awake between frames:
+
+| Decode, 60 frames a second | 1080p | 1440p | 4K |
+|---|---|---|---|
+| emberwave into Y, Cb and Cr textures | 1.42 to 1.44 | 1.87 | 2.70 to 2.84 |
+| HEVC into NV12 textures | 0.90 to 0.91 | 1.45 to 1.46 | 2.62 |
+| emberwave into an RGB texture | 1.32 to 1.70 | 2.31 to 2.34 | 3.26 to 3.27 |
+| HEVC into a BGRA texture | 1.89 to 1.90 | 2.97 to 2.98 | 5.62 to 5.64 |
+
+- **Frame after frame**, emberwave decodes into the planes 2.2 to 3.9 times as quickly as HEVC at Moonlight's rates into NV12. That is 0.42 against 0.96 to 1.51 ms at 1080p, and 1.00 against 2.64 to 3.38 ms at 4K.
+- **At 60 frames a second, the two take about as long.** Between frames, emberwave's decodes slowed down 2.8 to 5.1 times and HEVC's 1.1 to 2.1 times. Into the planes, emberwave then took from 17 % less to 12 % more than HEVC into NV12, run by run: 2.10 to 2.13 against 1.91 to 1.97 ms at 1080p, and 3.77 to 4.04 against 3.71 to 3.85 ms at 4K.
+- **emberwave's slowdown is the GPU's.** With the CPU kept awake, emberwave's decodes at 60 frames a second still took 2.4 to 3.4 times as long as frame after frame. HEVC's took 0.8 to 1.1 times as long, so its slowdown asleep is the CPU's part of VideoToolbox waking up. emberwave's GPU, idle between frames, slows down, and the media engine does not. With the CPU awake, emberwave into the planes took 3 to 8 % longer than HEVC into NV12 at 4K, and 56 to 60 % longer at 1080p.
+- **What a client sees.** A client draws every display refresh, and its network threads wake between frames, so it lies between these cadences. On this Mac, emberwave's decoding is quicker than HEVC's only when the GPU is kept busy. Issue #81 is to time decodes within a client's display loop.
+- **HEVC's decoding grows with the bytes.** At emberwave's bytes per frame it took 2.4 to 4.7 times as long as at Moonlight's rates, 12.3 to 12.7 ms at 4K. Raising HEVC's bit rate costs the client time.
+- **After a loss**, an HEVC client needs a keyframe: 600 to 730 kB at 4K, which took 5.6 to 7.8 ms to decode. Every PyroWave frame is one.
+- **BGRA** is VideoToolbox's colour conversion, which Moonlight does not use: it draws NV12. Into RGB, emberwave took 27 to 49 % less than HEVC into BGRA at 60 frames a second.
+- **Encoding.** The Mac's HEVC encoder at its fastest took 4.9 to 6.8 times as long as emberwave's GPU encoder. A prototype tried other settings, and those runs were not kept. With Apple's settings for low latency it took 22 ms a frame at 4K, and with real time at 60 frames per second 20 ms (D45). The host that matters for a Moonlight user is a PC with NVENC, which is not timed here.
+- **Not covered here:**
+  - NVENC's streams, and AV1, which Apple's devices decode but do not encode (issue #82);
+  - 10-bit video;
+  - FFmpeg's wrapper around VideoToolbox, through which Moonlight on the Mac decodes;
+  - the wait for the display, and power;
+  - that HEVC's decoder leaves the GPU free to draw while emberwave's decoding uses it;
+  - the pictures' quality. The report's luma PSNR, about 40 dB at Moonlight's rates and 43 dB at emberwave's bytes, only checks that the stream decodes to the pictures. The grain, fresh in every picture, dominates it.

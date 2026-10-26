@@ -1193,3 +1193,55 @@ It did find the contract text behind the code. Fixed:
   - `emberwave_texture_destroy` and `emberwave_context_destroy` name the newer constructors;
   - the refusals of each decode are listed in full, and the statuses described as returned;
   - the `# Safety` sections of the functions that take a decoder ask that no other thread uses it.
+
+### 2026-10-26 — D45: HEVC beside emberwave, in the benchmark app
+
+**Context.** emberwave's times had nothing beside them on the same devices but upstream's decoder. A client would replace Moonlight's hardware HEVC decoder, so a reader asks how long that path takes on the same Mac and iPhone (issue #80). Apple's devices encode and decode HEVC through VideoToolbox. They decode AV1 too but do not encode it, and the Mac had no AV1 encoder, so AV1 waits for streams made elsewhere (#82).
+
+**Decision.**
+- The benchmark app times HEVC through VideoToolbox in the same run as emberwave, on the same pictures (`VideoToolbox.swift`). A command-line front-end, `EmberwaveBenchMac`, runs the same code on a Mac, linked with the XCFramework's library for the Mac (`scripts/bench_app_on_mac.sh`). The Mac and the phone thus share one harness, and both codecs one process.
+- The device encodes the pictures in turn into one stream: a keyframe, then a frame for each one timed, each predicted from the one before, keyframes only where forced, no B-frames. The bit rate is an average. It is Moonlight's default for the size at 60 frames per second (moonlight-qt's `getDefaultBitrate`: 20, 40 and 80 Mbit/s), and, apart, emberwave's bytes per frame.
+- The encoder runs at its fastest: real time off, power efficiency off, speed before quality. A prototype on the M3 Max tried other settings at 4K, frame after frame. Its runs were not kept:
+  - Apple's settings for low latency, low-latency rate control with real time, chose another encoder, `hevc.rtvc`, which took 22 ms a frame;
+  - real time at 60 frames per second took 20 ms, also with frames handed over 60 a second;
+  - real time off took 12.4 ms.
+- The prototype also tried a cap per frame through `DataRateLimits`, which was dropped. With one frame's bytes per 1/60 s, the encoder spent 43 % of the rate and still made a frame of 372 kB against 167 kB.
+- Decoding takes the frame's bytes as a client receives them. They are wrapped without a copy in a block buffer and a sample buffer, with a format made once from the parameter sets. VideoToolbox decodes asynchronously, as Moonlight has it. The time ends in the output handler, once the picture is wrapped in Metal textures by a `CVMetalTextureCache`:
+  - NV12 as an R8 and an RG8 texture, the counterpart of emberwave's Y, Cb and Cr textures;
+  - BGRA as one texture, that of its RGB texture.
+
+  In the prototype, a synchronous decode returned 0.35 ms after its handler on average, at most 5.6 ms, so its return would have counted against VideoToolbox. HEVC's means are those of its frames' own times, keyframes' too.
+- Keyframes are not among the timed frames, as a stream has them only at its start and after a loss. The same keyframe decoded over again times them apart.
+- Both codecs' decodes into textures are timed in two ways: frame after frame, as before, and as a stream's frames arrive, 60 a second (`FrameClock`).
+  - Frames are due on a fixed schedule. A strict timer without leeway wakes the sleeping thread; a sleep woke it about 4 ms late, which made the first runs' cadence about 47 frames a second.
+  - With `EMBERWAVE_BENCH_SPIN=1` the thread spins instead, which tells the GPU's part of a paced frame from the CPU's.
+- One VideoToolbox session is open at a time. A frame that takes more than 10 s ends its session and fails the run.
+- The luma PSNR of the last frames decoded, against the pictures, checks the stream, and a run fails below 30 dB. It is not a comparison of quality: the scene's grain, fresh in every picture, dominates it.
+- A session that cannot be made or set up means a device without such an encoder or decoder. That is reported, and `-autorun` passes, as in a simulator or a virtual machine in CI. A failure after that fails the run.
+
+**Consequence.** On the M3 Max, three runs (`BENCHMARKS.md`):
+- Frame after frame, emberwave decodes into the planes 2.2 to 3.9 times as quickly as HEVC into NV12: 1.00 against 2.64 to 3.38 ms at 4K.
+- At 60 frames a second the two take about as long: emberwave from 17 % less to 12 % more than HEVC, run by run. emberwave's decodes slow down 2.8 to 5.1 times, HEVC's 1.1 to 2.1 times.
+- With the CPU kept awake, HEVC's paced decodes are no slower than frame after frame, and emberwave's still are, 2.4 to 3.4 times. The slowdown is the GPU's own, idle between frames. emberwave then takes 3 to 60 % longer than HEVC.
+- HEVC's decoding grows with its bytes: 12.3 to 12.7 ms at 4K at emberwave's. Its keyframes take 5.6 to 7.8 ms.
+
+So a client gains decoding time from emberwave only while its GPU stays busy. How long a client's decodes take while it draws every display refresh is issue #81.
+
+Grok argued the other side twice:
+- **Before the work.** It asked for both cadences for both codecs, the Metal wrap in the time, asynchronous decoding, one session at a time, keyframes apart and the encoder's identity in the report, all taken. Three of its points did not hold up when measured:
+  - its explanation of the slow real-time encoder by the frames' time stamps failed the paced test;
+  - a cap per frame did not make the encoder steadier;
+  - a keyframe every few seconds is not what Moonlight's hosts send.
+- **After the first runs.** It warned against claiming that an emberwave client is quicker, as no presenting client was timed, hence #81. It suspected that holding the decoded pictures slowed VideoToolbox frame after frame. A run without holding them was no quicker, 3.65 against 3.32 ms at 4K.
+
+A review of the change found no defect of the harness's correctness:
+- It checked the lifetimes of the frames' bytes against asynchronous decoding, and every path of the output handlers. Corrupt, truncated and reference-less frames fail cleanly.
+- It checked the mapping of decoded pictures to their sources for the PSNR check.
+
+It found that the paced cadence ran at about 47 frames a second. Its own A/B at an exact 60 changed the means by about 1 %. The runs above were made again with the fixed clock. The first runs had shown emberwave 11 to 20 % quicker than HEVC at 4K at that cadence, and these do not: paced times vary more from session to session than within one. Fixed besides:
+- the keyframes' and the means' time basis;
+- failures in setting up a session, all reported as an encoder or decoder missing;
+- the waits, now bounded;
+- frame sizes copied wrong into `BENCHMARKS.md`.
+
+The figures of the prototype's runs above are marked as not kept.
