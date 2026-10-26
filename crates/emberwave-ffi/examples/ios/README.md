@@ -12,7 +12,13 @@ It uses the pictures and budgets of the [browser benchmark](https://with-develop
 
 ## Running it on an iPhone
 
-You need a Mac with Xcode 16 or later, an Apple ID, an iPhone or iPad with iOS 16 or later, and a cable or the same Wi-Fi as the phone. Nothing is published: the app is signed for your own devices only.
+You need:
+- a Mac with Xcode 16 or later, recent enough for the Mac's macOS and the phone's iOS. A newer macOS refuses to open an older Xcode: update it from the App Store.
+- an Apple ID;
+- an iPhone or iPad with iOS 16 or later;
+- a USB cable that carries data. Xcode pairs with a phone over a cable the first time. Afterwards it reaches the phone over the network too, if *Connect via network* is on in *Window > Devices and Simulators*.
+
+Nothing is published: the app is signed for your own devices only.
 
 1. **The XCFramework.** From the root of the repository, fetch that of the release:
 
@@ -21,11 +27,25 @@ You need a Mac with Xcode 16 or later, an Apple ID, an iPhone or iPad with iOS 1
    ```
 
    or build it, with `rustup target add aarch64-apple-ios aarch64-apple-ios-sim` and `scripts/build_xcframework.sh`. The app is written for the C API of your checkout, and the script warns when the release's differs: then check out the release's tag, or build the XCFramework.
-2. **Open** `crates/emberwave-ffi/examples/ios/EmberwaveBench.xcodeproj` in Xcode.
-3. **Sign.** Select the project, the target `EmberwaveBench`, *Signing & Capabilities*, and choose your Apple ID under *Team* (a free *Personal Team* will do). If Xcode says the bundle identifier is taken, change `io.github.with-developer.emberwave-bench` to something of your own.
-4. **The phone.** Connect it, and turn on *Settings > Privacy & Security > Developer Mode* if Xcode asks for it (the phone restarts). Choose the phone as the run destination at the top of Xcode's window.
+2. **Open** `crates/emberwave-ffi/examples/ios/EmberwaveBench.xcodeproj` in Xcode: `open -a Xcode crates/emberwave-ffi/examples/ios/EmberwaveBench.xcodeproj`, as another editor may have taken over `.xcodeproj` files.
+3. **Sign.** Select the project, the target `EmberwaveBench`, *Signing & Capabilities*, and choose your Apple ID under *Team* (a free *Personal Team* will do). If Xcode says the bundle identifier is taken, change `io.github.with-developer.emberwave-bench` to something of your own. Until the phone is connected, a Personal Team reports that it has no devices: the next step registers the phone.
+4. **The phone.** Connect it, trust the Mac on it, and turn on *Settings > Privacy & Security > Developer Mode* if Xcode asks for it (the phone restarts). Choose the phone as the run destination at the top of Xcode's window.
 5. **Run** (Command-R). The scheme builds the Release configuration with Metal's API validation off, so that the timings are those of the app as it would ship. With a free account, the first start asks you to trust the developer: *Settings > General > VPN & Device Management*.
 6. **Benchmark.** In the app, tap *Run* and wait about two minutes with the app in front; the screen stays on meanwhile. Then *Copy the results*.
+
+**If Xcode keeps asking to unlock the phone.** Xcode's run needs the phone's developer services. It may keep saying "iPhone needs to be unlocked to enable development services" although the phone is unlocked. Installing the app does not need those services. You can build and install it from a terminal at the root of the repository, then start it from the home screen, which also leaves the debugger out:
+
+```sh
+xcrun devicectl list devices   # the phone's identifier
+xcodebuild -project crates/emberwave-ffi/examples/ios/EmberwaveBench.xcodeproj \
+    -scheme EmberwaveBench -configuration Release \
+    -destination 'platform=iOS,id=IDENTIFIER' -derivedDataPath target/ios-device \
+    -allowProvisioningUpdates build
+xcrun devicectl device install app --device IDENTIFIER \
+    target/ios-device/Build/Products/Release-iphoneos/EmberwaveBench.app
+```
+
+The signing of step 3 applies, and the first start asks you to trust the developer as in step 5.
 
 The project builds for iPhones and iPads, and for the iOS Simulator on Macs with Apple silicon only: the XCFramework has no library for the Simulator on Intel Macs.
 
