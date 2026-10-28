@@ -1276,3 +1276,26 @@ The figures of the prototype's runs above are marked as not kept.
 - Each figure states its devices and dates. The decode chart also says that frames one after the other are not a stream's pace, and by how much the native decodes slowed down at 60 frames a second.
 
 **Consequence.** The README shows the speed, the platforms and the pipeline before its first heading. The figures lag a new benchmark run until they are updated by hand.
+
+### 2026-10-29 — D48: At a stream's pace, the floor is Metal's; the pyramid stays FP32
+
+**Context.** At 60 frames a second, with the GPU idle between frames, emberwave's decodes on the M3 Max took 2.8 to 5.1 times as long as frame after frame, and 1.3 to 1.5 times as long as upstream's at the same FP32 precision (#81, #85, #86). Upstream keeps its wavelet pyramid in FP16 by default, which halves its GPU time at 4K frame after frame (#84). Before the decoder changed for the paced case, the cost had to be split up: what any Metal client pays, what the GPU's clock does, and what is emberwave's own.
+
+**Measured** with scratch tools that were not kept (#86: a quiet M3 Max on 2026-10-29, the iPhone 17 on 2026-10-27):
+- **The floor.** Through plain Metal, a command buffer with one tiny dispatch, committed and waited for 60 times a second, takes 0.99 to 1.01 ms, against 0.16 ms frame after frame. That is 0.67 to 0.70 ms until the GPU starts it and 0.28 to 0.32 ms from its end until the waiting thread runs again. On the A19 it takes 0.80 against 0.09 ms. At that cadence upstream's decoder spends 0.96 to 1.25 ms of a frame outside its GPU span: the same floor.
+- **The GPU's clock.** The GPU's own work runs slower: a 16 MB fill takes 2.3 to 2.5 times as long on the Mac and 4.3 times as long on the phone.
+- **emberwave's own share.** Like for like, with the planes in GPU memory and both threads asleep between frames, emberwave and upstream at FP32 are level frame after frame. At 60 frames a second emberwave takes 1.10 to 1.33 times upstream's time at 1080p and 1.14 to 1.43 times at 4K. That is 0.2 to 0.5 ms and 0.4 to 1.0 ms more, spread over the CPU's preparation, the GPU span and what lies outside it. Through the C API into textures it takes 0.1 to 0.7 ms more again.
+- **An FP16 pyramid.** The prototype of #84 stored the pyramid as FP16 pairs (`pack2x16float`) and kept the arithmetic in f32. Its output reached 64.8 dB against upstream's default decode and 67.5 dB against its FP32 decode, at most one step off. Through the app's harness it saved about 5 % at 4K frame after frame. It saved nothing measurable at 1080p or at 60 frames a second.
+
+**Decision.**
+- The pyramid stays FP32 (D13). FP16 storage would cost the 80 dB bar of D9 against upstream's FP32 decode, and gains too little for that. Upstream's gain also comes from halving its workgroup memory, which the prototype did not try; that would come after the levers below.
+- The passes stay as they are. The gaps between them are 3 to 15 µs, and one merged pass was no quicker.
+- The library adds no wake-up dispatch ahead of a frame, no spinning thread and no raised QoS. The first and last did not help, and spinning costs a core (#81).
+- Where emberwave can still gain at a stream's pace, in the order to try:
+  1. for Metal clients, the copy into textures, which cost about 0.1 ms at 4K frame after frame and 0.3 ms at 60 frames a second, and 0.03 ms at 1080p frame after frame: the planes stored straight into R8 storage textures where the adapter allows it;
+  2. the upload copies, with mappable buffers on GPUs that share memory with the CPU;
+  3. the CPU's preparation.
+
+  Each is worth a few tenths of a millisecond at most, against a floor of about 1 ms. #86 keeps them.
+
+**Consequence.** A paced decode's time is mostly the platform's: Metal's floor and an idle GPU's clock, which upstream's decoder pays as well. A client whose GPU stays busy, as a game-streaming host's does, sees times closer to those frame after frame. On the iPhone the floor and the slowdown are larger, and there the hardware HEVC decoder is quicker at a stream's pace (D45).
