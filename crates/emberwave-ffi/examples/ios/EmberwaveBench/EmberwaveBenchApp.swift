@@ -6,23 +6,18 @@
 // Started with the argument -autorun, as CI starts it in a simulator, it runs
 // a short benchmark and the texture check without the screen, prints the
 // report and exits: with status 0, or 1 if anything failed. With -run, it
-// does the same with the whole benchmark, for a run started from a Mac with
-// `xcrun devicectl device process launch --console`.
+// taps Run itself once it has stayed in front for a moment, and prints the
+// progress, its moves to and from the front and the report, for a run started
+// from a Mac with `xcrun devicectl device process launch --console` (see
+// ContentView.swift).
 
 import SwiftUI
-import UIKit
 
 @main
 struct EmberwaveBenchApp: App {
     init() {
-        let arguments = ProcessInfo.processInfo.arguments
-        if arguments.contains("-autorun") {
+        if ProcessInfo.processInfo.arguments.contains("-autorun") {
             DispatchQueue.global(qos: .userInitiated).async { autorun(.short) }
-        } else if arguments.contains("-run") {
-            // The screen stays on: a phone that locks halfway through spoils
-            // the run. The application exists once the main queue runs.
-            DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = true }
-            DispatchQueue.global(qos: .userInitiated).async { autorun(Plan()) }
         }
     }
 
