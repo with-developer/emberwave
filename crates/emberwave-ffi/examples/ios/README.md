@@ -54,6 +54,17 @@ The project builds for iPhones and iPads, and for the iOS Simulator on Macs with
 
 For steadier numbers, let the phone cool down first, close other apps, keep it plugged in, and leave Low Power Mode off, which slows the GPU down; the report gives the thermal state at the end and whether Low Power Mode was on. A run during which the app left the front, where iOS stops or slows its GPU work, is marked not valid. Stopping the app in Xcode and starting it again from the home screen leaves the debugger out.
 
+## Starting a run from a Mac
+
+With the app installed, a Mac can start a run and collect the report in its terminal, without a debugger:
+
+```sh
+xcrun devicectl device process launch --console --terminate-existing \
+    --device IDENTIFIER io.github.with-developer.emberwave-bench -run
+```
+
+Unlock the phone and leave it on the home screen first. With `-run`, the app starts the run itself once it has stayed in front for three seconds, as an app the Mac has just launched may still leave the front for a moment. It prints its progress, its moves to and from the front with the time since the launch, and the report, then exits: with status 0, or 1 if anything failed or the app left the front during the run. A launch during the unlock gesture loses the front at once: the app then waits until it is back in front for three seconds.
+
 ## On a Mac
 
 `scripts/bench_app_on_mac.sh` makes the same measurements on a Mac, by the app's own code: it builds `EmberwaveBenchMac`, a command-line front-end, against the XCFramework's library for the Mac, and prints the app's report. The progress goes to the standard error. It needs the XCFramework built by `scripts/build_xcframework.sh`, which has the library for the Mac.
