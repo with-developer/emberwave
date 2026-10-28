@@ -53,6 +53,13 @@ final class BenchModel: ObservableObject {
         guard launchedToRun, !startedByLaunch, pendingStart == nil else {
             return
         }
+        // Without a GPU there is nothing to run: the Mac, which waits for
+        // the app to end, learns why.
+        guard emberwave != nil else {
+            print("failed: \(status)")
+            fflush(stdout)
+            exit(1)
+        }
         // The screen stays on while the run waits too: a phone that locks
         // then would put the run off until someone unlocks it.
         UIApplication.shared.isIdleTimerDisabled = true

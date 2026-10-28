@@ -1229,7 +1229,7 @@ So a client gains decoding time from emberwave only while its GPU stays busy. Ho
 
 On the iPhone 17, two runs on 2026-10-27, started from the Mac with `-run` once the app waited for the front to settle (`BENCHMARKS.md`):
 - Frame after frame, emberwave decodes into the planes 1.4 to 1.7 times as quickly as the A19's HEVC decoder into NV12: 4.51 to 4.54 against 6.16 to 6.28 ms at 4K.
-- At 60 frames a second HEVC is the quicker, 1.5 to 2.7 times. emberwave's decodes slow down 1.6 to 4.8 times between frames, HEVC's by 5 % at most. The cadence adds 4.6 to 5.9 ms to a decode into the planes, against 1.6 to 3.0 ms on the Mac.
+- At 60 frames a second HEVC is the quicker, 1.5 to 2.7 times. emberwave's decodes slow down 1.6 to 4.8 times between frames, HEVC's by 5.3 % at most. The cadence adds 4.6 to 5.9 ms to a decode into the planes, against 1.6 to 3.0 ms on the Mac.
 
 Grok argued the other side twice:
 - **Before the work.** It asked for both cadences for both codecs, the Metal wrap in the time, asynchronous decoding, one session at a time, keyframes apart and the encoder's identity in the report, all taken. Three of its points did not hold up when measured:

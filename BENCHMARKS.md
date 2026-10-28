@@ -264,19 +264,19 @@ Measured on 2026-10-27 on the iPhone 17 of the section above (`iPhone18,3`, iOS 
 
 At Moonlight's rates, HEVC's frames averaged 41, 82 and 165 kB. The largest were 63 to 73, 154 and 279 to 333 kB, and the keyframes 134 to 164, 285 and 632 to 636 kB. The encoder and the decoder were the hardware's.
 
-The two runs' means differed by 4 % or less, except in five rows. HEVC's encoding at 1080p differed by 13 %. Four more differed by 4.5 to 7 %: emberwave's decodes into the planes at 60 frames a second at 1440p, and three of HEVC's rows at 1080p. emberwave's own rows agree within 2 % with those of [the section above](#on-the-iphone-natively), measured the day before, at 1080p and 1440p. At 4K its decodes took 5 to 10 % less than then, and its encodes 2 to 5 % less.
+The two runs' means differed by 4 % or less, except in five rows. HEVC's encoding at 1080p differed by 13 %. Four more differed by 4.5 to 7 %: emberwave's decodes into the planes at 60 frames a second at 1440p, and three of HEVC's rows at 1080p. At 1080p and 1440p, emberwave's own rows fall within the ranges of [the section above](#on-the-iphone-natively), measured the day before, or within 1.1 % of them. At 4K its decodes took 5 to 10 % less than then, and its encodes 2 to 5 % less.
 
-- **Frame after frame**, emberwave decodes into the planes 1.4 to 1.7 times as quickly as the A19's HEVC decoder into NV12 at Moonlight's rates. That is 1.27 against 2.08 to 2.16 ms at 1080p, and 4.51 to 4.54 against 6.16 to 6.28 ms at 4K. Into RGB it is 2.0 to 2.8 times as quick as HEVC into BGRA.
+- **Frame after frame**, emberwave decodes into the planes 1.4 to 1.7 times as quickly as the A19's HEVC decoder into NV12 at Moonlight's rates. That is 1.27 against 2.08 to 2.16 ms at 1080p, and 4.51 to 4.54 against 6.16 to 6.28 ms at 4K. Into RGB it is 2.0 to 2.7 times as quick as HEVC into BGRA.
 - **At 60 frames a second, HEVC is the quicker one on the phone.**
-  - Between frames, emberwave's decodes slowed down 1.6 to 4.8 times, and HEVC's by 5 % at most.
+  - Between frames, emberwave's decodes slowed down 1.6 to 4.8 times, and HEVC's by 5.3 % at most.
   - Into the planes, emberwave then took 2.7 times as long as HEVC into NV12 at 1080p: 5.88 to 5.96 against 2.19 to 2.20 ms. At 1440p it took 2.3 to 2.4 times as long, and at 4K 1.5 times: 9.37 to 9.39 against 6.27 to 6.43 ms.
   - On the Mac the two took about as long at that cadence.
 - **What the cadence adds hardly grows with the size.** At 60 frames a second, a decode into the planes took 4.6 to 4.7 ms longer than frame after frame at 1080p, 5.4 to 5.9 ms at 1440p and 4.9 ms at 4K. On the M3 Max that was about 1.7 ms at 1080p and 2.8 to 3.0 ms at 4K. Issue #86 follows where it goes.
 - **HEVC's decoding grows with the bytes.** At emberwave's bytes per frame it took 2.0 to 2.3 times as long as at Moonlight's rates. At 4K that is 12.9 ms, longer than emberwave's decode even at 60 frames a second.
 - **Keyframes** took no longer than the other frames: 6.2 ms at 4K for 632 to 636 kB. On the Mac they took about twice as long.
-- **BGRA**, VideoToolbox's colour conversion, which Moonlight does not use, doubles HEVC's decoding on the phone. At 60 frames a second, emberwave into RGB took 1.7 to 1.8 times as long as HEVC into BGRA at 1080p, 1.4 times at 1440p, and 21 to 23 % less at 4K.
+- **BGRA**, VideoToolbox's colour conversion, which Moonlight does not use, makes HEVC's decoding take 1.9 to 2.1 times as long on the phone. At 60 frames a second, emberwave into RGB took 1.7 to 1.8 times as long as HEVC into BGRA at 1080p, 1.4 times at 1440p, and 21 to 23 % less at 4K.
 - **Encoding.** The A19's HEVC encoder at its fastest took 2.1 to 2.7 times as long as emberwave's GPU encoder at Moonlight's rates, 16.9 to 17.2 against 7.9 ms at 4K, and 3.3 to 3.8 times at emberwave's bytes.
-- **Next to the M3 Max**, frame after frame, emberwave's decodes into the planes took 3.0 times as long on the phone at 1080p and 4.5 times at 4K. HEVC's took 1.4 to 2.2 times as long at 1080p and 1.8 to 2.4 times at 4K.
+- **Next to the M3 Max**, frame after frame, emberwave's decodes into the planes took 3.0 times as long on the phone at 1080p and 4.5 times at 4K. HEVC's took 1.4 to 2.3 times as long at 1080p and 1.8 to 2.4 times at 4K.
 
 ### Not covered
 
