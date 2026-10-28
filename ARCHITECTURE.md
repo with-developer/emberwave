@@ -1263,7 +1263,7 @@ The figures of the prototype's runs above are marked as not kept.
 - The demo plays when the page opens, unless `?play=NAME` asks for a sample.
 - `scripts/check_web.mjs` encodes the demo's first two pictures in Node, where the CPU encoder needs no GPU, and checks the PWV1 file they make. Playing it was checked in headless Chrome with WebGPU: the 60 pictures were encoded and played at 30 frames a second, and the screenshots showed the scene.
 
-**Consequence.** Opening the page shows a 960x540 stream decoded by WebGPU within seconds, also encoded in the page. Phones spend a few seconds of CPU on it first.
+**Consequence.** Opening the page shows a 960x540 stream decoded by WebGPU within seconds, also encoded in the page. A slower CPU takes longer: with Chrome's CPU throttled 4 and 6 times, the 60 pictures took 6.1 and 9.2 s, still one picture per task. Phones were not measured. The module grows by 6.4 kB.
 
 ### 2026-10-29 — D47: The README's figures, drawn from copied numbers
 

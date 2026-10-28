@@ -206,12 +206,14 @@ async function playDemo() {
     const total = Demo.frames();
     for (let done = 0; done < total;) {
       done = demo.encode_next();
-      if (mine !== request) {
-        return;
-      }
       info.className = "";
       info.textContent = `Drawing a demo stream and encoding it in this page: ${done} of ${total} pictures.`;
       await new Promise((resolve) => setTimeout(resolve, 0));
+      // Meanwhile another stream may have been asked for, or the module may
+      // have stopped working, which the page says already.
+      if (broken || mine !== request) {
+        return;
+      }
     }
     bytes = demo.take_file();
   } catch (error) {
@@ -220,7 +222,10 @@ async function playDemo() {
     }
     return;
   } finally {
-    demo?.free();
+    // A module that panicked cannot free what it was using.
+    if (!broken) {
+      demo?.free();
+    }
   }
   if (mine === request) {
     await play(bytes, "Demo, encoded in this page");

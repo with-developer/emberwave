@@ -1,7 +1,7 @@
 //! emberwave in the browser: decodes PyroWave (`.pwv1`) files with WebGPU and
-//! draws them on a canvas, and times the decoding on the browser's GPU
-//! ([`Bench`]). The pages are in `web/`, and `scripts/build_web.sh` builds
-//! this crate for them.
+//! draws them on a canvas, makes a demo stream for the player ([`Demo`]), and
+//! times the decoding on the browser's GPU ([`Bench`]). The pages are in
+//! `web/`, and `scripts/build_web.sh` builds this crate for them.
 //!
 //! Only the browser build has content. On other targets the crate is empty,
 //! so that the workspace builds everywhere.

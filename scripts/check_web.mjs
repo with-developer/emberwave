@@ -22,6 +22,7 @@ for (const [name, value] of [
   ["Bench.create", Bench?.create],
   ["Demo", Demo],
   ["Demo.frames", Demo?.frames],
+  ["Demo.frame_budget", Demo?.frame_budget],
 ]) {
   if (typeof value !== "function") {
     throw new Error(`${name} is missing from the module`);
@@ -52,5 +53,8 @@ for (let at = 24; at + 4 <= file.length;) {
 }
 if (encoded !== 2 || magic !== "PWV1" || sizes.length !== 2 || !(Demo.frames() > 2)) {
   throw new Error(`the demo made ${encoded} pictures, a file starting "${magic}" with ${sizes.length} frames`);
+}
+if (!sizes.every((size) => size <= Demo.frame_budget())) {
+  throw new Error(`the demo's frames take ${sizes.join(" and ")} bytes, over ${Demo.frame_budget()}`);
 }
 console.log(`the demo encodes: ${sizes.join(" and ")} bytes for its first two of ${Demo.frames()} pictures`);

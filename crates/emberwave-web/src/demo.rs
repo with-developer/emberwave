@@ -1,8 +1,9 @@
 //! A stream the player makes itself (`web/index.html`): an animated scene
 //! drawn and encoded in the page with the CPU encoder, so that a visitor
 //! without a `.pwv1` file sees a stream decoded at once. The scene is the
-//! README's banner set in motion: a wavelet whose crests travel under its
-//! envelope, and embers rising from it. Its pictures loop without a seam.
+//! README's banner (`docs/images/banner.svg`) set in motion: a wavelet whose
+//! crests travel under its envelope, and embers rising from it. Its pictures
+//! loop without a seam.
 
 use std::f32::consts::{PI, TAU};
 
@@ -67,6 +68,11 @@ impl Demo {
     /// How many pictures the stream has.
     pub fn frames() -> u32 {
         FRAMES
+    }
+
+    /// The most bytes a frame takes.
+    pub fn frame_budget() -> u32 {
+        BUDGET as u32
     }
 
     /// Draws and encodes the next picture, if any is left. Returns how many
