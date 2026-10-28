@@ -11,7 +11,7 @@ scripts/bench.sh                    # measures, then rewrites the results below 
 scripts/bench_lavapipe.sh           # optional: software Vulkan in a Linux container (needs Docker)
 ```
 
-`bench.sh` keeps the raw results in `target/bench/` as JSON; `scripts/bench_report.py write target/bench BENCHMARKS.md README.md` turns them into the tables again. Quit other programs first, keep a laptop on mains power, and run it twice: the two runs should agree within a few per cent.
+`bench.sh` keeps the raw results in `target/bench/` as JSON; `scripts/bench_report.py write target/bench BENCHMARKS.md README.md` turns them into the tables again. Quit other programs first, keep a laptop on mains power, and run it twice: the two runs should agree within a few per cent. The README's charts show some of the numbers on this page: `scripts/readme_figures.py` draws them, from numbers copied into it.
 
 ## What is measured
 

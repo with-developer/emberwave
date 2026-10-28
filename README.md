@@ -1,16 +1,46 @@
-# emberwave
+<p align="center">
+  <img src="docs/images/banner.svg" alt="emberwave: PyroWave's wavelet video codec, rewritten for wgpu" width="100%">
+</p>
 
-[![CI](https://github.com/with-developer/emberwave/actions/workflows/ci.yml/badge.svg)](https://github.com/with-developer/emberwave/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)
+<p align="center">
+  <a href="https://github.com/with-developer/emberwave/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/with-developer/emberwave/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/with-developer/emberwave/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/with-developer/emberwave?color=e8302a"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="https://with-developer.github.io/emberwave/"><img alt="Try it in the browser" src="https://img.shields.io/badge/try_it-WebGPU_player-ff7a1a"></a>
+</p>
 
-A portable ([wgpu](https://wgpu.rs)) port of the [PyroWave](https://github.com/Themaister/pyrowave) low-latency intra-frame wavelet video codec.
+<p align="center">
+  <b><a href="https://with-developer.github.io/emberwave/">Play a stream in your browser</a></b> ·
+  <a href="https://with-developer.github.io/emberwave/bench.html">Benchmark your device</a> ·
+  <a href="BENCHMARKS.md">Benchmarks</a> ·
+  <a href="crates/emberwave-ffi/README.md">C API</a> ·
+  <a href="crates/emberwave-ffi/examples/ios">iPhone app</a>
+</p>
 
-**[Play a stream in your browser](https://with-developer.github.io/emberwave/)**, decoded by WebGPU in the page (a recent Chrome or Edge has it).
+[PyroWave](https://github.com/Themaister/pyrowave) is a video codec for game streaming on a local network: a GPU encodes and decodes each frame in a millisecond or two, at the cost of bandwidth. Valve has added it to Steam Remote Play, in the Steam client's beta ([GamingOnLinux](https://www.gamingonlinux.com/2026/10/steam-client-beta-for-october-1st-brings-many-remote-play-pyrowave-improvements/)). Upstream's implementation is written as Vulkan compute shaders, with a separate port to Metal. **emberwave is PyroWave rewritten in Rust and WGSL on [wgpu](https://wgpu.rs)**: one code base, and the same bitstream, on Metal, Vulkan, DX12 and WebGPU, from a native app to a browser tab and an iPhone.
 
-PyroWave is an intra-only codec built for very fast GPU encode and decode (upstream reports under ~0.1 ms at 1080p and ~0.2 ms at 4K) for local-network game streaming. Its reference implementation is written as Vulkan compute shaders. **emberwave reimplements the decoder in Rust + WGSL on top of wgpu**, so a single code base can target Vulkan, Metal, DX12 and WebGPU.
+- **Fast.** On an Apple M3 Max, frames one after the other, a 4K frame decodes in 0.90 ms to its planes and 1.22 ms to RGB, and encodes in 1.90 ms on the GPU, from CPU memory to CPU memory. Upstream's own Metal port takes 0.80 ms to decode it at the same FP32 precision and 0.56 ms at its default FP16, and 3.2 to 3.3 ms to encode it ([`BENCHMARKS.md`](BENCHMARKS.md), 2026-10-26).
+- **Every frame stands alone.** No frame refers to another, so a lost packet costs one frame, with no wait for a keyframe. Each frame keeps to a fixed byte budget.
+- **Compatible with upstream, and a better encoder.** It decodes the streams of upstream's encoder as upstream's decoder does, at 64 dB PSNR or more, and upstream's decoder reads emberwave's streams. At the same bytes per frame, emberwave's encoder beats upstream's luma PSNR by up to 3.4 dB on the test scenes, and matches it within 0.01 dB on noise.
+- **Native, in the browser and on the iPhone.** A command line tool, a [browser player](https://with-developer.github.io/emberwave/) that decodes with WebGPU in the page, a C API with prebuilt libraries for Linux and Windows (x86_64) and macOS (Apple silicon), and an XCFramework for iPhone, iPad and Mac apps. Tested on Apple GPUs, and in CI on software Vulkan and DX12.
 
-> **Status: pre-alpha.** The wgpu/WGSL decoder matches the original decoder on real encoder output, up to 4K (at least 64 dB PSNR against its default precision and 86 dB against its FP32 mode). CI runs the tests on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Decoding works, converts to RGB on the GPU and comes with a command line tool, a browser player and a C API. An encoder makes streams that upstream's decoder reads, at upstream's PSNR or above for the same bytes, on the CPU or on the GPU, which encodes a 4K frame in about 1.9 ms on the same machine, faster than upstream's own encoder (3.2 to 3.4 ms at the same precision), also from pictures that are in GPU memory already. A 4K frame decodes in about 0.9 ms on an Apple M3 Max (1.2 ms including the conversion to RGB), 1.0 to 1.25 times the time of upstream's own Metal decoder at FP32, depending on the run (see [Performance](#performance)). Releases and their changes are in [`CHANGELOG.md`](CHANGELOG.md).
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/decode-dark.svg">
+  <img alt="Decode time per frame, to RGB in GPU memory. Apple M3 Max: 0.53 ms at 1080p and 1.22 ms at 4K natively through Metal, 0.70 to 1.00 and 1.69 to 1.88 ms in Chrome through WebGPU. iPhone 17: 1.62 to 1.63 and 6.21 to 6.29 ms in a native app, 2.36 and 8.05 ms in Safari." src="docs/images/decode-light.svg" width="100%">
+</picture>
+
+These times are for frames one after the other. A stream's frames arrive 60 a second, and between them the GPU idles and slows down, so each decode takes longer ([Performance](#performance)).
+
+> **Status: 0.x.** The bitstream is upstream's, and the Rust and C APIs may still change between minor versions. CI tests every change on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Releases and their changes are in [`CHANGELOG.md`](CHANGELOG.md).
+
+## How it works
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/pipeline-dark.svg">
+  <img alt="A 4K frame through emberwave on an Apple M3 Max. Encoding on the GPU: wavelet transform 0.40 ms, quantisation 0.59 ms, rate control 0.13 ms, packing 0.18 ms, a frame of at most 1.2 MB. The packets cross the network. Decoding: assembly on the CPU 0.10 ms, dequantisation 0.19 ms, inverse transform 0.40 ms, YUV to RGB 0.24 ms." src="docs/images/pipeline-light.svg" width="100%">
+</picture>
+
+A frame is a wavelet transform of the picture, its coefficients quantised in blocks and sent as bit-planes, most significant first. To fit a frame into its budget, the encoder drops the least significant planes where that costs the picture least, weighted by the eye's sensitivity to each band. Every stage of the figure but the decoder's assembly of the packets is a compute shader in WGSL; that assembly runs on the CPU, as in upstream's decoder. Around them, the CPU copies the planes in, the frame out and the picture's header. [`ARCHITECTURE.md`](ARCHITECTURE.md) describes the bitstream, the passes and the decisions behind them.
 
 ## Quick start
 
@@ -77,6 +107,11 @@ Upstream's own Metal decoder is faster on the same machine: 0.80 ms for a 4K fra
 Encoding a 4K frame within 1.2 MB takes 1.90 ms on the GPU, from the planes in CPU memory to the frame in CPU memory, and 3.33 ms with upstream's encoder at FP32.
 <!-- bench-summary:end -->
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/encode-dark.svg">
+  <img alt="Encoding a 4K frame on an Apple M3 Max: emberwave on the GPU 1.90 ms, upstream PyroWave 3.17 ms at FP16 and 3.33 ms at FP32, Apple's HEVC encoder at 80 Mbit/s 12.76 to 13.00 ms." src="docs/images/encode-light.svg" width="100%">
+</picture>
+
 In Safari on an iPhone 17 the [benchmark page](https://with-developer.github.io/emberwave/bench.html) decodes a 1080p frame in 2.4 ms and a 4K frame in 8.1 ms, to RGB in GPU memory ([`BENCHMARKS.md`](BENCHMARKS.md#in-the-browser-phones-included)). Natively, through the XCFramework, the [benchmark app](crates/emberwave-ffi/examples/ios) decodes them into a Metal texture in 1.6 and 6.2 to 6.3 ms, and into Y, Cb and Cr textures in 1.3 and 4.8 ms ([`BENCHMARKS.md`](BENCHMARKS.md#on-the-iphone-natively)).
 
 The same app times the hardware HEVC decoder that Moonlight uses, at Moonlight's default bit rates. Frame after frame, emberwave decodes into textures 2.2 to 3.9 times as quickly on the M3 Max, 1.0 against 2.6 to 3.4 ms at 4K, and 1.4 to 1.7 times as quickly on the iPhone 17, 4.5 against HEVC's 6.2 to 6.3 ms, in runs a day after those above. When frames come 60 a second, the GPU slows down while it idles between them, and the media engine does not. The two then take about as long on the Mac, and on the phone HEVC is 1.5 to 2.7 times as quick ([`BENCHMARKS.md`](BENCHMARKS.md#against-hevc-on-the-same-device)).
@@ -112,6 +147,7 @@ After the release: a [browser player](https://with-developer.github.io/emberwave
 | `crates/emberwave-web`, `web/` | The browser player and its benchmark: WebAssembly module and pages |
 | `testdata/` | Test vectors and how to regenerate them |
 | `scripts/` | Test data, 4K acceptance check and benchmark scripts |
+| `docs/images/` | The README's banner and charts, drawn by `scripts/readme_figures.py` from the numbers in `BENCHMARKS.md` |
 | `ARCHITECTURE.md` | Bitstream format, GPU pipeline and the decision log |
 | `BENCHMARKS.md` | How decode times are measured, and the results |
 | `CONTRIBUTING.md` | How to build, test and change the code |
@@ -138,9 +174,9 @@ MIT. See [`LICENSE`](LICENSE), which also carries the PyroWave copyright notice.
 
 ## 한국어 요약
 
-emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 코덱)의 **디코더를 Rust + wgpu + WGSL로 재구현**해서 Vulkan / Metal / DX12 / WebGPU에서 같은 코드로 돌아가게 만드는 프로젝트입니다. 원본 디코더는 Vulkan 전용이라 macOS, iOS, 브라우저용 클라이언트가 없는데, 그 빈자리를 채우는 것이 목표입니다.
+emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 코덱, Valve가 Steam Remote Play 베타에 넣은 코덱)를 **Rust + wgpu + WGSL로 재구현**해서 Metal / Vulkan / DX12 / WebGPU에서 같은 코드로 돌아가게 만드는 프로젝트입니다. 원본은 Vulkan 컴퓨트 셰이더와 Apple 전용 Metal 포트로 따로 구현되어 있고 브라우저에서는 돌지 않습니다. emberwave는 한 코드로 네이티브 앱, 브라우저 탭, iPhone까지 같은 비트스트림을 인코딩·디코딩합니다.
 
-- **현재 상태(프리알파)**: 비트스트림 파서, GPU 디코더(역양자화, 역 DWT, YUV→RGB), CLI(`emberwave-cli`)가 동작합니다. 원본 인코더가 만든 스트림을 원본 디코더와 PSNR 64 dB 이상(원본 FP32 모드 기준 86 dB 이상)으로 일치하게 디코딩하고, 4K 스트림도 같은 기준을 통과합니다. CI는 Linux(lavapipe), macOS(Metal), Windows(DX12, WARP)에서 테스트를 돌립니다.
+- **현재 상태(0.x)**: 비트스트림은 업스트림 것이고, Rust·C API는 마이너 버전 사이에 바뀔 수 있습니다. 비트스트림 파서, GPU 디코더(역양자화, 역 DWT, YUV→RGB), CLI(`emberwave-cli`)가 동작합니다. 원본 인코더가 만든 스트림을 원본 디코더와 PSNR 64 dB 이상(원본 FP32 모드 기준 86 dB 이상)으로 일치하게 디코딩하고, 4K 스트림도 같은 기준을 통과합니다. CI는 Linux(lavapipe), macOS(Metal), Windows(DX12, WARP)에서 테스트를 돌립니다.
 - **빠른 시작**: Rust 1.87 이상과 GPU(없으면 Linux는 Mesa lavapipe, Windows는 내장 WARP)가 있으면 위 Quick start의 네 줄로 PNG를 얻습니다. 처음 빌드는 몇 분 걸립니다.
 - **성능**: Apple M3 Max(Metal)에서 4K 한 프레임을 약 0.9 ms(RGB 변환 포함 1.2 ms)에 디코딩하며, 같은 기계에서 원본 Metal 디코더(FP32)의 1.0~1.25배입니다(측정 회차마다 다름). 디코딩한 그림을 CPU로 읽어 오면 4K RGB가 약 2.2 ms입니다(전에는 7.5 ms). 측정 환경과 전체 수치는 위 Performance 표와 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.
 - **릴리스**: v0.1.0이 첫 릴리스, v0.2.0이 속도 개선, v0.3.0이 브라우저 플레이어와 C API, v0.4.0이 인코더(CPU와 GPU), v0.5.0이 GPU 인코더 가속(4K 약 1.9 ms로 업스트림보다 빠름)과 기기 손실·Vulkan 로더 관련 수정, v0.6.0이 C API 인코더와 GPU 텍스처 입력 인코딩, v0.7.0이 iPhone·iPad·Mac 앱용 XCFramework, 휴대폰도 되는 브라우저 벤치마크, 디코딩 CPU 시간 단축, v0.8.0이 디코딩한 그림의 CPU 읽기 3배 가속(C API 4K RGB 7.6→2.7 ms), 텍스처 입력 인코딩 가속, 브라우저 페이지 리뷰 수정, v0.9.0이 Metal 클라이언트용 GPU 텍스처 출력(C API, M3 Max 4K 1.5 ms)과 iPhone·iPad 벤치마크 앱, v0.10.0이 Y·Cb·Cr 평면 텍스처(4K 1.0 ms), 복사로 채우는 RGB 텍스처(4K 1.5→1.3 ms), 앱의 Metal 큐에서 대기 없는 디코딩, v0.11.0이 앱 자신의 Metal 텍스처(CVPixelBuffer 등)로 디코딩과 모든 텍스처 경로를 재는 벤치마크 앱 릴리스입니다. Linux(x86_64), macOS(Apple Silicon), Windows(x86_64)용 `emberwave-cli`와 C 라이브러리(`emberwave-ffi`), iOS·macOS 앱용 `Emberwave.xcframework`를 [releases](https://github.com/with-developer/emberwave/releases)에서 받을 수 있습니다. 4K 1000프레임을 반복 디코딩해도 GPU 자원과 프로세스 메모리가 늘지 않는 것을 확인했습니다.

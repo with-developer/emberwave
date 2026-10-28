@@ -1249,3 +1249,16 @@ It found that the paced cadence ran at about 47 frames a second. Its own A/B at 
 - frame sizes copied wrong into `BENCHMARKS.md`.
 
 The figures of the prototype's runs above are marked as not kept.
+
+### 2026-10-29 — D47: The README's figures, drawn from copied numbers
+
+**Context.** The README opened with a line of text and a long status paragraph (#87). Charts of the decode and encode times and a figure of the pipeline show at a glance what emberwave does, and GitHub shows a README's images in its light or dark theme. Their numbers come from several sections of `BENCHMARKS.md`: some written by `scripts/bench.sh`, others by hand, about the iPhone, the browsers and HEVC.
+
+**Decision.**
+- `scripts/readme_figures.py` draws the banner and the figures as SVG, with the Python standard library only. Each chart is drawn for GitHub's light and dark themes and picked with `<picture>`. It has a background of its own, so that either file stays legible in the other theme. The colours are a two-series palette that a colour-vision checker passed against both themes' backgrounds.
+- The numbers are copied into the script, each with the section it comes from, rather than parsed from `BENCHMARKS.md`, whose hand-written sections have no fixed format. The README's highlights and the figures' alt texts carry some of them too.
+- CI checks that the committed SVG files are what the script draws. Unlike the tables (D21), running `scripts/bench.sh` again does not update the figures: after a run that changes their numbers, they are changed by hand in the script, the highlights and the alt texts.
+- Each figure states its devices and dates. The decode chart also says that frames one after the other are not a stream's pace, and by how much the native decodes slowed down at 60 frames a second.
+
+**Consequence.** The README shows the speed, the platforms and the pipeline before its first heading. The figures lag a new benchmark run until they are updated by hand.
+

@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="386" viewBox="0 0 960 386" role="img" aria-label="A 4K frame through emberwave's encoder and decoder, with the time of each stage on an Apple M3 Max" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif">
+<title>A 4K frame through emberwave's encoder and decoder, with the time of each stage on an Apple M3 Max</title>
+<rect x="0.5" y="0.5" width="959" height="385" rx="12" fill="#0d1117" stroke="#30363d"/>
+<text x="24.0" y="38.0" font-size="20" font-weight="600" fill="#f0efec" text-anchor="start">A 4K frame through emberwave</text>
+<text x="24.0" y="62.0" font-size="14" font-weight="400" fill="#c3c2b7" text-anchor="start">Every frame is coded on its own: no frame refers to another. Times on an Apple M3 Max.</text>
+<defs><marker id="head-dark" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0L8,4L0,8Z" fill="#4a4a46"/></marker></defs>
+<text x="24.0" y="84.0" font-size="13" font-weight="600" fill="#c3c2b7" text-anchor="start">Encode on the host's GPU</text>
+<rect x="24" y="96" width="138" height="64" rx="10" fill="none" stroke="#4a4a46" stroke-dasharray="4 3"/>
+<text x="93.0" y="120.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Picture</text>
+<text x="93.0" y="138.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">Y, Cb, Cr planes</text>
+<line x1="164" y1="128.0" x2="178" y2="128.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="180" y="96" width="138" height="64" rx="10" fill="#d95926" fill-opacity="0.12" stroke="#d95926" stroke-width="1.5"/>
+<text x="249.0" y="120.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Wavelet transform</text>
+<text x="249.0" y="138.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">CDF 9/7, 5 levels</text>
+<text x="249.0" y="154.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle" font-variant-numeric="tabular-nums">0.40 ms</text>
+<line x1="320" y1="128.0" x2="334" y2="128.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="336" y="96" width="138" height="64" rx="10" fill="#d95926" fill-opacity="0.12" stroke="#d95926" stroke-width="1.5"/>
+<text x="405.0" y="120.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Quantisation</text>
+<text x="405.0" y="138.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">8x8 blocks</text>
+<text x="405.0" y="154.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle" font-variant-numeric="tabular-nums">0.59 ms</text>
+<line x1="476" y1="128.0" x2="490" y2="128.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="492" y="96" width="138" height="64" rx="10" fill="#d95926" fill-opacity="0.12" stroke="#d95926" stroke-width="1.5"/>
+<text x="561.0" y="120.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Rate control</text>
+<text x="561.0" y="138.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">fits the budget</text>
+<text x="561.0" y="154.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle" font-variant-numeric="tabular-nums">0.13 ms</text>
+<line x1="632" y1="128.0" x2="646" y2="128.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="648" y="96" width="138" height="64" rx="10" fill="#d95926" fill-opacity="0.12" stroke="#d95926" stroke-width="1.5"/>
+<text x="717.0" y="120.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Packing</text>
+<text x="717.0" y="138.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">bit-planes</text>
+<text x="717.0" y="154.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle" font-variant-numeric="tabular-nums">0.18 ms</text>
+<line x1="788" y1="128.0" x2="802" y2="128.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="804" y="96" width="138" height="64" rx="10" fill="none" stroke="#4a4a46" stroke-dasharray="4 3"/>
+<text x="873.0" y="120.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Frame</text>
+<text x="873.0" y="138.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">at most 1.2 MB</text>
+<text x="24.0" y="318.0" font-size="13" font-weight="600" fill="#c3c2b7" text-anchor="start">Decode on the client's GPU</text>
+<rect x="24" y="232" width="138" height="64" rx="10" fill="none" stroke="#4a4a46" stroke-dasharray="4 3"/>
+<text x="93.0" y="256.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Packets</text>
+<text x="93.0" y="274.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">as they arrive</text>
+<line x1="164" y1="264.0" x2="178" y2="264.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="180" y="232" width="138" height="64" rx="10" fill="#898781" fill-opacity="0.12" stroke="#898781" stroke-width="1.5"/>
+<text x="249.0" y="256.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Assembly</text>
+<text x="249.0" y="274.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">on the CPU</text>
+<text x="249.0" y="290.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle" font-variant-numeric="tabular-nums">0.10 ms</text>
+<line x1="320" y1="264.0" x2="334" y2="264.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="336" y="232" width="138" height="64" rx="10" fill="#3987e5" fill-opacity="0.12" stroke="#3987e5" stroke-width="1.5"/>
+<text x="405.0" y="256.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Dequantisation</text>
+<text x="405.0" y="274.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">bit-planes to floats</text>
+<text x="405.0" y="290.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle" font-variant-numeric="tabular-nums">0.19 ms</text>
+<line x1="476" y1="264.0" x2="490" y2="264.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="492" y="232" width="138" height="64" rx="10" fill="#3987e5" fill-opacity="0.12" stroke="#3987e5" stroke-width="1.5"/>
+<text x="561.0" y="256.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Inverse transform</text>
+<text x="561.0" y="274.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">5 levels</text>
+<text x="561.0" y="290.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle" font-variant-numeric="tabular-nums">0.40 ms</text>
+<line x1="632" y1="264.0" x2="646" y2="264.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="648" y="232" width="138" height="64" rx="10" fill="#3987e5" fill-opacity="0.12" stroke="#3987e5" stroke-width="1.5"/>
+<text x="717.0" y="256.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">YUV to RGB</text>
+<text x="717.0" y="274.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">the stream's colours</text>
+<text x="717.0" y="290.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle" font-variant-numeric="tabular-nums">0.24 ms</text>
+<line x1="788" y1="264.0" x2="802" y2="264.0" stroke="#4a4a46" stroke-width="1.5" marker-end="url(#head-dark)"/>
+<rect x="804" y="232" width="138" height="64" rx="10" fill="none" stroke="#4a4a46" stroke-dasharray="4 3"/>
+<text x="873.0" y="256.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="middle">Picture</text>
+<text x="873.0" y="274.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="middle">in GPU memory</text>
+<path d="M873.0,162V202.0H93.0V228" fill="none" stroke="#4a4a46" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#head-dark)"/>
+<text x="483.0" y="194.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">packets over the network: the application's own transport</text>
+<text x="24.0" y="354.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="start">Stage times from GPU timestamps. The whole frame takes 1.90 ms to encode, memory to memory, and 1.22 ms to decode:</text>
+<text x="24.0" y="372.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="start">the rest is the CPU's part, copies and waiting (BENCHMARKS.md, 2026-10-26).</text>
+</svg>
