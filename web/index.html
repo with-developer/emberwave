@@ -19,9 +19,10 @@
 </head>
 <body>
 <h1>emberwave</h1>
-<p>Plays <a href="https://github.com/Themaister/pyrowave">PyroWave</a> streams (<code>.pwv1</code>), decoded with WebGPU in this page by <a href="https://github.com/with-developer/emberwave">emberwave</a>. Nothing is uploaded.</p>
+<p>Plays <a href="https://github.com/Themaister/pyrowave">PyroWave</a> streams (<code>.pwv1</code>), decoded with WebGPU in this page by <a href="https://github.com/with-developer/emberwave">emberwave</a>. Nothing is uploaded. Without a file, it plays a demo that the page draws and encodes first.</p>
 <div id="drop">
   <div class="row">
+    <button id="demo">Play the demo</button>
     <label>Open a file <input type="file" id="file" accept=".pwv1"></label>
     <span>or drop one here, or play a sample:</span>
     <span id="samples" class="row"></span>

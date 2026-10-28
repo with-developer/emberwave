@@ -1,6 +1,6 @@
 // The page of the emberwave player: loads a .pwv1 file and plays it with the
 // wasm module that scripts/build_web.sh builds into pkg/.
-import init, { Player } from "./pkg/emberwave_web.js";
+import init, { Demo, Player } from "./pkg/emberwave_web.js";
 
 // The streams in testdata/, copied to samples/ by scripts/build_web.sh.
 const SAMPLES = [
@@ -192,6 +192,41 @@ async function playSample(name) {
   }
 }
 
+// Draws and encodes the demo stream in this page, a picture at a time so that
+// the progress shows and a file chosen meanwhile takes over, then plays it.
+async function playDemo() {
+  if (broken) {
+    return;
+  }
+  const mine = ++request;
+  let demo;
+  let bytes;
+  try {
+    demo = new Demo();
+    const total = Demo.frames();
+    for (let done = 0; done < total;) {
+      done = demo.encode_next();
+      if (mine !== request) {
+        return;
+      }
+      info.className = "";
+      info.textContent = `Drawing a demo stream and encoding it in this page: ${done} of ${total} pictures.`;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    bytes = demo.take_file();
+  } catch (error) {
+    if (mine === request) {
+      failWith("demo", error);
+    }
+    return;
+  } finally {
+    demo?.free();
+  }
+  if (mine === request) {
+    await play(bytes, "Demo, encoded in this page");
+  }
+}
+
 async function start() {
   // A file dropped anywhere is the player's; without this, a drop outside the
   // drop zone, or before the player is ready, would open the file instead.
@@ -209,7 +244,7 @@ async function start() {
     fail(`WebGPU did not start: ${error}`);
     return;
   }
-  info.textContent = `GPU: ${player.adapter()}. Open a file or play a sample.`;
+  info.textContent = `GPU: ${player.adapter()}. Open a file, or play the demo or a sample.`;
 
   const input = document.getElementById("file");
   input.addEventListener("change", () => {
@@ -232,6 +267,8 @@ async function start() {
     }
   });
 
+  document.getElementById("demo").addEventListener("click", () => playDemo());
+
   const samples = document.getElementById("samples");
   for (const name of SAMPLES) {
     const button = document.createElement("button");
@@ -240,10 +277,13 @@ async function start() {
     samples.append(button);
   }
 
-  // ?play=NAME starts a sample straight away, for links to one.
+  // ?play=NAME starts a sample straight away, for links to one; otherwise
+  // the demo plays, so that the page shows a stream without a file.
   const requested = new URLSearchParams(location.search).get("play");
   if (SAMPLES.includes(requested)) {
     playSample(requested);
+  } else {
+    playDemo();
   }
 }
 

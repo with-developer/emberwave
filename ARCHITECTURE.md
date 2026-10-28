@@ -491,6 +491,8 @@ Nothing in a browser may block, so the player uses only the parts of the decoder
 
 The page paces frames by the stream's frame rate, keeping the remainder of each interval, so 25 frames per second play as 25 on a 60 Hz display. It shows the frames per second, the CPU time to record and submit a frame, and the time from submitting a frame until the browser reports the GPU done with it (`onSubmittedWorkDone`): decoding and drawing, plus the delay of the report, averaged over the frames reported each second. In headless Chrome 155 on an Apple M3 Max (2026-10-24) the 1080p benchmark stream took about 0.6 ms of CPU and 2.2 ms from submission to done, the 4K one about 1.2 and 3.8 ms, both playing at their 30 frames per second.
 
+Without a file the page plays a demo stream it makes itself (`crates/emberwave-web/src/demo.rs`, decision D46): 60 pictures of 960x540 at 30 frames a second, two seconds that loop, of a glowing wavelet whose crests travel and embers that rise from it. The page draws each picture and encodes it with the CPU encoder within 40 kB, one picture at a time, and shows its progress in between. It then plays the PWV1 file this makes like any other. In headless Chrome on an Apple M3 Max the 60 pictures took about 2 s. A file opened or dropped meanwhile, or a sample, takes over, and `?play=NAME` starts that sample instead of the demo.
+
 `web/bench.html` times the decoding on the device it runs on, a phone included, with the code of `crates/emberwave-web/src/bench.rs`. It makes test streams at 1080p, 1440p and 4K, four pictures each of a synthetic scene encoded by the CPU encoder in the page at the budgets of the native benchmarks, then decodes them in turn on the player's path, to RGB in GPU memory, and waits for each frame through `onSubmittedWorkDone` before the next: 300 frames after at least 30 and a second of warm-up, as `emberwave-cli bench --output rgb` does natively. wgpu's callback for that has to be `Send`, which a JavaScript function is not, so it sets a flag and wakes a future that `wasm_bindgen_futures` turns into the page's promise. Browsers coarsen `performance.now()`, to a millisecond in some, so the mean comes from the time of the whole run and the median and 99th percentile, which are per frame, are as fine as the timer, whose step the report states. The times include what WebGPU adds over native wgpu: the browser's checks, its process boundary and the delay of the report. A GPU error the browser reports during a size fails that size rather than give times for frames that were not decoded, a run during which the page was hidden is marked as not valid, and the benchmark lets go of its device when the run ends.
 
 CI builds the module as Pages does and instantiates it in Node (`scripts/check_web.mjs`), so that a module whose glue does not load fails a pull request rather than the published page.
@@ -1250,6 +1252,19 @@ It found that the paced cadence ran at about 47 frames a second. Its own A/B at 
 
 The figures of the prototype's runs above are marked as not kept.
 
+### 2026-10-29 — D46: A demo stream made in the page
+
+**Context.** The player's page, which the README sends visitors to, showed nothing until it was given a `.pwv1` file. Its samples are the test vectors, the largest 192x136, and a visitor without a PyroWave file of their own saw a stream only as large as a thumbnail. A larger sample would have to be committed, and a video file in the repository grows it with every change.
+
+**Decision.**
+- The page makes its own stream: `Demo` in `emberwave-web` draws the pictures of an animated scene and encodes them with the CPU encoder, and the player loads the PWV1 file this makes like any other. Nothing is downloaded but the module, and no video is committed.
+- The scene is the README's banner in motion, drawn in plain Rust: a Morlet wavelet whose crests travel under its envelope, two fainter echoes of it and embers. Its glow and embers fade out to nothing within their reach, so that no edge shows. The phase and every ember advance by whole cycles over the 60 pictures, so the loop has no seam.
+- 960x540 at 30 frames a second, 40 kB a frame: large enough to look like video, and small enough for the CPU encoder to make 60 pictures in about 2 s on an M3 Max in Chrome, more on a phone. The page encodes one picture per task and shows its progress, so it stays responsive, and a file or sample chosen meanwhile stops the demo.
+- The demo plays when the page opens, unless `?play=NAME` asks for a sample.
+- `scripts/check_web.mjs` encodes the demo's first two pictures in Node, where the CPU encoder needs no GPU, and checks the PWV1 file they make. Playing it was checked in headless Chrome with WebGPU: the 60 pictures were encoded and played at 30 frames a second, and the screenshots showed the scene.
+
+**Consequence.** Opening the page shows a 960x540 stream decoded by WebGPU within seconds, also encoded in the page. Phones spend a few seconds of CPU on it first.
+
 ### 2026-10-29 — D47: The README's figures, drawn from copied numbers
 
 **Context.** The README opened with a line of text and a long status paragraph (#87). Charts of the decode and encode times and a figure of the pipeline show at a glance what emberwave does, and GitHub shows a README's images in its light or dark theme. Their numbers come from several sections of `BENCHMARKS.md`: some written by `scripts/bench.sh`, others by hand, about the iPhone, the browsers and HEVC.
@@ -1261,4 +1276,3 @@ The figures of the prototype's runs above are marked as not kept.
 - Each figure states its devices and dates. The decode chart also says that frames one after the other are not a stream's pace, and by how much the native decodes slowed down at 60 frames a second.
 
 **Consequence.** The README shows the speed, the platforms and the pipeline before its first heading. The figures lag a new benchmark run until they are updated by hand.
-

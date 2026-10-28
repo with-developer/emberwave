@@ -16,7 +16,9 @@ use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions, TEXTURE_FORMATS};
 use wasm_bindgen::prelude::*;
 
 mod bench;
+mod demo;
 pub use bench::Bench;
+pub use demo::Demo;
 
 /// Frame rate for a stream that does not say: PWV1 files without one hold
 /// unrelated pictures, shown at this pace.
