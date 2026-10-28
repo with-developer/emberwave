@@ -1,7 +1,7 @@
 //! emberwave in the browser: decodes PyroWave (`.pwv1`) files with WebGPU and
-//! draws them on a canvas, and times the decoding on the browser's GPU
-//! ([`Bench`]). The pages are in `web/`, and `scripts/build_web.sh` builds
-//! this crate for them.
+//! draws them on a canvas, makes a demo stream for the player ([`Demo`]), and
+//! times the decoding on the browser's GPU ([`Bench`]). The pages are in
+//! `web/`, and `scripts/build_web.sh` builds this crate for them.
 //!
 //! Only the browser build has content. On other targets the crate is empty,
 //! so that the workspace builds everywhere.
@@ -16,7 +16,9 @@ use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions, TEXTURE_FORMATS};
 use wasm_bindgen::prelude::*;
 
 mod bench;
+mod demo;
 pub use bench::Bench;
+pub use demo::Demo;
 
 /// Frame rate for a stream that does not say: PWV1 files without one hold
 /// unrelated pictures, shown at this pace.
