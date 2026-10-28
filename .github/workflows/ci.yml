@@ -35,6 +35,8 @@ jobs:
       # The parser and the CPU decoder alone, which emberwave-core is without
       # its default `gpu` feature.
       - run: cargo clippy -p emberwave-core --no-default-features --all-targets -- -D warnings
+      # The README's figures are drawn by a script: they must be what it draws.
+      - run: python3 -B scripts/readme_figures.py && git diff --exit-code docs/images
 
   wasm:
     name: browser build (wasm32)

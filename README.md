@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/banner.svg" alt="emberwave: PyroWave's wavelet video codec, on every GPU" width="100%">
+  <img src="docs/images/banner.svg" alt="emberwave: PyroWave's wavelet video codec, rewritten for wgpu" width="100%">
 </p>
 
 <p align="center">
@@ -17,12 +17,12 @@
   <a href="crates/emberwave-ffi/examples/ios">iPhone app</a>
 </p>
 
-[PyroWave](https://github.com/Themaister/pyrowave) is a video codec for game streaming on a local network: a GPU encodes and decodes each frame in a millisecond or so, at the cost of bandwidth. Valve has added it to Steam Remote Play, in the Steam client's beta ([GamingOnLinux](https://www.gamingonlinux.com/2026/10/steam-client-beta-for-october-1st-brings-many-remote-play-pyrowave-improvements/)). Upstream's implementation is written as Vulkan compute shaders, with a separate port to Metal. **emberwave is PyroWave rewritten in Rust and WGSL on [wgpu](https://wgpu.rs)**: one code base, and the same bitstream, on Metal, Vulkan, DX12 and WebGPU, from a native app to a browser tab and an iPhone.
+[PyroWave](https://github.com/Themaister/pyrowave) is a video codec for game streaming on a local network: a GPU encodes and decodes each frame in a millisecond or two, at the cost of bandwidth. Valve has added it to Steam Remote Play, in the Steam client's beta ([GamingOnLinux](https://www.gamingonlinux.com/2026/10/steam-client-beta-for-october-1st-brings-many-remote-play-pyrowave-improvements/)). Upstream's implementation is written as Vulkan compute shaders, with a separate port to Metal. **emberwave is PyroWave rewritten in Rust and WGSL on [wgpu](https://wgpu.rs)**: one code base, and the same bitstream, on Metal, Vulkan, DX12 and WebGPU, from a native app to a browser tab and an iPhone.
 
-- **Fast.** On an Apple M3 Max, a 4K frame decodes in about 1 ms, near upstream's own Metal decoder, and encodes in 1.9 ms on the GPU, where upstream's own encoder takes 3.2 to 3.3 ms.
+- **Fast.** On an Apple M3 Max, frames one after the other, a 4K frame decodes in 0.90 ms to its planes and 1.22 ms to RGB, and encodes in 1.90 ms on the GPU, from CPU memory to CPU memory. Upstream's own Metal port takes 0.80 ms to decode it at the same FP32 precision and 0.56 ms at its default FP16, and 3.2 to 3.3 ms to encode it ([`BENCHMARKS.md`](BENCHMARKS.md), 2026-10-26).
 - **Every frame stands alone.** No frame refers to another, so a lost packet costs one frame, with no wait for a keyframe. Each frame keeps to a fixed byte budget.
-- **Compatible with upstream, and a better encoder.** It decodes the streams of upstream's encoder as upstream's decoder does, at 64 dB PSNR or more, and upstream's decoder reads emberwave's streams. At the same bytes per frame, emberwave's encoder reaches upstream's PSNR or more, up to 3.4 dB more on the test scenes.
-- **Wherever there is a GPU.** A command line tool, a [browser player](https://with-developer.github.io/emberwave/) that decodes with WebGPU in the page, a C API with prebuilt libraries for Linux, macOS and Windows, and an XCFramework for iPhone, iPad and Mac apps.
+- **Compatible with upstream, and a better encoder.** It decodes the streams of upstream's encoder as upstream's decoder does, at 64 dB PSNR or more, and upstream's decoder reads emberwave's streams. At the same bytes per frame, emberwave's encoder beats upstream's luma PSNR by up to 3.4 dB on the test scenes, and matches it within 0.01 dB on noise.
+- **Native, in the browser and on the iPhone.** A command line tool, a [browser player](https://with-developer.github.io/emberwave/) that decodes with WebGPU in the page, a C API with prebuilt libraries for Linux and Windows (x86_64) and macOS (Apple silicon), and an XCFramework for iPhone, iPad and Mac apps. Tested on Apple GPUs, and in CI on software Vulkan and DX12.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/decode-dark.svg">
@@ -40,7 +40,7 @@ These times are for frames one after the other. A stream's frames arrive 60 a se
   <img alt="A 4K frame through emberwave on an Apple M3 Max. Encoding on the GPU: wavelet transform 0.40 ms, quantisation 0.59 ms, rate control 0.13 ms, packing 0.18 ms, a frame of at most 1.2 MB. The packets cross the network. Decoding: assembly on the CPU 0.10 ms, dequantisation 0.19 ms, inverse transform 0.40 ms, YUV to RGB 0.24 ms." src="docs/images/pipeline-light.svg" width="100%">
 </picture>
 
-A frame is a wavelet transform of the picture, its coefficients quantised in blocks and sent as bit-planes, most significant first. To fit a frame into its budget, the encoder drops the least significant planes where that costs the picture least, weighted by the eye's sensitivity to each band. Every stage is a compute shader in WGSL; only the decoder's assembly of the packets runs on the CPU, as upstream's does. [`ARCHITECTURE.md`](ARCHITECTURE.md) describes the bitstream, the passes and the decisions behind them.
+A frame is a wavelet transform of the picture, its coefficients quantised in blocks and sent as bit-planes, most significant first. To fit a frame into its budget, the encoder drops the least significant planes where that costs the picture least, weighted by the eye's sensitivity to each band. Every stage of the figure but the decoder's assembly of the packets is a compute shader in WGSL; that assembly runs on the CPU, as in upstream's decoder. Around them, the CPU copies the planes in, the frame out and the picture's header. [`ARCHITECTURE.md`](ARCHITECTURE.md) describes the bitstream, the passes and the decisions behind them.
 
 ## Quick start
 

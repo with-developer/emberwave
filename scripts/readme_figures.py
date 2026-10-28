@@ -36,7 +36,9 @@ DECODE = [
 DECODE_NOTES = [
     "Apple M3 Max: macOS 27.0.1, emberwave-cli bench on 2026-10-26, Chrome 155 headless on 2026-10-24.",
     "iPhone 17: iOS 27.0.1, the benchmark app on 2026-10-26, Safari on 2026-10-24. Shaded: the spread between runs.",
-    "When frames arrive 60 a second, the GPU idles between them and a decode takes up to 5 times as long.",
+    # BENCHMARKS.md, "Against HEVC on the same device": the decodes into textures.
+    "At 60 frames a second the GPU idles between frames: natively, decodes took 2.8 to 5.1 times as long on the",
+    "M3 Max and 1.6 to 4.8 times on the iPhone 17. Not measured in the browsers.",
 ]
 
 # Encoding a 4K frame from the picture in CPU memory to the frame's bytes, on
@@ -83,7 +85,8 @@ THEMES = {
 
 
 def esc(text):
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    """Text for SVG content and attribute values."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
 def span(value):
@@ -344,7 +347,7 @@ def banner():
         out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" fill="{colour}" opacity="{0.35 + r / 8:.2f}" filter="url(#soft)"/>')
     x = 520
     out.append(text(x, 158, "emberwave", 96, "#fff5ec", 700, extra=' letter-spacing="-2"'))
-    out.append(text(x + 4, 208, "PyroWave's wavelet video codec, on every GPU", 30, "#f0d9c8"))
+    out.append(text(x + 4, 208, "PyroWave's wavelet video codec, rewritten for wgpu", 29, "#f0d9c8"))
     chips = ["Metal", "Vulkan", "DX12", "WebGPU", "iPhone", "C API"]
     cx_chip = x + 4
     for chip in chips:
@@ -355,7 +358,7 @@ def banner():
         )
         out.append(text(cx_chip + w / 2, 260, chip, 18, "#fbe6d6", 500, anchor="middle"))
         cx_chip += w + 12
-    return svg(width, height, "emberwave: PyroWave's wavelet video codec, on every GPU", "\n".join(out))
+    return svg(width, height, "emberwave: PyroWave's wavelet video codec, rewritten for wgpu", "\n".join(out))
 
 
 def main():
@@ -366,7 +369,8 @@ def main():
         files[f"encode-{theme}.svg"] = encode_chart(theme)
         files[f"pipeline-{theme}.svg"] = pipeline(theme)
     for name, content in files.items():
-        (OUT / name).write_text(content)
+        # UTF-8 and "\n" whatever the locale: the labels have en dashes.
+        (OUT / name).write_bytes(content.encode("utf-8"))
         print(f"wrote {(OUT / name).relative_to(ROOT)}")
 
 

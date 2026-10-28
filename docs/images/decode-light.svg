@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="438" viewBox="0 0 960 438" role="img" aria-label="Decode time per frame on an Apple M3 Max and an iPhone 17, natively and in the browser" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="456" viewBox="0 0 960 456" role="img" aria-label="Decode time per frame on an Apple M3 Max and an iPhone 17, natively and in the browser" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif">
 <title>Decode time per frame on an Apple M3 Max and an iPhone 17, natively and in the browser</title>
-<rect x="0.5" y="0.5" width="959" height="437" rx="12" fill="#ffffff" stroke="#d1d9e0"/>
+<rect x="0.5" y="0.5" width="959" height="455" rx="12" fill="#ffffff" stroke="#d1d9e0"/>
 <text x="24.0" y="38.0" font-size="20" font-weight="600" fill="#0b0b0b" text-anchor="start">Decode time per frame, lower is better</text>
 <text x="24.0" y="62.0" font-size="14" font-weight="400" fill="#52514e" text-anchor="start">One Rust + WGSL decoder: a frame's bytes to the RGB picture in GPU memory, frames one after the other.</text>
 <rect x="24" y="80" width="12" height="12" rx="3" fill="#2a78d6"/>
@@ -43,5 +43,6 @@
 <text x="778.7" y="331.0" font-size="12" font-weight="400" fill="#52514e" text-anchor="start" font-variant-numeric="tabular-nums">8.05 ms</text>
 <text x="24.0" y="392.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">Apple M3 Max: macOS 27.0.1, emberwave-cli bench on 2026-10-26, Chrome 155 headless on 2026-10-24.</text>
 <text x="24.0" y="410.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">iPhone 17: iOS 27.0.1, the benchmark app on 2026-10-26, Safari on 2026-10-24. Shaded: the spread between runs.</text>
-<text x="24.0" y="428.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">When frames arrive 60 a second, the GPU idles between them and a decode takes up to 5 times as long.</text>
+<text x="24.0" y="428.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">At 60 frames a second the GPU idles between frames: natively, decodes took 2.8 to 5.1 times as long on the</text>
+<text x="24.0" y="446.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">M3 Max and 1.6 to 4.8 times on the iPhone 17. Not measured in the browsers.</text>
 </svg>
