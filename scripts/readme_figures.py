@@ -36,9 +36,10 @@ DECODE = [
 DECODE_NOTES = [
     "Apple M3 Max: macOS 27.0.1, emberwave-cli bench on 2026-10-26, Chrome 155 headless on 2026-10-24.",
     "iPhone 17: iOS 27.0.1, the benchmark app on 2026-10-26, Safari on 2026-10-24. Shaded: the spread between runs.",
-    # BENCHMARKS.md, "Against HEVC on the same device": the decodes into textures.
-    "At 60 frames a second the GPU idles between frames: natively, decodes took 2.8 to 5.1 times as long on the",
-    "M3 Max and 1.6 to 4.8 times on the iPhone 17. Not measured in the browsers.",
+    # BENCHMARKS.md, "Against HEVC on the same device" (the decodes into
+    # textures) and "In the browser, phones included".
+    "At 60 frames a second the GPU idles between frames: decodes took 2.8 to 5.1 times as long natively on the M3 Max,",
+    "2.2 to 3.8 times in Chrome there, and 1.6 to 4.8 times natively on the iPhone 17. Safari not measured so yet.",
 ]
 
 # Encoding a 4K frame from the picture in CPU memory to the frame's bytes, on

@@ -43,6 +43,6 @@
 <text x="778.7" y="331.0" font-size="12" font-weight="400" fill="#52514e" text-anchor="start" font-variant-numeric="tabular-nums">8.05 ms</text>
 <text x="24.0" y="392.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">Apple M3 Max: macOS 27.0.1, emberwave-cli bench on 2026-10-26, Chrome 155 headless on 2026-10-24.</text>
 <text x="24.0" y="410.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">iPhone 17: iOS 27.0.1, the benchmark app on 2026-10-26, Safari on 2026-10-24. Shaded: the spread between runs.</text>
-<text x="24.0" y="428.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">At 60 frames a second the GPU idles between frames: natively, decodes took 2.8 to 5.1 times as long on the</text>
-<text x="24.0" y="446.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">M3 Max and 1.6 to 4.8 times on the iPhone 17. Not measured in the browsers.</text>
+<text x="24.0" y="428.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">At 60 frames a second the GPU idles between frames: decodes took 2.8 to 5.1 times as long natively on the M3 Max,</text>
+<text x="24.0" y="446.0" font-size="12" font-weight="400" fill="#6f6d67" text-anchor="start">2.2 to 3.8 times in Chrome there, and 1.6 to 4.8 times natively on the iPhone 17. Safari not measured so yet.</text>
 </svg>

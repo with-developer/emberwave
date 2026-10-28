@@ -19,7 +19,7 @@
 </head>
 <body>
 <h1>emberwave benchmark</h1>
-<p>Times the decoding of PyroWave video on this device's GPU, through WebGPU in this page: test streams at 1080p, 1440p and 4K, made here with emberwave's encoder, decoded frame after frame to RGB in GPU memory as the <a href="./">player</a> does. Nothing is uploaded. It takes about a minute; keep the page in front, and the device plugged in if it can be. The times are in milliseconds.</p>
+<p>Times the decoding of PyroWave video on this device's GPU, through WebGPU in this page: test streams at 1080p, 1440p and 4K, made here with emberwave's encoder, decoded to RGB in GPU memory as the <a href="./">player</a> does: frame after frame, then as a stream's frames arrive, 60 a second, when the GPU idles in between. Nothing is uploaded. It takes a minute or two; keep the page in front, and the device plugged in if it can be. The times are in milliseconds.</p>
 <p><button id="start">Start</button></p>
 <p id="status"></p>
 <div class="scroll">

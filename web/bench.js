@@ -1,6 +1,8 @@
 // The benchmark page: decodes test streams frame after frame with the wasm
 // module (scripts/build_web.sh builds it into pkg/) and reports the times, in
-// the way `emberwave-cli bench --output rgb` reports them natively.
+// the way `emberwave-cli bench --output rgb` reports them natively; then
+// again as a stream's frames arrive, 60 a second, as the benchmark app and
+// `refgen bench --fps` time them natively.
 import init, { Bench } from "./pkg/emberwave_web.js";
 
 // The pictures of the native benchmarks (BENCHMARKS.md), at their budgets.
@@ -16,6 +18,8 @@ const FRAMES = 300;
 // runs slower for the first moments of a load.
 const WARMUP_FRAMES = 30;
 const WARMUP_MS = 1000;
+// A stream's frames, a second.
+const FRAME_RATE = 60;
 
 const status = document.getElementById("status");
 const results = document.getElementById("results");
@@ -94,6 +98,50 @@ async function measure(bench) {
   };
 }
 
+// Waits until `due` on the page's clock. Timers wake a little late, which the
+// schedule absorbs: frames stay due on it unless one is late by a whole frame.
+function until(due) {
+  const delay = due - performance.now();
+  return delay > 0 ? new Promise((resolve) => setTimeout(resolve, delay)) : Promise.resolve();
+}
+
+// As `measure`, but with the frames FRAME_RATE a second, the warm-up's too,
+// so that the GPU idles between them as in a stream. Its idle time is not
+// counted, so the mean is that of the frames' own times, which are as fine as
+// the timer.
+async function measurePaced(bench) {
+  const period = 1000 / FRAME_RATE;
+  let due = performance.now();
+  const next = async () => {
+    due = Math.max(due + period, performance.now());
+    await until(due);
+  };
+  const warm = performance.now();
+  for (let n = 0; n < WARMUP_FRAMES || performance.now() - warm < WARMUP_MS; n++) {
+    await next();
+    await decodeAndWait(bench);
+  }
+  const each = [];
+  let cpu = 0;
+  for (let i = 0; i < FRAMES; i++) {
+    await next();
+    const before = performance.now();
+    cpu += await decodeAndWait(bench);
+    each.push(performance.now() - before);
+  }
+  await bench.work_done();
+  await paint();
+  bench.check();
+  const mean = each.reduce((sum, t) => sum + t, 0) / FRAMES;
+  each.sort((a, b) => a - b);
+  return {
+    mean,
+    median: percentile(each, 50),
+    p99: percentile(each, 99),
+    cpu: cpu / FRAMES,
+  };
+}
+
 function row(cells) {
   const tr = document.createElement("tr");
   for (const cell of cells) {
@@ -160,7 +208,7 @@ async function measureAll(bench, body, wasHidden) {
     `Browser: ${navigator.userAgent}`,
     `GPU: ${bench.adapter()}`,
     `Timer step: ${step.toFixed(3)} ms; ${FRAMES} frames after at least ${WARMUP_FRAMES} and ${WARMUP_MS} ms of warm-up, ${PICTURES} pictures in turn`,
-    "Decode to RGB in GPU memory, per frame (ms): mean, median, 99th percentile, CPU",
+    `Decode to RGB in GPU memory, per frame (ms): mean, median, 99th percentile, CPU; frame after frame, then ${FRAME_RATE} a second`,
   ];
   results.hidden = false;
   for (const size of SIZES) {
@@ -168,19 +216,25 @@ async function measureAll(bench, body, wasHidden) {
       say(`${size.name}: making ${PICTURES} test pictures with the encoder (this takes a moment)…`);
       await paint();
       const bytes = bench.prepare(size.width, size.height, PICTURES, size.budget);
-      say(`${size.name}: decoding…`);
-      await paint();
-      const time = await measure(bench);
-      const cells = [
-        `${size.name} (${Math.round(bytes / PICTURES / 1000)} kB a frame)`,
-        time.mean.toFixed(2),
-        time.median.toFixed(2),
-        time.p99.toFixed(2),
-        time.cpu.toFixed(2),
-        String(FRAMES),
-      ];
-      body.append(row(cells));
-      lines.push(`${cells[0]}: ${cells.slice(1, 5).join(" / ")}`);
+      const name = `${size.name} (${Math.round(bytes / PICTURES / 1000)} kB a frame)`;
+      for (const [cadence, timing] of [
+        ["frame after frame", measure],
+        [`${FRAME_RATE} a second`, measurePaced],
+      ]) {
+        say(`${size.name}: decoding ${cadence}…`);
+        await paint();
+        const time = await timing(bench);
+        const cells = [
+          `${name}, ${cadence}`,
+          time.mean.toFixed(2),
+          time.median.toFixed(2),
+          time.p99.toFixed(2),
+          time.cpu.toFixed(2),
+          String(FRAMES),
+        ];
+        body.append(row(cells));
+        lines.push(`${cells[0]}: ${cells.slice(1, 5).join(" / ")}`);
+      }
     } catch (error) {
       say(`${size.name}: ${error}`, true);
       lines.push(`${size.name}: failed: ${error}`);

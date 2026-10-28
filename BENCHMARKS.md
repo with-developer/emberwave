@@ -134,7 +134,7 @@ About the encoder, written by hand about the run of 2026-10-24 with the changes 
 
 ## In the browser, phones included
 
-[`bench.html`](https://with-developer.github.io/emberwave/bench.html), next to the browser player, measures on whatever device opens it: it encodes test streams at the three sizes in the page, four pictures each at the budgets above, and decodes them in turn to RGB in GPU memory through WebGPU, waiting for each frame, 300 frames after at least 30 and a second of warm-up ([`ARCHITECTURE.md`](ARCHITECTURE.md#browser-player)). The times include what the browser adds to the GPU work: its checks, its process boundary and the delay until it reports the frame done. Browsers coarsen their clocks, Safari to a millisecond, so the mean is taken over the whole run.
+[`bench.html`](https://with-developer.github.io/emberwave/bench.html), next to the browser player, measures on whatever device opens it: it encodes test streams at the three sizes in the page, four pictures each at the budgets above, and decodes them in turn to RGB in GPU memory through WebGPU, waiting for each frame, 300 frames after at least 30 and a second of warm-up ([`ARCHITECTURE.md`](ARCHITECTURE.md#browser-player)). The times include what the browser adds to the GPU work: its checks, its process boundary and the delay until it reports the frame done. Browsers coarsen their clocks, Safari to a millisecond, so the mean is taken over the whole run. It then decodes the same frames as a stream's frames arrive, 60 a second, the warm-up too, paced by the page's timers. The idle time between those frames is not counted, so their mean is that of the frames' own times, as fine as the timer.
 
 Mean milliseconds per frame, 2026-10-24:
 
@@ -146,6 +146,17 @@ Mean milliseconds per frame, 2026-10-24:
 
 - **On the iPhone 17** a 4K frame decodes in about 8 ms, under half the 16.7 ms of a frame at 60 Hz, and a 1080p frame in 2.4 ms. The CPU's part is small, 0.11 to 0.26 ms; the rest is the GPU and the browser's report. Safari's per-frame medians and 99th percentiles, 2, 4 and 8 ms and 3, 5 and 9 ms, are as coarse as its clock. Its user agent reads "iPhone OS 18_7".
 - **Next to the M3 Max** in Chrome the phone takes 2.4 to 4.8 times as long, more at 4K than at 1080p; the first size of a run on the Mac varied most between runs. A native app does not pay the browser's share, which the M3 Max shows at 0.2 to 0.7 ms a frame, and the iPhone 17 at 0.7 to 1.8 ms ([below](#on-the-iphone-natively)).
+
+At a stream's pace, measured on 2026-10-29 on the M3 Max in Chrome 156, headless, in three runs (issue #95). Mean milliseconds per frame, the lowest and the highest of the runs:
+
+| Device | Browser | Cadence | 1080p | 1440p | 4K |
+|---|---|---|---|---|---|
+| Apple M3 Max | Chrome 156, headless | frame after frame | 0.72 to 1.16 | 1.04 to 1.52 | 1.70 to 2.54 |
+| Apple M3 Max | Chrome 156, headless | 60 a second | 2.58 to 2.73 | 3.28 to 3.68 | 4.50 to 5.67 |
+
+- **At a stream's pace** the decodes in the browser took 2.2 to 3.8 times as long as frame after frame, run by run: the GPU idles between frames, as it does natively (decision D48). A 4K frame then took 4.5 to 5.7 ms, against 3.7 to 4.3 ms natively into an RGB texture on the same Mac ([below](#on-the-apple-m3-max)).
+- **Frame after frame** the runs varied more than at 60 frames a second. A 4K frame took 1.70 to 2.54 ms on average, but its medians, 1.70 to 1.80 ms, agree with the runs of 2026-10-24 above.
+- Safari on the iPhone is still to be measured at this cadence.
 
 ## On the iPhone, natively
 
