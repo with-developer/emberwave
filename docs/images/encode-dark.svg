@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="296" viewBox="0 0 960 296" role="img" aria-label="Encoding a 4K frame on an Apple M3 Max: emberwave, upstream PyroWave and Apple's HEVC encoder" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif">
+<title>Encoding a 4K frame on an Apple M3 Max: emberwave, upstream PyroWave and Apple's HEVC encoder</title>
+<rect x="0.5" y="0.5" width="959" height="295" rx="12" fill="#0d1117" stroke="#30363d"/>
+<text x="24.0" y="38.0" font-size="20" font-weight="600" fill="#f0efec" text-anchor="start">Encoding a 4K frame on an Apple M3 Max, lower is better</text>
+<text x="24.0" y="62.0" font-size="14" font-weight="400" fill="#c3c2b7" text-anchor="start">From the picture in memory to the frame's bytes, frames one after the other.</text>
+<text x="300.0" y="242.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">0</text>
+<line x1="376.6" y1="78" x2="376.6" y2="224" stroke="#2c2c2a" stroke-width="1"/>
+<text x="376.6" y="242.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">2</text>
+<line x1="453.1" y1="78" x2="453.1" y2="224" stroke="#2c2c2a" stroke-width="1"/>
+<text x="453.1" y="242.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">4</text>
+<line x1="529.7" y1="78" x2="529.7" y2="224" stroke="#2c2c2a" stroke-width="1"/>
+<text x="529.7" y="242.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">6</text>
+<line x1="606.3" y1="78" x2="606.3" y2="224" stroke="#2c2c2a" stroke-width="1"/>
+<text x="606.3" y="242.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">8</text>
+<line x1="682.9" y1="78" x2="682.9" y2="224" stroke="#2c2c2a" stroke-width="1"/>
+<text x="682.9" y="242.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">10</text>
+<line x1="759.4" y1="78" x2="759.4" y2="224" stroke="#2c2c2a" stroke-width="1"/>
+<text x="759.4" y="242.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">12</text>
+<line x1="836.0" y1="78" x2="836.0" y2="224" stroke="#2c2c2a" stroke-width="1"/>
+<text x="836.0" y="242.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="middle">14 ms</text>
+<line x1="300" y1="78" x2="300" y2="224" stroke="#4a4a46" stroke-width="1"/>
+<text x="24.0" y="99.0" font-size="14" font-weight="600" fill="#f0efec" text-anchor="start">emberwave, on the GPU</text>
+<path d="M300.0,86.0H368.7A4.0,4.0 0 0 1 372.7,90.0V100.0A4.0,4.0 0 0 1 368.7,104.0H300.0Z" fill="#d95926"/>
+<text x="378.7" y="99.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="start" font-variant-numeric="tabular-nums">1.90 ms</text>
+<text x="24.0" y="135.0" font-size="14" font-weight="400" fill="#f0efec" text-anchor="start">Upstream PyroWave, FP16 (its default)</text>
+<path d="M300.0,122.0H417.4A4.0,4.0 0 0 1 421.4,126.0V136.0A4.0,4.0 0 0 1 417.4,140.0H300.0Z" fill="#898781"/>
+<text x="427.4" y="135.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="start" font-variant-numeric="tabular-nums">3.17 ms</text>
+<text x="24.0" y="171.0" font-size="14" font-weight="400" fill="#f0efec" text-anchor="start">Upstream PyroWave, FP32</text>
+<path d="M300.0,158.0H423.5A4.0,4.0 0 0 1 427.5,162.0V172.0A4.0,4.0 0 0 1 423.5,176.0H300.0Z" fill="#898781"/>
+<text x="433.5" y="171.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="start" font-variant-numeric="tabular-nums">3.33 ms</text>
+<text x="24.0" y="207.0" font-size="14" font-weight="400" fill="#f0efec" text-anchor="start">Apple's HEVC encoder, at 80 Mbit/s</text>
+<path d="M300.0,194.0H793.7A4.0,4.0 0 0 1 797.7,198.0V208.0A4.0,4.0 0 0 1 793.7,212.0H300.0Z" fill="#898781" fill-opacity="0.35"/><rect x="300.0" y="194.0" width="488.5" height="18" fill="#898781"/>
+<text x="803.7" y="207.0" font-size="12" font-weight="400" fill="#c3c2b7" text-anchor="start" font-variant-numeric="tabular-nums">12.76–13.00 ms</text>
+<text x="24.0" y="268.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="start">PyroWave at 1.2 MB a frame (BENCHMARKS.md, 2026-10-26); HEVC through VideoToolbox at its fastest</text>
+<text x="24.0" y="286.0" font-size="12" font-weight="400" fill="#9d9b94" text-anchor="start">settings, Moonlight's default rate for 4K, three runs. A PC's NVENC is not measured here.</text>
+</svg>
