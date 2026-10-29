@@ -1332,7 +1332,7 @@ The figures of the prototype's runs above are marked as not kept.
 - Code, commit messages, merge commits, issues and pull requests are in English. A pull request's description has the sections Purpose, Changes, Testing, Benchmark impact and Related issue, and Review for the project's own. This replaces D6's Korean template; earlier issues and pull requests keep their Korean.
 - The CLI's release packages hold both READMEs.
 
-**Consequence.** A change to the README is made twice, and a benchmark run rewrites both summaries. A Korean reader gets the whole README, and the rest of the documentation in English only.
+**Consequence.** A change to the README is made twice, and a benchmark run rewrites both summaries. A Korean reader gets the whole README, and the rest of the documentation in English only. (2026-10-30: `README.ko.md` was written again as Korean prose, having read as a translation, #118.)
 
 ### 2026-10-29 — D51: `LICENSE` is the MIT license alone
 
