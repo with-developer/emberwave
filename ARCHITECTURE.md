@@ -308,10 +308,10 @@ A frame takes six dispatches in two compute passes, whatever its size, and a sev
 | Stage | Shader | Dispatch | Reads | Writes |
 |---|---|---|---|---|
 | Dequantisation | `dequant.wgsl` | 1: one workgroup of 128 invocations per block index | payload, block offsets | the pyramid |
-| Inverse DWT | `idwt.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or, at the last level of a component, the packed 8-bit planes |
+| Inverse DWT | `idwt.wgsl` with `idwt_packed.wgsl`, or with `idwt_planes.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or, at the last level of a component, the packed 8-bit planes, or on Metal the caller's plane textures (D52) |
 | Colour conversion (optional) | `yuv2rgb.wgsl` | 1: one invocation per pixel | packed planes | RGBA words |
 
-The packed planes are copied to a mappable buffer and returned as a `Frame`. When the frame is converted to RGB, the RGBA words are copied instead, as an `RgbFrame`, and the packed planes stay in GPU memory.
+The packed planes are copied to a mappable buffer and returned as a `Frame`. When the frame is converted to RGB, the RGBA words are copied instead, as an `RgbFrame`, and the packed planes stay in GPU memory. A decode into the caller's plane textures copies the packed planes into them, or on Metal has the last levels store the planes there instead (D41, D52).
 
 ### Memory
 
@@ -329,7 +329,7 @@ The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 
 
 Per-dispatch parameters (band table, tile sizes, buffer offsets) depend only on the picture size, so they are computed once and live in small uniform buffers.
 
-No GPU resource outlives a frame. The decoder's own buffers are created once (the payload buffer grows when a frame needs more room), and the only allocations of a frame are the staging buffers wgpu uses for `Queue::write_buffer`, three or four of them, which it frees when the frame is done. The test `decoding_frame_after_frame_allocates_nothing` compares every count wgpu keeps of live objects and memory (buffers, textures, bind groups, pipelines, command encoders, query sets and so on; Metal does not count memory) after a first pass over every frame and every way of decoding with the counts after 48 more decodes. The same check over 1000 frames of a 4K stream, `a_thousand_4k_frames_leave_no_trace`, which runs on request, found 19 buffers, 8 bind groups, 3 command encoders and 1 query set before and after on an Apple M3 Max (2026-10-23, v0.2.0). `scripts/soak.sh` found the resident memory of `emberwave-cli` flat at 178 MiB while it decoded 1000 4K frames to RGB and read them back.
+No GPU resource outlives a frame. The decoder's own buffers are created once (the payload buffer grows when a frame needs more room), and the only allocations of a frame are the staging buffers wgpu uses for `Queue::write_buffer`, three or four of them, which it frees when the frame is done, and, where the last levels store into the caller's plane textures, the one or two bind groups that name those textures (D52), which go with the frame as well (`decoding_into_plane_textures_frame_after_frame_leaves_nothing_behind`). The test `decoding_frame_after_frame_allocates_nothing` compares every count wgpu keeps of live objects and memory (buffers, textures, bind groups, pipelines, command encoders, query sets and so on; Metal does not count memory) after a first pass over every frame and every way of decoding with the counts after 48 more decodes. The same check over 1000 frames of a 4K stream, `a_thousand_4k_frames_leave_no_trace`, which runs on request, found 19 buffers, 8 bind groups, 3 command encoders and 1 query set before and after on an Apple M3 Max (2026-10-23, v0.2.0). `scripts/soak.sh` found the resident memory of `emberwave-cli` flat at 178 MiB while it decoded 1000 4K frames to RGB and read them back.
 
 ### Dequantisation
 
@@ -357,6 +357,8 @@ The lifting, and the loads and stores around it, are written out with constant i
 The last level of each component writes the decoded plane as 8-bit samples, which is what upstream's UNORM storage images hold. A sample is `round(clamp(v + 0.5, 0, 1) * 255)` (`to_unorm8` in `idwt.wgsl`); the float picture never goes to memory. The vertical pass leaves the 8-bit levels of its 32x32 tile in the window array, which is free by then, and after one barrier each of the 256 invocations writes one word: four samples of a tile row. Every level waits at that barrier, though only the last needs it. Inside `if (is_final)` the barrier would be legal, since `is_final` is the same for the whole workgroup, but there it crashed WARP, Direct3D's software rasteriser, in CI; a bisection of the commits pinned the crash on it.
 
 WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words with zero samples. A decoder's rows are then padded with words it never writes to a multiple of 256 bytes, the rows a copy into a texture takes, and its planes start at multiples of 512 bytes (D41). The CPU side cuts the padding off.
+
+The writing is the end of the shader, `store_plane`, in a file of its own behind `idwt.wgsl`: `idwt_packed.wgsl` packs the words as described, and `idwt_planes.wgsl` stores the tile's samples into three `r8unorm` storage textures, one per plane, as upstream's last level does. Each invocation stores four samples of a row, those inside the plane, as `level / 255`, which the store turns back into the same level exactly. WebGPU does not guarantee such textures, so the decoder builds the second shader only on Metal, whose GPUs write them, and uses it for a decode into the caller's plane textures when all three have the `STORAGE_BINDING` usage (D52). The levels at which no plane ends, and every decode that does not go into such textures, run the first.
 
 ### Colour conversion
 

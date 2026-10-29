@@ -755,6 +755,57 @@ fn into_app_textures(
         for ((metal, _), plane) in planes.iter().zip(&expected[0].1) {
             assert!(read(device, metal) == *plane, "a plane");
         }
+        // Textures the app's shaders may write as well: the decodes store the
+        // planes into them (decision D52), waiting and not.
+        let writable = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR]
+            .into_iter()
+            .zip(sizes)
+            .map(|(plane, size)| {
+                let usage = MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
+                let metal = app_texture(device, MTLPixelFormat::R8Unorm, size, usage, false);
+                let mut texture = ptr::null_mut();
+                assert_eq!(
+                    emberwave_texture_from_metal_plane(decoder, plane, raw(&metal), &mut texture),
+                    EmberwaveStatus::Ok,
+                    "{}",
+                    last_error()
+                );
+                (metal, texture)
+            })
+            .collect::<Vec<_>>();
+        push(frames[0]);
+        assert_eq!(
+            emberwave_decoder_decode_plane_textures(
+                decoder,
+                writable[0].1,
+                writable[1].1,
+                writable[2].1
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        for ((metal, _), plane) in writable.iter().zip(&expected[0].1) {
+            assert!(read(device, metal) == *plane, "a plane stored into");
+        }
+        push(frames[1]);
+        assert_eq!(
+            emberwave_decoder_submit_plane_textures(
+                decoder,
+                writable[0].1,
+                writable[1].1,
+                writable[2].1
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        for ((metal, _), plane) in writable.iter().zip(&expected[1].1) {
+            assert!(
+                blit(queue, metal).contents() == *plane,
+                "a plane stored into, submitted"
+            );
+        }
         let shared = app_texture(
             device,
             MTLPixelFormat::R8Unorm,
@@ -875,6 +926,7 @@ fn into_app_textures(
         for texture in [texture, loose]
             .into_iter()
             .chain(planes.iter().map(|(_, texture)| *texture))
+            .chain(writable.iter().map(|(_, texture)| *texture))
         {
             emberwave_texture_destroy(texture);
         }
