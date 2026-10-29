@@ -227,6 +227,7 @@ pub struct Decoder {
 
     /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
     lost: Arc<Mutex<Option<String>>>,
+    record_lock: Arc<Mutex<()>>,
 }
 
 /// The pipeline of `draw.wgsl` for one target format, and its bind group:
@@ -389,6 +390,7 @@ impl Decoder {
                 draw: None,
                 timestamps,
                 lost: context.lost_record(),
+                record_lock: Arc::clone(&context.record_lock),
                 context_id: context.id(),
             }
         })
@@ -899,6 +901,8 @@ impl Decoder {
         assembled_in: Duration,
         consume: &mut dyn FnMut(&[u8]),
     ) -> Result<Timings, GpuError> {
+        let record_lock = Arc::clone(&self.record_lock);
+        let _record = record_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
@@ -1098,6 +1102,8 @@ impl Decoder {
         read: Read<'_>,
     ) -> Result<(), GpuError> {
         self.check_device()?;
+        let record_lock = Arc::clone(&self.record_lock);
+        let _record = record_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {

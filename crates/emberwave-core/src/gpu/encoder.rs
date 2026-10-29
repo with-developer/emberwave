@@ -205,6 +205,7 @@ pub struct Encoder {
 
     /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
     lost: Arc<Mutex<Option<String>>>,
+    record_lock: Arc<Mutex<()>>,
 }
 
 impl Encoder {
@@ -410,6 +411,7 @@ impl Encoder {
                     .supports_timestamps()
                     .then(|| StageQueries::new(&device, &queue, TIMED_STAGES)),
                 lost: context.lost_record(),
+                record_lock: Arc::clone(&context.record_lock),
             }
         })
         .map_err(|error| context.explain(error))
@@ -524,6 +526,8 @@ impl Encoder {
         budget: usize,
         timed: bool,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
+        let record_lock = Arc::clone(&self.record_lock);
+        let _record = record_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let prepare_start = Instant::now();
         // The planes in the upload buffer, or a pass that gathers them from
         // the textures.

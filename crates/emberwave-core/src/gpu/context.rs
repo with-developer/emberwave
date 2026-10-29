@@ -151,6 +151,10 @@ pub struct GpuContext {
     /// Why the device was lost, once it has been; shared with the decoders
     /// and the encoders.
     lost: Arc<Mutex<Option<String>>>,
+    /// Serialises the recording and submission of the work of every decoder
+    /// and encoder of the context (#126). WIP: held for the whole call, the
+    /// wait for the GPU included, as the review's prototype holds it.
+    pub(crate) record_lock: Arc<Mutex<()>>,
 }
 
 impl GpuContext {
@@ -272,6 +276,7 @@ impl GpuContext {
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             lost,
+            record_lock: Arc::default(),
         }
     }
 
