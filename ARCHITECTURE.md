@@ -27,6 +27,7 @@ Steps that upstream runs on the CPU stay on the CPU, and steps that upstream run
 | `bitstream` | Pure Rust, GPU independent: headers, block layout, packet assembly, PWV1 files. Never panics on malformed input. This is the CPU stage. |
 | `cpu` | Dequantisation and inverse DWT as plain sequential Rust, following `bitstream.md` literally. A test oracle and the yardstick for shader stages, not a product feature. |
 | `color` | The YCbCr to RGB conversion: matrices, range handling and chroma siting, with a CPU implementation that the shader is tested against. |
+| `encode` | The encoder on the CPU, plain sequential Rust: forward DWT, quantisation, rate control and packing, the reference of the GPU encoder; and `packets`, which splits a frame at its blocks for a network. |
 | `gpu` | wgpu pipelines and WGSL shaders for the GPU stages (cargo feature `gpu`, on by default). |
 
 ## Bitstream format
@@ -418,7 +419,7 @@ The wall-clock time exceeds the sum of the stages, because submitting work and n
 
 ### Portability
 
-The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder reads pictures in textures as sampled `r8unorm` and `rg8unorm` textures with `textureGather` and a non-filtering sampler, which WebGPU has without any feature. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account:
+The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. One shader is the exception, on a path of its own: on Metal, where the adapter offers it, `idwt_planes.wgsl` stores the planes into `r8unorm` storage textures (D52), and the portable copies stay the fallback; likewise the frames written where the shaders read them on Apple silicon need `MAPPABLE_PRIMARY_BUFFERS` (D53). Neither is asked for under strict WebGPU. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder reads pictures in textures as sampled `r8unorm` and `rg8unorm` textures with `textureGather` and a non-filtering sampler, which WebGPU has without any feature. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account:
 
 - `tests/shaders.rs` validates the WGSL of every shader with naga using an empty capability set, without a GPU, and checks the entry points, the workgroup sizes and memory.
 - `tests/gpu.rs` and `tests/gpu_encoder.rs` create a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decode a vector on it, and encode pictures on it.
@@ -582,7 +583,7 @@ PSNR is not what either encoder minimises: both minimise the squared error of th
 
 | Stage | Shaders | Dispatches | What it does |
 |---|---|---|---|
-| Input from textures | `gather.wgsl` | 1, in the transform's pass: a workgroup per 64x16 samples of a plane, the component in z | Each sample of the R8 or Rg8 textures, its byte back from the unorm float, packed four to a word with rows padded to whole words: the words the upload writes for the same picture |
+| Input from textures | `gather.wgsl` | 1, in the transform's pass: a workgroup per 64x32 samples of a plane, the component in z | Each sample of the R8 or Rg8 textures, its byte back from the unorm float, packed four to a word with rows padded to whole words: the words the upload writes for the same picture |
 | Forward transform | `fdwt.wgsl` | 5: one per level, finest first; a workgroup per 32x32 tile of the level's image and component | The inverse transform's shape and parameters (`TransformLevel`), the other way round: a 40x40 window of the image, rows and then columns lifted in registers, and the four bands written. At a component's finest level the image is the 8-bit plane, its last column and row repeated up to the aligned size |
 | Quantisation | `quantise.wgsl`, `equant.wgsl` | 1: a workgroup of 128 invocations per block | Scales, magnitudes and bit-planes of `quant.rs`, then the block's size and distortion for 0 to 15 dropped planes, its cost table. Each invocation adds up the squared errors of its own 4x2 subblock in registers, and the subblocks are added up per 8x8 block, in the grouping the CPU adds in. Each 8x8 block is measured only up to the drop that leaves nothing of it; beyond, its error is the same sum of the same terms |
 | Rate control | `rate.wgsl`, `scan.wgsl` | 4, and two prefix sums of 3 | Each block's steps, and their saved words added into a histogram of the keys; the key at which the frame fits; what each block's steps of that key save, summed in block order; each block's drop and size, and their sums in block order, which are the blocks' places in the payload |
@@ -603,7 +604,7 @@ The GPU cannot repeat the CPU's floating point exactly, so the contract between 
 
 A frame is therefore the CPU encoder's, or one that differs in the blocks whose coefficients sit on a rounding boundary. On an Apple M3 Max all 25 frames of the committed vectors come out identical. Of `refgen`'s scene at 1080p, 1440p and 4K about one sent block in 200 differs, mostly at the same size, and the PSNR is the same to a thousandth of a dB; of pictures of flat rectangles, thin strokes or squares, between none and one in 200. The tests allow differing frames as long as they are as good (within 0.05 dB). The CPU encoder stays the one that makes the same bytes on every system.
 
-[`BENCHMARKS.md`](BENCHMARKS.md#encode-next-to-upstream) has the encoder's times next to upstream's, measured as the decoder's are: on an Apple M3 Max a 4K frame takes 1.91 ms from the planes in CPU memory to the frame in CPU memory, against 3.39 ms for upstream's encoder at the same FP32 precision and 218 ms for the CPU encoder (decision D30).
+[`BENCHMARKS.md`](BENCHMARKS.md#encode-next-to-upstream) has the encoder's times next to upstream's, measured as the decoder's are: on an Apple M3 Max a 4K frame takes 1.90 ms from the planes in CPU memory to the frame in CPU memory, against 3.33 ms for upstream's encoder at the same FP32 precision and 212 ms for the CPU encoder (decision D30).
 
 ## Decisions
 
@@ -1388,7 +1389,7 @@ The figures of the prototype's runs above are marked as not kept.
 
 ### 2026-10-29 — D55: The browser player decodes packets as they arrive
 
-**Context.** The browser player decoded whole frames from a file. A browser client of a live stream, which phase 4 of the roadmap is to build, receives each frame as packets, in any order, some late or lost, and the C API decodes such packets (`emberwave_decoder_push_packet`, partial frames). The page could not show what PyroWave does with a lost packet (#109).
+**Context.** The browser player decoded whole frames from a file. A browser client of a live stream, which the roadmap's third step is to build (README, "Roadmap"), receives each frame as packets, in any order, some late or lost, and the C API decodes such packets (`emberwave_decoder_push_packet`, partial frames). The page could not show what PyroWave does with a lost packet (#109).
 
 **Decision.**
 - `Player` in `emberwave-web` gets the packet functions of the C API: `open_stream` for a stream of a known size without a file, `push_packet`, `is_ready`, `draw_assembled` and `drop_packets`. The colours of a stream opened that way follow each frame's start of frame header until `set_colors` sets them, as the C API's caller can pass better ones; a file's follow its PWV1 header, as before.
@@ -1423,7 +1424,7 @@ The figures of the prototype's runs above are marked as not kept.
 
 ### 2026-10-29 — D58: Every frame carries the coarsest level
 
-**Context.** A frame that lost packets may be decoded in part once every block of the coarsest level has arrived, its LL band and its detail bands, and 90 percent of all blocks (`FrameAssembler::is_ready`, as upstream's decoder decides). A block that the encoder did not send, because nothing of it was left, counts as missing there: a decoder cannot tell it from a lost one. emberwave's encoder, as upstream's, left such blocks out, and the coarsest chroma detail is often zero. Of the 48 blocks of the coarsest level of a 1080p frame of the benchmark scene at 400 kB, 6 were never sent, so a frame that lost any packet could not be decoded at all. In the browser stream of emberwave-stream, which drops datagrams at random on request, 41 of 1195 frames were shown at 1 % loss, every one of them whole.
+**Context.** A frame that lost packets may be decoded in part once every block of the coarsest level has arrived, its LL band and its detail bands, and 90 percent of all blocks (`FrameAssembler::is_ready`, as upstream's decoder decides). A block that the encoder did not send, because nothing of it was left, counts as missing there: a decoder cannot tell it from a lost one. emberwave's encoder, as upstream's, left such blocks out, and the coarsest chroma detail is often zero. Of the 48 blocks of the coarsest level of a 1080p frame of the benchmark scene at 400 kB, 6 were never sent, so a frame that lost any packet could not be decoded at all. In emberwave-stream, a prototype of that streaming to a browser kept in a repository of its own, private for now, whose host drops datagrams at random on request, 41 of 1195 frames were shown at 1 % loss, every one of them whole.
 
 **Decision.**
 - The encoder sends every block of the coarsest level. A block with nothing left goes as its header and one empty 8x8 block: the first, which is always inside the band, with a code word and a scale of zero, so no bit-planes; 12 bytes. `bitstream.md` says a block with no 8x8 block at all (`ballot` 0) should not be sent, and lets a decoder ignore one; an 8x8 block with no bit-planes is valid and decodes as zeros. Upstream's decoder at 7fe0e26 decoded the regenerated vectors with such blocks as emberwave's decoders do.

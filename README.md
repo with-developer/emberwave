@@ -105,7 +105,7 @@ The decoder, and the encoder with `--gpu`, use whatever GPU the machine offers: 
 
 The C API decodes packets as a client receives them, into the caller's memory, and encodes pictures into frames and packets as a host sends them: a header, `crates/emberwave-ffi/include/emberwave.h`, and a shared or static library, which each release also ships prebuilt. [`crates/emberwave-ffi/README.md`](crates/emberwave-ffi/README.md) explains how to build and link it, and [`examples/c/decode.c`](crates/emberwave-ffi/examples/c/decode.c) and [`examples/c/encode.c`](crates/emberwave-ffi/examples/c/encode.c) are complete programs.
 
-For apps on iPhones, iPads and Macs, each release also has the static library as an XCFramework, `Emberwave.xcframework`, which Swift imports as `Emberwave`; Metal clients can have the picture drawn into a texture on the GPU, or its Y, Cb and Cr planes copied into three, and read the `id<MTLTexture>` ([Pictures on the GPU](crates/emberwave-ffi/README.md#pictures-on-the-gpu-metal)). [`examples/swift`](crates/emberwave-ffi/examples/swift) decodes a file with it from Swift, [`examples/ios`](crates/emberwave-ffi/examples/ios) is a benchmark app for iPhones and iPads, and CI runs the examples and the app with it in an iOS Simulator ([iPhone, iPad and Mac apps](crates/emberwave-ffi/README.md#iphone-ipad-and-mac-apps)).
+For apps on iPhones, iPads and Macs, each release also has the static library as an XCFramework, `Emberwave.xcframework`, which Swift imports as `Emberwave`; Metal clients can have the picture drawn into a texture on the GPU, or its Y, Cb and Cr planes put into three, and read the `id<MTLTexture>` ([Pictures on the GPU](crates/emberwave-ffi/README.md#pictures-on-the-gpu-metal)). [`examples/swift`](crates/emberwave-ffi/examples/swift) decodes a file with it from Swift, [`examples/ios`](crates/emberwave-ffi/examples/ios) is a benchmark app for iPhones and iPads, and CI runs the examples and the app with it in an iOS Simulator ([iPhone, iPad and Mac apps](crates/emberwave-ffi/README.md#iphone-ipad-and-mac-apps)).
 
 ## Performance
 
@@ -135,7 +135,7 @@ The same app times the hardware HEVC decoder that Moonlight uses, at Moonlight's
 ## Goals
 
 - Decode bitstreams produced by the original PyroWave encoder, straight from a file, and match the reference decoder's output. PyroWave decoding is floating-point and not bit-exact by design, so the acceptance bar is PSNR ≥ 60 dB per plane against the reference decoder.
-- Rely only on features wgpu guarantees on every backend: no Vulkan-only extensions and no subgroup operations.
+- Rely only on features wgpu guarantees on every backend: no Vulkan-only extensions and no subgroup operations. Where Metal offers more, an optional path may use it with the portable one as its fallback (decisions D52 and D53).
 - Measure per-frame decode time at 1080p / 1440p / 4K on macOS (Metal) and publish the numbers together with their environment.
 
 Out of scope: network transport, RTP and FEC.
