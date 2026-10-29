@@ -11,7 +11,7 @@ scripts/bench.sh                    # measures, then rewrites the results below 
 scripts/bench_lavapipe.sh           # optional: software Vulkan in a Linux container (needs Docker)
 ```
 
-`bench.sh` keeps the raw results in `target/bench/` as JSON; `scripts/bench_report.py write target/bench BENCHMARKS.md README.md` turns them into the tables again. Quit other programs first, keep a laptop on mains power, and run it twice: the two runs should agree within a few per cent. The README's charts show some of the numbers on this page: `scripts/readme_figures.py` draws them, from numbers copied into it.
+`bench.sh` keeps the raw results in `target/bench/` as JSON; `scripts/bench_report.py write target/bench BENCHMARKS.md README.md` turns them into the tables again. Quit other programs first, keep a laptop on mains power, and run it twice: the two runs should agree within a few per cent. The README's charts show some of the numbers on this page: `scripts/readme_figures.py` draws them, from numbers copied into it. `scripts/quality_figure.py` makes the first table of [Picture quality](#picture-quality) and the README's picture of it, from a picture of your own; it needs numpy, Pillow and a release build of `emberwave-cli`.
 
 ## What is measured
 
@@ -296,4 +296,28 @@ The two runs' means differed by 4 % or less, except in five rows. HEVC's encodin
 - FFmpeg's wrapper around VideoToolbox, through which Moonlight on the Mac decodes;
 - the wait for the display, and power;
 - that HEVC's decoder leaves the GPU free to draw while emberwave's decoding uses it;
-- the pictures' quality. The report's luma PSNR only checks that the stream decodes to the pictures: about 40 dB at Moonlight's rates and 43 dB at emberwave's bytes on both devices. The grain, fresh in every picture, dominates it.
+- the pictures' quality. The report's luma PSNR only checks that the stream decodes to the pictures: about 40 dB at Moonlight's rates and 43 dB at emberwave's bytes on both devices. The grain, fresh in every picture, dominates it. [Picture quality](#picture-quality) sets a key frame of HEVC beside emberwave's frames on a picture of a game.
+
+## Picture quality
+
+What a frame's budget buys, on a hard picture: a 4K frame of the game Crimson Desert, grass, pines and a stone wall in daylight, from a screenshot taken in the game, a 3840x2160 PNG. It was converted to 8-bit 4:2:0 in BT.709's video range, each chroma sample the mean of its four pixels. On 2026-10-29, on the Apple M3 Max of the tables above, `emberwave-cli encode` encoded it within five budgets on the CPU, which makes the same bytes on every machine, and `emberwave-cli decode` decoded it again, built from the code of release 0.11.0. The GPU encoder (`--gpu`), on 2026-10-27 and 2026-10-29, gave the same sizes and the same PSNR to two decimals. PSNR is per plane, over the whole picture, against the 4:2:0 picture that the encoder took. `scripts/quality_figure.py` does all this from the 4:2:0 picture, prints this table and draws the README's picture, which enlarges the region that loses the most at the smallest budget. The frame itself is not in the repository (decision D49).
+
+| Budget | Frame | at 60 frames a second | bits per pixel | PSNR Y | Cb | Cr |
+|---|---|---|---|---|---|---|
+| 670 kB | 669,964 bytes | 322 Mbit/s | 0.65 | 25.77 | 30.96 | 31.93 |
+| 1.04 MB | 1,039,976 bytes | 499 Mbit/s | 1.00 | 27.12 | 32.45 | 32.79 |
+| 1.7 MB | 1,699,860 bytes | 816 Mbit/s | 1.64 | 29.94 | 34.36 | 34.66 |
+| 2.5 MB | 2,499,912 bytes | 1200 Mbit/s | 2.41 | 32.87 | 36.77 | 37.13 |
+| 4 MB | 3,999,996 bytes | 1920 Mbit/s | 3.86 | 35.71 | 42.71 | 42.54 |
+
+- **The picture decides.** Within 670 kB, the first picture of the synthetic 4K scene that the encoder benchmarks use, colour bars, a gradient, a shaded disc, a fine grid and a little film grain, keeps 42.69 dB of luma, where the game's frame keeps 25.77 dB.
+- **Next to HEVC.** On 2026-10-27, on the same Mac with macOS 27.0.1, Apple's hardware HEVC encoder, through VideoToolbox and outside its real-time mode, encoded the same picture as a single key frame, Main profile, at the highest quality setting whose frame fits each budget with its parameter sets, and VideoToolbox decoded it again; the PSNR was computed again on 2026-10-29. With 2 to 10 % fewer bytes than emberwave's frame, the key frame has 1.9 to 3.5 dB more luma PSNR and 0.7 to 1.9 dB more chroma PSNR. A streaming host runs its encoder in real-time mode, which may cost quality; this was not measured. In a stream, HEVC also predicts frames from the ones before, which a single picture does not show, and needs a key frame only at the start and after a loss, where every PyroWave frame stands alone.
+
+| Budget | HEVC key frame | at 60 frames a second | PSNR Y | Cb | Cr | emberwave's Y |
+|---|---|---|---|---|---|---|
+| 670 kB | 643,583 bytes | 309 Mbit/s | 27.67 | 32.89 | 33.16 | 25.77 |
+| 1.04 MB | 931,023 bytes | 447 Mbit/s | 29.55 | 33.69 | 33.85 | 27.12 |
+| 1.7 MB | 1,667,267 bytes | 800 Mbit/s | 33.43 | 35.78 | 35.83 | 29.94 |
+| 2.5 MB | 2,319,594 bytes | 1113 Mbit/s | 36.34 | 37.87 | 37.85 | 32.87 |
+
+- **How firm the numbers are.** One picture, and PSNR, which follows what the eye sees only roughly. The HEVC numbers come from a scratch program that was not kept.

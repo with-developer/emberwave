@@ -1299,3 +1299,15 @@ The figures of the prototype's runs above are marked as not kept.
   Each is worth a few tenths of a millisecond at most, against a floor of about 1 ms. #86 keeps them.
 
 **Consequence.** A paced decode's time is mostly the platform's: Metal's floor and an idle GPU's clock, which upstream's decoder pays as well. A client whose GPU stays busy, as a game-streaming host's does, sees times closer to those frame after frame. On the iPhone the floor and the slowdown are larger, and there the hardware HEVC decoder is quicker at a stream's pace (D45).
+
+### 2026-10-29 — D49: A game's frame shows the quality, outside the license
+
+**Context.** The README showed how fast emberwave decodes and encodes, but not what a frame looks like within a budget, and `BENCHMARKS.md` listed the quality as not covered (#97). The benchmarks' synthetic scenes flatter the codec: within 670 kB, their 4K scene keeps 42.7 dB of luma PSNR, and a 4K frame of a game 25.8 dB. A game's frame shows what a stream would look like, but its pictures are the publisher's.
+
+**Decision.**
+- The README shows a frame of Crimson Desert within four budgets (`docs/images/quality.png`), from a screenshot taken in the game. Pearl Abyss's [fan content guidelines](https://crimsondesert.pearlabyss.com/en-US/Policy?_policyNo=130) (dated 2021-03-26, read on 2026-10-29) allow in-game screenshots in non-commercial content that says it is unofficial, and ask that their material stay out of other products. Pearl Abyss's Terms of Service, which the guidelines defer to for what they do not cover, were not reviewed.
+- The README under the picture and the picture in its corner say that it is unofficial. `LICENSE` and the README exclude it from the MIT license. `.gitattributes` leaves it out of the source archives that GitHub makes of releases; the release packages never held `docs/`. Clones, forks and the history still hold it.
+- `scripts/quality_figure.py`, which makes the picture and its numbers from an 8-bit 4:2:0 picture of at least 320x180, is in the repository; the frame is not.
+- Should Pearl Abyss object, the picture leaves the README and the tree, and the numbers stay; the history keeps it unless it is rewritten.
+
+**Consequence.** The quality's numbers come from one picture and a script run by hand, not from CI, and HEVC's are those of a key frame alone.
