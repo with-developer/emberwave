@@ -19,32 +19,17 @@ const asPackets = document.getElementById("packets");
 const packetBytes = document.getElementById("packet-bytes");
 const loss = document.getElementById("loss");
 
-// The frames of a PWV1 file, an ArrayBuffer or a Uint8Array: after its
-// 24-byte header, each frame's size as a 32-bit little-endian number and then
-// its bytes. Stops at a frame that is cut off.
-function framesOf(bytes) {
-  const file = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
-  const frames = [];
-  for (let at = 24; at + 4 <= file.byteLength;) {
-    const size = view.getUint32(at, true);
-    at += 4;
-    if (at + size > file.byteLength) {
-      break;
-    }
-    frames.push(file.subarray(at, at + size));
-    at += size;
-  }
-  return frames;
-}
-
 // What playing as packets has met since it was last shown.
 const tally = { frames: 0, whole: 0, partial: 0, skipped: 0, packets: 0, lost: 0, malformed: 0 };
 
+function resetTally() {
+  Object.keys(tally).forEach((key) => { tally[key] = 0; });
+}
+
 // Sends `frame` to the player as a network would deliver it: cut at its
-// blocks into packets of at most the chosen size, shuffled, and with the
+// blocks into packets of up to the chosen size, shuffled, and with the
 // chosen share of them lost. Then draws what arrived, if enough did, and
-// returns the CPU's milliseconds for the draw.
+// returns the CPU's milliseconds for the draw, or null for a frame skipped.
 function playAsPackets(frame) {
   const ends = packet_ends(frame, Number(packetBytes.value));
   const packets = [];
@@ -75,7 +60,7 @@ function playAsPackets(frame) {
     // Too little arrived: the frame is skipped, and the last one stays.
     tally.skipped += 1;
     player.drop_packets();
-    return 0;
+    return null;
   }
   if (player.is_ready(false)) {
     tally.whole += 1;
@@ -97,7 +82,7 @@ function showTally() {
     `${(100 * tally.lost / tally.packets).toFixed(1)} % lost · frames drawn whole ${tally.whole}, ` +
     `in part ${tally.partial}, skipped ${tally.skipped}` +
     (tally.malformed ? ` · malformed packets ${tally.malformed}` : "");
-  Object.keys(tally).forEach((key) => { tally[key] = 0; });
+  resetTally();
 }
 
 let player;
@@ -117,6 +102,8 @@ function fail(message) {
   info.textContent = message;
   info.className = "error";
   stats.textContent = "";
+  network.textContent = "";
+  resetTally();
 }
 
 // Reports what went wrong with a file. A panic in the module, which
@@ -194,10 +181,12 @@ async function play(bytes, name) {
 
   const mine = ++generation;
   const interval = 1000 / player.frame_rate();
-  // The file's frames, for playing them as packets.
-  const frames = framesOf(bytes);
+  // The next of the file's frames to play as packets, which the player hands
+  // out, so that the page keeps no copy of the file.
+  const count = player.frames();
   let next = 0;
   network.textContent = "";
+  resetTally();
   // When the next frame is due. Advancing it by the interval, not to the
   // time of drawing, keeps a rate that does not divide the display's.
   let due = 0;
@@ -217,21 +206,26 @@ async function play(bytes, name) {
         due = now + interval;
       }
       try {
-        if (asPackets.checked && frames.length > 0) {
-          cpu += playAsPackets(frames[next]);
-          next = (next + 1) % frames.length;
+        // A frame skipped as packets draws nothing, and is not counted.
+        let spent = null;
+        if (asPackets.checked && count > 0) {
+          spent = playAsPackets(player.frame(next));
+          next = (next + 1) % count;
         } else {
-          cpu += player.draw_next();
+          spent = player.draw_next();
+        }
+        if (spent !== null) {
+          cpu += spent;
+          drawn += 1;
         }
       } catch (error) {
         failWith(name, error);
         return;
       }
-      drawn += 1;
       if (now - since >= 1000) {
         stats.textContent =
-          `${(drawn * 1000 / (now - since)).toFixed(1)} frames per second · ` +
-          `CPU ${(cpu / drawn).toFixed(2)} ms · ` +
+          `${(drawn * 1000 / (now - since)).toFixed(1)} frames drawn per second · ` +
+          `CPU ${(cpu / Math.max(drawn, 1)).toFixed(2)} ms · ` +
           `submitted to done ${player.take_gpu_ms().toFixed(2)} ms per frame`;
         showTally();
         drawn = 0;
@@ -377,15 +371,21 @@ async function start() {
     samples.append(button);
   }
 
-  // ?packets plays as packets, and ?loss=0.05 loses that share of them, for
-  // links to the network's view.
+  // ?packets plays as packets (?packets=0 does not), and ?loss=0.05 loses
+  // that share of them, from 0 to 1, for links to the network's view.
   const params = new URLSearchParams(location.search);
-  if (params.has("packets")) {
+  if (params.has("packets") && !["0", "false"].includes(params.get("packets"))) {
     asPackets.checked = true;
   }
-  const lossAsked = params.get("loss");
-  if ([...loss.options].some((option) => option.value === lossAsked)) {
-    loss.value = lossAsked;
+  const lossAsked = Number(params.get("loss"));
+  if (params.has("loss") && Number.isFinite(lossAsked)) {
+    const share = Math.min(1, Math.max(0, lossAsked));
+    let option = [...loss.options].find((candidate) => Number(candidate.value) === share);
+    if (!option) {
+      option = new Option(`${+(share * 100).toFixed(2)} %`, String(share));
+      loss.add(option);
+    }
+    loss.value = option.value;
   }
 
   // ?play=NAME starts a sample straight away, for links to one; otherwise

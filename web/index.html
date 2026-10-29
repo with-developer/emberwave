@@ -25,7 +25,7 @@
 <p id="stats"></p>
 <div class="row">
   <label><input type="checkbox" id="packets"> Play as packets</label>
-  <label>of at most <select id="packet-bytes">
+  <label>of up to <select id="packet-bytes">
     <option value="1200" selected>1200</option>
     <option value="8000">8000</option>
   </select> bytes, in any order, losing
@@ -45,7 +45,7 @@
     <span id="samples" class="row"></span>
   </div>
 </div>
-<p>As packets, each frame is cut at its blocks into packets as a host sends them, shuffled and some dropped, as a network may, and the player decodes what arrives: a frame missing only some of its finer blocks shows with those blocks blank, and a lost packet costs no other frame.</p>
+<p>As packets, each frame is cut at its blocks into packets as a host sends them (a block larger than a packet goes alone), shuffled and some dropped, as a network may, and the player decodes what arrives. A frame whose coarse bands all arrived shows with the lost finer blocks blank, and other frames are skipped; a lost packet costs no other frame.</p>
 <p><a href="bench.html">Benchmark this device</a>: how fast it decodes 1080p, 1440p and 4K.</p>
 <script type="module" src="main.js"></script>
 </body>

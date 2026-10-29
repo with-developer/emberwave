@@ -11,8 +11,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use emberwave_core::bitstream::{ChromaSubsampling, Pwv1File, consts, pwv1};
-use emberwave_core::color::ColorParams;
+use emberwave_core::bitstream::{ChromaSubsampling, Pwv1File, YcbcrRange, consts, pwv1};
+use emberwave_core::color::{ColorMatrix, ColorParams};
 use emberwave_core::encode;
 use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions, TEXTURE_FORMATS};
 use wasm_bindgen::prelude::*;
@@ -89,15 +89,17 @@ struct Stream {
     /// Where the frames end that can be played: the end of the file, or
     /// where the first one starts that cannot.
     end: usize,
+    /// Where each frame that can be played is in `file`, without its size.
+    frames: Vec<std::ops::Range<usize>>,
     /// Where the size of the next frame to play is.
     next: usize,
     decoder: Decoder,
     /// The colours of the file's header, or for a stream opened without a
     /// file those it takes until a frame's start of frame header says
-    /// otherwise.
+    /// otherwise, or those set by [`Player::set_colors`].
     color: ColorParams,
     /// Whether the colours follow each frame's start of frame header, as for
-    /// a stream opened without a file.
+    /// a stream opened without a file until [`Player::set_colors`].
     follows_frames: bool,
     width: u32,
     height: u32,
@@ -260,6 +262,13 @@ impl Player {
             ));
         }
         let decoder = self.new_decoder(stream.width, stream.height, stream.chroma)?;
+        let mut frames = Vec::with_capacity(count);
+        let mut at = pwv1::HEADER_BYTES;
+        while at < end {
+            let size = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+            frames.push(at + 4..at + 4 + size as usize);
+            at += 4 + size as usize;
+        }
 
         let frame_rate = if header.frame_rate_num != 0 && header.frame_rate_den != 0 {
             f64::from(header.frame_rate_num) / f64::from(header.frame_rate_den)
@@ -276,6 +285,7 @@ impl Player {
         self.stream = Some(Stream {
             file: bytes,
             end,
+            frames,
             next: pwv1::HEADER_BYTES,
             decoder,
             color: ColorParams::from_stream(&stream),
@@ -292,7 +302,8 @@ impl Player {
     /// file: its frames come as packets through
     /// [`push_packet`](Self::push_packet), as a client of a live stream
     /// receives them. Sizes the canvas, and returns a line that describes the
-    /// stream. The colours follow each frame's start of frame header.
+    /// stream. The colours follow each frame's start of frame header, unless
+    /// [`set_colors`](Self::set_colors) sets them.
     pub fn open_stream(
         &mut self,
         width: u32,
@@ -322,6 +333,7 @@ impl Player {
         self.stream = Some(Stream {
             file: Vec::new(),
             end: 0,
+            frames: Vec::new(),
             next: 0,
             decoder,
             color: ColorParams::default(),
@@ -335,10 +347,65 @@ impl Player {
         ))
     }
 
+    /// Sets the colours to convert the stream's pictures with: `matrix`
+    /// `bt601`, `bt709` or `bt2020`, and `range` `full` or `limited`. Then
+    /// they no longer follow the frames' start of frame headers, which can
+    /// signal the wrong ones: upstream's encoder signals full range whatever
+    /// the pictures are.
+    pub fn set_colors(&mut self, matrix: &str, range: &str) -> Result<(), JsError> {
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| JsError::new("no stream is open"))?;
+        stream.color.matrix = match matrix {
+            "bt601" => ColorMatrix::Bt601,
+            "bt709" => ColorMatrix::Bt709,
+            "bt2020" => ColorMatrix::Bt2020,
+            other => {
+                return Err(JsError::new(&format!(
+                    "the matrix is {other:?}, not bt601, bt709 or bt2020"
+                )));
+            }
+        };
+        stream.color.range = match range {
+            "full" => YcbcrRange::Full,
+            "limited" => YcbcrRange::Limited,
+            other => {
+                return Err(JsError::new(&format!(
+                    "the range is {other:?}, not full or limited"
+                )));
+            }
+        };
+        stream.follows_frames = false;
+        Ok(())
+    }
+
+    /// How many frames of the loaded file can be played; 0 for a stream
+    /// opened without a file.
+    pub fn frames(&self) -> u32 {
+        self.stream
+            .as_ref()
+            .map_or(0, |stream| stream.frames.len() as u32)
+    }
+
+    /// A copy of frame `index` of the loaded file, of those that can be
+    /// played, for a page that sends it on as packets.
+    pub fn frame(&self, index: u32) -> Result<Vec<u8>, JsError> {
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| JsError::new("no file is loaded"))?;
+        let range = stream
+            .frames
+            .get(index as usize)
+            .ok_or_else(|| JsError::new(&format!("the file has no frame {index}")))?;
+        Ok(stream.file[range.clone()].to_vec())
+    }
+
     /// Adds a packet of the stream, as it arrives: a start of frame header
     /// with blocks, or blocks alone, in any order. A packet of a newer frame
-    /// drops what arrived of an older one. A malformed packet is an error and
-    /// leaves the frame as it was.
+    /// drops what arrived of an older one. A malformed packet is an error;
+    /// the blocks in front of what is malformed are kept.
     pub fn push_packet(&mut self, packet: &[u8]) -> Result<(), JsError> {
         let stream = self
             .stream
