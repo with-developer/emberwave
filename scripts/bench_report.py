@@ -452,22 +452,22 @@ def readme_block_ko(results, env):
     """The summary of readme_block in Korean, for README.ko.md."""
     r = readme_results(results)
     text = (
-        f"{env['cpu']}({r['backend']})에서 잰 프레임당 디코딩 시간입니다. RGB 출력은 GPU 메모리에 "
-        f"두었고, {env['date']}에 측정했으며, 단위는 밀리초입니다.\n\n"
+        f"{env['cpu']}({r['backend']})에서 측정한 프레임당 디코딩 시간입니다. 단위는 밀리초이고, "
+        f"RGB 출력은 GPU 메모리에 둔 채로 쟀습니다({env['date']} 측정).\n\n"
         + table(["스트림", "평균", "p99"], r["rows"])
         + "\n"
     )
     if r["planes"] and r["planes_upstream"]:
         text += (
-            "\n같은 기계에서는 업스트림의 Metal 디코더가 더 빠릅니다. 4K 한 프레임에 FP32로 "
-            f"{ms(value(r['planes_upstream'], 'total'))} ms가 걸리고, emberwave는 "
-            f"{ms(value(r['planes'], 'total'))} ms가 걸립니다(평면까지만). "
-            "측정 방법과 전체 수치는 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.\n"
+            "\n같은 기기에서 업스트림의 Metal 디코더는 이보다 빠릅니다. 4K 프레임 하나를 평면까지 "
+            f"디코딩하는 데 업스트림은 FP32로 {ms(value(r['planes_upstream'], 'total'))} ms, "
+            f"emberwave는 {ms(value(r['planes'], 'total'))} ms가 걸립니다. "
+            "측정 방법과 전체 결과는 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.\n"
         )
     if r["encode"]:
         text += (
-            f"\n4K 한 프레임을 1.2 MB 안에 인코딩하는 데 GPU에서 {ms(value(r['encode'], 'total'))} ms가 "
-            "걸립니다. CPU 메모리의 평면에서 CPU 메모리의 프레임까지의 시간"
+            f"\n4K 프레임 하나를 1.2 MB 이내로 인코딩하는 데는 GPU에서 {ms(value(r['encode'], 'total'))} ms가 "
+            "걸립니다. CPU 메모리의 평면을 받아 CPU 메모리에 프레임을 내놓기까지의 시간"
             + (
                 f"이며, 업스트림 인코더는 FP32로 {ms(value(r['encode_upstream'], 'total'))} ms가 "
                 "걸립니다."
