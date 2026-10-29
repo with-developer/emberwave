@@ -99,7 +99,7 @@ jobs:
           exe=emberwave-cli
           if [ "$RUNNER_OS" = Windows ]; then exe=emberwave-cli.exe; fi
           mkdir "$name"
-          cp "target/release/$exe" README.md README.ko.md LICENSE CHANGELOG.md "$name/"
+          cp "target/release/$exe" README.md README.ko.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md "$name/"
           pack "$name"
 
           name="emberwave-ffi-${ref}-${{ matrix.target }}"
@@ -112,7 +112,7 @@ jobs:
           esac
           for lib in $libs; do cp "target/release/$lib" "$name/lib/"; done
           cp native-static-libs.txt "$name/lib/"
-          cp crates/emberwave-ffi/README.md LICENSE CHANGELOG.md "$name/"
+          cp crates/emberwave-ffi/README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md "$name/"
           pack "$name"
       - uses: actions/upload-artifact@v7
         with:
@@ -143,7 +143,7 @@ jobs:
           mkdir "$name"
           cp -R target/xcframework/Emberwave.xcframework "$name/"
           cp target/xcframework/native-static-libs-*.txt "$name/"
-          cp crates/emberwave-ffi/README.md LICENSE CHANGELOG.md "$name/"
+          cp crates/emberwave-ffi/README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md "$name/"
           # ditto zips a bundle as Apple's tools do.
           ditto -c -k --keepParent "$name" "$name.zip"
       - uses: actions/upload-artifact@v7

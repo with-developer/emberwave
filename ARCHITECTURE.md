@@ -1306,7 +1306,7 @@ The figures of the prototype's runs above are marked as not kept.
 
 **Decision.**
 - The README shows a frame of Crimson Desert within four budgets (`docs/images/quality.png`), from a screenshot taken in the game. Pearl Abyss's [fan content guidelines](https://crimsondesert.pearlabyss.com/en-US/Policy?_policyNo=130) (dated 2021-03-26, read on 2026-10-29) allow in-game screenshots in non-commercial content that says it is unofficial, and ask that their material stay out of other products. Pearl Abyss's Terms of Service, which the guidelines defer to for what they do not cover, were not reviewed.
-- The README under the picture and the picture in its corner say that it is unofficial. `LICENSE` and the README exclude it from the MIT license. `.gitattributes` leaves it out of the source archives that GitHub makes of releases; the release packages never held `docs/`. Clones, forks and the history still hold it.
+- The README under the picture and the picture in its corner say that it is unofficial. `LICENSE` and the README exclude it from the MIT license (since D51, `THIRD_PARTY_NOTICES.md` instead of `LICENSE`). `.gitattributes` leaves it out of the source archives that GitHub makes of releases; the release packages never held `docs/`. Clones, forks and the history still hold it.
 - `scripts/quality_figure.py`, which makes the picture and its numbers from an 8-bit 4:2:0 picture of at least 320x180, is in the repository; the frame is not.
 - Should Pearl Abyss object, the picture leaves the README and the tree, and the numbers stay; the history keeps it unless it is rewritten.
 
@@ -1325,3 +1325,14 @@ The figures of the prototype's runs above are marked as not kept.
 - The CLI's release packages hold both READMEs.
 
 **Consequence.** A change to the README is made twice, and a benchmark run rewrites both summaries. A Korean reader gets the whole README, and the rest of the documentation in English only.
+
+### 2026-10-29 — D51: `LICENSE` is the MIT license alone
+
+**Context.** `LICENSE` held emberwave's MIT license, then PyroWave's license as a third-party notice, as `CLAUDE.md` asks, and since D49 the exclusion of the picture of the quality. GitHub's license detection compares the whole file with the licenses it knows, and with the additions it reported "Other" instead of MIT: on the repository's page, in its API and to the tools that read either (#101). The repository owner left the fix to the maintainers on 2026-10-29.
+
+**Decision.**
+- `LICENSE` is the MIT license alone, GitHub's template with the year and "emberwave contributors".
+- `THIRD_PARTY_NOTICES.md` holds PyroWave's copyright notice and license, word for word as `LICENSE` held them, and the exclusion of `docs/images/quality.png`.
+- It ships wherever `LICENSE` does: in the release packages of the command line tool, of the C library and of the XCFramework. Both READMEs and `CONTRIBUTING.md` point to it.
+
+**Consequence.** GitHub can tell that the license is MIT. A copy of `LICENSE` alone no longer carries PyroWave's notice; the packages carry both files.

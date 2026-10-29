@@ -165,6 +165,7 @@ README 말고는 모든 문서가 영어로 되어 있습니다.
 | `BENCHMARKS.md` | 디코딩 시간을 재는 방법과 그 결과 |
 | `CONTRIBUTING.md` | 코드를 빌드하고 테스트하고 바꾸는 방법 |
 | `CHANGELOG.md` | 릴리스마다 바뀐 것 |
+| `LICENSE`, `THIRD_PARTY_NOTICES.md` | MIT 라이선스, PyroWave의 라이선스와 이 라이선스가 적용되지 않는 것 |
 
 ## 개발
 
@@ -183,4 +184,4 @@ emberwave는 PyroWave의 알고리즘 구조와 [비트스트림 정의](https:/
 
 ## 라이선스
 
-MIT입니다. [`LICENSE`](LICENSE)를 보세요. PyroWave의 저작권 고지도 그 안에 있습니다. `docs/images/quality.png`의 붉은사막 프레임은 © Pearl Abyss이며 이 라이선스가 적용되지 않습니다. 릴리스의 소스 아카이브에는 들어가지 않습니다.
+MIT입니다. [`LICENSE`](LICENSE)를 보세요. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)에는 PyroWave의 저작권 고지와 라이선스, 그리고 이 라이선스가 적용되지 않는 것이 있습니다. `docs/images/quality.png`의 붉은사막 프레임은 © Pearl Abyss이며, 릴리스의 소스 아카이브에는 들어가지 않습니다.
