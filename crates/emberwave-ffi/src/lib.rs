@@ -704,6 +704,7 @@ fn gpu_options(options: &EmberwaveContextOptions) -> Result<GpuOptions, Failure>
         force_fallback_adapter: options.flags & EMBERWAVE_CONTEXT_SOFTWARE != 0,
         strict_webgpu: false,
         timestamps: false,
+        plane_stores: true,
     })
 }
 
@@ -1324,15 +1325,17 @@ pub unsafe extern "C" fn emberwave_texture_create(
     )
 }
 
-/// Creates a texture that `emberwave_decoder_decode_plane_textures` copies one
+/// Creates a texture that `emberwave_decoder_decode_plane_textures` puts one
 /// plane of the pictures of `decoder` into, on the decoder's GPU device:
 /// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
 /// `EMBERWAVE_PLANE_CR`, and the texture is for that plane only, of its size
 /// as `emberwave_decoder_info` gives it, in one unsigned normalised 8-bit
 /// channel (`MTLPixelFormatR8Unorm` in Metal), which the GPU can sample and
-/// copy from but the CPU cannot read. `emberwave_texture_metal` gives its
-/// Metal texture. Decoders of the same picture size and chroma format on the
-/// same context may share textures.
+/// copy from but the CPU cannot read. On Metal the decodes store the planes
+/// into it from their shaders rather than copy them (decision D52), so its
+/// usage includes `MTLTextureUsageShaderWrite`. `emberwave_texture_metal`
+/// gives its Metal texture. Decoders of the same picture size and chroma
+/// format on the same context may share textures.
 ///
 /// # Safety
 ///
@@ -1424,8 +1427,11 @@ pub unsafe extern "C" fn emberwave_texture_from_metal(
 /// one: `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
 /// `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_metal`, but the
 /// texture is `MTLPixelFormatR8Unorm` of the plane's size, and as a decode
-/// copies a plane, not framebuffer-only. A Metal texture can be wrapped for
-/// more than one plane, but a decode refuses it in two of them.
+/// copies a plane, not framebuffer-only. When all three textures of a decode
+/// have `MTLTextureUsageShaderWrite`, the decode stores the planes into them
+/// from its shaders instead, which takes less time (decision D52). A Metal
+/// texture can be wrapped for more than one plane, but a decode refuses it in
+/// two of them.
 ///
 /// # Safety
 ///
@@ -1558,7 +1564,8 @@ unsafe fn metal_import(
 
     // What wgpu may do with it: copies unless it is framebuffer-only, as a
     // drawable is by default, draws with RenderTarget, sampling with
-    // ShaderRead.
+    // ShaderRead, and for a plane, where the decoder stores planes, stores
+    // with ShaderWrite (decision D52).
     let copies = !metal.isFramebufferOnly();
     let mut usage = wgpu::TextureUsages::empty();
     if copies {
@@ -1569,6 +1576,12 @@ unsafe fn metal_import(
     }
     if metal.usage().contains(MTLTextureUsage::ShaderRead) {
         usage |= wgpu::TextureUsages::TEXTURE_BINDING;
+    }
+    if plane.is_some()
+        && decoder.decoder.stores_planes()
+        && metal.usage().contains(MTLTextureUsage::ShaderWrite)
+    {
+        usage |= wgpu::TextureUsages::STORAGE_BINDING;
     }
     let fillable = match plane {
         Some(_) => copies,
@@ -1866,8 +1879,8 @@ fn require_shared_queue(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
     }
 }
 
-/// Decodes the frame received so far and copies its Y, Cb and Cr planes into
-/// `y`, `cb` and `cr` on the GPU, then waits for the GPU: when this returns,
+/// Decodes the frame received so far into its Y, Cb and Cr planes in `y`,
+/// `cb` and `cr` on the GPU, then waits for the GPU: when this returns,
 /// the textures hold the planes, for the caller's graphics API to read on any
 /// queue of the device. They hold the samples of the stream, as
 /// `emberwave_decoder_decode_yuv` writes them, which the caller converts to
@@ -1876,8 +1889,10 @@ fn require_shared_queue(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
 /// chroma sample sits vertically halfway between two rows of luma, and
 /// horizontally halfway between two luma samples with
 /// `EMBERWAVE_SITING_CENTER`, on the left one with `EMBERWAVE_SITING_LEFT`.
-/// The planes never go through CPU memory. Blocks that did not arrive decode
-/// as zeros.
+/// The planes never go through CPU memory: on Metal the decode stores them
+/// into the textures from its shaders when all three allow it, and copies
+/// them in otherwise (decision D52). Blocks that did not arrive decode as
+/// zeros.
 ///
 /// Each texture is one for that plane, from `emberwave_texture_create_plane`
 /// or `emberwave_texture_from_metal_plane`, on a decoder of the same context,
@@ -2443,6 +2458,74 @@ mod tests {
         // SAFETY: both live, destroyed once.
         unsafe {
             emberwave_encoder_destroy(encoder);
+            emberwave_context_destroy(context);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_plane_texture_the_app_may_write_takes_stores() {
+        // tests/metal.rs sees the same planes either way: this pins that the
+        // app's plane textures with MTLTextureUsageShaderWrite take the stores
+        // where the decoder stores (decision D52), and the others the copies.
+        use objc2::runtime::ProtocolObject;
+        use objc2_metal::{MTLDevice, MTLPixelFormat, MTLTextureDescriptor, MTLTextureUsage};
+
+        let mut context = std::ptr::null_mut();
+        // SAFETY: NULL options and a pointer to store the context in.
+        if unsafe { emberwave_context_create(std::ptr::null(), &mut context) }
+            != EmberwaveStatus::Ok
+        {
+            return;
+        }
+        // SAFETY: live objects, and pointers to store results in.
+        unsafe {
+            let device = emberwave_context_metal_device(context);
+            if !device.is_null() {
+                let device: &ProtocolObject<dyn MTLDevice> = &*device.cast();
+                let mut decoder = std::ptr::null_mut();
+                assert_eq!(
+                    emberwave_decoder_create(context, 64, 32, EMBERWAVE_CHROMA_420, &mut decoder),
+                    EmberwaveStatus::Ok
+                );
+                let stores = (*decoder).decoder.stores_planes();
+                for (usage, storage) in [
+                    (MTLTextureUsage::ShaderRead, false),
+                    (
+                        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite,
+                        stores,
+                    ),
+                ] {
+                    let descriptor =
+                        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                            MTLPixelFormat::R8Unorm,
+                            64,
+                            32,
+                            false,
+                        );
+                    descriptor.setUsage(usage);
+                    let metal = device
+                        .newTextureWithDescriptor(&descriptor)
+                        .expect("a texture");
+                    let mut texture = std::ptr::null_mut();
+                    assert_eq!(
+                        emberwave_texture_from_metal_plane(
+                            decoder,
+                            EMBERWAVE_PLANE_Y,
+                            objc2::rc::Retained::as_ptr(&metal).cast_mut().cast(),
+                            &mut texture
+                        ),
+                        EmberwaveStatus::Ok
+                    );
+                    let wrapped = (*texture)
+                        .texture
+                        .usage()
+                        .contains(wgpu::TextureUsages::STORAGE_BINDING);
+                    assert_eq!(wrapped, storage, "{usage:?}");
+                    emberwave_texture_destroy(texture);
+                }
+                emberwave_decoder_destroy(decoder);
+            }
             emberwave_context_destroy(context);
         }
     }

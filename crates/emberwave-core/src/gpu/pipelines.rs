@@ -5,6 +5,7 @@
 //! most of all), so a [`GpuContext`](super::GpuContext) builds them on first
 //! use and hands out the same ones afterwards.
 
+use super::decoder::PLANE_FORMAT;
 use super::error::GpuError;
 use super::shader_sources;
 
@@ -20,12 +21,19 @@ pub(crate) struct Stage {
 pub(crate) struct Pipelines {
     pub dequant: Stage,
     pub idwt: Stage,
+    /// The inverse transform that stores the planes into textures, on a
+    /// device that can (decision D52).
+    pub idwt_planes: Option<Stage>,
     pub yuv2rgb: Stage,
 }
 
 impl Pipelines {
-    pub(crate) fn new(device: &wgpu::Device) -> Result<Self, GpuError> {
-        with_error_scope(device, || Self {
+    /// The decoder's pipelines, with `idwt_planes` if `plane_stores`: the
+    /// device must have the adapter's own format features then, and take
+    /// [`PLANE_FORMAT`] as a storage texture. A device that fails to build
+    /// it decodes with the copies.
+    pub(crate) fn new(device: &wgpu::Device, plane_stores: bool) -> Result<Self, GpuError> {
+        let mut pipelines = with_error_scope(device, || Self {
             dequant: create_stage(
                 device,
                 "dequant",
@@ -47,6 +55,7 @@ impl Pipelines {
                     uniform_entry(2),
                 ],
             ),
+            idwt_planes: None,
             yuv2rgb: create_stage(
                 device,
                 "yuv2rgb",
@@ -57,7 +66,25 @@ impl Pipelines {
                     uniform_entry(2),
                 ],
             ),
-        })
+        })?;
+        if plane_stores {
+            pipelines.idwt_planes = with_error_scope(device, || {
+                create_stage(
+                    device,
+                    "idwt planes",
+                    shader_sources::IDWT_PLANES,
+                    &[
+                        storage_entry(0, false),
+                        uniform_entry(2),
+                        plane_entry(3),
+                        plane_entry(4),
+                        plane_entry(5),
+                    ],
+                )
+            })
+            .ok();
+        }
+        Ok(pipelines)
     }
 }
 
@@ -204,6 +231,20 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false,
             min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+/// A plane's texture that `idwt_planes.wgsl` stores into.
+fn plane_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: PLANE_FORMAT,
+            view_dimension: wgpu::TextureViewDimension::D2,
         },
         count: None,
     }

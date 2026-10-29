@@ -21,7 +21,7 @@ use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{DrawPipeline, Pipelines, Stage, with_error_scope};
 use super::resources::{
     StageQueries, buffer, buffer_limit, check_size, entry, map_for_writing, read_back,
-    read_back_with, uniform_buffer,
+    read_back_with, texture, uniform_buffer,
 };
 
 /// Zero words after the payload. The dequantiser may read a little past the
@@ -148,7 +148,33 @@ struct FrameUpload {
 /// A dispatch of the inverse transform for one decomposition level.
 struct IdwtStage {
     bind_group: wgpu::BindGroup,
+    /// The level's parameters, which the bind groups of decodes that store
+    /// the planes into textures take as well.
+    params: wgpu::Buffer,
+    /// Whether the level is the last of a component, which writes its plane.
+    writes_plane: bool,
     grid: (u32, u32, u32),
+}
+
+/// How the planes of a decode into plane textures get there.
+enum PlaneFill {
+    /// Copies of the packed planes (decision D41).
+    Copy,
+    /// Stores of the inverse transform's last levels (decision D52): a bind
+    /// group with the textures for each level that writes a plane, in the
+    /// order of `idwt_stages`, and none for the others.
+    Store(Vec<Option<wgpu::BindGroup>>),
+}
+
+/// What a decode puts into textures besides its passes, which
+/// [`Decoder::prepare_output`] makes ready.
+enum Output {
+    /// Nothing.
+    None,
+    /// The RGB picture.
+    Picture(Fill),
+    /// The Y, Cb and Cr planes.
+    Planes(PlaneFill),
 }
 
 /// Decodes PyroWave frames of one size and chroma format on the GPU.
@@ -238,7 +264,7 @@ pub const TEXTURE_FORMATS: [wgpu::TextureFormat; 2] = [
     wgpu::TextureFormat::Bgra8Unorm,
 ];
 
-/// The format of the textures the decoder copies the planes into: one
+/// The format of the textures the decoder puts the planes into: one
 /// unsigned normalised 8-bit channel, which holds the samples of the stream
 /// exactly (decision D41).
 pub const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
@@ -323,6 +349,8 @@ impl Decoder {
                             layout: &pipelines.idwt.layout,
                             entries: &[entry(0, &pyramid), entry(1, &packed), entry(2, &params)],
                         }),
+                        writes_plane: stage.params.comps.iter().any(|comp| comp.is_plane != 0),
+                        params,
                         grid: stage.grid(),
                     }
                 })
@@ -549,8 +577,8 @@ impl Decoder {
 
     /// Records the decode of one complete frame into `encoder`, as
     /// [`encode_rgb_to_texture`](Self::encode_rgb_to_texture) does but
-    /// without the colour conversion, and then copies of its Y, Cb and Cr
-    /// planes into `targets`, in that order. Once the caller has submitted
+    /// without the colour conversion, with its Y, Cb and Cr planes going
+    /// into `targets`, in that order. Once the caller has submitted
     /// `encoder`, the textures hold the planes: the samples of the stream, as
     /// [`decode`](Self::decode) gives them, for a caller that converts the
     /// colours itself (decision D41).
@@ -560,7 +588,11 @@ impl Decoder {
     /// [`PLANE_FORMAT`] and with the `COPY_DST` usage, such as those of
     /// [`create_plane_texture`](Self::create_plane_texture). An unsuitable
     /// texture is [`GpuError::Texture`], before the frame is used. Only the
-    /// views' textures matter.
+    /// views' textures matter, except that where the decoder
+    /// [stores the planes](Self::stores_planes) and all three textures have
+    /// the `STORAGE_BINDING` usage, the inverse transform stores the planes
+    /// into the views, which must then allow that usage. Otherwise the planes
+    /// are copied into the textures.
     pub fn encode_to_plane_textures(
         &mut self,
         frame: &[u8],
@@ -576,7 +608,7 @@ impl Decoder {
     }
 
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
-    /// calls and copies its planes into `targets`, as
+    /// calls into its planes in `targets`, as
     /// [`encode_to_plane_textures`](Self::encode_to_plane_textures) does, and
     /// waits for the GPU. When this returns the textures hold the planes, for
     /// any queue of the device to read; textures another queue may still be
@@ -612,18 +644,26 @@ impl Decoder {
 
     /// A texture that [`encode_to_plane_textures`](Self::encode_to_plane_textures)
     /// and [`decode_assembled_to_plane_textures`](Self::decode_assembled_to_plane_textures)
-    /// can copy the plane of `component` into: the plane's size, in
+    /// can put the plane of `component` into: the plane's size, in
     /// [`PLANE_FORMAT`], for copying into, sampling and copying from
-    /// (`COPY_DST`, `TEXTURE_BINDING` and `COPY_SRC`).
+    /// (`COPY_DST`, `TEXTURE_BINDING` and `COPY_SRC`), and where the decoder
+    /// [stores the planes](Self::stores_planes) for storing into as well
+    /// (`STORAGE_BINDING`).
     pub fn create_plane_texture(&self, component: Component) -> Result<wgpu::Texture, GpuError> {
         self.check_device()?;
         let size = self.layout().plane_size(component);
-        self.new_texture(
-            "decoded plane",
-            size,
-            PLANE_FORMAT,
-            wgpu::TextureUsages::COPY_DST,
-        )
+        let mut usage = wgpu::TextureUsages::COPY_DST;
+        usage.set(wgpu::TextureUsages::STORAGE_BINDING, self.stores_planes());
+        self.new_texture("decoded plane", size, PLANE_FORMAT, usage)
+    }
+
+    /// Whether decodes into plane textures store the planes straight into
+    /// textures with the `STORAGE_BINDING` usage, from the inverse transform,
+    /// rather than copy them in: on Metal, where a 4K frame takes 0.08 to
+    /// 0.12 ms less on an Apple M3 Max, frame after frame (decision D52).
+    /// See [`GpuContext::stores_planes`].
+    pub fn stores_planes(&self) -> bool {
+        self.pipelines.idwt_planes.is_some()
     }
 
     /// A texture of `size` and `format` that the decoder can write with
@@ -826,7 +866,7 @@ impl Decoder {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
-        let fill = self.prepare_output(color, read)?;
+        let output = self.prepare_output(color, read)?;
         let prepare = assembled_in + prepare_start.elapsed();
 
         self.make_readback(read)?;
@@ -870,8 +910,8 @@ impl Decoder {
                     payload_bytes,
                 );
             }
-            self.encode_passes(&mut encoder, color.is_some(), queries);
-            self.encode_output(&mut encoder, read, fill);
+            self.encode_passes(&mut encoder, color.is_some(), queries, &output);
+            self.encode_output(&mut encoder, read, &output);
             if let Some((source, target, bytes)) = copy_back {
                 encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
             }
@@ -913,36 +953,81 @@ impl Decoder {
     /// Makes ready what a decode with `color` and `read` needs besides its
     /// passes: the colour conversion's parameters, in the channel order a
     /// copy into the texture of `read` needs, and the draw, if the texture
-    /// takes one. Says how the picture gets into that texture.
+    /// takes one, or the bind groups that store the planes into textures.
+    /// Says how the picture or the planes get into the textures.
     fn prepare_output(
         &mut self,
         color: Option<&ColorParams>,
         read: Read<'_>,
-    ) -> Result<Option<Fill>, GpuError> {
-        let fill = match read {
-            Read::Texture(target) => Some(Fill::of(target.texture())),
-            Read::Nothing | Read::Yuv | Read::Rgb | Read::Planes(_) => None,
+    ) -> Result<Output, GpuError> {
+        let output = match read {
+            Read::Texture(target) => Output::Picture(Fill::of(target.texture())),
+            Read::Planes(targets) => Output::Planes(self.plane_fill(targets)),
+            Read::Nothing | Read::Yuv | Read::Rgb => Output::None,
         };
         if let Some(color) = color {
-            self.prepare_color(color, fill == Some(Fill::Copy { bgra: true }))?;
+            let bgra = matches!(output, Output::Picture(Fill::Copy { bgra: true }));
+            self.prepare_color(color, bgra)?;
         }
-        if let (Read::Texture(target), Some(Fill::Draw)) = (read, fill) {
+        if let (Read::Texture(target), Output::Picture(Fill::Draw)) = (read, &output) {
             self.prepare_draw(target.texture().format())?;
         }
-        Ok(fill)
+        Ok(output)
+    }
+
+    /// How the planes get into `targets`: stored by the inverse transform
+    /// where this decoder can store them and every texture allows it, the
+    /// `STORAGE_BINDING` usage, and copied otherwise (decisions D41, D52).
+    /// A view that does not allow stores, which its texture's usage cannot
+    /// tell, fails the bind groups and takes the copy, which the checks of
+    /// the targets made sure of.
+    fn plane_fill(&self, targets: [&wgpu::TextureView; 3]) -> PlaneFill {
+        let Some(stage) = &self.pipelines.idwt_planes else {
+            return PlaneFill::Copy;
+        };
+        let storage = wgpu::TextureUsages::STORAGE_BINDING;
+        if !targets
+            .iter()
+            .all(|target| target.texture().usage().contains(storage))
+        {
+            return PlaneFill::Copy;
+        }
+        let [y, cb, cr] = targets;
+        let stores = with_error_scope(&self.device, || {
+            let bind_groups = self
+                .idwt_stages
+                .iter()
+                .map(|level| {
+                    level.writes_plane.then(|| {
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("idwt planes"),
+                            layout: &stage.layout,
+                            entries: &[
+                                entry(0, &self.pyramid),
+                                entry(2, &level.params),
+                                texture(3, y),
+                                texture(4, cb),
+                                texture(5, cr),
+                            ],
+                        })
+                    })
+                })
+                .collect();
+            PlaneFill::Store(bind_groups)
+        });
+        stores.unwrap_or(PlaneFill::Copy)
     }
 
     /// Records, after the passes, what `read` asks of textures, which
     /// [`prepare_output`](Self::prepare_output) made ready.
-    fn encode_output(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        read: Read<'_>,
-        fill: Option<Fill>,
-    ) {
-        match (read, fill) {
-            (Read::Texture(target), Some(fill)) => self.encode_picture(encoder, target, fill),
-            (Read::Planes(targets), _) => self.encode_plane_copies(encoder, targets),
+    fn encode_output(&self, encoder: &mut wgpu::CommandEncoder, read: Read<'_>, output: &Output) {
+        match (read, output) {
+            (Read::Texture(target), Output::Picture(fill)) => {
+                self.encode_picture(encoder, target, *fill);
+            }
+            (Read::Planes(targets), Output::Planes(PlaneFill::Copy)) => {
+                self.encode_plane_copies(encoder, targets);
+            }
             _ => {}
         }
     }
@@ -960,9 +1045,9 @@ impl Decoder {
     ) -> Result<(), GpuError> {
         self.ensure_payload_capacity()?;
         with_error_scope(&self.device, || self.upload())?;
-        let fill = self.prepare_output(color, read)?;
-        self.encode_passes(encoder, color.is_some(), None);
-        self.encode_output(encoder, read, fill);
+        let output = self.prepare_output(color, read)?;
+        self.encode_passes(encoder, color.is_some(), None, &output);
+        self.encode_output(encoder, read, &output);
         Ok(())
     }
 
@@ -1203,12 +1288,14 @@ impl Decoder {
 
     /// Records the GPU stages of a frame into `encoder`: dequantisation, the
     /// inverse transform and, with `rgb`, the colour conversion. With
-    /// `queries` each pass writes its timestamps.
+    /// `queries` each pass writes its timestamps. When `output` stores the
+    /// planes into textures, the levels that write planes store them there.
     fn encode_passes(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         rgb: bool,
         queries: Option<&StageQueries>,
+        output: &Output,
     ) {
         // Each pass is a stage of its own.
         let writes = |pass: u32| queries.map(|q| q.writes(Some(pass), Some(pass)));
@@ -1228,9 +1315,21 @@ impl Decoder {
                 label: Some("idwt"),
                 timestamp_writes: writes(1),
             });
-            pass.set_pipeline(&self.pipelines.idwt.pipeline);
-            for stage in &self.idwt_stages {
-                pass.set_bind_group(0, &stage.bind_group, &[]);
+            let stores = match output {
+                Output::Planes(PlaneFill::Store(bind_groups)) => bind_groups.as_slice(),
+                _ => &[],
+            };
+            for (index, stage) in self.idwt_stages.iter().enumerate() {
+                match (stores.get(index), &self.pipelines.idwt_planes) {
+                    (Some(Some(bind_group)), Some(planes)) => {
+                        pass.set_pipeline(&planes.pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
+                    }
+                    _ => {
+                        pass.set_pipeline(&self.pipelines.idwt.pipeline);
+                        pass.set_bind_group(0, &stage.bind_group, &[]);
+                    }
+                }
                 pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
             }
         }
@@ -1781,6 +1880,72 @@ mod tests {
                 "{width} wide, {format:?}, {usage:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_planes_are_stored_where_all_three_textures_take_stores() {
+        // The plane tests see the same planes either way: this pins which way
+        // each set of textures takes (decision D52).
+        let Some(context) = test_context() else {
+            return;
+        };
+        let decoder = Decoder::new(context, 64, 32, ChromaSubsampling::Yuv420).expect("decoder");
+        assert_eq!(decoder.stores_planes(), context.stores_planes());
+        // Textures a client samples, which decodes copy into, or store into.
+        let copy = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING;
+        let store = copy | wgpu::TextureUsages::STORAGE_BINDING;
+        let textures = |usages: [wgpu::TextureUsages; 3]| {
+            Component::ALL.map(|component| {
+                let (width, height) = decoder.layout().plane_size(component);
+                context.device().create_texture(&wgpu::TextureDescriptor {
+                    label: Some("plane"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: PLANE_FORMAT,
+                    usage: usages[component.index()],
+                    view_formats: &[],
+                })
+            })
+        };
+        let fill = |textures: &[wgpu::Texture; 3], view: &wgpu::TextureViewDescriptor| {
+            let views = textures.each_ref().map(|texture| texture.create_view(view));
+            decoder.plane_fill(views.each_ref())
+        };
+        let plain = wgpu::TextureViewDescriptor::default();
+        assert!(matches!(
+            fill(&textures([copy; 3]), &plain),
+            PlaneFill::Copy
+        ));
+        if !context.stores_planes() {
+            // Textures of R8 storage need the adapter's own format features.
+            return;
+        }
+        // In 4:2:0 the planes end at levels 1 and 0, the last two of five.
+        match fill(&textures([store; 3]), &plain) {
+            PlaneFill::Store(bind_groups) => assert_eq!(
+                bind_groups.iter().map(Option::is_some).collect::<Vec<_>>(),
+                [false, false, false, true, true]
+            ),
+            PlaneFill::Copy => panic!("textures that take stores are copied into"),
+        }
+        assert!(matches!(
+            fill(&textures([store, copy, store]), &plain),
+            PlaneFill::Copy
+        ));
+        let sampled = wgpu::TextureViewDescriptor {
+            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+            ..Default::default()
+        };
+        assert!(matches!(
+            fill(&textures([store; 3]), &sampled),
+            PlaneFill::Copy
+        ));
     }
 
     #[test]

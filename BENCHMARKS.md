@@ -298,6 +298,37 @@ The two runs' means differed by 4 % or less, except in five rows. HEVC's encodin
 - that HEVC's decoder leaves the GPU free to draw while emberwave's decoding uses it;
 - the pictures' quality. The report's luma PSNR only checks that the stream decodes to the pictures: about 40 dB at Moonlight's rates and 43 dB at emberwave's bytes on both devices. The grain, fresh in every picture, dominates it. [Picture quality](#picture-quality) sets a key frame of HEVC beside emberwave's frames on a picture of a game.
 
+## Planes stored into textures
+
+Since decision D52, on Metal a decode into Y, Cb and Cr textures has the inverse transform's last levels store the planes into them, where it used to pack them into a buffer and copy them in (D41). Measured on 2026-10-29 from 19:00 to 19:20 on the Apple M3 Max of the tables above, macOS 27.0.1, on mains power, the code of `main` at `5f69efb` against that of [#103](https://github.com/with-developer/emberwave/pull/103). Nobody used the Mac, but a screen recorder and other programs ran.
+
+The benchmark app's program for the Mac (`scripts/bench_app_on_mac.sh`), through the C API's `emberwave_decoder_decode_plane_textures`, built from each, two runs of each in turn. Mean milliseconds per frame, the lowest and the highest of the two runs:
+
+| Into Y, Cb and Cr textures | 1080p | 1440p | 4K |
+|---|---|---|---|
+| Copies (`main`) | 0.43 to 0.46 | 0.59 to 0.60 | 1.03 to 1.05 |
+| Stores | 0.41 | 0.54 | 0.91 to 0.93 |
+| *60 frames a second:* | | | |
+| Copies (`main`) | 1.92 to 2.27 | 2.37 to 2.70 | 3.46 to 3.69 |
+| Stores | 2.17 to 2.29 | 2.30 to 2.38 | 3.51 to 3.68 |
+
+At 60 frames a second the runs differ more than the two ways do. A scratch program, not kept, therefore decoded the scene streams of the tables at the top into two sets of textures in turn, a frame each, through the Rust API (`decode_assembled_to_plane_textures`): one set took the stores and the other the copies, so that both met the GPU in the same state. Six rounds of 600 frames of each; mean milliseconds per frame, the lowest and the highest of the rounds, and the difference within each round:
+
+| | 1080p | 4K |
+|---|---|---|
+| Copies, frame after frame | 0.42 to 0.43 | 0.99 to 1.01 |
+| Stores, frame after frame | 0.40 to 0.41 | 0.90 to 0.93 |
+| Less with the stores | 0.018 to 0.026 | 0.078 to 0.085 |
+| Copies, 60 frames a second | 1.64 to 2.16 | 3.11 to 3.49 |
+| Stores, 60 frames a second | 1.82 to 2.07 | 3.04 to 3.40 |
+| Less with the stores, the median round (all rounds) | −0.02 (−0.32 to 0.29) | 0.16 (−0.29 to 0.40) |
+
+One round at 1080p, frame after frame, was disturbed for both, 0.54 and 0.58 ms, and is left out of the ranges.
+
+- **Frame after frame** the stores take 8 to 12 % less at 4K, 0.08 to 0.12 ms, about all that leaving out the copies promised ([#86](https://github.com/with-developer/emberwave/issues/86)), and about 0.02 ms, 5 %, less at 1080p.
+- **At 60 frames a second** the difference is within the noise of these runs: at 4K the median round gained 0.16 ms, about 5 %, while single rounds went from 0.29 ms worse to 0.40 ms better, and at 1080p nothing is measurable. Leaving out the copies had suggested about 0.3 ms at 4K. The gap to upstream at that pace (decision D48) remains for the next items of #86.
+- **The copies cost the same as before.** Timed alternately with the program built from `main`, the branch's copies took the same time frame after frame, 0.96 to 0.97 ms at 4K against 0.96 to 0.98 ms, so splitting the inverse transform into two shaders cost nothing.
+
 ## Picture quality
 
 What a frame's budget buys, on a hard picture: a 4K frame of the game Crimson Desert, grass, pines and a stone wall in daylight, from a screenshot taken in the game, a 3840x2160 PNG. It was converted to 8-bit 4:2:0 in BT.709's video range, each chroma sample the mean of its four pixels. On 2026-10-29, on the Apple M3 Max of the tables above, `emberwave-cli encode` encoded it within five budgets on the CPU, which makes the same bytes on every machine, and `emberwave-cli decode` decoded it again, built from the code of release 0.11.0. The GPU encoder (`--gpu`), on 2026-10-27 and 2026-10-29, gave the same sizes and the same PSNR to two decimals. PSNR is per plane, over the whole picture, against the 4:2:0 picture that the encoder took. `scripts/quality_figure.py` does all this from the 4:2:0 picture, prints this table and draws the README's picture, which enlarges the region that loses the most at the smallest budget. The frame itself is not in the repository (decision D49).
