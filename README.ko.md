@@ -19,16 +19,16 @@
   <a href="crates/emberwave-ffi/examples/ios">iPhone 앱</a>
 </p>
 
-[PyroWave](https://github.com/Themaister/pyrowave)는 로컬 네트워크 게임 스트리밍을 위한 비디오 코덱입니다. 대역폭을 넉넉히 쓰는 대신, GPU로 프레임 하나를 1~2 ms 안에 인코딩하고 디코딩합니다. Valve는 이 코덱을 Steam 클라이언트 베타의 Steam Remote Play에 도입했습니다([GamingOnLinux](https://www.gamingonlinux.com/2026/10/steam-client-beta-for-october-1st-brings-many-remote-play-pyrowave-improvements/)). 원본 구현(이하 업스트림)은 Vulkan 컴퓨트 셰이더로 작성되어 있고, 별도의 Metal 포트도 있습니다. **emberwave는 PyroWave를 [wgpu](https://wgpu.rs) 위에서 Rust와 WGSL로 새로 구현한 것입니다.** 코드 하나로 같은 비트스트림을 Metal, Vulkan, DX12, WebGPU에서 처리하므로, 네이티브 앱은 물론 브라우저 탭과 iPhone에서도 돌아갑니다.
+[PyroWave](https://github.com/Themaister/pyrowave)는 로컬 네트워크에서 게임을 스트리밍하는 데 쓰는 비디오 코덱입니다. 대역폭을 넉넉히 쓰는 대신, GPU로 프레임 하나를 1~2 ms 안에 인코딩하고 디코딩합니다. Valve는 이 코덱을 Steam 클라이언트 베타의 Steam Remote Play에 도입했습니다([GamingOnLinux](https://www.gamingonlinux.com/2026/10/steam-client-beta-for-october-1st-brings-many-remote-play-pyrowave-improvements/)). 원본 구현(이하 업스트림)은 Vulkan 컴퓨트 셰이더로 작성되어 있고, 별도의 Metal 포트도 있습니다. **emberwave는 PyroWave를 [wgpu](https://wgpu.rs) 위에서 Rust와 WGSL로 새로 구현한 것입니다.** 코드 하나로 같은 비트스트림을 Metal, Vulkan, DX12, WebGPU에서 처리하므로, 네이티브 앱은 물론 브라우저 탭과 iPhone에서도 돌아갑니다.
 
-- **빠릅니다.** Apple M3 Max에서 프레임을 연달아 처리하면 4K 프레임 하나를 YUV 평면으로 0.90 ms, RGB로 1.22 ms에 디코딩합니다. GPU 인코딩은 CPU 메모리의 그림을 받아 CPU 메모리에 프레임을 내놓기까지 1.90 ms가 걸립니다. 업스트림의 Metal 포트는 같은 FP32 정밀도에서 0.80 ms, 기본값인 FP16에서 0.56 ms에 디코딩하고, 인코딩에는 3.2~3.3 ms가 걸립니다([`BENCHMARKS.md`](BENCHMARKS.md), 2026-10-26 측정).
+- **빠릅니다.** Apple M3 Max에서 프레임을 연달아 처리하면 4K 프레임 하나를 YUV 평면으로 0.90 ms, RGB로 1.22 ms에 디코딩하고, GPU에서는 CPU 메모리의 평면에서 CPU 메모리의 프레임까지 1.90 ms에 인코딩합니다. 업스트림의 Metal 포트는 같은 FP32 정밀도에서 0.80 ms, 기본값인 FP16에서 0.56 ms에 디코딩하고, 인코딩에는 3.2~3.3 ms가 걸립니다([`BENCHMARKS.md`](BENCHMARKS.md), 2026-10-26 측정).
 - **프레임마다 독립적입니다.** 다른 프레임을 참조하는 프레임이 없습니다. 그래서 패킷을 잃어도 잃는 것은 많아야 그 프레임 하나이고, 키프레임을 기다릴 필요도 없습니다. 잃은 패킷에 가장 거친 레벨이나 프레임 헤더가 들어 있지 않았다면, emberwave의 프레임은 일부만이라도 화면에 보여 줄 수 있습니다. 모든 프레임은 정해진 바이트 예산을 넘지 않습니다.
-- **업스트림과 양방향으로 호환됩니다.** 업스트림 인코더로 만든 스트림을 업스트림 디코더와 같은 결과(PSNR 64 dB 이상)로 디코딩하고, 업스트림 디코더도 emberwave가 만든 스트림을 그대로 읽습니다. 프레임 크기가 같을 때, 두 인코더가 공통으로 최소화하는 대비 감도 가중 오차는 emberwave 쪽이 업스트림 인코더(2026년 10월에 레이트 컨트롤을 고친 버전)보다 6.5~13% 적습니다. luma PSNR로 비교하면 그라데이션에서는 0.8 dB 낮고 테스트 장면에서는 최대 2.3 dB 높으며, 노이즈에서는 차이가 없습니다.
-- **네이티브 앱, 브라우저, iPhone 어디서나.** 명령줄 도구가 있고, [브라우저 플레이어](https://with-developer.github.io/emberwave/)는 페이지 안에서 WebGPU로 디코딩합니다. 플레이어는 직접 인코딩한 데모 스트림으로 시작하며, 네트워크에서처럼 순서가 뒤섞이고 일부가 사라진 패킷으로도 스트림을 재생합니다. C API는 Linux·Windows(x86_64)와 macOS(Apple silicon)용으로 미리 빌드한 라이브러리를 함께 제공하고, iPhone·iPad·Mac 앱을 위한 XCFramework도 있습니다. Apple GPU에서 테스트했고, CI에서는 소프트웨어 Vulkan과 DX12로 테스트합니다.
+- **업스트림과 양방향으로 호환됩니다.** 업스트림 인코더로 만든 스트림을 업스트림 디코더와 같은 결과(PSNR 64 dB 이상)로 디코딩하고, 업스트림 디코더도 emberwave가 만든 스트림을 읽습니다. 프레임당 바이트 수가 같을 때, 두 인코더가 공통으로 최소화하는 대비 감도로 가중한 오차는 emberwave 쪽이 업스트림 인코더(2026년 10월에 레이트 컨트롤을 고친 버전)보다 6.5~13% 적습니다. 노이즈만은 예외로, 두 인코더의 차이가 1% 안입니다. luma PSNR 차이는 그림에 따라 그러데이션의 −0.8 dB부터 테스트 장면의 +2.3 dB까지 걸쳐 있고, 노이즈에서는 차이가 없습니다.
+- **네이티브 앱, 브라우저, iPhone 어디서나.** 명령줄 도구가 있고, [브라우저 플레이어](https://with-developer.github.io/emberwave/)는 페이지 안에서 WebGPU로 디코딩합니다. 플레이어는 스스로 인코딩한 데모 스트림으로 시작하며, 네트워크에서처럼 패킷이 하나씩, 순서가 뒤섞이고 일부가 사라진 채로 들어와도 스트림을 재생합니다. C API는 Linux·Windows(x86_64)와 macOS(Apple silicon)용으로 미리 빌드한 라이브러리를 함께 제공하고, iPhone·iPad·Mac 앱을 위한 XCFramework도 있습니다. Apple GPU에서 테스트했고, CI에서는 소프트웨어 Vulkan과 DX12로 테스트합니다.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/decode-dark.svg">
-  <img alt="프레임당 디코딩 시간(GPU 메모리의 RGB까지). Apple M3 Max: Metal 네이티브 1080p 0.53 ms, 4K 1.22 ms, Chrome의 WebGPU 0.70~1.00 ms, 1.69~1.88 ms. iPhone 17: 네이티브 앱 1.62~1.63 ms, 6.21~6.29 ms, Safari 2.36 ms, 8.05 ms." src="docs/images/decode-light.svg" width="100%">
+  <img alt="프레임당 디코딩 시간(GPU 메모리의 RGB까지). Apple M3 Max: Metal 네이티브로 1080p 0.53 ms, 4K 1.22 ms, Chrome의 WebGPU로 1080p 0.70~1.00 ms, 4K 1.69~1.88 ms. iPhone 17: 네이티브 앱에서 1080p 1.62~1.63 ms, 4K 6.21~6.29 ms, Safari에서 1080p 2.36 ms, 4K 8.05 ms." src="docs/images/decode-light.svg" width="100%">
 </picture>
 
 위 수치는 프레임을 쉬지 않고 연달아 처리할 때의 시간입니다. 실제 스트림에서는 프레임이 초당 60개씩 들어오고, 그 사이에 쉬는 GPU가 속도를 낮추기 때문에 디코딩 한 번에 시간이 더 걸립니다([성능](#성능)).
@@ -41,7 +41,7 @@
   <img alt="게임 붉은사막의 4K 프레임과, 돌벽 앞 소나무가 있는 320×180 영역을 두 배로 확대한 모습. 원본과, 네 가지 예산으로 인코딩한 emberwave 프레임의 디코딩 결과입니다. 초당 60프레임 기준 비트레이트와 프레임 전체의 luma PSNR은 322 Mbit/s 25.8 dB, 499 Mbit/s 27.1 dB, 816 Mbit/s 29.9 dB, 1200 Mbit/s 32.9 dB입니다." src="docs/images/quality.png" width="100%">
 </p>
 
-PyroWave는 대역폭을 더 쓰는 대신 속도를 얻습니다. 필요한 대역폭은 그림에 따라 크게 달라집니다. 위의 4K 게임 화면은 풀과 솔잎, 돌이 대부분이라 압축하기 어려운 그림입니다. 프레임은 emberwave 인코더로 만들었고, 디코딩한 패널마다 초당 60프레임 기준 비트레이트와 프레임 전체의 luma PSNR을 적었습니다. 확대한 곳은 화질이 가장 많이 떨어지는 영역입니다. 322 Mbit/s에서는 솔잎이 뭉개지고 벽의 이음매가 흐려집니다. 816 Mbit/s에서는 대부분 되살아나고, 1.2 Gbit/s에서는 원본과 거의 같아집니다. 반면 벤치마크용 합성 4K 장면의 첫 그림은 322 Mbit/s에서도 42.7 dB를 유지합니다. 같은 게임 프레임을 Apple 하드웨어 HEVC 인코더로 실시간 모드 없이 키프레임 하나로 만들면, 같은 예산에서 luma PSNR이 1.9~3.5 dB 높습니다(Apple M3 Max, macOS 27.0.1, 2026-10-27). 게다가 HEVC 스트림은 시작할 때와 손실 뒤에만 키프레임이 필요합니다. PyroWave는 대역폭이 넉넉한 로컬 네트워크를 위한 코덱입니다([`BENCHMARKS.md`](BENCHMARKS.md#picture-quality)).
+PyroWave는 대역폭을 더 쓰는 대신 속도를 얻습니다. 필요한 대역폭은 그림에 따라 크게 달라집니다. 위의 4K 게임 화면은 상당 부분이 풀과 솔잎, 돌이라 압축하기 어려운 그림입니다. 패널의 프레임은 모두 emberwave 인코더로 인코딩했고, 디코딩한 패널마다 초당 60프레임 기준 비트레이트와 프레임 전체의 luma PSNR을 적었습니다. 두 배로 확대한 곳은 화질이 가장 많이 떨어지는 영역입니다. 322 Mbit/s에서는 솔잎이 뭉개지고 벽의 이음매가 흐려집니다. 816 Mbit/s에서는 대부분 되살아나고, 1.2 Gbit/s에서는 원본에 가까워집니다. 반면 벤치마크용 합성 4K 장면의 첫 그림은 322 Mbit/s에서도 42.7 dB를 유지합니다. 같은 게임 프레임을 Apple 하드웨어 HEVC 인코더로, 실시간 모드를 쓰지 않고 키프레임 하나로 만들면 같은 예산에서 luma PSNR이 emberwave보다 1.9~3.5 dB 높습니다(Apple M3 Max, macOS 27.0.1, 2026-10-27). 게다가 HEVC 스트림은 시작할 때와 손실 뒤에만 키프레임이 필요합니다. PyroWave는 대역폭이 넉넉한 로컬 네트워크를 위한 코덱입니다([`BENCHMARKS.md`](BENCHMARKS.md#picture-quality)).
 
 <sub>프레임은 붉은사막(Crimson Desert)의 것이며 © Pearl Abyss입니다. 본 콘텐츠는 펄어비스의 공식 자료가 아니며, 본 콘텐츠에는 펄어비스가 권리를 보유하고 있는 상표 또는 저작물이 포함되어 있습니다. 펄어비스가 만들거나 보증한 것이 아닙니다. 이 그림에는 이 저장소의 라이선스가 적용되지 않습니다.</sub>
 
@@ -49,14 +49,14 @@ PyroWave는 대역폭을 더 쓰는 대신 속도를 얻습니다. 필요한 대
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/pipeline-dark.svg">
-  <img alt="Apple M3 Max에서 4K 프레임 하나가 emberwave를 거치는 과정. GPU 인코딩: 웨이블릿 변환 0.40 ms, 양자화 0.59 ms, 레이트 제어 0.13 ms, 패킹 0.18 ms, 최대 1.2 MB의 프레임. 패킷이 네트워크를 건넌 뒤 디코딩: CPU에서 조립 0.10 ms, 역양자화 0.19 ms, 역변환 0.40 ms, YUV에서 RGB로 변환 0.24 ms." src="docs/images/pipeline-light.svg" width="100%">
+  <img alt="Apple M3 Max에서 4K 프레임 하나가 emberwave를 거치는 과정. GPU 인코딩: 웨이블릿 변환 0.40 ms, 양자화 0.59 ms, 레이트 컨트롤 0.13 ms, 패킹 0.18 ms, 최대 1.2 MB의 프레임. 패킷이 네트워크를 건넌 뒤 디코딩: CPU에서 조립 0.10 ms, 역양자화 0.19 ms, 역변환 0.40 ms, YUV에서 RGB로 변환 0.24 ms." src="docs/images/pipeline-light.svg" width="100%">
 </picture>
 
-프레임은 그림을 웨이블릿 변환한 결과입니다. 변환 계수를 블록 단위로 양자화한 뒤 비트 평면으로 나누어, 가장 중요한 비트부터 보냅니다. 프레임을 예산에 맞출 때 인코더는 화질을 가장 덜 해치는 곳에서부터 하위 비트 평면을 버리는데, 이때 대역마다 사람 눈이 얼마나 민감한지를 가중치로 씁니다. 그림에 나온 단계는 디코더의 패킷 조립을 빼면 모두 WGSL 컴퓨트 셰이더로 실행됩니다. 조립은 업스트림 디코더와 마찬가지로 CPU에서 합니다. 그 밖에 CPU는 평면을 GPU로 올리고, 완성된 프레임을 받아 오고, 그림의 헤더를 복사합니다. 비트스트림 구조와 각 패스, 그리고 설계 결정의 배경은 [`ARCHITECTURE.md`](ARCHITECTURE.md)에 있습니다.
+프레임은 그림을 웨이블릿 변환한 결과입니다. 변환 계수를 블록 단위로 양자화한 뒤 비트 평면으로 나누어, 최상위 비트부터 보냅니다. 프레임을 예산에 맞출 때 인코더는 화질을 가장 덜 해치는 곳에서부터 하위 비트 평면을 버리는데, 이때 대역마다 사람 눈이 얼마나 민감한지를 가중치로 씁니다. 위 도식에 나온 단계는 디코더의 패킷 조립을 빼면 모두 WGSL 컴퓨트 셰이더로 실행됩니다. 조립은 업스트림 디코더와 마찬가지로 CPU에서 합니다. 이 단계들의 앞뒤로 CPU는 평면을 GPU로 올리고, 완성된 프레임을 받아 오고, 그림의 헤더를 복사합니다. 비트스트림 구조와 각 패스, 그리고 설계 결정의 배경은 [`ARCHITECTURE.md`](ARCHITECTURE.md)에 있습니다.
 
 ## 빠른 시작
 
-[Rust](https://rustup.rs) 1.87 이상과, Vulkan·Metal·DX12 중 하나를 지원하는 GPU가 필요합니다. GPU가 없어도 소프트웨어 드라이버로 실행할 수 있습니다. Linux에서는 Mesa의 lavapipe를(Debian과 Ubuntu에서는 `sudo apt install mesa-vulkan-drivers libvulkan1`), Windows에서는 기본으로 들어 있는 WARP를 씁니다.
+[Rust](https://rustup.rs) 1.87 이상, 그리고 Vulkan·Metal·DX12 중 하나를 지원하는 GPU가 필요합니다. GPU가 없어도 소프트웨어 드라이버로 실행할 수 있습니다. Linux에서는 Mesa의 lavapipe(Debian과 Ubuntu에서는 `sudo apt install mesa-vulkan-drivers libvulkan1`로 설치), Windows에서는 기본으로 들어 있는 WARP를 쓰면 됩니다.
 
 ```sh
 git clone https://github.com/with-developer/emberwave.git
@@ -65,9 +65,9 @@ cargo build --release -p emberwave-cli
 target/release/emberwave-cli decode testdata/gradient_200x120_420.pwv1 --out-dir out
 ```
 
-처음 빌드할 때는 몇 분이 걸립니다. 마지막 명령은 사용 중인 어댑터와 프레임별 시간을 출력하고, 색 그라데이션 그림 `out/gradient_200x120_420_000000.png`부터 `000002.png`까지를 만듭니다. `testdata/`의 `.pwv1` 파일들은 업스트림 인코더로 만든 작은 스트림입니다.
+처음 빌드할 때는 몇 분이 걸립니다. 마지막 명령은 사용 중인 어댑터와 프레임별 시간을 출력하고, 색 그러데이션 그림 `out/gradient_200x120_420_000000.png`부터 `000002.png`까지를 만듭니다. `testdata/`의 `.pwv1` 파일은 업스트림 인코더로 만든 작은 스트림입니다.
 
-Rust가 없다면 [릴리스](https://github.com/with-developer/emberwave/releases)에서 Linux(x86_64), macOS(Apple silicon), Windows(x86_64)용 `emberwave-cli`를 내려받아 `testdata/`의 `.pwv1` 파일을 디코딩해 보면 됩니다. macOS 바이너리는 서명되어 있지 않으므로, 내려받은 뒤 `xattr -d com.apple.quarantine emberwave-cli`를 한 번 실행하세요.
+Rust가 없다면 [릴리스](https://github.com/with-developer/emberwave/releases)에서 Linux(x86_64), macOS(Apple silicon), Windows(x86_64)용 `emberwave-cli`를 내려받아 `testdata/`의 `.pwv1` 파일을 디코딩해 보면 됩니다. macOS 바이너리는 서명이 없으므로, 내려받은 뒤 `xattr -d com.apple.quarantine emberwave-cli`를 한 번 실행하세요.
 
 ## 사용법
 
@@ -103,14 +103,14 @@ emberwave-cli bench-encode testdata/encoder/scene_200x120_420.source.y4m --bytes
 
 ### C에서 쓰기
 
-C API를 쓰면 클라이언트는 받은 패킷을 그대로 넘겨 호출자의 메모리에 디코딩하고, 호스트는 보낼 그림을 프레임과 패킷으로 인코딩합니다. 헤더 `crates/emberwave-ffi/include/emberwave.h`와 공유·정적 라이브러리로 이루어지며, 릴리스마다 미리 빌드한 라이브러리도 올라갑니다. 빌드와 링크 방법은 [`crates/emberwave-ffi/README.md`](crates/emberwave-ffi/README.md)에 있고, [`examples/c/decode.c`](crates/emberwave-ffi/examples/c/decode.c)와 [`examples/c/encode.c`](crates/emberwave-ffi/examples/c/encode.c)는 그대로 빌드해 실행할 수 있는 예제입니다.
+C API를 쓰면 클라이언트는 패킷을 받는 대로 넘겨 호출자의 메모리에 디코딩하고, 호스트는 보낼 그림을 프레임과 패킷으로 인코딩합니다. 헤더 `crates/emberwave-ffi/include/emberwave.h`와 공유·정적 라이브러리로 이루어지며, 릴리스마다 미리 빌드한 라이브러리도 올라갑니다. 빌드와 링크 방법은 [`crates/emberwave-ffi/README.md`](crates/emberwave-ffi/README.md)에 있고, [`examples/c/decode.c`](crates/emberwave-ffi/examples/c/decode.c)와 [`examples/c/encode.c`](crates/emberwave-ffi/examples/c/encode.c)는 완전한 예제 프로그램입니다.
 
-iPhone, iPad, Mac 앱을 위해서는 릴리스마다 정적 라이브러리를 XCFramework(`Emberwave.xcframework`)로도 제공하며, Swift에서는 `import Emberwave`로 씁니다. Metal 클라이언트는 그림을 GPU 텍스처 한 장에 그려 받거나 Y, Cb, Cr 평면을 텍스처 세 장에 받아서, 그 `id<MTLTexture>`를 바로 쓸 수 있습니다([GPU의 그림](crates/emberwave-ffi/README.md#pictures-on-the-gpu-metal)). [`examples/swift`](crates/emberwave-ffi/examples/swift)는 이 프레임워크로 Swift에서 파일을 디코딩하는 예제이고, [`examples/ios`](crates/emberwave-ffi/examples/ios)는 iPhone·iPad용 벤치마크 앱입니다. CI는 예제와 앱을 iOS 시뮬레이터에서 실행합니다([iPhone, iPad, Mac 앱](crates/emberwave-ffi/README.md#iphone-ipad-and-mac-apps)).
+iPhone, iPad, Mac 앱을 위해서는 릴리스마다 정적 라이브러리를 XCFramework(`Emberwave.xcframework`)로도 제공하며, Swift에서는 `import Emberwave`로 씁니다. Metal 클라이언트는 그림을 GPU 텍스처 한 장에 그리게 하거나 Y, Cb, Cr 평면을 텍스처 세 장에 담게 한 뒤, 그 `id<MTLTexture>`를 읽을 수 있습니다([GPU의 그림](crates/emberwave-ffi/README.md#pictures-on-the-gpu-metal)). [`examples/swift`](crates/emberwave-ffi/examples/swift)는 이 프레임워크로 Swift에서 파일을 디코딩하는 예제이고, [`examples/ios`](crates/emberwave-ffi/examples/ios)는 iPhone·iPad용 벤치마크 앱입니다. CI는 예제와 앱을 이 프레임워크로 iOS 시뮬레이터에서 실행합니다([iPhone, iPad, Mac 앱](crates/emberwave-ffi/README.md#iphone-ipad-and-mac-apps)).
 
 ## 성능
 
 <!-- bench-summary:begin (scripts/bench.sh가 생성합니다. 고쳐도 덮어씁니다) -->
-Apple M3 Max(Metal)에서 측정한 프레임당 디코딩 시간입니다. 단위는 밀리초이고, RGB 출력은 GPU 메모리에 둔 채로 쟀습니다(2026-10-26 측정).
+Apple M3 Max(Metal)에서 2026-10-26에 측정한 프레임당 디코딩 시간입니다. RGB 출력은 GPU 메모리에 둔 채로 쟀고, 단위는 밀리초입니다.
 
 | 스트림 | 평균 | p99 |
 |---|---|---|
@@ -118,9 +118,9 @@ Apple M3 Max(Metal)에서 측정한 프레임당 디코딩 시간입니다. 단�
 | 1440p | 0.69 | 0.97 |
 | 4K | 1.22 | 1.62 |
 
-같은 기기에서 업스트림의 Metal 디코더는 이보다 빠릅니다. 4K 프레임 하나를 평면까지 디코딩하는 데 업스트림은 FP32로 0.80 ms, emberwave는 0.90 ms가 걸립니다. 측정 방법과 전체 결과는 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.
+같은 기기에서는 업스트림의 Metal 디코더가 emberwave보다 빠릅니다. 4K 프레임 하나를 평면까지 디코딩하는 데 업스트림은 FP32로 0.80 ms, emberwave는 0.90 ms가 걸립니다. 측정 방법과 전체 결과는 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.
 
-4K 프레임 하나를 1.2 MB 이내로 인코딩하는 데는 GPU에서 1.90 ms가 걸립니다. CPU 메모리의 평면을 받아 CPU 메모리에 프레임을 내놓기까지의 시간이며, 업스트림 인코더는 FP32로 3.33 ms가 걸립니다.
+4K 프레임 하나를 1.2 MB 이내로 인코딩하는 데는 GPU에서 1.90 ms가 걸립니다. CPU 메모리의 평면을 받아 CPU 메모리에 프레임을 내놓기까지의 시간이며, 업스트림 인코더는 같은 구간에서 FP32로 3.33 ms가 걸립니다.
 <!-- bench-summary:end -->
 
 <picture>
@@ -130,11 +130,11 @@ Apple M3 Max(Metal)에서 측정한 프레임당 디코딩 시간입니다. 단�
 
 iPhone 17의 Safari에서는 [벤치마크 페이지](https://with-developer.github.io/emberwave/bench.html)가 1080p 프레임을 2.4 ms, 4K 프레임을 8.1 ms에 GPU 메모리의 RGB로 디코딩합니다([`BENCHMARKS.md`](BENCHMARKS.md#in-the-browser-phones-included)). XCFramework를 쓰는 네이티브 [벤치마크 앱](crates/emberwave-ffi/examples/ios)은 같은 프레임을 Metal 텍스처 한 장에는 1.6 ms와 6.2~6.3 ms, Y·Cb·Cr 텍스처에는 1.3 ms와 4.8 ms에 디코딩합니다([`BENCHMARKS.md`](BENCHMARKS.md#on-the-iphone-natively)).
 
-같은 앱으로 Moonlight가 쓰는 하드웨어 HEVC 디코더도 Moonlight의 기본 비트레이트에서 측정했습니다(위 측정의 하루 뒤). 프레임을 연달아 디코딩하면 emberwave의 텍스처 디코딩이 M3 Max에서 2.2~3.9배(4K 기준 1.0 ms 대 2.6~3.4 ms), iPhone 17에서 1.4~1.7배(4.5 ms 대 HEVC 6.2~6.3 ms) 빠릅니다. 하지만 프레임이 초당 60개씩 들어오면, GPU는 프레임 사이에 쉬면서 느려지는 반면 미디어 엔진은 그렇지 않습니다. 이때 Mac에서는 둘이 비슷하고, 폰에서는 HEVC가 1.5~2.7배 빠릅니다([`BENCHMARKS.md`](BENCHMARKS.md#against-hevc-on-the-same-device)).
+같은 앱으로 Moonlight가 쓰는 하드웨어 HEVC 디코더도 Moonlight의 기본 비트레이트에서 측정했습니다. 프레임을 연달아 디코딩하면 emberwave의 텍스처 디코딩이 M3 Max에서 2.2~3.9배(4K 기준 1.0 ms 대 2.6~3.4 ms), iPhone 17에서 1.4~1.7배(4.5 ms 대 HEVC 6.2~6.3 ms) 빠릅니다(위 측정의 하루 뒤에 잰 값). 하지만 프레임이 초당 60개씩 들어오면, GPU는 프레임 사이에 쉬면서 느려지는 반면 미디어 엔진은 그렇지 않습니다. 이때 Mac에서는 둘이 비슷하고, iPhone에서는 HEVC가 1.5~2.7배 빠릅니다([`BENCHMARKS.md`](BENCHMARKS.md#against-hevc-on-the-same-device)).
 
 ## 목표
 
-- 원본 PyroWave 인코더가 만든 비트스트림을 파일에서 바로 디코딩해, 레퍼런스 디코더와 같은 출력을 냅니다. PyroWave 디코딩은 부동소수점 연산이라 애초에 비트 단위로 일치하지 않으므로, 레퍼런스 디코더 대비 평면별 PSNR 60 dB 이상을 합격 기준으로 삼습니다.
+- 업스트림 인코더가 만든 비트스트림을 파일에서 바로 디코딩해, 레퍼런스 디코더의 출력에 맞춥니다. PyroWave 디코딩은 부동소수점 연산이라 설계상 비트 단위로 같지 않으므로, 레퍼런스 디코더 대비 평면별 PSNR 60 dB 이상을 합격 기준으로 삼습니다.
 - wgpu가 모든 백엔드에서 보장하는 기능만 씁니다. Vulkan 전용 확장이나 서브그룹 연산은 쓰지 않습니다.
 - macOS(Metal)에서 1080p, 1440p, 4K의 프레임당 디코딩 시간을 재고, 측정 환경과 함께 공개합니다.
 
@@ -142,17 +142,17 @@ iPhone 17의 Safari에서는 [벤치마크 페이지](https://with-developer.git
 
 ## 로드맵
 
-지금까지 첫 릴리스까지의 마일스톤 M0~M5([#1](https://github.com/with-developer/emberwave/issues/1)~[#6](https://github.com/with-developer/emberwave/issues/6))를 마쳤습니다. 그 뒤로 CPU·GPU 인코더([#14](https://github.com/with-developer/emberwave/issues/14)), 브라우저 플레이어와 벤치마크 페이지([#15](https://github.com/with-developer/emberwave/issues/15)), 클라이언트와 호스트를 위한 C API([#16](https://github.com/with-developer/emberwave/issues/16), [#42](https://github.com/with-developer/emberwave/issues/42)), Metal 텍스처를 포함해 GPU 메모리의 그림을 주고받는 기능([#27](https://github.com/with-developer/emberwave/issues/27), [#33](https://github.com/with-developer/emberwave/issues/33)), iPhone·iPad·Mac 앱용 XCFramework([#52](https://github.com/with-developer/emberwave/issues/52))를 만들었습니다. 0.12에서는 Apple GPU에서 프레임마다 하던 복사 두 가지를 없앴습니다. Metal에서는 평면을 텍스처에 바로 쓰고, Apple silicon에서는 프레임을 셰이더가 읽는 메모리에 바로 씁니다([#86](https://github.com/with-developer/emberwave/issues/86)). 릴리스별 변경 사항은 [`CHANGELOG.md`](CHANGELOG.md)에 있습니다.
+첫 릴리스까지의 마일스톤 M0~M5([#1](https://github.com/with-developer/emberwave/issues/1)~[#6](https://github.com/with-developer/emberwave/issues/6))를 마쳤고, 그 뒤로 CPU·GPU 인코더([#14](https://github.com/with-developer/emberwave/issues/14)), 브라우저 플레이어와 벤치마크 페이지([#15](https://github.com/with-developer/emberwave/issues/15)), 클라이언트와 호스트를 위한 C API([#16](https://github.com/with-developer/emberwave/issues/16), [#42](https://github.com/with-developer/emberwave/issues/42)), Metal 텍스처를 포함해 GPU 메모리의 그림을 주고받는 기능([#27](https://github.com/with-developer/emberwave/issues/27), [#33](https://github.com/with-developer/emberwave/issues/33)), iPhone·iPad·Mac 앱용 XCFramework([#52](https://github.com/with-developer/emberwave/issues/52))를 만들었습니다. 0.12에서는 Apple GPU에서 프레임마다 하던 복사 두 가지를 없앴습니다. Metal에서는 평면을 텍스처에 바로 쓰고, Apple silicon에서는 프레임을 셰이더가 읽는 메모리에 바로 씁니다([#86](https://github.com/with-developer/emberwave/issues/86)). 릴리스별 변경 사항은 [`CHANGELOG.md`](CHANGELOG.md)에 있습니다.
 
 앞으로는 다음 순서로 진행합니다.
 
-1. **0.13, 실사용 환경에서 측정.** 클라이언트의 화면 출력 루프 안에서 디코딩해, 화면에 나오기까지의 시간을 Mac과 iPhone에서 잽니다([#81](https://github.com/with-developer/emberwave/issues/81)). NVENC로 만든 HEVC와 AV1 스트림을 emberwave 스트림과 나란히 디코딩하고, 움직이는 게임 영상의 화질을 같은 비트레이트에서 예측 프레임을 쓰는 HEVC와 비교합니다([#82](https://github.com/with-developer/emberwave/issues/82)). XCFramework는 Swift 패키지로도 배포합니다. [#86](https://github.com/with-developer/emberwave/issues/86)의 마지막 항목인 프레임마다의 CPU 준비 작업도 줄입니다.
+1. **0.13, 실사용 환경에서 측정.** 클라이언트의 화면 출력 루프 안에서 디코딩해, 화면에 나오기까지의 시간을 Mac과 iPhone에서 잽니다([#81](https://github.com/with-developer/emberwave/issues/81)). NVENC로 만든 HEVC와 AV1 스트림을 emberwave 스트림과 나란히 디코딩하고, 움직이는 게임 영상의 화질을 같은 비트레이트에서 예측 프레임을 쓰는 HEVC와 비교합니다([#82](https://github.com/with-developer/emberwave/issues/82)). XCFramework는 Swift 패키지로도 배포합니다. [#86](https://github.com/with-developer/emberwave/issues/86)의 마지막 항목인, 프레임마다 하는 CPU 준비 작업도 줄입니다.
 2. **0.14, 화질과 플랫폼.** 비트스트림은 그대로 두고 인코더의 화질을 높입니다. 또 Linux와 Windows의 클라이언트·호스트를 위해 C API의 GPU 연동에 Vulkan과 Direct3D 12 핸들을 추가합니다.
-3. **1.0을 향해: 클라이언트.** emberwave는 코덱으로 남기고, 브라우저 스트리밍은 별도 저장소에서 만듭니다. 호스트 화면을 GPU에서 인코딩해 로컬 네트워크로 보내고, 브라우저 탭에서 WebGPU로 디코딩합니다. 지연 시간부터 잽니다. 그다음에는 PyroWave로 스트리밍하는 호스트들에 emberwave 인코더를 제안합니다. 1.0이 되려면 안정된 C·Rust API, 실제로 쓰이는 클라이언트 하나, 그리고 실제 스트림 속도에서 업스트림만큼 빠른 디코딩이 필요합니다.
+3. **1.0을 향해: 클라이언트.** emberwave가 코덱으로 남도록, 브라우저 스트리밍은 별도 저장소에서 만듭니다. 호스트 화면을 GPU에서 인코딩해 로컬 네트워크로 보내고, 브라우저 탭에서 WebGPU로 디코딩합니다. 지연 시간부터 잽니다. 그다음에는 PyroWave로 스트리밍하는 호스트들에 emberwave 인코더를 제안합니다. 1.0이 되려면 안정된 C·Rust API, 실제로 쓰이는 클라이언트 하나, 그리고 프레임이 실제 스트림의 간격으로 들어올 때 업스트림만큼 빠른 디코딩이 필요합니다.
 
 ## 저장소 구성
 
-README를 제외한 문서는 모두 영어로 되어 있습니다.
+한국어판이 있는 문서는 이 README뿐이고, 나머지 문서는 모두 영어로 되어 있습니다.
 
 | 경로 | 내용 |
 |---|---|
@@ -162,7 +162,7 @@ README를 제외한 문서는 모두 영어로 되어 있습니다.
 | `crates/emberwave-web`, `web/` | 브라우저 플레이어와 벤치마크: WebAssembly 모듈과 페이지 |
 | `testdata/` | 테스트 벡터와 재생성 방법 |
 | `scripts/` | 테스트 데이터, 4K 합격 검사, 벤치마크 스크립트 |
-| `docs/images/` | README의 배너와 차트(`scripts/readme_figures.py`가 `BENCHMARKS.md`의 수치로 그림), 화질 그림(`scripts/quality_figure.py`로 만듦) |
+| `docs/images/` | README의 배너와 차트(`scripts/readme_figures.py`가 `BENCHMARKS.md`의 수치로 생성), 화질 그림(`scripts/quality_figure.py`로 생성) |
 | `README.md` | 이 README의 영어판 |
 | `ARCHITECTURE.md` | 비트스트림 형식, GPU 파이프라인, 결정 기록 |
 | `BENCHMARKS.md` | 디코딩 시간 측정 방법과 결과 |
@@ -183,8 +183,8 @@ GPU 어댑터가 없으면 GPU 테스트는 건너뜁니다. 단, `EMBERWAVE_REQ
 
 emberwave는 PyroWave의 알고리즘 구조와 [비트스트림 정의](https://github.com/Themaister/pyrowave/blob/7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b/bitstream/bitstream.md)를 따르지만, 업스트림 저장소에서 코드를 가져오지 않고 새로 작성했습니다. 테스트 벡터와 레퍼런스 출력은 업스트림의 인코더와 디코더로 만듭니다([`testdata/README.md`](testdata/README.md) 참고).
 
-업스트림에도 Apple 전용 Metal 포트가 있습니다. emberwave는 Vulkan, DX12, 브라우저까지 하나의 이식 가능한 코드로 아우르는 것을 목표로 합니다.
+업스트림에도 Apple 전용 Metal 포트가 있습니다. emberwave는 Vulkan, DX12, 브라우저까지 이식 가능한 코드 하나로 아우르는 것을 목표로 합니다.
 
 ## 라이선스
 
-MIT 라이선스입니다([`LICENSE`](LICENSE)). [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)에는 PyroWave의 저작권 고지와 라이선스, 그리고 이 라이선스가 적용되지 않는 항목이 정리되어 있습니다. `docs/images/quality.png`의 붉은사막 프레임은 © Pearl Abyss이며, 릴리스의 소스 아카이브에는 들어가지 않습니다.
+MIT 라이선스입니다([`LICENSE`](LICENSE)). [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)에는 PyroWave의 저작권 고지와 라이선스, 그리고 이 라이선스가 적용되지 않는 항목이 정리되어 있습니다. 그중 `docs/images/quality.png`의 붉은사막 프레임은 © Pearl Abyss이며, 릴리스의 소스 아카이브에는 들어가지 않습니다.
