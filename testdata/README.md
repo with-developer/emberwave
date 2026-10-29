@@ -53,7 +53,7 @@ Vectors use upstream's raw disk format, PWV1 (`.pwv1`): a `PWV1Header`, then for
 
 Pictures are synthesised deterministically by `scripts/refgen/refgen.mm`, a small tool that only writes the pictures into upstream's encoder and reads decoded pictures out of upstream's decoder. All bitstream production and decoding is upstream's.
 
-The pictures are BT.709 in video range, and the PWV1 header that `refgen` writes says so (`--range` and `--siting` change it). The start of frame header of each frame says something else: BT.709, full range and centred chroma, the zero values of its fields. That header is the encoder's, and upstream's Metal encoder has no way to set its colour signalling. Tools that read files (`emberwave-cli`, the browser player) take the colours from the file header; the C API, which sees only packets, takes those of the frame unless the caller passes better ones.
+The pictures are BT.709 in video range, and the PWV1 header that `refgen` writes says so (`--range` and `--siting` change it). The start of frame header of each frame says something else: BT.709, full range and centred chroma, the zero values of its fields. That header is the encoder's, and upstream's Metal encoder has no way to set its colour signalling. Tools that read files (`emberwave-cli`, the browser player) take the colours from the file header; the C API, which sees only packets, takes those of the frame unless the caller passes better ones, and so does the browser player with a stream it receives as packets, unless `set_colors` sets them.
 
 Each vector comes as:
 
