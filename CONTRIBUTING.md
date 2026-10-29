@@ -75,4 +75,4 @@ After a deliberate change to what the encoder writes, `scripts/gen_encoder_vecto
 
 ## Licence
 
-emberwave is MIT licensed, and contributions are accepted under the same licence.
+emberwave is MIT licensed, and contributions are accepted under the same licence. [`LICENSE`](LICENSE) is the MIT licence alone; PyroWave's licence, and what is in the repository but not covered by the licence, are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), which ships wherever `LICENSE` does (decision D51).

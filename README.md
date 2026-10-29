@@ -163,6 +163,7 @@ Next, in this order:
 | `BENCHMARKS.md` | How decode times are measured, and the results |
 | `CONTRIBUTING.md` | How to build, test and change the code |
 | `CHANGELOG.md` | What each release changed |
+| `LICENSE`, `THIRD_PARTY_NOTICES.md` | The MIT license; PyroWave's license and what the license does not cover |
 
 ## Development
 
@@ -181,4 +182,4 @@ Upstream also ships an Apple-only Metal port. emberwave aims at one portable cod
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE), which also carries the PyroWave copyright notice. The frame of Crimson Desert in `docs/images/quality.png` is © Pearl Abyss and not covered by the license; the source archives of releases leave it out.
+MIT. See [`LICENSE`](LICENSE). [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) has PyroWave's copyright notice and license, and what the license does not cover: the frame of Crimson Desert in `docs/images/quality.png`, © Pearl Abyss, which the source archives of releases leave out.
