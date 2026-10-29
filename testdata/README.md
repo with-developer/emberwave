@@ -7,8 +7,10 @@ Test vectors are encoded by the **original PyroWave encoder**, and the reference
 | | |
 |---|---|
 | Repository | <https://github.com/Themaister/pyrowave> |
-| Commit | `79a3232a2199281f33f7a2e2659fc4fac62b022a` (2026-10-21, "Added Metal P010 support") |
+| Commit | `7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b` (2026-10-27, "Port shader quality fixes to Metal") |
 | Bitstream | v1, frozen 2026-10-03 (`bitstream/bitstream.md`) |
+
+The committed vectors and their reference decodes were made at `79a3232a2199281f33f7a2e2659fc4fac62b022a` (2026-10-21). The pin moved on 2026-10-29, after upstream fixed two faults of its encoder's rate control, which change no bitstream: at the new commit upstream's decoder makes every committed reference decode, `*.ref.y4m` and `*.ref-fp32.y4m`, those of `testdata/encoder/` too, byte for byte, so they stay. `ARCHITECTURE.md`, decision D56, has the details.
 
 ## Building the upstream reference
 
@@ -18,7 +20,7 @@ No Granite and no Vulkan SDK are needed. The MSL shaders are committed upstream 
 
 ```sh
 git clone https://github.com/Themaister/pyrowave.git
-git -C pyrowave checkout 79a3232a2199281f33f7a2e2659fc4fac62b022a
+git -C pyrowave checkout 7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b
 cmake -S pyrowave/metal -B build/pyrowave-metal -DCMAKE_BUILD_TYPE=Release
 cmake --build build/pyrowave-metal -j
 ```
@@ -27,7 +29,7 @@ This produces `build/pyrowave-metal/libpyrowave-metal.dylib`. Its C API is decla
 
 Requirements: Apple Silicon (Apple7 GPU family or newer), Xcode command line tools, CMake 3.20 or newer.
 
-Verified on 2026-10-23 with an M3 Max, macOS 27.0.1, Xcode 26.4.1 (Apple clang 21.0.0) and CMake 4.3.1. Besides building, a smoke test created a device, a 256x256 4:2:0 decoder and a 256x256 4:2:0 encoder successfully.
+Verified on 2026-10-23 with an M3 Max, macOS 27.0.1, Xcode 26.4.1 (Apple clang 21.0.0) and CMake 4.3.1. Besides building, a smoke test created a device, a 256x256 4:2:0 decoder and a 256x256 4:2:0 encoder successfully. Built again at the new commit on 2026-10-29, on the same machine with the same tools, and checked with the decodes above.
 
 ### Linux / Windows: upstream Vulkan implementation (not verified here)
 
