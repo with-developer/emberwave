@@ -532,14 +532,7 @@ impl Encoder {
                 self.upload_planes(planes, strides)?;
                 None
             }
-            Input::Textures(picture) => {
-                // Where the planes buffer is written in place, a failed upload
-                // can have left it mapped, and the gather writes it.
-                if self.upload.is_none() {
-                    self.unmap_upload()?;
-                }
-                Some(self.gather_bind_group(picture)?)
-            }
+            Input::Textures(picture) => Some(self.gather_bind_group(picture)?),
         };
         // No frame takes more than every block at its largest, which fits
         // 32 bits; neither need the budget.
@@ -735,34 +728,46 @@ impl Encoder {
             Some(strides) => check_strided_planes(&self.layout, planes, strides)?,
         }
         self.map_upload()?;
+        let written = self.write_planes(planes, strides);
+        // Unmapped whatever happened: where the planes buffer is written in
+        // place, the gather from textures writes it too (decision D54).
+        let unmapped = self.unmap_upload();
+        written?;
+        unmapped
+    }
+
+    /// The writing of [`upload_planes`](Self::upload_planes), into the mapped
+    /// buffer: rows padded to whole words.
+    fn write_planes(
+        &self,
+        planes: [&[u8]; 3],
+        strides: Option<[usize; 3]>,
+    ) -> Result<(), GpuError> {
         let mut view = self
             .upload_target()
             .slice(..)
             .get_mapped_range_mut()
             .map_err(|error| GpuError::Device(error.to_string()))?;
-        {
-            for (component, plane) in Component::ALL.into_iter().zip(planes) {
-                let i = component.index();
-                let (width, height) = self.layout.plane_size(component);
-                let (width, height) = (width as usize, height as usize);
-                let source_stride = strides.map_or(width, |strides| strides[i]);
-                let stride = self.buffers.packed_strides[i] as usize * 4;
-                let start = self.buffers.packed_offsets[i] as usize * 4;
-                if width == stride && source_stride == width {
-                    view.slice(start..start + width * height)
-                        .copy_from_slice(&plane[..width * height]);
-                    continue;
-                }
-                for row in 0..height {
-                    let samples = &plane[row * source_stride..][..width];
-                    let at = start + row * stride;
-                    view.slice(at..at + width).copy_from_slice(samples);
-                    view.slice(at + width..at + stride).fill(0);
-                }
+        for (component, plane) in Component::ALL.into_iter().zip(planes) {
+            let i = component.index();
+            let (width, height) = self.layout.plane_size(component);
+            let (width, height) = (width as usize, height as usize);
+            let source_stride = strides.map_or(width, |strides| strides[i]);
+            let stride = self.buffers.packed_strides[i] as usize * 4;
+            let start = self.buffers.packed_offsets[i] as usize * 4;
+            if width == stride && source_stride == width {
+                view.slice(start..start + width * height)
+                    .copy_from_slice(&plane[..width * height]);
+                continue;
+            }
+            for row in 0..height {
+                let samples = &plane[row * source_stride..][..width];
+                let at = start + row * stride;
+                view.slice(at..at + width).copy_from_slice(samples);
+                view.slice(at + width..at + stride).fill(0);
             }
         }
-        drop(view);
-        self.unmap_upload()
+        Ok(())
     }
 
     /// The bind group of `gather.wgsl` for `picture`, or an error if its

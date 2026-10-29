@@ -533,6 +533,51 @@ fn pictures_in_textures_encode_as_the_same_planes_do() {
 }
 
 #[test]
+fn planes_written_in_place_encode_as_uploaded_ones() {
+    // On Metal on Apple silicon the encoder writes a picture's planes into
+    // the buffer its shaders read, which the gather from textures writes as
+    // well; elsewhere, and with `shared_uploads` off, they go through an
+    // upload buffer (decision D54). One encoder takes every kind of picture
+    // in turn, and its frames are those of an encoder on the upload path.
+    let context = gpu_or_return!();
+    let options = GpuOptions {
+        shared_uploads: false,
+        ..GpuOptions::default()
+    };
+    let Some(copied) = create_context(&options) else {
+        return;
+    };
+    assert!(!copied.shares_uploads());
+    for vector in vectors().into_iter().take(3) {
+        let mut mixed = encoder_for(context, &vector.layout);
+        let mut reference = encoder_for(&copied, &vector.layout);
+        for index in 0..8 {
+            let source = &vector.source.frames[index % vector.source.frames.len()];
+            let expected = reference.encode(planes(source), vector.budget).unwrap();
+            let textures = Textures::new(context, &vector.layout, source);
+            let mut strides = [0; 3];
+            let padded: [Vec<u8>; 3] = std::array::from_fn(|i| {
+                let (width, _) = vector.layout.plane_size(Component::ALL[i]);
+                let width = width as usize;
+                strides[i] = width + 5;
+                source[i]
+                    .chunks_exact(width)
+                    .flat_map(|row| row.iter().copied().chain([0xA5; 5]))
+                    .collect()
+            });
+            let frame = match index % 4 {
+                0 => mixed.encode(planes(source), vector.budget),
+                1 => mixed.encode_textures(textures.planes(), vector.budget),
+                2 => mixed.encode_strided(planes(&padded), strides, vector.budget),
+                _ => mixed.encode_textures(textures.luma_chroma(), vector.budget),
+            }
+            .unwrap();
+            assert!(frame == expected, "{} frame {index}", vector.name);
+        }
+    }
+}
+
+#[test]
 fn textures_that_cannot_hold_their_planes_are_errors() {
     let context = gpu_or_return!();
     let layout = FrameLayout::new(64, 32, ChromaSubsampling::Yuv420).unwrap();

@@ -748,3 +748,21 @@ fn gathering_textures_writes_the_words_of_the_upload() {
         }
     }
 }
+
+#[test]
+fn planes_go_where_the_shaders_read_them_where_memory_is_shared() {
+    // The encoder tests see the same frames either way: this pins which way
+    // the planes go (decision D54).
+    let Some(context) = test_context() else {
+        return;
+    };
+    let encoder = Encoder::new(context, 64, 32, Yuv420, Signalling::default()).unwrap();
+    assert_eq!(encoder.upload.is_none(), context.shares_uploads());
+    assert_eq!(
+        encoder
+            .planes
+            .usage()
+            .contains(wgpu::BufferUsages::MAP_WRITE),
+        context.shares_uploads()
+    );
+}

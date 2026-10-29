@@ -35,11 +35,12 @@ pub struct GpuOptions {
     /// Without it, and elsewhere, the decoders copy the planes into the
     /// textures (decision D41). Ignored with `strict_webgpu`.
     pub plane_stores: bool,
-    /// Let the decoders write a frame where their shaders read it, on GPUs
-    /// that share their memory with the CPU: on Metal on Apple silicon,
-    /// through mappable storage buffers (decision D53). Without it, and
-    /// elsewhere, a frame goes into an upload buffer that the GPU copies from
-    /// (decision D34). Ignored with `strict_webgpu`.
+    /// Let the decoders write a frame, and the encoders a picture's planes,
+    /// where their shaders read them, on GPUs that share their memory with
+    /// the CPU: on Metal on Apple silicon, through mappable storage buffers
+    /// (decisions D53, D54). Without it, and elsewhere, they go into an
+    /// upload buffer that the GPU copies from (decisions D30, D34). Ignored
+    /// with `strict_webgpu`.
     pub shared_uploads: bool,
 }
 
@@ -140,8 +141,8 @@ pub struct GpuContext {
     timestamps: bool,
     /// Whether the decoders store planes into textures (decision D52).
     plane_stores: bool,
-    /// Whether the decoders write frames where their shaders read them
-    /// (decision D53).
+    /// Whether the decoders write frames, and the encoders planes, where
+    /// their shaders read them (decisions D53, D54).
     shared_uploads: bool,
     /// Built on first use, shared by every clone of the context: the
     /// decoder's and the encoder's, so that neither compiles the other's.
@@ -347,9 +348,10 @@ impl GpuContext {
         self.plane_stores
     }
 
-    /// Whether the decoders write a frame's data where their shaders read
-    /// it, without an upload buffer and the copies from it: on Metal on Apple
-    /// silicon, unless [`GpuOptions::shared_uploads`] was off (decision D53).
+    /// Whether the decoders write a frame's data, and the encoders a
+    /// picture's planes, where their shaders read them, without an upload
+    /// buffer and the copies from it: on Metal on Apple silicon, unless
+    /// [`GpuOptions::shared_uploads`] was off (decisions D53, D54).
     pub fn shares_uploads(&self) -> bool {
         self.shared_uploads
     }
