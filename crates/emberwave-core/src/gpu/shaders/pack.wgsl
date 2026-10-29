@@ -93,8 +93,9 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     let drop = drops[block_index];
     let words = costs[block_index].words[drop];
     let offset = offsets[block_index];
-    // Blocks that keep nothing are not sent. The rest fit the payload buffer
-    // unless the frame is larger than it, which the CPU reports.
+    // Blocks that keep nothing are not sent, but for those of the coarsest
+    // level, whose size is EMPTY_BLOCK_WORDS then. The rest fit the payload
+    // buffer unless the frame is larger than it, which the CPU reports.
     if (words == 0u || offset + words > frame.capacity_words) {
         return;
     }

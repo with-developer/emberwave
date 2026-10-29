@@ -114,7 +114,9 @@ pub(crate) fn pristine_blocks(layout: &FrameLayout) -> u32 {
     const {
         // One band would be the coarsest LL band alone, whose blocks the
         // detail bands of each component interleave: not a prefix.
-        assert!(DEFAULT_PRISTINE_BANDS >= 2 && DEFAULT_PRISTINE_BANDS <= DECOMPOSITION_LEVELS);
+        // More than DECOMPOSITION_LEVELS - 1 bands, `is_ready` counts as that
+        // many, which the prefix below would overshoot.
+        assert!(DEFAULT_PRISTINE_BANDS >= 2 && DEFAULT_PRISTINE_BANDS < DECOMPOSITION_LEVELS);
     }
     let finest = DECOMPOSITION_LEVELS + 1 - DEFAULT_PRISTINE_BANDS;
     layout

@@ -50,7 +50,7 @@ struct RateState {
     // Words of all blocks with nothing dropped, and with all they may drop.
     total: atomic<u32>,
     minimum: atomic<u32>,
-    // Blocks sent, those that keep anything.
+    // Blocks sent: those that keep anything, and those of the coarsest level.
     sent: atomic<u32>,
     // The key at which the frame fits and what its steps must still save; 0
     // and 0 when nothing is dropped. 1 if the frame fits at all.

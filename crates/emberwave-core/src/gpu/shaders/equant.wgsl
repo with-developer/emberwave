@@ -26,7 +26,8 @@
 
 // What the rate control knows of a block (rate.rs, BlockCost).
 struct BlockCost {
-    // Size in words with 0 to 15 planes dropped; 0 when nothing is left.
+    // Size in words with 0 to 15 planes dropped; 0 when nothing is left,
+    // except for the blocks below pristine_blocks: at least EMPTY_BLOCK_WORDS.
     words: array<u32, 16>,
     // Weighted squared error of the coded 8x8 blocks with 0 to 15 planes
     // dropped.

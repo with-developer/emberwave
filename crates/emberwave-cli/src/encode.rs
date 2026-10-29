@@ -36,7 +36,9 @@ pub struct Args {
     out: PathBuf,
 
     /// The most bytes a frame may take, its start of frame header included;
-    /// at least 8
+    /// at least the smallest frame of the pictures' size, the header and the
+    /// blocks of the coarsest level, which the error for a smaller one names
+    /// (152 bytes at 200x120)
     #[arg(long)]
     bytes_per_frame: usize,
 
