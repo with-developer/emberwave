@@ -2,6 +2,35 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-10-29
+
+Fewer stages per frame on Apple's GPUs: the planes stored straight into Metal textures, and on Apple silicon the frames written where the shaders read them. Also HEVC timed beside emberwave on the same Mac and iPhone, timings at a stream's pace in the benchmark app, in the browser benchmark and for upstream's decoder, a browser player that opens with a stream it makes itself, and a README in English and in Korean that shows the picture quality on a frame of a game.
+
+### Changed
+
+- On Metal, a decode into Y, Cb and Cr textures has the inverse transform's last levels store the planes into them, as upstream does, rather than copy them in (decision D52, [#86](https://github.com/with-developer/emberwave/issues/86)).
+  - On an Apple M3 Max a 4K frame takes 0.08 to 0.12 ms less frame after frame, 0.91 to 0.93 ms through the C API instead of 1.03 to 1.05 ms, and a 1080p frame about 0.02 ms less. At 60 frames a second the gain is within the noise of the runs.
+  - The decode stores into textures with the `STORAGE_BINDING` usage, which `create_plane_texture` and `emberwave_texture_create_plane` now give theirs; the C API gives it to the caller's Metal plane textures with `MTLTextureUsageShaderWrite`. Other textures, views that refuse the stores, and the other backends keep the copies of decision D41.
+  - A context on Metal asks for `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`. `GpuOptions::plane_stores` turns the stores off, and `GpuContext::stores_planes` and `Decoder::stores_planes` tell whether they happen.
+- On Apple silicon, a decode that waits for its frame writes the frame's block table and payload where its shaders read them, rather than into an upload buffer that the GPU copies from (decision D53, [#86](https://github.com/with-developer/emberwave/issues/86)).
+  - On an Apple M3 Max at 60 frames a second, a 4K frame takes 0.14 ms less in the median of ten rounds, and a 1080p frame 0.06 ms less; frame after frame about 2 % less.
+  - A context on Metal with an integrated GPU asks for `MAPPABLE_PRIMARY_BUFFERS`. `GpuOptions::shared_uploads` turns it off, and `GpuContext::shares_uploads` tells whether it happens.
+- `GpuOptions` has the two new fields, `plane_stores` and `shared_uploads`: a struct literal of it needs them, or `..Default::default()`.
+- `LICENSE` is the MIT license alone, so that GitHub reports it as MIT. PyroWave's license, and what the license does not cover, are in `THIRD_PARTY_NOTICES.md`, which the release packages carry next to it (decision D51, [#101](https://github.com/with-developer/emberwave/issues/101)).
+- The README is in English, `README.md`, and in Korean, `README.ko.md`, which the command line tool's package carries too. `scripts/bench_report.py write` takes both and writes the benchmark summary into each (decision D50, [#99](https://github.com/with-developer/emberwave/issues/99)).
+
+### Added
+
+- The benchmark app also times HEVC through VideoToolbox, the decoder Moonlight uses, on the same device and pictures: encoding, and decoding into NV12 and BGRA textures, at Moonlight's rates and at emberwave's bytes per frame (decision D45, [#80](https://github.com/with-developer/emberwave/issues/80)). It times its decodes into textures at 60 frames a second as well as frame after frame, and `scripts/bench_app_on_mac.sh` runs it on a Mac. `BENCHMARKS.md` has the M3 Max's and the iPhone 17's results.
+- `refgen bench --fps` times upstream's decoder at a stream's pace, and the browser benchmark page times every size at 60 frames a second after frame after frame ([#95](https://github.com/with-developer/emberwave/issues/95)). Decision D48 splits up where the time goes at that pace.
+- The browser player opens with a 960x540 stream that it draws and encodes itself with the CPU encoder, before any file is given (decision D46, [#90](https://github.com/with-developer/emberwave/issues/90)).
+- The README's front page: a banner and charts of decode and encode times, drawn by `scripts/readme_figures.py` from the numbers of `BENCHMARKS.md` (decision D47, [#87](https://github.com/with-developer/emberwave/issues/87)), and a frame of Crimson Desert within four budgets, made by `scripts/quality_figure.py`, with a key frame of Apple's HEVC encoder beside it in `BENCHMARKS.md` (decision D49, [#97](https://github.com/with-developer/emberwave/issues/97)).
+
+### Fixed
+
+- On a phone, the browser player's picture comes before its controls, so that the demo plays without scrolling ([#93](https://github.com/with-developer/emberwave/issues/93)).
+- The benchmark app, started from a Mac with `-run`, waits until it has been in front for three seconds, and reports and fails a run that lost the front ([#80](https://github.com/with-developer/emberwave/issues/80)).
+
 ## [0.11.0] - 2026-10-24
 
 Decoding into the Metal client's own textures, such as the texture of a `CVPixelBuffer` for an `AVSampleBufferDisplayLayer`, a C API whose documentation sets out how decodes and the client's reads are ordered, and an iPhone and iPad benchmark app that times and checks every way into textures.
