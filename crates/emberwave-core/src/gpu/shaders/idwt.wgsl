@@ -12,10 +12,14 @@
 // 32x32 tile of the output: it loads the 40x40 interleaved neighbourhood
 // (4 samples of extension on each side, one per lifting step), filters
 // horizontally and then vertically in workgroup memory, and stores the tile.
-// At the last level of a component the tile is stored as 8-bit samples,
-// packed four to a word, which is what upstream's UNORM storage images hold;
-// the float picture never goes to memory. Workgroup z selects the colour
-// component.
+// At the last level of a component the tile becomes 8-bit samples, which is
+// what upstream's UNORM storage images hold; the float picture never goes to
+// memory. Workgroup z selects the colour component.
+//
+// This file is the front of two shaders, which differ in where the last level
+// stores its samples: `store_plane` of idwt_packed.wgsl packs them four to a
+// word into a buffer, and that of idwt_planes.wgsl stores them straight into
+// a texture per plane, where the adapter allows it (decision D52).
 
 // The parameters of a level are shared with fdwt.wgsl, which goes the other
 // way between the same places (gpu/layout.rs, TransformLevel).
@@ -24,13 +28,13 @@ struct CompParams {
     band_offset: vec4<u32>,
     // Where the output goes, the level's image: the LL band of the next level
     // in the pyramid (offset and row length in floats), or at the last level
-    // the packed 8-bit plane (offset and row length in words).
+    // the packed 8-bit plane (offset and row length in words), if it is packed.
     image_offset: u32,
     image_stride: u32,
     // Size of the plane, which the last level crops its output to.
     plane_width: u32,
     plane_height: u32,
-    // 1: the last level, which writes the packed plane; 0: an earlier level.
+    // 1: the last level, which writes the plane; 0: an earlier level.
     is_plane: u32,
     pad0: u32,
     pad1: u32,
@@ -47,7 +51,6 @@ struct LevelParams {
 }
 
 @group(0) @binding(0) var<storage, read_write> pyramid: array<f32>;
-@group(0) @binding(1) var<storage, read_write> packed: array<u32>;
 @group(0) @binding(2) var<uniform> params: LevelParams;
 
 // Lifting step constants of the CDF 9/7 filter (ITU-T T.800, F.4.8.2).
@@ -148,14 +151,6 @@ fn store_ll(comp: CompParams, x: i32, y: i32, value: f32) {
 // the window array; it is a whole number from 0 to 255.
 fn to_unorm8(v: f32) -> f32 {
     return round(clamp(v, 0.0, 1.0) * 255.0);
-}
-
-// The 8-bit level of tile sample `at` collected in the window array, or 0 for
-// a padding sample past the right edge of the plane. `select` evaluates both
-// arms, so the window is read for padding samples too: the vertical pass has
-// to write the whole tile, not only the part inside the plane.
-fn level_at(at: u32, x: u32, width: u32) -> u32 {
-    return select(0u, u32(window[at]), x < width);
 }
 
 @compute @workgroup_size(256)
@@ -268,30 +263,14 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         }
     }
 
-    // At the last level every invocation writes one word of the tile: four
-    // samples of a row, the first in the low byte. Rows of a packed plane are
-    // padded to whole words, and the padding samples are zero. Words after
-    // the row's last sample are not written: a decoder pads its rows further,
-    // to the rows of a copy into a texture (decision D41), and nothing reads
-    // that padding.
+    // At the last level every invocation stores four samples of a row of the
+    // tile, from the window array, in the file behind this one.
     //
     // The barrier is outside the branch on purpose: every level waits, though
     // only the last needs it. Inside `if (is_final)`, uniform as that is, it
     // crashed WARP, Direct3D's software rasteriser.
     workgroupBarrier();
     if (is_final) {
-        let row = tid / 8u;
-        let word = tid % 8u;
-        let y = u32(tile_y) + row;
-        let word_x = u32(tile_x) / 4u + word;
-        let x = 4u * word_x;
-        if (y < comp.plane_height && x < comp.plane_width) {
-            let at = row * TILE + 4u * word;
-            let width = comp.plane_width;
-            packed[comp.image_offset + y * comp.image_stride + word_x] = level_at(at, x, width) |
-                (level_at(at + 1u, x + 1u, width) << 8u) |
-                (level_at(at + 2u, x + 2u, width) << 16u) |
-                (level_at(at + 3u, x + 3u, width) << 24u);
-        }
+        store_plane(comp, wg.z, u32(tile_x), u32(tile_y), tid);
     }
 }

@@ -143,6 +143,80 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
     }
 }
 
+/// The storage textures of `module`: name, format and access.
+fn storage_textures(
+    module: &naga::Module,
+) -> Vec<(String, naga::StorageFormat, naga::StorageAccess)> {
+    module
+        .global_variables
+        .iter()
+        .filter_map(|(_, variable)| match module.types[variable.ty].inner {
+            naga::TypeInner::Image {
+                class: naga::ImageClass::Storage { format, access },
+                ..
+            } => Some((variable.name.clone().unwrap_or_default(), format, access)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn no_portable_shader_has_a_storage_texture() {
+    // WebGPU guarantees storage textures in a few formats only, and the
+    // shaders use none.
+    for (name, source, _) in shader_sources::ALL {
+        let module = validate(name, source);
+        assert_eq!(storage_textures(&module), [], "{name}");
+    }
+}
+
+#[test]
+fn the_inverse_transform_that_stores_planes_differs_only_in_its_store() {
+    // IDWT_PLANES stores the planes into r8unorm storage textures, which
+    // WebGPU does not guarantee: the decoder builds it only where the adapter
+    // writes them (decision D52). naga validates the format without a
+    // capability, so the checks are on what the module holds: idwt's entry
+    // point and workgroup memory, which was checked for writes before reads,
+    // and the three textures in place of the packed planes.
+    let module = validate("idwt planes", shader_sources::IDWT_PLANES);
+    let entry_points: Vec<&str> = module
+        .entry_points
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(entry_points, ["main"]);
+    let mut layouter = naga::proc::Layouter::default();
+    layouter.update(module.to_ctx()).expect("layout");
+    let workgroup: Vec<(String, u32)> = module
+        .global_variables
+        .iter()
+        .filter(|(_, variable)| variable.space == naga::AddressSpace::WorkGroup)
+        .map(|(_, variable)| {
+            let name = variable.name.clone().unwrap_or_default();
+            (name, layouter[variable.ty].size)
+        })
+        .collect();
+    assert_eq!(
+        workgroup,
+        [("window".to_owned(), 6400), ("horizontal".to_owned(), 5120)]
+    );
+    let store = naga::StorageAccess::STORE;
+    assert_eq!(
+        storage_textures(&module),
+        ["plane_y", "plane_cb", "plane_cr"].map(|name| (
+            name.to_owned(),
+            naga::StorageFormat::R8Unorm,
+            store
+        ))
+    );
+    let names: Vec<String> = module
+        .global_variables
+        .iter()
+        .filter_map(|(_, variable)| variable.name.clone())
+        .collect();
+    assert!(!names.contains(&"packed".to_owned()), "{names:?}");
+}
+
 #[test]
 fn the_draw_shader_validates_without_optional_capabilities() {
     let module = validate("draw", shader_sources::DRAW);

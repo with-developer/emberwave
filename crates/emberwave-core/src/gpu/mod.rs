@@ -3,7 +3,10 @@
 //! [`GpuContext`] creates the device, [`Decoder`] decodes frames on it and
 //! [`Encoder`] encodes pictures. The shaders are plain WGSL that uses only what
 //! wgpu guarantees on Vulkan, Metal, DX12 and WebGPU: no subgroup operations,
-//! no 8 or 16 bit storage and no optional features.
+//! no 8 or 16 bit storage and no optional features. One variant of the
+//! inverse transform, which stores the planes into 8-bit textures, runs only
+//! where the adapter allows it, and the portable one everywhere else
+//! (decision D52).
 
 mod context;
 mod decoder;
@@ -25,8 +28,20 @@ pub use error::GpuError;
 pub mod shader_sources {
     /// Coefficient decoding and dequantisation.
     pub const DEQUANT: &str = include_str!("shaders/dequant.wgsl");
-    /// Inverse wavelet transform of one level.
-    pub const IDWT: &str = include_str!("shaders/idwt.wgsl");
+    /// Inverse wavelet transform of one level, whose last level packs the
+    /// planes into a buffer.
+    pub const IDWT: &str = concat!(
+        include_str!("shaders/idwt.wgsl"),
+        include_str!("shaders/idwt_packed.wgsl")
+    );
+    /// The inverse transform whose last level stores the planes straight into
+    /// three 8-bit textures instead, on adapters that can write them
+    /// (decision D52). Not among the portable shaders of [`ALL`]: WebGPU does
+    /// not guarantee `r8unorm` storage textures.
+    pub const IDWT_PLANES: &str = concat!(
+        include_str!("shaders/idwt.wgsl"),
+        include_str!("shaders/idwt_planes.wgsl")
+    );
     /// 8-bit YCbCr planes to RGB.
     pub const YUV2RGB: &str = include_str!("shaders/yuv2rgb.wgsl");
     /// The RGB picture drawn into a texture: a vertex and a fragment shader,

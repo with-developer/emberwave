@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::GpuError;
+use super::decoder::PLANE_FORMAT;
 use super::pipelines::{EncoderPipelines, Pipelines};
 
 /// Environment variable that restricts the backends considered, for example
@@ -28,6 +29,12 @@ pub struct GpuOptions {
     /// [`Decoder::time_frame`](super::Decoder::time_frame) can report the time
     /// of each stage. Ignored with `strict_webgpu`.
     pub timestamps: bool,
+    /// Let the decoders store the Y, Cb and Cr planes straight into textures
+    /// that allow it, where the adapter can write 8-bit storage textures: on
+    /// Metal, through the adapter's own format features (decision D52).
+    /// Without it, and elsewhere, the decoders copy the planes into the
+    /// textures (decision D41). Ignored with `strict_webgpu`.
+    pub plane_stores: bool,
 }
 
 impl GpuOptions {
@@ -39,6 +46,7 @@ impl GpuOptions {
             force_fallback_adapter: false,
             strict_webgpu: false,
             timestamps: false,
+            plane_stores: true,
         }
     }
 
@@ -123,6 +131,8 @@ pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     timestamps: bool,
+    /// Whether the decoders store planes into textures (decision D52).
+    plane_stores: bool,
     /// Built on first use, shared by every clone of the context: the
     /// decoder's and the encoder's, so that neither compiles the other's.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
@@ -196,13 +206,16 @@ impl GpuContext {
         let timestamps = options.timestamps
             && !options.strict_webgpu
             && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let plane_stores = options.plane_stores && !options.strict_webgpu && stores_planes(adapter);
+        let mut required_features = wgpu::Features::empty();
+        required_features.set(wgpu::Features::TIMESTAMP_QUERY, timestamps);
+        required_features.set(
+            wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+            plane_stores,
+        );
         wgpu::DeviceDescriptor {
             label: Some("emberwave"),
-            required_features: if timestamps {
-                wgpu::Features::TIMESTAMP_QUERY
-            } else {
-                wgpu::Features::empty()
-            },
+            required_features,
             required_limits: required_limits(&adapter.limits(), options.strict_webgpu),
             ..Default::default()
         }
@@ -214,6 +227,10 @@ impl GpuContext {
     /// the descriptor, making the pipelines fails, naming the limit.
     pub fn from_device(adapter: wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let plane_stores = device
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+            && stores_planes(&adapter);
 
         // A lost device stays lost. Errors of a lost device do not reach the
         // error scopes, so the decoders check this record before and after
@@ -232,6 +249,7 @@ impl GpuContext {
             queue,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             timestamps,
+            plane_stores,
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             lost,
@@ -301,10 +319,20 @@ impl GpuContext {
         self.timestamps
     }
 
+    /// Whether the decoders store the planes straight into the textures of
+    /// decodes into plane textures, those that allow it, rather than copy
+    /// them in: on Metal, unless [`GpuOptions::plane_stores`] was off
+    /// (decision D52).
+    pub fn stores_planes(&self) -> bool {
+        self.plane_stores
+    }
+
     /// The decoder's compute pipelines, compiled the first time they are
     /// asked for.
     pub(crate) fn pipelines(&self) -> Result<Arc<Pipelines>, GpuError> {
-        cached(&self.pipelines, || Pipelines::new(&self.device))
+        cached(&self.pipelines, || {
+            Pipelines::new(&self.device, self.plane_stores)
+        })
     }
 
     /// The encoder's compute pipelines, compiled the first time they are
@@ -314,6 +342,26 @@ impl GpuContext {
             EncoderPipelines::new(&self.device)
         })
     }
+}
+
+/// Whether the decoders can store the planes into textures on `adapter`, once
+/// its device has the adapter's own format features: on Metal, whose GPUs
+/// write 8-bit storage textures (decision D52). Other adapters may write
+/// them too, but only Metal's gain was measured, and WARP, which runs the
+/// Windows tests, has crashed on shaders that the others ran: they keep the
+/// copies.
+fn stores_planes(adapter: &wgpu::Adapter) -> bool {
+    let format = adapter.get_texture_format_features(PLANE_FORMAT);
+    adapter.get_info().backend == wgpu::Backend::Metal
+        && adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+        && format
+            .allowed_usages
+            .contains(wgpu::TextureUsages::STORAGE_BINDING)
+        && format
+            .flags
+            .contains(wgpu::TextureFormatFeatureFlags::STORAGE_WRITE_ONLY)
 }
 
 /// After a call failed on `device`: polls it once, without waiting, while

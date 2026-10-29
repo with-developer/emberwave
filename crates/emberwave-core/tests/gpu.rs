@@ -660,6 +660,169 @@ fn decodes_submitted_without_waiting_reach_their_textures() {
         .expect("a view in the texture's format");
 }
 
+/// A texture for `component`'s plane of `layout` with `usage`, as a caller
+/// makes one.
+fn plane_texture(
+    context: &GpuContext,
+    layout: &FrameLayout,
+    component: Component,
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
+    let (width, height) = layout.plane_size(component);
+    context.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("caller's plane"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: emberwave_core::gpu::PLANE_FORMAT,
+        usage,
+        view_formats: &[],
+    })
+}
+
+#[test]
+fn planes_stored_into_textures_are_the_copied_planes() {
+    let context = gpu_or_return!();
+    // Metal stores the planes from the inverse transform, the other backends
+    // copy them in (decision D52).
+    let metal = context.adapter_info().backend == wgpu::Backend::Metal;
+    assert_eq!(context.stores_planes(), metal);
+    if !metal {
+        return;
+    }
+    let copy = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC;
+    let store = copy | wgpu::TextureUsages::STORAGE_BINDING;
+    // 4:2:0, whose chroma planes come out a level before luma, and 4:4:4 of
+    // an odd size, whose last tiles stick out of the planes.
+    for name in ["noise_192x136_420", "noise_131x67_444"] {
+        let (layout, frames) = vector_frames(name);
+        let mut decoder = decoder_for(context, &layout);
+        assert!(decoder.stores_planes(), "{name}");
+        let made = decoder.create_plane_texture(Component::Cr).expect("plane");
+        assert!(
+            made.usage().contains(wgpu::TextureUsages::STORAGE_BINDING),
+            "{name}"
+        );
+        // Stored into all three; copied into all three; and copied into all
+        // three when one of them takes no stores.
+        for usages in [[store; 3], [copy; 3], [store, copy, store]] {
+            let textures: Vec<wgpu::Texture> = Component::ALL
+                .into_iter()
+                .zip(usages)
+                .map(|(component, usage)| plane_texture(context, &layout, component, usage))
+                .collect();
+            let views: Vec<wgpu::TextureView> = textures
+                .iter()
+                .map(|texture| texture.create_view(&Default::default()))
+                .collect();
+            let targets = [&views[0], &views[1], &views[2]];
+            for (index, frame) in frames.iter().enumerate() {
+                let planes = decoder.decode(frame).expect("decode").planes;
+                // Waiting for the GPU, and recorded into the caller's
+                // encoder, in turn.
+                if index % 2 == 0 {
+                    decoder.clear();
+                    decoder.push_packet(frame).expect("packet");
+                    decoder
+                        .decode_assembled_to_plane_textures(targets)
+                        .expect("decode into plane textures");
+                } else {
+                    let mut encoder = context.device().create_command_encoder(&Default::default());
+                    decoder
+                        .encode_to_plane_textures(frame, targets, &mut encoder)
+                        .expect("recorded decode into plane textures");
+                    context.queue().submit([encoder.finish()]);
+                }
+                for (component, texture) in Component::ALL.into_iter().zip(&textures) {
+                    assert_eq!(
+                        read_texture(context, texture),
+                        planes[component.index()].data,
+                        "{name}: {component:?}, frame {index}, {usages:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn without_plane_stores_the_planes_are_copied() {
+    let options = GpuOptions {
+        plane_stores: false,
+        ..GpuOptions::default()
+    };
+    let Some(context) = create_context(&options) else {
+        return;
+    };
+    assert!(!context.stores_planes());
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(&context, &layout);
+    assert!(!decoder.stores_planes());
+    let textures =
+        Component::ALL.map(|component| decoder.create_plane_texture(component).expect("plane"));
+    let views = textures
+        .each_ref()
+        .map(|texture| texture.create_view(&Default::default()));
+    for texture in &textures {
+        let usage = texture.usage();
+        assert!(!usage.contains(wgpu::TextureUsages::STORAGE_BINDING));
+    }
+    for frame in &frames {
+        let planes = decoder.decode(frame).expect("decode").planes;
+        decoder.clear();
+        decoder.push_packet(frame).expect("packet");
+        decoder
+            .decode_assembled_to_plane_textures(views.each_ref())
+            .expect("decode into plane textures");
+        for (component, texture) in Component::ALL.into_iter().zip(&textures) {
+            assert_eq!(
+                read_texture(&context, texture),
+                planes[component.index()].data,
+                "{component:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn decoding_into_plane_textures_frame_after_frame_leaves_nothing_behind() {
+    // A context of its own: the counters belong to the device. Where the
+    // planes are stored, every decode makes the bind groups of its textures,
+    // which must go again.
+    let Some(context) = create_context(&GpuOptions::default()) else {
+        return;
+    };
+    let (layout, frames) = vector_frames("noise_192x136_420");
+    let mut decoder = decoder_for(&context, &layout);
+    let textures =
+        Component::ALL.map(|component| decoder.create_plane_texture(component).expect("plane"));
+    let views = textures
+        .each_ref()
+        .map(|texture| texture.create_view(&Default::default()));
+    let mut decode = |frame: &[u8]| {
+        decoder.clear();
+        decoder.push_packet(frame).expect("packet");
+        decoder
+            .decode_assembled_to_plane_textures(views.each_ref())
+            .expect("decode into plane textures");
+    };
+    decode(&frames[0]);
+    let before = live_resources(&context);
+    for frame in frames.iter().cycle().take(24) {
+        decode(frame);
+    }
+    assert_eq!(
+        live_resources(&context),
+        before,
+        "live GPU objects and memory"
+    );
+}
+
 #[test]
 fn only_textures_the_planes_fit_take_them() {
     let context = gpu_or_return!();
