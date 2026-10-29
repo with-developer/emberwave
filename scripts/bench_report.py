@@ -3,10 +3,12 @@
 
     bench_report.py environment OUT.json
         Records the machine the benchmark runs on.
-    bench_report.py write RESULTS_DIR BENCHMARKS.md README.md
-        Rewrites the generated blocks of both files from the JSON results that
-        `emberwave-cli bench --json`, `emberwave-cli bench-encode --json`,
-        `refgen bench --json` and `refgen bench-encode --json` wrote.
+    bench_report.py write RESULTS_DIR BENCHMARKS.md README.md README.ko.md
+        Rewrites the generated blocks of the three files, the tables of
+        BENCHMARKS.md and the summary of each README in its language, from the
+        JSON results that `emberwave-cli bench --json`, `emberwave-cli
+        bench-encode --json`, `refgen bench --json` and `refgen bench-encode
+        --json` wrote.
 
 Only the Python standard library is used.
 """
@@ -398,38 +400,79 @@ def encode_parts(results):
     return parts
 
 
-def readme_block(results, env):
+def readme_results(results):
+    """What the READMEs' summaries are made of: the decode to RGB at 1080p,
+    1440p and 4K as table rows, its backend, and the 4K frame's planes and
+    encode next to upstream's at FP32, each None if it was not measured."""
     rows = []
     for stem, label in STREAMS[:3]:
         r = load(results, f"{stem}.rgb")
         if r:
             rows.append([label.split()[0], ms(value(r, "total")), ms(value(r, "total", "p99"))])
-    first = load(results, f"{STREAMS[0][0]}.rgb")
+    return {
+        "rows": rows,
+        "backend": load(results, f"{STREAMS[0][0]}.rgb")["backend"],
+        "planes": load(results, "scene_4k_420.yuv"),
+        "planes_upstream": load(results, "scene_4k_420.upstream-fp32"),
+        "encode": load(results, "scene_4k_420.encode-gpu"),
+        "encode_upstream": load(results, "scene_4k_420.encode-upstream-fp32"),
+    }
+
+
+def readme_block(results, env):
+    r = readme_results(results)
     text = (
-        f"Decode time per frame on an {env['cpu']} ({first['backend']}), RGB output kept in GPU "
+        f"Decode time per frame on an {env['cpu']} ({r['backend']}), RGB output kept in GPU "
         f"memory, measured on {env['date']}, in milliseconds:\n\n"
-        + table(["Stream", "mean", "p99"], rows)
+        + table(["Stream", "mean", "p99"], r["rows"])
         + "\n"
     )
-    ours = load(results, "scene_4k_420.yuv")
-    theirs = load(results, "scene_4k_420.upstream-fp32")
-    if ours and theirs:
+    if r["planes"] and r["planes_upstream"]:
         text += (
             f"\nUpstream's own Metal decoder is faster on the same machine: "
-            f"{ms(value(theirs, 'total'))} ms for a 4K frame at FP32 against emberwave's "
-            f"{ms(value(ours, 'total'))} ms (planes only). "
+            f"{ms(value(r['planes_upstream'], 'total'))} ms for a 4K frame at FP32 against "
+            f"emberwave's {ms(value(r['planes'], 'total'))} ms (planes only). "
             "[`BENCHMARKS.md`](BENCHMARKS.md) has the method and all the numbers.\n"
         )
-    encoded = load(results, "scene_4k_420.encode-gpu")
-    upstream = load(results, "scene_4k_420.encode-upstream-fp32")
-    if encoded:
+    if r["encode"]:
         text += (
-            f"\nEncoding a 4K frame within 1.2 MB takes {ms(value(encoded, 'total'))} ms on the GPU, "
-            "from the planes in CPU memory to the frame in CPU memory"
+            f"\nEncoding a 4K frame within 1.2 MB takes {ms(value(r['encode'], 'total'))} ms on "
+            "the GPU, from the planes in CPU memory to the frame in CPU memory"
             + (
-                f", and {ms(value(upstream, 'total'))} ms with upstream's encoder at FP32."
-                if upstream
+                f", and {ms(value(r['encode_upstream'], 'total'))} ms with upstream's encoder at FP32."
+                if r["encode_upstream"]
                 else "."
+            )
+            + "\n"
+        )
+    return text
+
+
+def readme_block_ko(results, env):
+    """The summary of readme_block in Korean, for README.ko.md."""
+    r = readme_results(results)
+    text = (
+        f"{env['cpu']}({r['backend']})에서 잰 프레임당 디코딩 시간입니다. RGB 출력은 GPU 메모리에 "
+        f"두었고, {env['date']}에 측정했으며, 단위는 밀리초입니다.\n\n"
+        + table(["스트림", "평균", "p99"], r["rows"])
+        + "\n"
+    )
+    if r["planes"] and r["planes_upstream"]:
+        text += (
+            "\n같은 기계에서는 업스트림의 Metal 디코더가 더 빠릅니다. 4K 한 프레임에 FP32로 "
+            f"{ms(value(r['planes_upstream'], 'total'))} ms가 걸리고, emberwave는 "
+            f"{ms(value(r['planes'], 'total'))} ms가 걸립니다(평면까지만). "
+            "측정 방법과 전체 수치는 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.\n"
+        )
+    if r["encode"]:
+        text += (
+            f"\n4K 한 프레임을 1.2 MB 안에 인코딩하는 데 GPU에서 {ms(value(r['encode'], 'total'))} ms가 "
+            "걸립니다. CPU 메모리의 평면에서 CPU 메모리의 프레임까지의 시간"
+            + (
+                f"이며, 업스트림 인코더는 FP32로 {ms(value(r['encode_upstream'], 'total'))} ms가 "
+                "걸립니다."
+                if r["encode_upstream"]
+                else "입니다."
             )
             + "\n"
         )
@@ -447,7 +490,7 @@ def replace_block(path, tag, body):
 def main(argv):
     if len(argv) == 3 and argv[1] == "environment":
         pathlib.Path(argv[2]).write_text(json.dumps(environment(), indent=2) + "\n")
-    elif len(argv) == 5 and argv[1] == "write":
+    elif len(argv) == 6 and argv[1] == "write":
         global RUN_START
         results = pathlib.Path(argv[2])
         env = load(results, "environment")
@@ -456,6 +499,7 @@ def main(argv):
         RUN_START = (results / "environment.json").stat().st_mtime
         replace_block(pathlib.Path(argv[3]), "bench", benchmarks_block(results, env))
         replace_block(pathlib.Path(argv[4]), "bench-summary", readme_block(results, env))
+        replace_block(pathlib.Path(argv[5]), "bench-summary", readme_block_ko(results, env))
     else:
         raise SystemExit(__doc__)
 

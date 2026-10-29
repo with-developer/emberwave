@@ -7,11 +7,11 @@ How long emberwave takes to decode a frame, and to encode one. The tables under 
 ```sh
 scripts/gen_bench_data.sh --noise   # the streams, once (Apple Silicon macOS: upstream's encoder)
 scripts/gen_bench_data.sh --sources # the pictures for the encoders, once
-scripts/bench.sh                    # measures, then rewrites the results below and the README summary
+scripts/bench.sh                    # measures, then rewrites the results below and the READMEs' summaries
 scripts/bench_lavapipe.sh           # optional: software Vulkan in a Linux container (needs Docker)
 ```
 
-`bench.sh` keeps the raw results in `target/bench/` as JSON; `scripts/bench_report.py write target/bench BENCHMARKS.md README.md` turns them into the tables again. Quit other programs first, keep a laptop on mains power, and run it twice: the two runs should agree within a few per cent. The README's charts show some of the numbers on this page: `scripts/readme_figures.py` draws them, from numbers copied into it. `scripts/quality_figure.py` makes the first table of [Picture quality](#picture-quality) and the README's picture of it, from a picture of your own; it needs numpy, Pillow and a release build of `emberwave-cli`.
+`bench.sh` keeps the raw results in `target/bench/` as JSON; `scripts/bench_report.py write target/bench BENCHMARKS.md README.md README.ko.md` turns them into the tables again, and into the summary of each README, in English and in Korean. Quit other programs first, keep a laptop on mains power, and run it twice: the two runs should agree within a few per cent. The README's charts show some of the numbers on this page: `scripts/readme_figures.py` draws them, from numbers copied into it. `scripts/quality_figure.py` makes the first table of [Picture quality](#picture-quality) and the README's picture of it, from a picture of your own; it needs numpy, Pillow and a release build of `emberwave-cli`.
 
 ## What is measured
 

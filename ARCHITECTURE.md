@@ -631,7 +631,7 @@ Short-form ADRs, newest last. Each entry is dated.
 
 ### 2026-10-23 — D6: Workflow conventions
 
-**Decision.** Pull requests are merged with a merge commit, so each milestone shows up as one entry in the first-parent history. Commit messages, code and documentation are in English. Issues and pull request descriptions follow the Korean template from `CLAUDE.md`. Third-party GitHub Actions are pinned by commit SHA; first-party actions use a major version tag.
+**Decision.** (The language of issues and pull requests is superseded by D50: English since 2026-10-29.) Pull requests are merged with a merge commit, so each milestone shows up as one entry in the first-parent history. Commit messages, code and documentation are in English. Issues and pull request descriptions follow the Korean template from `CLAUDE.md`. Third-party GitHub Actions are pinned by commit SHA; first-party actions use a major version tag.
 
 ### 2026-10-23 — D7: Hosting
 
@@ -1311,3 +1311,17 @@ The figures of the prototype's runs above are marked as not kept.
 - Should Pearl Abyss object, the picture leaves the README and the tree, and the numbers stay; the history keeps it unless it is rewritten.
 
 **Consequence.** The quality's numbers come from one picture and a script run by hand, not from CI, and HEVC's are those of a key frame alone.
+
+### 2026-10-29 — D50: The README in English and in Korean
+
+**Context.** `CLAUDE.md` asked for an English README with a Korean summary, and D6 for issues and pull requests on a Korean template. The summary had become a text of its own, shorter than the README and written apart from it: an English reader scrolled past it, and a Korean reader got less than the README. On 2026-10-29 the repository owner set the languages (#99): pull requests, commits and issues in English only, and the documentation as separate English and Korean versions, the README first.
+
+**Decision.**
+- `README.md` is in English and `README.ko.md` is the same README in Korean: the same sections, figures and numbers, alt texts in Korean, the commands as they are, and a line at the top of each that links the other. They change together.
+- Under the picture of the quality, `README.ko.md` gives the notice in the Korean wording of Pearl Abyss's fan content guidelines, from their Korean page, dated 2021-03-26 like the English one and read on 2026-10-29 (D49).
+- `scripts/bench_report.py write` takes both READMEs and writes the summary of the benchmarks into each, in its language.
+- `ARCHITECTURE.md`, `BENCHMARKS.md`, `CONTRIBUTING.md`, `CHANGELOG.md` and the other READMEs stay in English alone, which the Korean README says.
+- Code, commit messages, merge commits, issues and pull requests are in English. A pull request's description has the sections Purpose, Changes, Testing, Benchmark impact and Related issue, and Review for the project's own. This replaces D6's Korean template; earlier issues and pull requests keep their Korean.
+- The CLI's release packages hold both READMEs.
+
+**Consequence.** A change to the README is made twice, and a benchmark run rewrites both summaries. A Korean reader gets the whole README, and the rest of the documentation in English only.
