@@ -138,14 +138,13 @@ iPhone 17의 Safari에서 [벤치마크 페이지](https://with-developer.github
 
 ## 로드맵
 
-끝난 일: 첫 릴리스까지의 마일스톤 M0~M5([#1](https://github.com/with-developer/emberwave/issues/1)~[#6](https://github.com/with-developer/emberwave/issues/6)), 그 뒤로 CPU와 GPU의 인코더([#14](https://github.com/with-developer/emberwave/issues/14)), 브라우저 플레이어와 벤치마크 페이지([#15](https://github.com/with-developer/emberwave/issues/15)), 클라이언트와 호스트를 위한 C API([#16](https://github.com/with-developer/emberwave/issues/16), [#42](https://github.com/with-developer/emberwave/issues/42)), Metal 텍스처를 포함해 GPU 메모리의 그림을 주고받기([#27](https://github.com/with-developer/emberwave/issues/27), [#33](https://github.com/with-developer/emberwave/issues/33)), iPhone·iPad·Mac 앱용 XCFramework([#52](https://github.com/with-developer/emberwave/issues/52)). 릴리스마다의 변경은 [`CHANGELOG.md`](CHANGELOG.md)에 있습니다.
+끝난 일: 첫 릴리스까지의 마일스톤 M0~M5([#1](https://github.com/with-developer/emberwave/issues/1)~[#6](https://github.com/with-developer/emberwave/issues/6)), 그 뒤로 CPU와 GPU의 인코더([#14](https://github.com/with-developer/emberwave/issues/14)), 브라우저 플레이어와 벤치마크 페이지([#15](https://github.com/with-developer/emberwave/issues/15)), 클라이언트와 호스트를 위한 C API([#16](https://github.com/with-developer/emberwave/issues/16), [#42](https://github.com/with-developer/emberwave/issues/42)), Metal 텍스처를 포함해 GPU 메모리의 그림을 주고받기([#27](https://github.com/with-developer/emberwave/issues/27), [#33](https://github.com/with-developer/emberwave/issues/33)), iPhone·iPad·Mac 앱용 XCFramework([#52](https://github.com/with-developer/emberwave/issues/52)). 0.12에서는 Apple GPU에서 프레임마다 하던 복사 두 가지를 없앴습니다. Metal에서는 평면을 텍스처에 바로 쓰고, Apple silicon에서는 프레임을 셰이더가 읽는 곳에 바로 씁니다([#86](https://github.com/with-developer/emberwave/issues/86)). 릴리스마다의 변경은 [`CHANGELOG.md`](CHANGELOG.md)에 있습니다.
 
 다음은 이 순서로 합니다.
 
-1. **0.12, 스트림의 속도로.** 스트림의 프레임은 초당 60개씩 오고, 이 속도에서 emberwave의 디코딩은 업스트림의 1.3~1.5배 걸립니다. Metal에서 평면을 텍스처에 바로 쓰고, CPU와 GPU가 함께 쓰는 메모리로 올리고, CPU의 준비를 줄여서 이 차이를 절반으로 줄이는 것이 목표입니다([#86](https://github.com/with-developer/emberwave/issues/86)).
-2. **0.13, 실제 사용에서 재기.** 클라이언트의 화면 출력 루프 안에서 디코딩해 화면까지의 시간을 Mac과 iPhone에서 잽니다([#81](https://github.com/with-developer/emberwave/issues/81)). NVENC의 HEVC와 AV1 스트림을 emberwave의 스트림 옆에서 디코딩하고, 움직이는 게임 영상의 화질을 같은 비트레이트에서 예측 프레임을 쓰는 HEVC와 비교합니다([#82](https://github.com/with-developer/emberwave/issues/82)). XCFramework를 Swift 패키지로도 냅니다.
-3. **0.14, 화질과 플랫폼.** 같은 비트스트림 안에서 더 나은 인코더를 만들고, Linux와 Windows의 클라이언트와 호스트를 위해 C API의 GPU 연동에 Vulkan과 Direct3D 12 핸들을 넣습니다.
-4. **1.0을 향해, 클라이언트.** emberwave가 코덱으로 남도록 별도 저장소에서 브라우저로 스트리밍합니다. 호스트의 화면을 GPU에서 인코딩해 로컬 네트워크로 보내고, 탭에서 WebGPU로 디코딩하며, 먼저 지연 시간부터 잽니다. 그다음 PyroWave를 스트리밍하는 호스트들에 emberwave 인코더를 제안합니다. 1.0에는 안정된 C와 Rust API, 실제로 쓰이는 클라이언트 하나, 그리고 스트림의 속도에서 업스트림만큼 빠른 디코딩이 필요합니다.
+1. **0.13, 실제 사용에서 재기.** 클라이언트의 화면 출력 루프 안에서 디코딩해 화면까지의 시간을 Mac과 iPhone에서 잽니다([#81](https://github.com/with-developer/emberwave/issues/81)). NVENC의 HEVC와 AV1 스트림을 emberwave의 스트림 옆에서 디코딩하고, 움직이는 게임 영상의 화질을 같은 비트레이트에서 예측 프레임을 쓰는 HEVC와 비교합니다([#82](https://github.com/with-developer/emberwave/issues/82)). XCFramework를 Swift 패키지로도 냅니다. [#86](https://github.com/with-developer/emberwave/issues/86)의 마지막 항목인 프레임마다의 CPU 준비도 줄입니다.
+2. **0.14, 화질과 플랫폼.** 같은 비트스트림 안에서 더 나은 인코더를 만들고, Linux와 Windows의 클라이언트와 호스트를 위해 C API의 GPU 연동에 Vulkan과 Direct3D 12 핸들을 넣습니다.
+3. **1.0을 향해, 클라이언트.** emberwave가 코덱으로 남도록 별도 저장소에서 브라우저로 스트리밍합니다. 호스트의 화면을 GPU에서 인코딩해 로컬 네트워크로 보내고, 탭에서 WebGPU로 디코딩하며, 먼저 지연 시간부터 잽니다. 그다음 PyroWave를 스트리밍하는 호스트들에 emberwave 인코더를 제안합니다. 1.0에는 안정된 C와 Rust API, 실제로 쓰이는 클라이언트 하나, 그리고 스트림의 속도에서 업스트림만큼 빠른 디코딩이 필요합니다.
 
 ## 저장소 구성
 
