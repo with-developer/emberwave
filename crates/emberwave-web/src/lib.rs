@@ -412,9 +412,10 @@ impl Player {
     ///
     /// A packet of a frame one to three frames newer by the bitstream's
     /// sequence number starts that frame and drops what arrived of the older
-    /// one; one of a frame further off is ignored or, eight frames off,
-    /// taken for the current one, as the number has three bits. So a
-    /// transport keeps frame numbers of its own: it ignores the packets of
+    /// one. As the number has three bits, one of a frame four to seven frames
+    /// newer, or one to four frames older, is ignored; one five to seven
+    /// frames older passes for a newer frame, and one eight frames off for
+    /// the current one. So a transport keeps frame numbers of its own: it ignores the packets of
     /// frames older than the one being assembled, and before it pushes the
     /// first packet of a newer frame it draws the current one if it is
     /// ready, then calls [`drop_packets`](Self::drop_packets).
