@@ -151,8 +151,11 @@ pub struct Encoder {
     /// Kept from frame to frame, so that a frame's planes go into memory
     /// that is there already; `Queue::write_buffer` allocates new memory for
     /// every frame, and the first writes to it cost more than the copy.
-    upload: wgpu::Buffer,
-    /// Whether `upload` is mapped for writing.
+    /// `None` where the context shares uploads: the CPU writes into `planes`
+    /// itself then, and nothing is copied (decision D54).
+    upload: Option<wgpu::Buffer>,
+    /// Whether the buffer the CPU writes the planes into is mapped for
+    /// writing.
     upload_mapped: bool,
     /// [`sample_level`] of every 8-bit value, for `fdwt.wgsl`.
     sample_levels: wgpu::Buffer,
@@ -245,12 +248,17 @@ impl Encoder {
             let usage = wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST;
-            let planes = storage("planes", buffers.packed_words * 4, usage);
-            let upload = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("planes upload"),
-                size: (buffers.packed_words * 4).max(16),
-                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: true,
+            let shared_uploads = context.shares_uploads();
+            let mut planes_usage = usage;
+            planes_usage.set(wgpu::BufferUsages::MAP_WRITE, shared_uploads);
+            let planes = storage("planes", buffers.packed_words * 4, planes_usage);
+            let upload = (!shared_uploads).then(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("planes upload"),
+                    size: (buffers.packed_words * 4).max(16),
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                })
             });
             let levels: Vec<f32> = (0..=u8::MAX).map(sample_level).collect();
             let sample_levels = storage("sample levels", levels.len() as u64 * 4, usage);
@@ -368,9 +376,9 @@ impl Encoder {
                 signalling,
                 sequence: 0,
                 pipelines: Arc::clone(&pipelines),
+                upload_mapped: upload.is_some(),
                 planes,
                 upload,
-                upload_mapped: true,
                 sample_levels,
                 gather_planes,
                 gather_luma_chroma,
@@ -681,14 +689,29 @@ impl Encoder {
         Ok(())
     }
 
-    /// Maps the upload buffer for writing, unless it is. The GPU is done with
-    /// it: every encode waits for its frame.
+    /// The buffer the CPU writes the planes into: the upload buffer, or where
+    /// the context shares uploads the planes buffer itself (decision D54).
+    fn upload_target(&self) -> &wgpu::Buffer {
+        self.upload.as_ref().unwrap_or(&self.planes)
+    }
+
+    /// Maps the buffer the CPU writes the planes into, unless it is. The GPU
+    /// is done with it: every encode waits for its frame.
     fn map_upload(&mut self) -> Result<(), GpuError> {
         if self.upload_mapped {
             return Ok(());
         }
-        map_for_writing(&self.device, &[&self.upload])?;
+        map_for_writing(&self.device, &[self.upload_target()])?;
         self.upload_mapped = true;
+        Ok(())
+    }
+
+    /// Unmaps the buffer the CPU writes the planes into, if it is mapped.
+    fn unmap_upload(&mut self) -> Result<(), GpuError> {
+        if self.upload_mapped {
+            with_error_scope(&self.device, || self.upload_target().unmap())?;
+            self.upload_mapped = false;
+        }
         Ok(())
     }
 
@@ -705,35 +728,45 @@ impl Encoder {
             Some(strides) => check_strided_planes(&self.layout, planes, strides)?,
         }
         self.map_upload()?;
+        let written = self.write_planes(planes, strides);
+        // Unmapped whatever happened: where the planes buffer is written in
+        // place, the gather from textures writes it too (decision D54).
+        let unmapped = self.unmap_upload();
+        written?;
+        unmapped
+    }
+
+    /// The writing of [`upload_planes`](Self::upload_planes), into the mapped
+    /// buffer: rows padded to whole words.
+    fn write_planes(
+        &self,
+        planes: [&[u8]; 3],
+        strides: Option<[usize; 3]>,
+    ) -> Result<(), GpuError> {
         let mut view = self
-            .upload
+            .upload_target()
             .slice(..)
             .get_mapped_range_mut()
             .map_err(|error| GpuError::Device(error.to_string()))?;
-        {
-            for (component, plane) in Component::ALL.into_iter().zip(planes) {
-                let i = component.index();
-                let (width, height) = self.layout.plane_size(component);
-                let (width, height) = (width as usize, height as usize);
-                let source_stride = strides.map_or(width, |strides| strides[i]);
-                let stride = self.buffers.packed_strides[i] as usize * 4;
-                let start = self.buffers.packed_offsets[i] as usize * 4;
-                if width == stride && source_stride == width {
-                    view.slice(start..start + width * height)
-                        .copy_from_slice(&plane[..width * height]);
-                    continue;
-                }
-                for row in 0..height {
-                    let samples = &plane[row * source_stride..][..width];
-                    let at = start + row * stride;
-                    view.slice(at..at + width).copy_from_slice(samples);
-                    view.slice(at + width..at + stride).fill(0);
-                }
+        for (component, plane) in Component::ALL.into_iter().zip(planes) {
+            let i = component.index();
+            let (width, height) = self.layout.plane_size(component);
+            let (width, height) = (width as usize, height as usize);
+            let source_stride = strides.map_or(width, |strides| strides[i]);
+            let stride = self.buffers.packed_strides[i] as usize * 4;
+            let start = self.buffers.packed_offsets[i] as usize * 4;
+            if width == stride && source_stride == width {
+                view.slice(start..start + width * height)
+                    .copy_from_slice(&plane[..width * height]);
+                continue;
+            }
+            for row in 0..height {
+                let samples = &plane[row * source_stride..][..width];
+                let at = start + row * stride;
+                view.slice(at..at + width).copy_from_slice(samples);
+                view.slice(at + width..at + stride).fill(0);
             }
         }
-        drop(view);
-        with_error_scope(&self.device, || self.upload.unmap())?;
-        self.upload_mapped = false;
         Ok(())
     }
 
@@ -785,15 +818,18 @@ impl Encoder {
         })
     }
 
-    /// Records the copy of the uploaded planes into the planes buffer.
+    /// Records the copy of the uploaded planes into the planes buffer, if
+    /// they went into the upload buffer.
     fn encode_upload(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.copy_buffer_to_buffer(
-            &self.upload,
-            0,
-            &self.planes,
-            0,
-            self.buffers.packed_words * 4,
-        );
+        if let Some(upload) = &self.upload {
+            encoder.copy_buffer_to_buffer(
+                upload,
+                0,
+                &self.planes,
+                0,
+                self.buffers.packed_words * 4,
+            );
+        }
     }
 
     /// Records the forward transform of the uploaded planes; with `queries`,
@@ -1040,9 +1076,11 @@ impl Drop for Encoder {
     /// browser dropping a buffer leaves its memory to the garbage collector.
     /// Work already submitted keeps its buffers until it is done.
     fn drop(&mut self) {
+        if let Some(upload) = &self.upload {
+            upload.destroy();
+        }
         for buffer in [
             &self.planes,
-            &self.upload,
             &self.sample_levels,
             &self.pyramid,
             &self.costs,
