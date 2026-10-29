@@ -14,6 +14,7 @@ use common::{
     vector_names,
 };
 use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
+use emberwave_core::bitstream::header::Header;
 use emberwave_core::bitstream::{
     Band, BlockHeader, ChromaSiting, ChromaSubsampling, Component, FrameAssembler, FrameLayout,
     YcbcrRange,
@@ -1117,6 +1118,68 @@ fn an_incomplete_frame_is_an_error_until_it_is_allowed_to_be_partial() {
     }
     let complete = decoder.decode(&frames[0]).unwrap();
     assert_ne!(frame, complete, "the missing blocks must make a difference");
+}
+
+#[test]
+fn a_partial_frame_needs_the_share_of_blocks_its_decoder_asks() {
+    let context = gpu_or_return!();
+    // A frame of emberwave's encoder, which sends every block of the
+    // coarsest level (decision D58).
+    let name = "gradient_200x120_420";
+    let bytes = std::fs::read(encoder_dir().join(format!("{name}.pwv1"))).expect("stream");
+    let (layout, frames) = frames_of(name, &bytes);
+    let mut decoder = decoder_for(context, &layout);
+    let coarsest = layout
+        .bands()
+        .find(|&(_, level, _, _)| level < DECOMPOSITION_LEVELS - 1)
+        .map_or(layout.block_count(), |(_, _, _, band)| band.first_block);
+
+    // Packets of a block each, mostly; every other one past the coarsest
+    // level is lost.
+    let mut assembler = FrameAssembler::new(layout.clone());
+    for (number, packet) in emberwave_core::encode::packets(&frames[0], 64)
+        .into_iter()
+        .enumerate()
+    {
+        // The start of frame header may go alone, and is kept.
+        let mut at = 0;
+        let first_block = loop {
+            match Header::parse(&packet[at..]) {
+                Ok(Header::StartOfFrame(_)) => at += 8,
+                Ok(Header::Block(block)) => break Some(block.block_index),
+                Err(_) => break None,
+            }
+        };
+        if first_block.is_some_and(|block| block >= coarsest) && number % 2 == 1 {
+            continue;
+        }
+        decoder.push_packet(packet).unwrap();
+        assembler.push_packet(packet).unwrap();
+    }
+    let share = assembler.received_blocks() as f32 / assembler.total_blocks() as f32;
+    assert!((0.4..0.9).contains(&share), "{share}");
+
+    assert_eq!(decoder.partial_share(), 0.9);
+    assert!(!decoder.is_ready(true), "90 % by default");
+    decoder.set_partial_share(share - 0.05);
+    assert!(decoder.is_ready(true));
+    assert!(!decoder.is_ready(false));
+    // A share above what arrived; the edge itself, where exactly the share
+    // is not enough, is the assembler's test.
+    decoder.set_partial_share(share + 0.01);
+    assert!(!decoder.is_ready(true));
+    decoder.set_partial_share(1.0);
+    assert!(!decoder.is_ready(true), "1 takes whole frames only");
+    decoder.set_partial_share(-1.0);
+    assert_eq!(decoder.partial_share(), 0.0);
+    decoder.set_partial_share(f32::NAN);
+    assert_eq!(decoder.partial_share(), 0.9);
+
+    // What arrived decodes, as it always could.
+    decoder.set_partial_share(0.0);
+    assert!(decoder.is_ready(true));
+    let frame = decoder.decode_assembled().unwrap();
+    assert_eq!(frame.planes[0].data.len(), 200 * 120);
 }
 
 #[test]

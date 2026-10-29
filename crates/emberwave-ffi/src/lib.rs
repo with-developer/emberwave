@@ -1164,7 +1164,8 @@ pub unsafe extern "C" fn emberwave_decoder_push_packet(
 /// Whether the frame being received can be decoded: all its blocks arrived,
 /// or, with `allow_partial_frame`, enough of them for a usable picture: every
 /// block of the coarsest level, and more than 90 percent of the blocks its
-/// start of frame header announced. Until that header arrives the count is of
+/// start of frame header announced, or the share
+/// `emberwave_decoder_set_partial_share` set. Until that header arrives the count is of
 /// all the picture's blocks, so a frame without it is ready only if its
 /// encoder left out few blocks. emberwave's encoder sends every block of the
 /// coarsest level for partial decodes; upstream's leaves out the empty ones,
@@ -1187,6 +1188,36 @@ pub unsafe extern "C" fn emberwave_decoder_is_ready(
         .unwrap_or(false),
         None => false,
     }
+}
+
+/// Sets the share of a frame's announced blocks that must have arrived, with
+/// every block of the coarsest level, for `emberwave_decoder_is_ready` with
+/// `allow_partial_frame` to accept a frame that lost packets: 0.9 by
+/// default, as upstream's decoder has it. A lower share accepts frames that
+/// lost more, with more of their detail blank, where a client would skip
+/// them; 1 accepts whole frames only. The share stays until it is set again.
+/// A share outside 0 to 1, NaN included, gives
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and changes nothing.
+///
+/// # Safety
+///
+/// `decoder` is `NULL` or a live decoder that no other thread is using.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_set_partial_share(
+    decoder: *mut EmberwaveDecoder,
+    share: f32,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        let decoder = unsafe { live_mut(decoder) }?;
+        if !(0.0..=1.0).contains(&share) {
+            return Err(Failure::argument(format!(
+                "a share of {share} is not from 0 to 1"
+            )));
+        }
+        decoder.decoder.set_partial_share(share);
+        Ok(())
+    })
 }
 
 /// Discards what was received, and forgets the order of the frames: the next

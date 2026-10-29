@@ -431,13 +431,36 @@ impl Player {
     /// Whether the frame assembled from packets can be drawn: all of it, or
     /// with `allow_partial` the part that arrived, if that includes every
     /// block of the coarsest level and more than 90 percent of the blocks
-    /// the start of frame header announced. Until that header arrives, the
-    /// count is of all the picture's blocks, so a frame without it is ready
-    /// only if its encoder left out few blocks.
+    /// the start of frame header announced, or the share `set_partial_share`
+    /// set. Until that header arrives, the count is of all the picture's
+    /// blocks, so a frame without it is ready only if its encoder left out
+    /// few blocks.
     pub fn is_ready(&self, allow_partial: bool) -> bool {
         self.stream
             .as_ref()
             .is_some_and(|stream| stream.decoder.is_ready(allow_partial))
+    }
+
+    /// Sets the share of a frame's announced blocks that must have arrived,
+    /// with every block of the coarsest level, for `is_ready(true)` and
+    /// `draw_assembled` to take a frame that lost packets: 0.9 by default,
+    /// as upstream's decoder has it. A lower share draws frames that lost
+    /// more, with more of their detail blank, where a page would skip them
+    /// and leave the last picture; 1 draws whole frames only. It holds for
+    /// the stream open. Throws for a share outside 0 to 1, and without a
+    /// stream.
+    pub fn set_partial_share(&mut self, share: f32) -> Result<(), JsError> {
+        if !(0.0..=1.0).contains(&share) {
+            return Err(JsError::new(&format!(
+                "a share of {share} is not from 0 to 1"
+            )));
+        }
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| JsError::new("no stream is open"))?;
+        stream.decoder.set_partial_share(share);
+        Ok(())
     }
 
     /// Drops what arrived of the frame being assembled, and forgets its

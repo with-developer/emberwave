@@ -715,6 +715,18 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_frame_needs_more_than_the_share() {
+        let mut a = assembler();
+        a.push_packet(&start_of_frame(1, 24)).unwrap();
+        // The 12 blocks of level 4 are half of the 24 announced: not more.
+        let level4: Vec<u8> = (0..12).flat_map(|i| block(i, 1, 0)).collect();
+        a.push_packet(&level4).unwrap();
+        assert!(!a.is_ready_with(true, 2, 0.5, None));
+        a.push_packet(&block(12, 1, 0)).unwrap();
+        assert!(a.is_ready_with(true, 2, 0.5, None));
+    }
+
+    #[test]
     fn missing_coarse_block_blocks_partial_decode() {
         let mut a = assembler();
         a.push_packet(&start_of_frame(1, 20)).unwrap();
