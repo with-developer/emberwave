@@ -30,9 +30,10 @@ pub(crate) struct Pipelines {
 impl Pipelines {
     /// The decoder's pipelines, with `idwt_planes` if `plane_stores`: the
     /// device must have the adapter's own format features then, and take
-    /// [`PLANE_FORMAT`] as a storage texture.
+    /// [`PLANE_FORMAT`] as a storage texture. A device that fails to build
+    /// it decodes with the copies.
     pub(crate) fn new(device: &wgpu::Device, plane_stores: bool) -> Result<Self, GpuError> {
-        with_error_scope(device, || Self {
+        let mut pipelines = with_error_scope(device, || Self {
             dequant: create_stage(
                 device,
                 "dequant",
@@ -54,7 +55,20 @@ impl Pipelines {
                     uniform_entry(2),
                 ],
             ),
-            idwt_planes: plane_stores.then(|| {
+            idwt_planes: None,
+            yuv2rgb: create_stage(
+                device,
+                "yuv2rgb",
+                shader_sources::YUV2RGB,
+                &[
+                    storage_entry(0, true),
+                    storage_entry(1, false),
+                    uniform_entry(2),
+                ],
+            ),
+        })?;
+        if plane_stores {
+            pipelines.idwt_planes = with_error_scope(device, || {
                 create_stage(
                     device,
                     "idwt planes",
@@ -67,18 +81,10 @@ impl Pipelines {
                         plane_entry(5),
                     ],
                 )
-            }),
-            yuv2rgb: create_stage(
-                device,
-                "yuv2rgb",
-                shader_sources::YUV2RGB,
-                &[
-                    storage_entry(0, true),
-                    storage_entry(1, false),
-                    uniform_entry(2),
-                ],
-            ),
-        })
+            })
+            .ok();
+        }
+        Ok(pipelines)
     }
 }
 

@@ -330,6 +330,13 @@ fn read_planes(
             let metal: &ProtocolObject<dyn MTLTexture> = &*emberwave_texture_metal(texture).cast();
             assert_eq!((metal.width(), metal.height()), size);
             assert_eq!(metal.pixelFormat(), MTLPixelFormat::R8Unorm);
+            // The decodes store the planes into it from their shaders, rather
+            // than copy them in (decision D52).
+            assert!(
+                metal.usage().contains(MTLTextureUsage::ShaderWrite),
+                "{:?}",
+                metal.usage()
+            );
             let on: Retained<ProtocolObject<dyn MTLDevice>> = metal.device();
             assert!(
                 ptr::eq(&*on, device),

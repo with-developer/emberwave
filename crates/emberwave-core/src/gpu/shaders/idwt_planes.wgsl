@@ -12,8 +12,9 @@
 @group(0) @binding(5) var plane_cr: texture_storage_2d<r8unorm, write>;
 
 // Stores an 8-bit level into the texture of `component`. The level is a whole
-// number from 0 to 255, so level / 255 converts back to it exactly, whatever
-// way the store rounds.
+// number from 0 to 255, and Metal turns a float into a UNORM texel by rounding
+// to the nearest level, so level / 255 comes back as the level exactly; the
+// tests compare the stores with the packed planes byte for byte.
 fn store_level(component: u32, at: vec2<u32>, level: f32) {
     let texel = vec4<f32>(level / 255.0, 0.0, 0.0, 1.0);
     switch (component) {

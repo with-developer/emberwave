@@ -502,7 +502,7 @@ enum EmberwaveStatus emberwave_texture_create(const struct EmberwaveDecoder *dec
                                               uint32_t format,
                                               struct EmberwaveTexture **texture);
 
-// Creates a texture that `emberwave_decoder_decode_plane_textures` copies one
+// Creates a texture that `emberwave_decoder_decode_plane_textures` puts one
 // plane of the pictures of `decoder` into, on the decoder's GPU device:
 // `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
 // `EMBERWAVE_PLANE_CR`, and the texture is for that plane only, of its size

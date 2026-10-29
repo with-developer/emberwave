@@ -1325,7 +1325,7 @@ pub unsafe extern "C" fn emberwave_texture_create(
     )
 }
 
-/// Creates a texture that `emberwave_decoder_decode_plane_textures` copies one
+/// Creates a texture that `emberwave_decoder_decode_plane_textures` puts one
 /// plane of the pictures of `decoder` into, on the decoder's GPU device:
 /// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
 /// `EMBERWAVE_PLANE_CR`, and the texture is for that plane only, of its size
@@ -2458,6 +2458,74 @@ mod tests {
         // SAFETY: both live, destroyed once.
         unsafe {
             emberwave_encoder_destroy(encoder);
+            emberwave_context_destroy(context);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_plane_texture_the_app_may_write_takes_stores() {
+        // tests/metal.rs sees the same planes either way: this pins that the
+        // app's plane textures with MTLTextureUsageShaderWrite take the stores
+        // where the decoder stores (decision D52), and the others the copies.
+        use objc2::runtime::ProtocolObject;
+        use objc2_metal::{MTLDevice, MTLPixelFormat, MTLTextureDescriptor, MTLTextureUsage};
+
+        let mut context = std::ptr::null_mut();
+        // SAFETY: NULL options and a pointer to store the context in.
+        if unsafe { emberwave_context_create(std::ptr::null(), &mut context) }
+            != EmberwaveStatus::Ok
+        {
+            return;
+        }
+        // SAFETY: live objects, and pointers to store results in.
+        unsafe {
+            let device = emberwave_context_metal_device(context);
+            if !device.is_null() {
+                let device: &ProtocolObject<dyn MTLDevice> = &*device.cast();
+                let mut decoder = std::ptr::null_mut();
+                assert_eq!(
+                    emberwave_decoder_create(context, 64, 32, EMBERWAVE_CHROMA_420, &mut decoder),
+                    EmberwaveStatus::Ok
+                );
+                let stores = (*decoder).decoder.stores_planes();
+                for (usage, storage) in [
+                    (MTLTextureUsage::ShaderRead, false),
+                    (
+                        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite,
+                        stores,
+                    ),
+                ] {
+                    let descriptor =
+                        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                            MTLPixelFormat::R8Unorm,
+                            64,
+                            32,
+                            false,
+                        );
+                    descriptor.setUsage(usage);
+                    let metal = device
+                        .newTextureWithDescriptor(&descriptor)
+                        .expect("a texture");
+                    let mut texture = std::ptr::null_mut();
+                    assert_eq!(
+                        emberwave_texture_from_metal_plane(
+                            decoder,
+                            EMBERWAVE_PLANE_Y,
+                            objc2::rc::Retained::as_ptr(&metal).cast_mut().cast(),
+                            &mut texture
+                        ),
+                        EmberwaveStatus::Ok
+                    );
+                    let wrapped = (*texture)
+                        .texture
+                        .usage()
+                        .contains(wgpu::TextureUsages::STORAGE_BINDING);
+                    assert_eq!(wrapped, storage, "{usage:?}");
+                    emberwave_texture_destroy(texture);
+                }
+                emberwave_decoder_destroy(decoder);
+            }
             emberwave_context_destroy(context);
         }
     }

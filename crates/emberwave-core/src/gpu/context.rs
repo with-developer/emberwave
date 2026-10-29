@@ -322,7 +322,9 @@ impl GpuContext {
     /// Whether the decoders store the planes straight into the textures of
     /// decodes into plane textures, those that allow it, rather than copy
     /// them in: on Metal, unless [`GpuOptions::plane_stores`] was off
-    /// (decision D52).
+    /// (decision D52). Should the device fail to build the shader that
+    /// stores, the decoders copy all the same, which
+    /// [`Decoder::stores_planes`](super::Decoder::stores_planes) tells.
     pub fn stores_planes(&self) -> bool {
         self.plane_stores
     }

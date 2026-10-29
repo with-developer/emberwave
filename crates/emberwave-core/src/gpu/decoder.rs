@@ -962,7 +962,7 @@ impl Decoder {
     ) -> Result<Output, GpuError> {
         let output = match read {
             Read::Texture(target) => Output::Picture(Fill::of(target.texture())),
-            Read::Planes(targets) => Output::Planes(self.plane_fill(targets)?),
+            Read::Planes(targets) => Output::Planes(self.plane_fill(targets)),
             Read::Nothing | Read::Yuv | Read::Rgb => Output::None,
         };
         if let Some(color) = color {
@@ -978,19 +978,22 @@ impl Decoder {
     /// How the planes get into `targets`: stored by the inverse transform
     /// where this decoder can store them and every texture allows it, the
     /// `STORAGE_BINDING` usage, and copied otherwise (decisions D41, D52).
-    fn plane_fill(&self, targets: [&wgpu::TextureView; 3]) -> Result<PlaneFill, GpuError> {
+    /// A view that does not allow stores, which its texture's usage cannot
+    /// tell, fails the bind groups and takes the copy, which the checks of
+    /// the targets made sure of.
+    fn plane_fill(&self, targets: [&wgpu::TextureView; 3]) -> PlaneFill {
         let Some(stage) = &self.pipelines.idwt_planes else {
-            return Ok(PlaneFill::Copy);
+            return PlaneFill::Copy;
         };
         let storage = wgpu::TextureUsages::STORAGE_BINDING;
         if !targets
             .iter()
             .all(|target| target.texture().usage().contains(storage))
         {
-            return Ok(PlaneFill::Copy);
+            return PlaneFill::Copy;
         }
         let [y, cb, cr] = targets;
-        with_error_scope(&self.device, || {
+        let stores = with_error_scope(&self.device, || {
             let bind_groups = self
                 .idwt_stages
                 .iter()
@@ -1011,7 +1014,8 @@ impl Decoder {
                 })
                 .collect();
             PlaneFill::Store(bind_groups)
-        })
+        });
+        stores.unwrap_or(PlaneFill::Copy)
     }
 
     /// Records, after the passes, what `read` asks of textures, which
@@ -1876,6 +1880,72 @@ mod tests {
                 "{width} wide, {format:?}, {usage:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_planes_are_stored_where_all_three_textures_take_stores() {
+        // The plane tests see the same planes either way: this pins which way
+        // each set of textures takes (decision D52).
+        let Some(context) = test_context() else {
+            return;
+        };
+        let decoder = Decoder::new(context, 64, 32, ChromaSubsampling::Yuv420).expect("decoder");
+        assert_eq!(decoder.stores_planes(), context.stores_planes());
+        // Textures a client samples, which decodes copy into, or store into.
+        let copy = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING;
+        let store = copy | wgpu::TextureUsages::STORAGE_BINDING;
+        let textures = |usages: [wgpu::TextureUsages; 3]| {
+            Component::ALL.map(|component| {
+                let (width, height) = decoder.layout().plane_size(component);
+                context.device().create_texture(&wgpu::TextureDescriptor {
+                    label: Some("plane"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: PLANE_FORMAT,
+                    usage: usages[component.index()],
+                    view_formats: &[],
+                })
+            })
+        };
+        let fill = |textures: &[wgpu::Texture; 3], view: &wgpu::TextureViewDescriptor| {
+            let views = textures.each_ref().map(|texture| texture.create_view(view));
+            decoder.plane_fill(views.each_ref())
+        };
+        let plain = wgpu::TextureViewDescriptor::default();
+        assert!(matches!(
+            fill(&textures([copy; 3]), &plain),
+            PlaneFill::Copy
+        ));
+        if !context.stores_planes() {
+            // Textures of R8 storage need the adapter's own format features.
+            return;
+        }
+        // In 4:2:0 the planes end at levels 1 and 0, the last two of five.
+        match fill(&textures([store; 3]), &plain) {
+            PlaneFill::Store(bind_groups) => assert_eq!(
+                bind_groups.iter().map(Option::is_some).collect::<Vec<_>>(),
+                [false, false, false, true, true]
+            ),
+            PlaneFill::Copy => panic!("textures that take stores are copied into"),
+        }
+        assert!(matches!(
+            fill(&textures([store, copy, store]), &plain),
+            PlaneFill::Copy
+        ));
+        let sampled = wgpu::TextureViewDescriptor {
+            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+            ..Default::default()
+        };
+        assert!(matches!(
+            fill(&textures([store; 3]), &sampled),
+            PlaneFill::Copy
+        ));
     }
 
     #[test]

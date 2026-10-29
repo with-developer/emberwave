@@ -695,7 +695,10 @@ fn planes_stored_into_textures_are_the_copied_planes() {
     if !metal {
         return;
     }
-    let copy = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC;
+    // Textures a client samples, which decodes copy into, or store into.
+    let copy = wgpu::TextureUsages::COPY_DST
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::TEXTURE_BINDING;
     let store = copy | wgpu::TextureUsages::STORAGE_BINDING;
     // 4:2:0, whose chroma planes come out a level before luma, and 4:4:4 of
     // an odd size, whose last tiles stick out of the planes.
@@ -708,9 +711,20 @@ fn planes_stored_into_textures_are_the_copied_planes() {
             made.usage().contains(wgpu::TextureUsages::STORAGE_BINDING),
             "{name}"
         );
-        // Stored into all three; copied into all three; and copied into all
-        // three when one of them takes no stores.
-        for usages in [[store; 3], [copy; 3], [store, copy, store]] {
+        // Stored into all three; copied into all three; copied into all
+        // three when one of them takes no stores; and copied into textures
+        // that take stores through views for sampling, which do not.
+        let sampled = wgpu::TextureViewDescriptor {
+            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+            ..Default::default()
+        };
+        let plain = wgpu::TextureViewDescriptor::default();
+        for (usages, view) in [
+            ([store; 3], &plain),
+            ([copy; 3], &plain),
+            ([store, copy, store], &plain),
+            ([store; 3], &sampled),
+        ] {
             let textures: Vec<wgpu::Texture> = Component::ALL
                 .into_iter()
                 .zip(usages)
@@ -718,7 +732,7 @@ fn planes_stored_into_textures_are_the_copied_planes() {
                 .collect();
             let views: Vec<wgpu::TextureView> = textures
                 .iter()
-                .map(|texture| texture.create_view(&Default::default()))
+                .map(|texture| texture.create_view(view))
                 .collect();
             let targets = [&views[0], &views[1], &views[2]];
             for (index, frame) in frames.iter().enumerate() {
@@ -742,7 +756,8 @@ fn planes_stored_into_textures_are_the_copied_planes() {
                     assert_eq!(
                         read_texture(context, texture),
                         planes[component.index()].data,
-                        "{name}: {component:?}, frame {index}, {usages:?}"
+                        "{name}: {component:?}, frame {index}, {usages:?}, {:?}",
+                        view.usage
                     );
                 }
             }
@@ -1006,10 +1021,20 @@ fn a_device_limited_to_webgpu_guarantees_decodes_the_same() {
     let Some(context) = create_context(&options) else {
         return;
     };
+    // Not even the stores into plane textures, which Metal's own format
+    // features allow (decision D52).
+    assert!(!context.stores_planes());
+    assert!(
+        !context
+            .device()
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+    );
 
     let (layout, frames) = vector_frames("noise_131x67_444");
     let reference = read_reference("noise_131x67_444", Reference::Fp32);
     let mut decoder = decoder_for(&context, &layout);
+    assert!(!decoder.stores_planes());
     let mut worst = f64::INFINITY;
     for (index, frame) in frames.iter().enumerate() {
         let decoded = decoder.decode(frame).unwrap();
