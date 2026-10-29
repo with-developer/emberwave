@@ -766,6 +766,55 @@ fn planes_stored_into_textures_are_the_copied_planes() {
 }
 
 #[test]
+fn frames_written_in_place_decode_as_copied_ones() {
+    // On Metal on Apple silicon the decodes that wait write a frame where the
+    // shaders read it; elsewhere, and with `shared_uploads` off, it goes
+    // through an upload buffer and copies (decision D53).
+    let context = gpu_or_return!();
+    let info = context.adapter_info();
+    let shares =
+        info.backend == wgpu::Backend::Metal && info.device_type == wgpu::DeviceType::IntegratedGpu;
+    assert_eq!(context.shares_uploads(), shares);
+    let options = GpuOptions {
+        shared_uploads: false,
+        ..GpuOptions::default()
+    };
+    let Some(copied) = create_context(&options) else {
+        return;
+    };
+    assert!(!copied.shares_uploads());
+    let color = ColorParams::default();
+    // A frame that grows the payload buffer, frames that shrink again, and
+    // decodes that do not wait in between, which write through the queue.
+    for name in [
+        "noise_192x136_420",
+        "gradient_200x120_420",
+        "noise_131x67_444",
+    ] {
+        let (layout, frames) = vector_frames(name);
+        let mut shared = decoder_for(context, &layout);
+        let mut through = decoder_for(&copied, &layout);
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                shared.decode(frame).expect("decode"),
+                through.decode(frame).expect("decode"),
+                "{name}: frame {index}"
+            );
+            assert_eq!(
+                shared.decode_rgb(frame, &color).expect("RGB decode"),
+                through.decode_rgb(frame, &color).expect("RGB decode"),
+                "{name}: frame {index}, RGB"
+            );
+            let mut encoder = context.device().create_command_encoder(&Default::default());
+            shared
+                .encode_rgb(frame, &color, &mut encoder)
+                .expect("recorded decode");
+            context.queue().submit([encoder.finish()]);
+        }
+    }
+}
+
+#[test]
 fn without_plane_stores_the_planes_are_copied() {
     let options = GpuOptions {
         plane_stores: false,
@@ -1022,14 +1071,13 @@ fn a_device_limited_to_webgpu_guarantees_decodes_the_same() {
         return;
     };
     // Not even the stores into plane textures, which Metal's own format
-    // features allow (decision D52).
+    // features allow (decision D52), nor frames written where the shaders
+    // read them, which mappable storage buffers allow (decision D53).
     assert!(!context.stores_planes());
-    assert!(
-        !context
-            .device()
-            .features()
-            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
-    );
+    assert!(!context.shares_uploads());
+    let features = context.device().features();
+    assert!(!features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES));
+    assert!(!features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS));
 
     let (layout, frames) = vector_frames("noise_131x67_444");
     let reference = read_reference("noise_131x67_444", Reference::Fp32);

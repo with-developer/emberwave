@@ -194,8 +194,13 @@ pub struct Decoder {
     block_offsets: wgpu::Buffer,
     /// Made on the first decode that waits for its frame, and made again
     /// when the payload buffer grows; `encode_rgb`, which does not wait,
-    /// writes through the queue instead, as a browser has to.
+    /// writes through the queue instead, as a browser has to. Never made
+    /// where `shared_uploads` is.
     upload: Option<FrameUpload>,
+    /// Whether the decodes that wait for their frame write it straight into
+    /// `payload` and `block_offsets`, which the CPU can map then (decision
+    /// D53).
+    shared_uploads: bool,
     pyramid: wgpu::Buffer,
     packed: wgpu::Buffer,
     /// Made by the first decode that reads the planes back: a player never
@@ -299,15 +304,12 @@ impl Decoder {
             let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
 
             let payload_capacity_words = MIN_PAYLOAD_WORDS;
-            let payload = storage(
-                "payload",
-                payload_capacity_words as u64 * 4,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            );
+            let frame_usage = frame_buffer_usage(context.shares_uploads());
+            let payload = storage("payload", payload_capacity_words as u64 * 4, frame_usage);
             let block_offsets = storage(
                 "block offsets",
                 u64::from(layout.block_count()) * 4,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                frame_usage,
             );
             let pyramid = storage(
                 "wavelet pyramid",
@@ -369,6 +371,7 @@ impl Decoder {
                 payload_capacity_words,
                 block_offsets,
                 upload: None,
+                shared_uploads: context.shares_uploads(),
                 pyramid,
                 packed,
                 readback: None,
@@ -1489,7 +1492,7 @@ impl Decoder {
             let payload = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("payload"),
                 size: capacity_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: frame_buffer_usage(self.shared_uploads),
                 mapped_at_creation: false,
             });
             let bind_group = dequant_bind_group(
@@ -1522,6 +1525,9 @@ impl Decoder {
     /// frame's command buffer. The previous frame is done, so mapping the
     /// buffer waits for nothing.
     fn upload_mapped(&mut self) -> Result<(u64, u64), GpuError> {
+        if self.shared_uploads {
+            return self.upload_in_place();
+        }
         let payload_start = self.table_capacity_bytes();
         let capacity_bytes = payload_start + self.payload_capacity_words as u64 * 4;
         let upload = match &mut self.upload {
@@ -1546,7 +1552,7 @@ impl Decoder {
             }
         };
         if !upload.mapped {
-            map_for_writing(&self.device, &upload.buffer)?;
+            map_for_writing(&self.device, &[&upload.buffer])?;
             upload.mapped = true;
         }
 
@@ -1570,6 +1576,38 @@ impl Decoder {
         with_error_scope(&self.device, || upload.buffer.unmap())?;
         upload.mapped = false;
         Ok((table.len() as u64, payload_bytes))
+    }
+
+    /// Writes the block table and the payload of the assembled frame where
+    /// the shaders read them, on a GPU that shares its memory with the CPU
+    /// (decision D53): no upload buffer, and no copies at the start of the
+    /// frame's command buffer, whose sizes this returns as zero. The previous
+    /// frame is done, so mapping the buffers waits for nothing.
+    fn upload_in_place(&mut self) -> Result<(u64, u64), GpuError> {
+        map_for_writing(&self.device, &[&self.block_offsets, &self.payload])?;
+        let frame = self.assembler.frame();
+        let table: &[u8] = bytemuck::cast_slice(frame.block_offsets());
+        let payload: &[u8] = bytemuck::cast_slice(frame.payload());
+        let padded = payload.len() + PAYLOAD_PADDING_WORDS * 4;
+        let mapped = |buffer: &wgpu::Buffer, bytes: usize| {
+            buffer
+                .slice(..bytes as u64)
+                .get_mapped_range_mut()
+                .map_err(|error| GpuError::Device(error.to_string()))
+        };
+        mapped(&self.block_offsets, table.len())?
+            .slice(..)
+            .copy_from_slice(table);
+        {
+            let mut view = mapped(&self.payload, padded)?;
+            view.slice(..payload.len()).copy_from_slice(payload);
+            view.slice(payload.len()..).fill(0);
+        }
+        with_error_scope(&self.device, || {
+            self.block_offsets.unmap();
+            self.payload.unmap();
+        })?;
+        Ok((0, 0))
     }
 
     /// Uploads the block table and the payload of the assembled frame through
@@ -1734,6 +1772,14 @@ fn payload_capacity_bytes(needed_words: usize, limit_bytes: u64) -> Option<u64> 
     Some(rounded.min(limit))
 }
 
+/// The usage of the buffers the shaders read a frame from: written through
+/// the queue, or with `shared_uploads` also mapped by the CPU (decision D53).
+fn frame_buffer_usage(shared_uploads: bool) -> wgpu::BufferUsages {
+    let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    usage.set(wgpu::BufferUsages::MAP_WRITE, shared_uploads);
+    usage
+}
+
 fn dequant_bind_group(
     device: &wgpu::Device,
     stage: &Stage,
@@ -1880,6 +1926,29 @@ mod tests {
                 "{width} wide, {format:?}, {usage:?}"
             );
         }
+    }
+
+    #[test]
+    fn frames_go_where_the_shaders_read_them_where_memory_is_shared() {
+        // The decode tests see the same frames either way: this pins which
+        // way a frame goes (decision D53).
+        let Some(context) = test_context() else {
+            return;
+        };
+        let mut decoder =
+            Decoder::new(context, 64, 32, ChromaSubsampling::Yuv420).expect("decoder");
+        assert_eq!(decoder.shared_uploads, context.shares_uploads());
+        decoder
+            .decode(&empty_frame(64, 32, ChromaSubsampling::Yuv420))
+            .expect("decode");
+        // No upload buffer and so no copies from it, or the buffer.
+        assert_eq!(decoder.upload.is_none(), context.shares_uploads());
+        let usage = decoder.payload.usage();
+        assert_eq!(
+            usage.contains(wgpu::BufferUsages::MAP_WRITE),
+            context.shares_uploads()
+        );
+        assert_eq!(usage, decoder.block_offsets.usage());
     }
 
     #[test]
