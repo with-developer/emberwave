@@ -527,7 +527,9 @@ impl Encoder {
         timed: bool,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
         let record_lock = Arc::clone(&self.record_lock);
-        let _record = record_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = record_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prepare_start = Instant::now();
         // The planes in the upload buffer, or a pass that gathers them from
         // the textures.

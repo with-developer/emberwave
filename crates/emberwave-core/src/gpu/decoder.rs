@@ -902,7 +902,9 @@ impl Decoder {
         consume: &mut dyn FnMut(&[u8]),
     ) -> Result<Timings, GpuError> {
         let record_lock = Arc::clone(&self.record_lock);
-        let _record = record_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = record_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
@@ -1103,7 +1105,9 @@ impl Decoder {
     ) -> Result<(), GpuError> {
         self.check_device()?;
         let record_lock = Arc::clone(&self.record_lock);
-        let _record = record_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = record_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
