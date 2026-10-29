@@ -1,7 +1,8 @@
 //! emberwave in the browser: decodes PyroWave (`.pwv1`) files with WebGPU and
-//! draws them on a canvas, makes a demo stream for the player ([`Demo`]), and
-//! times the decoding on the browser's GPU ([`Bench`]). The pages are in
-//! `web/`, and `scripts/build_web.sh` builds this crate for them.
+//! draws them on a canvas, or a stream packet by packet as a client receives
+//! it, makes a demo stream for the player ([`Demo`]), and times the decoding
+//! on the browser's GPU ([`Bench`]). The pages are in `web/`, and
+//! `scripts/build_web.sh` builds this crate for them.
 //!
 //! Only the browser build has content. On other targets the crate is empty,
 //! so that the workspace builds everywhere.
@@ -10,8 +11,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use emberwave_core::bitstream::{Pwv1File, consts, pwv1};
+use emberwave_core::bitstream::{ChromaSubsampling, Pwv1File, consts, pwv1};
 use emberwave_core::color::ColorParams;
+use emberwave_core::encode;
 use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions, TEXTURE_FORMATS};
 use wasm_bindgen::prelude::*;
 
@@ -60,6 +62,17 @@ fn surface_format(surface: &wgpu::Surface<'_>, adapter: &wgpu::Adapter) -> wgpu:
         .unwrap_or(wgpu::TextureFormat::Bgra8Unorm)
 }
 
+/// The canvas's texture to draw the next picture on.
+fn current_texture(surface: &wgpu::Surface<'_>) -> Result<wgpu::SurfaceTexture, JsError> {
+    match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(texture)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Ok(texture),
+        other => Err(JsError::new(&format!(
+            "the canvas has no texture to draw on: {other:?}"
+        ))),
+    }
+}
+
 /// Times from submitting a frame until the browser reported it done, summed
 /// up by the callbacks of the queue until the page asks for their average.
 #[derive(Debug, Default)]
@@ -70,7 +83,8 @@ struct GpuTimes {
 
 /// The stream being played.
 struct Stream {
-    /// The file, whose frames are played in turn up to `end`.
+    /// The file, whose frames are played in turn up to `end`; empty for a
+    /// stream of packets opened without one.
     file: Vec<u8>,
     /// Where the frames end that can be played: the end of the file, or
     /// where the first one starts that cannot.
@@ -78,10 +92,30 @@ struct Stream {
     /// Where the size of the next frame to play is.
     next: usize,
     decoder: Decoder,
+    /// The colours of the file's header, or for a stream opened without a
+    /// file those it takes until a frame's start of frame header says
+    /// otherwise.
     color: ColorParams,
+    /// Whether the colours follow each frame's start of frame header, as for
+    /// a stream opened without a file.
+    follows_frames: bool,
     width: u32,
     height: u32,
     frame_rate: f64,
+}
+
+/// Where `frame`, an encoded frame, splits into packets of at most
+/// `max_bytes` each, at its blocks, as a host sends them: the end of each
+/// packet, in bytes from the start of the frame. The first packet starts with
+/// the start of frame header, and a block larger than `max_bytes` gets a
+/// packet of its own, as with `emberwave_frame_packets` in the C API.
+#[wasm_bindgen]
+pub fn packet_ends(frame: &[u8], max_bytes: usize) -> Vec<u32> {
+    let start = frame.as_ptr() as usize;
+    encode::packets(frame, max_bytes)
+        .into_iter()
+        .map(|packet| (packet.as_ptr() as usize - start + packet.len()) as u32)
+        .collect()
 }
 
 /// The frames of a file that can be played, in order: how many there are,
@@ -218,38 +252,14 @@ impl Player {
         let file = Pwv1File::parse(&bytes).map_err(js_error)?;
         let header = *file.header();
         let stream = header.stream;
-        let largest = self.context.device().limits().max_texture_dimension_2d;
-        if stream.width > largest || stream.height > largest {
-            return Err(JsError::new(&format!(
-                "the pictures are {}x{}, and this browser draws at most {largest} pixels across",
-                stream.width, stream.height
-            )));
-        }
-        if u64::from(stream.width) * u64::from(stream.height) > MAX_PIXELS {
-            return Err(JsError::new(&format!(
-                "the pictures are {}x{}, and the player decodes at most {MAX_PIXELS} pixels, \
-                 those of 8192x4320",
-                stream.width, stream.height
-            )));
-        }
+        self.check_size(stream.width, stream.height)?;
         let (count, end, unplayable) = playable_frames(&file);
         if count == 0 {
             return Err(JsError::new(
                 unplayable.as_deref().unwrap_or("the file has no frames"),
             ));
         }
-
-        let decoder = Decoder::new(&self.context, stream.width, stream.height, stream.chroma)
-            .map_err(js_error)?;
-        let config = self
-            .surface
-            .get_default_config(&self.adapter, stream.width, stream.height)
-            .ok_or_else(|| JsError::new("this canvas cannot show the picture"))?;
-        let config = wgpu::SurfaceConfiguration {
-            format: surface_format(&self.surface, &self.adapter),
-            ..config
-        };
-        self.surface.configure(self.context.device(), &config);
+        let decoder = self.new_decoder(stream.width, stream.height, stream.chroma)?;
 
         let frame_rate = if header.frame_rate_num != 0 && header.frame_rate_den != 0 {
             f64::from(header.frame_rate_num) / f64::from(header.frame_rate_den)
@@ -269,11 +279,185 @@ impl Player {
             next: pwv1::HEADER_BYTES,
             decoder,
             color: ColorParams::from_stream(&stream),
+            follows_frames: false,
             width: stream.width,
             height: stream.height,
             frame_rate,
         });
         Ok(description)
+    }
+
+    /// Opens a stream of `width` x `height` pictures, in 4:4:4 with
+    /// `chroma_444` and 4:2:0 otherwise, `frame_rate` a second, without a
+    /// file: its frames come as packets through
+    /// [`push_packet`](Self::push_packet), as a client of a live stream
+    /// receives them. Sizes the canvas, and returns a line that describes the
+    /// stream. The colours follow each frame's start of frame header.
+    pub fn open_stream(
+        &mut self,
+        width: u32,
+        height: u32,
+        chroma_444: bool,
+        frame_rate: f64,
+    ) -> Result<String, JsError> {
+        self.stream = None;
+        if let Ok(mut times) = self.gpu_times.lock() {
+            *times = GpuTimes::default();
+        }
+        if let Ok(mut first) = self.gpu_error.lock() {
+            *first = None;
+        }
+        self.check_size(width, height)?;
+        let chroma = if chroma_444 {
+            ChromaSubsampling::Yuv444
+        } else {
+            ChromaSubsampling::Yuv420
+        };
+        let decoder = self.new_decoder(width, height, chroma)?;
+        let frame_rate = if frame_rate > 0.0 {
+            frame_rate
+        } else {
+            DEFAULT_FRAME_RATE
+        };
+        self.stream = Some(Stream {
+            file: Vec::new(),
+            end: 0,
+            next: 0,
+            decoder,
+            color: ColorParams::default(),
+            follows_frames: true,
+            width,
+            height,
+            frame_rate,
+        });
+        Ok(format!(
+            "{width}x{height} {chroma:?}, a stream of packets at {frame_rate:.2} fps"
+        ))
+    }
+
+    /// Adds a packet of the stream, as it arrives: a start of frame header
+    /// with blocks, or blocks alone, in any order. A packet of a newer frame
+    /// drops what arrived of an older one. A malformed packet is an error and
+    /// leaves the frame as it was.
+    pub fn push_packet(&mut self, packet: &[u8]) -> Result<(), JsError> {
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| JsError::new("no stream is open"))?;
+        stream.decoder.push_packet(packet).map_err(js_error)
+    }
+
+    /// Whether the frame assembled from packets can be drawn: all of it, or
+    /// with `allow_partial` the part that arrived, if that includes the
+    /// coarse bands and enough of the rest.
+    pub fn is_ready(&self, allow_partial: bool) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(|stream| stream.decoder.is_ready(allow_partial))
+    }
+
+    /// Drops what arrived of the frame being assembled.
+    pub fn drop_packets(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
+            stream.decoder.clear();
+        }
+    }
+
+    /// Decodes the frame assembled from packets and draws it: all of it, or
+    /// what arrived of it, if [`is_ready`](Self::is_ready) allows that; the
+    /// blocks that did not arrive decode as zeros. Returns the milliseconds
+    /// the CPU spent on it.
+    pub fn draw_assembled(&mut self) -> Result<f64, JsError> {
+        self.take_gpu_error()?;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| JsError::new("no stream is open"))?;
+        if !stream.decoder.is_ready(true) {
+            return Err(JsError::new("no frame is ready to draw"));
+        }
+        if stream.follows_frames {
+            if let Some(header) = stream.decoder.start_of_frame() {
+                stream.color = ColorParams::from_stream(header);
+            }
+        }
+        let start = now_ms();
+        let target = current_texture(&self.surface)?;
+        let view = target.texture.create_view(&Default::default());
+        stream
+            .decoder
+            .submit_assembled_to_texture(&stream.color, &view)
+            .map_err(js_error)?;
+        let submitted = now_ms();
+        self.time_until_done(submitted);
+        self.context.queue().present(target);
+        Ok(submitted - start)
+    }
+
+    /// An error unless pictures of `width` x `height` fit this browser and
+    /// the player.
+    fn check_size(&self, width: u32, height: u32) -> Result<(), JsError> {
+        let largest = self.context.device().limits().max_texture_dimension_2d;
+        if width > largest || height > largest {
+            return Err(JsError::new(&format!(
+                "the pictures are {width}x{height}, and this browser draws at most {largest} pixels across"
+            )));
+        }
+        if u64::from(width) * u64::from(height) > MAX_PIXELS {
+            return Err(JsError::new(&format!(
+                "the pictures are {width}x{height}, and the player decodes at most {MAX_PIXELS} pixels, \
+                 those of 8192x4320"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A decoder for pictures of `width` x `height`, and the canvas sized to
+    /// them.
+    fn new_decoder(
+        &mut self,
+        width: u32,
+        height: u32,
+        chroma: ChromaSubsampling,
+    ) -> Result<Decoder, JsError> {
+        let decoder = Decoder::new(&self.context, width, height, chroma).map_err(js_error)?;
+        let config = self
+            .surface
+            .get_default_config(&self.adapter, width, height)
+            .ok_or_else(|| JsError::new("this canvas cannot show the picture"))?;
+        let config = wgpu::SurfaceConfiguration {
+            format: surface_format(&self.surface, &self.adapter),
+            ..config
+        };
+        self.surface.configure(self.context.device(), &config);
+        Ok(decoder)
+    }
+
+    /// The first error the browser reported for the GPU's work since the
+    /// last frame, as an error.
+    fn take_gpu_error(&self) -> Result<(), JsError> {
+        match self
+            .gpu_error
+            .lock()
+            .ok()
+            .and_then(|mut first| first.take())
+        {
+            Some(error) => Err(JsError::new(&format!("the GPU reported an error: {error}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Adds the time from `submitted` until the browser reports the work
+    /// submitted so far done to the times [`take_gpu_ms`](Self::take_gpu_ms)
+    /// averages.
+    fn time_until_done(&self, submitted: f64) {
+        let gpu_times = Arc::clone(&self.gpu_times);
+        self.context.queue().on_submitted_work_done(move || {
+            if let Ok(mut times) = gpu_times.lock() {
+                times.total_ms += now_ms() - submitted;
+                times.frames += 1;
+            }
+        });
     }
 
     /// Width of the loaded pictures, 0 before a file is loaded.
@@ -296,31 +480,16 @@ impl Player {
     /// Decodes the next frame, the file's frames in turn, and draws it.
     /// Returns the milliseconds the CPU spent recording and submitting it.
     pub fn draw_next(&mut self) -> Result<f64, JsError> {
-        if let Some(error) = self
-            .gpu_error
-            .lock()
-            .ok()
-            .and_then(|mut first| first.take())
-        {
-            return Err(JsError::new(&format!("the GPU reported an error: {error}")));
-        }
+        self.take_gpu_error()?;
         let stream = self
             .stream
             .as_mut()
+            .filter(|stream| !stream.file.is_empty())
             .ok_or_else(|| JsError::new("no file is loaded"))?;
         let start = now_ms();
         let device = self.context.device();
         let queue = self.context.queue();
-
-        let target = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-            other => {
-                return Err(JsError::new(&format!(
-                    "the canvas has no texture to draw on: {other:?}"
-                )));
-            }
-        };
+        let target = current_texture(&self.surface)?;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
@@ -350,13 +519,7 @@ impl Player {
         queue.submit([encoder.finish()]);
 
         let submitted = now_ms();
-        let gpu_times = Arc::clone(&self.gpu_times);
-        queue.on_submitted_work_done(move || {
-            if let Ok(mut times) = gpu_times.lock() {
-                times.total_ms += now_ms() - submitted;
-                times.frames += 1;
-            }
-        });
+        self.time_until_done(submitted);
         queue.present(target);
         Ok(submitted - start)
     }

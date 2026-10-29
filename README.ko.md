@@ -24,7 +24,7 @@
 - **빠릅니다.** Apple M3 Max에서 프레임을 연달아 처리하면, 4K 프레임 하나를 평면까지 0.90 ms, RGB까지 1.22 ms에 디코딩하고, GPU에서 CPU 메모리부터 CPU 메모리까지 1.90 ms에 인코딩합니다. 업스트림의 Metal 포트는 같은 FP32 정밀도로 0.80 ms, 기본값인 FP16으로 0.56 ms에 디코딩하고, 인코딩에는 3.2~3.3 ms가 걸립니다([`BENCHMARKS.md`](BENCHMARKS.md), 2026-10-26).
 - **프레임마다 독립적입니다.** 다른 프레임을 참조하는 프레임이 없어서, 패킷을 잃어도 그 프레임 하나만 잃고 키프레임을 기다리지 않습니다. 프레임마다 정해진 바이트 예산을 지킵니다.
 - **업스트림과 호환되고, 인코더는 더 낫습니다.** 업스트림 인코더가 만든 스트림을 업스트림 디코더와 같게, PSNR 64 dB 이상으로 디코딩하고, 업스트림 디코더는 emberwave의 스트림을 읽습니다. 프레임당 바이트가 같으면 emberwave 인코더의 luma PSNR이 테스트 장면에서 업스트림 인코더보다 최대 3.4 dB 높고, 노이즈에서는 0.01 dB 안으로 같습니다.
-- **네이티브로, 브라우저에서, iPhone에서.** 명령줄 도구, 페이지 안에서 WebGPU로 디코딩하고 스스로 인코딩한 데모 스트림으로 시작하는 [브라우저 플레이어](https://with-developer.github.io/emberwave/), Linux와 Windows(x86_64), macOS(Apple silicon)용으로 미리 빌드한 라이브러리가 있는 C API, iPhone·iPad·Mac 앱용 XCFramework가 있습니다. Apple GPU에서 테스트했고, CI에서는 소프트웨어 Vulkan과 DX12에서 테스트합니다.
+- **네이티브로, 브라우저에서, iPhone에서.** 명령줄 도구, 페이지 안에서 WebGPU로 디코딩하고, 스스로 인코딩한 데모 스트림으로 시작하며, 네트워크가 전하듯 순서가 섞이고 일부가 사라진 패킷으로도 스트림을 재생하는 [브라우저 플레이어](https://with-developer.github.io/emberwave/), Linux와 Windows(x86_64), macOS(Apple silicon)용으로 미리 빌드한 라이브러리가 있는 C API, iPhone·iPad·Mac 앱용 XCFramework가 있습니다. Apple GPU에서 테스트했고, CI에서는 소프트웨어 Vulkan과 DX12에서 테스트합니다.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/decode-dark.svg">

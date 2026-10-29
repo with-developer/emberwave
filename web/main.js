@@ -1,6 +1,6 @@
 // The page of the emberwave player: loads a .pwv1 file and plays it with the
 // wasm module that scripts/build_web.sh builds into pkg/.
-import init, { Demo, Player } from "./pkg/emberwave_web.js";
+import init, { Demo, Player, packet_ends } from "./pkg/emberwave_web.js";
 
 // The streams in testdata/, copied to samples/ by scripts/build_web.sh.
 const SAMPLES = [
@@ -14,6 +14,91 @@ const SAMPLES = [
 const canvas = document.getElementById("screen");
 const info = document.getElementById("info");
 const stats = document.getElementById("stats");
+const network = document.getElementById("network");
+const asPackets = document.getElementById("packets");
+const packetBytes = document.getElementById("packet-bytes");
+const loss = document.getElementById("loss");
+
+// The frames of a PWV1 file, an ArrayBuffer or a Uint8Array: after its
+// 24-byte header, each frame's size as a 32-bit little-endian number and then
+// its bytes. Stops at a frame that is cut off.
+function framesOf(bytes) {
+  const file = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+  const frames = [];
+  for (let at = 24; at + 4 <= file.byteLength;) {
+    const size = view.getUint32(at, true);
+    at += 4;
+    if (at + size > file.byteLength) {
+      break;
+    }
+    frames.push(file.subarray(at, at + size));
+    at += size;
+  }
+  return frames;
+}
+
+// What playing as packets has met since it was last shown.
+const tally = { frames: 0, whole: 0, partial: 0, skipped: 0, packets: 0, lost: 0, malformed: 0 };
+
+// Sends `frame` to the player as a network would deliver it: cut at its
+// blocks into packets of at most the chosen size, shuffled, and with the
+// chosen share of them lost. Then draws what arrived, if enough did, and
+// returns the CPU's milliseconds for the draw.
+function playAsPackets(frame) {
+  const ends = packet_ends(frame, Number(packetBytes.value));
+  const packets = [];
+  let start = 0;
+  for (const end of ends) {
+    packets.push(frame.subarray(start, end));
+    start = end;
+  }
+  for (let i = packets.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [packets[i], packets[j]] = [packets[j], packets[i]];
+  }
+  const share = Number(loss.value);
+  for (const packet of packets) {
+    tally.packets += 1;
+    if (Math.random() < share) {
+      tally.lost += 1;
+      continue;
+    }
+    try {
+      player.push_packet(packet);
+    } catch {
+      tally.malformed += 1;
+    }
+  }
+  tally.frames += 1;
+  if (!player.is_ready(true)) {
+    // Too little arrived: the frame is skipped, and the last one stays.
+    tally.skipped += 1;
+    player.drop_packets();
+    return 0;
+  }
+  if (player.is_ready(false)) {
+    tally.whole += 1;
+  } else {
+    tally.partial += 1;
+  }
+  const cpu = player.draw_assembled();
+  player.drop_packets();
+  return cpu;
+}
+
+function showTally() {
+  if (tally.frames === 0) {
+    network.textContent = "";
+    return;
+  }
+  network.textContent =
+    `As packets: ${(tally.packets / tally.frames).toFixed(1)} a frame, ` +
+    `${(100 * tally.lost / tally.packets).toFixed(1)} % lost · frames drawn whole ${tally.whole}, ` +
+    `in part ${tally.partial}, skipped ${tally.skipped}` +
+    (tally.malformed ? ` · malformed packets ${tally.malformed}` : "");
+  Object.keys(tally).forEach((key) => { tally[key] = 0; });
+}
 
 let player;
 // Set once the module failed for good: a panic in it leaves its objects in
@@ -109,10 +194,14 @@ async function play(bytes, name) {
 
   const mine = ++generation;
   const interval = 1000 / player.frame_rate();
+  // The file's frames, for playing them as packets.
+  const frames = framesOf(bytes);
+  let next = 0;
+  network.textContent = "";
   // When the next frame is due. Advancing it by the interval, not to the
   // time of drawing, keeps a rate that does not divide the display's.
   let due = 0;
-  let frames = 0;
+  let drawn = 0;
   let cpu = 0;
   let since = performance.now();
 
@@ -128,18 +217,24 @@ async function play(bytes, name) {
         due = now + interval;
       }
       try {
-        cpu += player.draw_next();
+        if (asPackets.checked && frames.length > 0) {
+          cpu += playAsPackets(frames[next]);
+          next = (next + 1) % frames.length;
+        } else {
+          cpu += player.draw_next();
+        }
       } catch (error) {
         failWith(name, error);
         return;
       }
-      frames += 1;
+      drawn += 1;
       if (now - since >= 1000) {
         stats.textContent =
-          `${(frames * 1000 / (now - since)).toFixed(1)} frames per second · ` +
-          `CPU ${(cpu / frames).toFixed(2)} ms · ` +
+          `${(drawn * 1000 / (now - since)).toFixed(1)} frames per second · ` +
+          `CPU ${(cpu / drawn).toFixed(2)} ms · ` +
           `submitted to done ${player.take_gpu_ms().toFixed(2)} ms per frame`;
-        frames = 0;
+        showTally();
+        drawn = 0;
         cpu = 0;
         since = now;
       }
@@ -282,9 +377,20 @@ async function start() {
     samples.append(button);
   }
 
+  // ?packets plays as packets, and ?loss=0.05 loses that share of them, for
+  // links to the network's view.
+  const params = new URLSearchParams(location.search);
+  if (params.has("packets")) {
+    asPackets.checked = true;
+  }
+  const lossAsked = params.get("loss");
+  if ([...loss.options].some((option) => option.value === lossAsked)) {
+    loss.value = lossAsked;
+  }
+
   // ?play=NAME starts a sample straight away, for links to one; otherwise
   // the demo plays, so that the page shows a stream without a file.
-  const requested = new URLSearchParams(location.search).get("play");
+  const requested = params.get("play");
   if (SAMPLES.includes(requested)) {
     playSample(requested);
   } else {
