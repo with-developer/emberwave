@@ -351,8 +351,9 @@ impl Player {
     /// `bt601`, `bt709` or `bt2020`, and `range` `full` or `limited`. Then
     /// these two no longer follow the frames' start of frame headers, which
     /// can signal the wrong ones: upstream's encoder signals full range
-    /// whatever the pictures are. The chroma siting still follows them. An
-    /// error changes nothing.
+    /// whatever the pictures are. The chroma siting of a stream opened
+    /// without a file still follows them; a loaded file's is its PWV1
+    /// header's. An error changes nothing.
     pub fn set_colors(&mut self, matrix: &str, range: &str) -> Result<(), JsError> {
         let stream = self
             .stream
@@ -429,8 +430,10 @@ impl Player {
 
     /// Whether the frame assembled from packets can be drawn: all of it, or
     /// with `allow_partial` the part that arrived, if that includes every
-    /// block of the coarsest level and the start of frame header, and more
-    /// than 90 percent of the blocks the frame announced.
+    /// block of the coarsest level and more than 90 percent of the blocks
+    /// the start of frame header announced. Until that header arrives, the
+    /// count is of all the picture's blocks, so a frame without it is ready
+    /// only if its encoder left out few blocks.
     pub fn is_ready(&self, allow_partial: bool) -> bool {
         self.stream
             .as_ref()
@@ -462,10 +465,13 @@ impl Player {
         if !stream.decoder.is_ready(true) {
             return Err(JsError::new("no frame is ready to draw"));
         }
+        // A loaded file's colours are its header's, siting included; a
+        // stream without a file follows its frames' headers, for the siting
+        // also after `set_colors`.
         if let Some(header) = stream.decoder.start_of_frame() {
             if stream.follows_frames {
                 stream.color = ColorParams::from_stream(header);
-            } else {
+            } else if stream.file.is_empty() {
                 stream.color.chroma_siting = header.chroma_siting;
             }
         }
