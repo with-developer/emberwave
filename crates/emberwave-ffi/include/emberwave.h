@@ -444,12 +444,14 @@ enum EmberwaveStatus emberwave_decoder_push_packet(struct EmberwaveDecoder *deco
                                                    size_t size);
 
 // Whether the frame being received can be decoded: all its blocks arrived,
-// or, with `allow_partial_frame`, enough of them for a usable picture: its
-// start of frame header, every block of the coarsest level, and more than
-// 90 percent of the blocks it announced. emberwave's encoder sends every
-// block of the coarsest level for that; upstream's leaves out the empty
-// ones, so that a frame of it that lost any packet may never be ready in
-// part. False once the frame has been decoded, and for `NULL`.
+// or, with `allow_partial_frame`, enough of them for a usable picture: every
+// block of the coarsest level, and more than 90 percent of the blocks its
+// start of frame header announced. Until that header arrives the count is of
+// all the picture's blocks, so a frame without it is ready only if its
+// encoder left out few blocks. emberwave's encoder sends every block of the
+// coarsest level for partial decodes; upstream's leaves out the empty ones,
+// so that a frame of it that lost any packet may never be ready in part.
+// False once the frame has been decoded, and for `NULL`.
 //
 // # Safety
 //
