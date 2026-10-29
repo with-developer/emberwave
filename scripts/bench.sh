@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Measures decode and encode times on this machine and rewrites the generated
-# tables of BENCHMARKS.md and README.md.
+# tables of BENCHMARKS.md and the summaries of README.md and README.ko.md.
 #
 # Usage: scripts/bench.sh [--frames N] [--no-upstream]
 #
@@ -105,5 +105,5 @@ for entry in $ENCODE; do
     fi
 done
 
-python3 "$ROOT/scripts/bench_report.py" write "$OUT" "$ROOT/BENCHMARKS.md" "$ROOT/README.md"
-echo "updated BENCHMARKS.md and README.md from $OUT"
+python3 "$ROOT/scripts/bench_report.py" write "$OUT" "$ROOT/BENCHMARKS.md" "$ROOT/README.md" "$ROOT/README.ko.md"
+echo "updated BENCHMARKS.md, README.md and README.ko.md from $OUT"

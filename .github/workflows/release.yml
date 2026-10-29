@@ -99,7 +99,7 @@ jobs:
           exe=emberwave-cli
           if [ "$RUNNER_OS" = Windows ]; then exe=emberwave-cli.exe; fi
           mkdir "$name"
-          cp "target/release/$exe" README.md LICENSE CHANGELOG.md "$name/"
+          cp "target/release/$exe" README.md README.ko.md LICENSE CHANGELOG.md "$name/"
           pack "$name"
 
           name="emberwave-ffi-${ref}-${{ matrix.target }}"
