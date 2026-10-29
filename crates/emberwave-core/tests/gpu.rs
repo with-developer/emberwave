@@ -784,8 +784,7 @@ fn frames_written_in_place_decode_as_copied_ones() {
     };
     assert!(!copied.shares_uploads());
     let color = ColorParams::default();
-    // A frame that grows the payload buffer, frames that shrink again, and
-    // decodes that do not wait in between, which write through the queue.
+    // Decodes that do not wait in between, which write through the queue.
     for name in [
         "noise_192x136_420",
         "gradient_200x120_420",
@@ -811,6 +810,68 @@ fn frames_written_in_place_decode_as_copied_ones() {
                 .expect("recorded decode");
             context.queue().submit([encoder.finish()]);
         }
+    }
+}
+
+#[test]
+fn frames_written_in_place_wait_for_the_frame_before() {
+    // A decode that does not wait, still on the GPU when the next decode,
+    // which waits, maps the buffers it reads to write its own frame into
+    // them: the first must still decode its own frame (decision D53). The
+    // frames are large enough to keep the GPU busy, and the first one grows
+    // the payload buffer.
+    let context = gpu_or_return!();
+    let options = GpuOptions {
+        shared_uploads: false,
+        ..GpuOptions::default()
+    };
+    let Some(copied) = create_context(&options) else {
+        return;
+    };
+    let layout = FrameLayout::new(1920, 1080, ChromaSubsampling::Yuv420).unwrap();
+    let frames: Vec<Vec<u8>> = (0..4)
+        .map(|seed| synthetic_frame(&layout, 0x5EED_0100 + seed, seed % 2 == 1))
+        .collect();
+    assert!(frames[0].len() > 64 * 1024, "{}", frames[0].len());
+    let color = ColorParams::default();
+    let mut reference = decoder_for(&copied, &layout);
+    let mut decoder = decoder_for(context, &layout);
+    let device = context.device();
+    for pair in frames.windows(2) {
+        let (first, second) = (&pair[0], &pair[1]);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        decoder
+            .encode_rgb(first, &color, &mut encoder)
+            .expect("recorded decode");
+        let rgba = decoder.rgba_buffer().expect("RGBA buffer");
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test readback"),
+            size: rgba.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(rgba, 0, &readback, 0, rgba.size());
+        context.queue().submit([encoder.finish()]);
+        // No wait: the next decode maps the buffers at once.
+        let planes = decoder.decode(second).expect("decode");
+        assert_eq!(planes, reference.decode(second).expect("decode"));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.expect("map"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let words = slice.get_mapped_range().expect("mapped").to_vec();
+        let rgb: Vec<u8> = words
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        assert_eq!(
+            rgb,
+            reference
+                .decode_rgb(first, &color)
+                .expect("RGB decode")
+                .data
+        );
     }
 }
 

@@ -1584,7 +1584,22 @@ impl Decoder {
     /// frame's command buffer, whose sizes this returns as zero. The previous
     /// frame is done, so mapping the buffers waits for nothing.
     fn upload_in_place(&mut self) -> Result<(u64, u64), GpuError> {
-        map_for_writing(&self.device, &[&self.block_offsets, &self.payload])?;
+        let written = map_for_writing(&self.device, &[&self.block_offsets, &self.payload])
+            .and_then(|()| self.write_in_place());
+        // Unmapped whatever happened: a buffer left mapped would fail every
+        // later decode and every write through the queue.
+        let unmapped = with_error_scope(&self.device, || {
+            self.block_offsets.unmap();
+            self.payload.unmap();
+        });
+        written?;
+        unmapped?;
+        Ok((0, 0))
+    }
+
+    /// The writing of [`upload_in_place`](Self::upload_in_place), into the
+    /// mapped buffers.
+    fn write_in_place(&self) -> Result<(), GpuError> {
         let frame = self.assembler.frame();
         let table: &[u8] = bytemuck::cast_slice(frame.block_offsets());
         let payload: &[u8] = bytemuck::cast_slice(frame.payload());
@@ -1598,16 +1613,10 @@ impl Decoder {
         mapped(&self.block_offsets, table.len())?
             .slice(..)
             .copy_from_slice(table);
-        {
-            let mut view = mapped(&self.payload, padded)?;
-            view.slice(..payload.len()).copy_from_slice(payload);
-            view.slice(payload.len()..).fill(0);
-        }
-        with_error_scope(&self.device, || {
-            self.block_offsets.unmap();
-            self.payload.unmap();
-        })?;
-        Ok((0, 0))
+        let mut view = mapped(&self.payload, padded)?;
+        view.slice(..payload.len()).copy_from_slice(payload);
+        view.slice(payload.len()..).fill(0);
+        Ok(())
     }
 
     /// Uploads the block table and the payload of the assembled frame through

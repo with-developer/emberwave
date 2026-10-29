@@ -102,6 +102,9 @@ pub(crate) fn map_for_writing(
                 });
         }
     })?;
+    // Only the callbacks hold senders now, so a callback that wgpu drops
+    // uncalled ends the wait below with an error rather than never.
+    drop(sender);
     let failed = |error: &dyn std::fmt::Display| {
         GpuError::Device(format!("mapping the upload buffer failed: {error}"))
     };
