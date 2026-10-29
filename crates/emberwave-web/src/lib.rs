@@ -349,15 +349,17 @@ impl Player {
 
     /// Sets the colours to convert the stream's pictures with: `matrix`
     /// `bt601`, `bt709` or `bt2020`, and `range` `full` or `limited`. Then
-    /// they no longer follow the frames' start of frame headers, which can
-    /// signal the wrong ones: upstream's encoder signals full range whatever
-    /// the pictures are.
+    /// these two no longer follow the frames' start of frame headers, which
+    /// can signal the wrong ones: upstream's encoder signals full range
+    /// whatever the pictures are. The chroma siting of a stream opened
+    /// without a file still follows them; a loaded file's is its PWV1
+    /// header's. An error changes nothing.
     pub fn set_colors(&mut self, matrix: &str, range: &str) -> Result<(), JsError> {
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| JsError::new("no stream is open"))?;
-        stream.color.matrix = match matrix {
+        let matrix = match matrix {
             "bt601" => ColorMatrix::Bt601,
             "bt709" => ColorMatrix::Bt709,
             "bt2020" => ColorMatrix::Bt2020,
@@ -367,7 +369,7 @@ impl Player {
                 )));
             }
         };
-        stream.color.range = match range {
+        let range = match range {
             "full" => YcbcrRange::Full,
             "limited" => YcbcrRange::Limited,
             other => {
@@ -376,6 +378,8 @@ impl Player {
                 )));
             }
         };
+        stream.color.matrix = matrix;
+        stream.color.range = range;
         stream.follows_frames = false;
         Ok(())
     }
@@ -402,10 +406,20 @@ impl Player {
         Ok(stream.file[range.clone()].to_vec())
     }
 
-    /// Adds a packet of the stream, as it arrives: a start of frame header
-    /// with blocks, or blocks alone, in any order. A packet of a newer frame
-    /// drops what arrived of an older one. A malformed packet is an error;
-    /// the blocks in front of what is malformed are kept.
+    /// Adds a packet of the frame being assembled, as it arrives: a start of
+    /// frame header with blocks, or blocks alone, in any order; a block that
+    /// arrived already is ignored. A malformed packet is an error; the blocks
+    /// in front of what is malformed are kept.
+    ///
+    /// A packet of a frame one to three frames newer by the bitstream's
+    /// sequence number starts that frame and drops what arrived of the older
+    /// one. As the number has three bits, one of a frame four to seven frames
+    /// newer, or one to four frames older, is ignored; one five to seven
+    /// frames older passes for a newer frame, and one eight frames off for
+    /// the current one. So a transport keeps frame numbers of its own: it ignores the packets of
+    /// frames older than the one being assembled, and before it pushes the
+    /// first packet of a newer frame it draws the current one if it is
+    /// ready, then calls [`drop_packets`](Self::drop_packets).
     pub fn push_packet(&mut self, packet: &[u8]) -> Result<(), JsError> {
         let stream = self
             .stream
@@ -415,15 +429,21 @@ impl Player {
     }
 
     /// Whether the frame assembled from packets can be drawn: all of it, or
-    /// with `allow_partial` the part that arrived, if that includes the
-    /// coarse bands and enough of the rest.
+    /// with `allow_partial` the part that arrived, if that includes every
+    /// block of the coarsest level and more than 90 percent of the blocks
+    /// the start of frame header announced. Until that header arrives, the
+    /// count is of all the picture's blocks, so a frame without it is ready
+    /// only if its encoder left out few blocks.
     pub fn is_ready(&self, allow_partial: bool) -> bool {
         self.stream
             .as_ref()
             .is_some_and(|stream| stream.decoder.is_ready(allow_partial))
     }
 
-    /// Drops what arrived of the frame being assembled.
+    /// Drops what arrived of the frame being assembled, and forgets its
+    /// sequence number, so that the next packet starts a frame of its own.
+    /// Call it before pushing the first packet of a newer frame, never after:
+    /// that packet would go too.
     pub fn drop_packets(&mut self) {
         if let Some(stream) = self.stream.as_mut() {
             stream.decoder.clear();
@@ -431,9 +451,11 @@ impl Player {
     }
 
     /// Decodes the frame assembled from packets and draws it: all of it, or
-    /// what arrived of it, if [`is_ready`](Self::is_ready) allows that; the
-    /// blocks that did not arrive decode as zeros. Returns the milliseconds
-    /// the CPU spent on it.
+    /// what arrived of it if `is_ready(true)` allows that; the blocks that
+    /// did not arrive decode as zeros. A page that draws whole frames only
+    /// checks `is_ready(false)` first. Packets of the frame that arrive after
+    /// it was drawn are kept, and the frame is not drawn again. Returns the
+    /// milliseconds the CPU spent on it.
     pub fn draw_assembled(&mut self) -> Result<f64, JsError> {
         self.take_gpu_error()?;
         let stream = self
@@ -443,9 +465,14 @@ impl Player {
         if !stream.decoder.is_ready(true) {
             return Err(JsError::new("no frame is ready to draw"));
         }
-        if stream.follows_frames {
-            if let Some(header) = stream.decoder.start_of_frame() {
+        // A loaded file's colours are its header's, siting included; a
+        // stream without a file follows its frames' headers, for the siting
+        // also after `set_colors`.
+        if let Some(header) = stream.decoder.start_of_frame() {
+            if stream.follows_frames {
                 stream.color = ColorParams::from_stream(header);
+            } else if stream.file.is_empty() {
+                stream.color.chroma_siting = header.chroma_siting;
             }
         }
         let start = now_ms();
@@ -584,6 +611,9 @@ impl Player {
             after
         };
         queue.submit([encoder.finish()]);
+        // The decoder assembled the frame to decode it: let go of it, so that
+        // packets pushed next, after a switch to them, start afresh.
+        stream.decoder.clear();
 
         let submitted = now_ms();
         self.time_until_done(submitted);
