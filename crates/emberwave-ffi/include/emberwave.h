@@ -419,11 +419,21 @@ enum EmberwaveStatus emberwave_decoder_info(const struct EmberwaveDecoder *decod
                                             struct EmberwaveFrameInfo *info);
 
 // Gives received data to the decoder: one packet, or several back to back,
-// such as a whole frame of a PWV1 file. Packets may come in any order.
-// Packets of a newer frame discard what was received of an older one, and
-// packets of older frames are ignored. A malformed header or block is
+// such as a whole frame of a PWV1 file. Packets may come in any order, and a
+// block that arrived already is ignored. A malformed header or block is
 // rejected without changing anything, but blocks before it in the same data
 // are kept.
+//
+// Frames are told apart by the bitstream's sequence number, which has three
+// bits: a packet of a frame one to three frames newer discards what was
+// received of the older one and starts its own; one of a frame four to seven
+// frames newer, or one to four frames older, is ignored; one five to seven
+// frames older passes for a newer frame, and one eight frames off for the
+// same frame. So a transport keeps frame numbers of its own: it drops
+// packets of frames older than the one being received, and before it gives
+// the first packet of a newer frame it decodes the current one if it is
+// ready, then calls `emberwave_decoder_clear`, not after, which would
+// discard that packet too.
 //
 // # Safety
 //
@@ -434,8 +444,12 @@ enum EmberwaveStatus emberwave_decoder_push_packet(struct EmberwaveDecoder *deco
                                                    size_t size);
 
 // Whether the frame being received can be decoded: all its blocks arrived,
-// or, with `allow_partial_frame`, enough of them for a usable picture. False
-// once the frame has been decoded, and for `NULL`.
+// or, with `allow_partial_frame`, enough of them for a usable picture: its
+// start of frame header, every block of the coarsest level, and more than
+// 90 percent of the blocks it announced. emberwave's encoder sends every
+// block of the coarsest level for that; upstream's leaves out the empty
+// ones, so that a frame of it that lost any packet may never be ready in
+// part. False once the frame has been decoded, and for `NULL`.
 //
 // # Safety
 //
