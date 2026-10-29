@@ -340,7 +340,8 @@ fn the_coefficient_error_is_what_the_rate_control_counted() {
     // The rate control counts each 32x32 block's distortion at the drop it
     // chose; an 8x8 block too small ever to be coded counts for its whole
     // weighted energy, which no choice changes. Measured from the frame
-    // instead, the sum is the same, up to the rounding of f32 sums.
+    // instead, each component's sum is the same, up to the rounding of f32
+    // sums.
     for (width, height, chroma, budget) in [
         (200, 120, ChromaSubsampling::Yuv420, 6000),
         (200, 120, ChromaSubsampling::Yuv420, 300),
@@ -356,17 +357,15 @@ fn the_coefficient_error_is_what_the_rate_control_counted() {
         let blocks = encoder.quantise(&bands);
         let costs: Vec<BlockCost> = blocks.iter().map(|block| block.cost.clone()).collect();
         let drops = rate::choose(&costs, ((budget - HEADER_BYTES) / 4) as u64).unwrap();
-        let mut counted: f64 = blocks
-            .iter()
-            .zip(&drops)
-            .map(|(block, &drop)| f64::from(block.cost.distortion[usize::from(drop)]))
-            .sum();
-        let mut blocks = blocks.iter();
+        let mut counted = [0.0f64; 3];
+        let mut chosen = blocks.iter().zip(&drops);
         for (component, level, band, band_layout) in layout.bands() {
             let coefficients = &bands[component.index()][level][band.index()];
+            let counted = &mut counted[component.index()];
             for block_y in 0..band_layout.blocks_y {
                 for block_x in 0..band_layout.blocks_x {
-                    let block = blocks.next().unwrap();
+                    let (block, &drop) = chosen.next().unwrap();
+                    *counted += f64::from(block.cost.distortion[usize::from(drop)]);
                     for (raster, block8) in block.blocks8.iter().enumerate() {
                         if block8.is_none() {
                             let values = quant::gather_block8(
@@ -377,18 +376,22 @@ fn the_coefficient_error_is_what_the_rate_control_counted() {
                                 raster,
                             );
                             let energy: f32 = values.iter().map(|v| v * v).sum();
-                            counted += f64::from(block.quant.weight * energy);
+                            *counted += f64::from(block.quant.weight * energy);
                         }
                     }
                 }
             }
         }
+        assert!(chosen.next().is_none());
 
-        let measured = error_of(&layout, &planes, &frame).weighted_total();
-        assert!(
-            (measured - counted).abs() <= 1e-5 * counted,
-            "{width}x{height} {chroma:?} at {budget} bytes: measured {measured}, counted {counted}"
-        );
+        let measured = error_of(&layout, &planes, &frame).weighted;
+        for (component, (measured, counted)) in measured.iter().zip(counted).enumerate() {
+            assert!(
+                counted > 0.0 && (measured - counted).abs() <= 1e-6 * counted,
+                "{width}x{height} {chroma:?} at {budget} bytes, component {component}: \
+                 measured {measured}, counted {counted}"
+            );
+        }
     }
 }
 

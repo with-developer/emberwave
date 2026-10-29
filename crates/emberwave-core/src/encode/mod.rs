@@ -414,6 +414,8 @@ pub fn coefficient_error(
     for (component, level, band, _) in layout.bands() {
         let c = component.index();
         let coded = decoded.plane(component, level, band).unwrap_or_default();
+        // The decoder's bands are the layout's, as the encoder's are.
+        debug_assert_eq!(coded.len(), picture[c][level][band.index()].len());
         let squared: f64 = picture[c][level][band.index()]
             .iter()
             .zip(coded)

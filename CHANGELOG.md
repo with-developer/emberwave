@@ -6,7 +6,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Added
 
-- `emberwave-cli quality SOURCE.y4m FILE.pwv1` measures a stream from any encoder against the pictures it was encoded from: per frame and on average, its size, the PSNR of each plane and the coefficient error that the rate control minimises, weighted per band as it weighs it. `emberwave_core::encode::coefficient_error` returns that error for a frame (decision D57).
+- `emberwave-cli quality SOURCE.y4m FILE.pwv1 [--frames N]` measures a stream from any encoder against the pictures it was encoded from: per frame and over all frames, its size, the PSNR of each plane and the coefficient error that the rate control minimises, weighted per band as it weighs it. `emberwave_core::encode::coefficient_error` returns that error for a frame (decision D57).
 
 ### Changed
 

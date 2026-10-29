@@ -936,3 +936,53 @@ fn quality_refuses_pictures_of_another_size() {
         stderr(&output)
     );
 }
+
+#[test]
+fn quality_measures_the_first_frames_and_refuses_incomplete_ones() {
+    let source = testdata("encoder/scene_200x120_420.source.y4m");
+    let committed = testdata("encoder/scene_200x120_420.pwv1");
+    // --frames: the first of the two frames only.
+    let output = cli()
+        .arg("quality")
+        .args([&source, &committed])
+        .args(["--frames", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("frame    0:") && !text.contains("frame    1:") && text.contains("mean:"),
+        "{text}"
+    );
+
+    // The first frame without its last blocks, as a network might leave
+    // it: refused, by frame, rather than measured.
+    let bytes = std::fs::read(&committed).unwrap();
+    let file = emberwave_core::bitstream::pwv1::Pwv1File::parse(&bytes).unwrap();
+    let frames: Vec<&[u8]> = file.frames().map(|frame| frame.unwrap()).collect();
+    let first: Vec<u8> = emberwave_core::encode::packets(frames[0], 1000)
+        .into_iter()
+        .take(2)
+        .flatten()
+        .copied()
+        .collect();
+    let mut cut = file.header().to_bytes().to_vec();
+    for frame in [&first[..], frames[1]] {
+        cut.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        cut.extend_from_slice(frame);
+    }
+    let dir = scratch("quality_incomplete");
+    let stream = dir.join("cut.pwv1");
+    std::fs::write(&stream, cut).unwrap();
+    let output = cli()
+        .arg("quality")
+        .args([&source, &stream])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("frame 0: incomplete:"),
+        "{}",
+        stderr(&output)
+    );
+}
