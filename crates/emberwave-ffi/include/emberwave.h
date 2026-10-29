@@ -285,7 +285,8 @@ const char *emberwave_version(void);
 
 // Describes the last failure on the calling thread, or is empty if no call on
 // it has failed. The string stays valid until the next failing call on the
-// same thread.
+// same thread, and no longer than the thread: copy it to keep it, or to
+// hand it to another thread. Empty, too, while the thread is ending.
 const char *emberwave_last_error(void);
 
 // Describes the stream of a PWV1 file from its header, the first 24 bytes:
@@ -351,10 +352,17 @@ enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptio
 //   decoded into them has returned, from whichever thread.
 // - Use the textures in them directly, not through a heap or through an
 //   argument buffer without `useResource`: Metal does not track those.
-// - emberwave commits two command buffers a decode. A queue's default of 64
-//   command buffers in flight is plenty, and a full queue makes a call wait
-//   until the GPU frees one. A queue made with room for fewer than four can
-//   wait for good: emberwave makes its two before it commits them.
+// - A call makes all its command buffers before it commits them: on an
+//   Apple M3 Max, 9 for a decode to a texture or to RGB, 7 to planes, 6 to
+//   plane textures and 18 for an encode, as wgpu makes one for each pass
+//   and transition. A full queue makes a call wait until the GPU frees one,
+//   and a queue with room for fewer than a call needs waits for good. The
+//   default of 64 holds a few calls at a time; the decoders and encoders of
+//   a context take turns (#126).
+// - Do not call a function that waits for the GPU inside a completion
+//   handler of a command buffer of this queue: the wait ends in a handler
+//   of emberwave's that Metal runs after that one, so it never ends.
+//   `emberwave_decoder_submit_texture` returns without waiting, and may.
 //
 // # Safety
 //

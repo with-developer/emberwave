@@ -1153,7 +1153,7 @@ The decoding thread is free 1 ms sooner at 4K. The client's draw completes as ea
 
 Grok argued the other side before the work began. It agreed that tracked hazards order the work, and named their conditions: a direct use of the texture, commits after the call, and no heap. It also advised refusing the other contexts and leaving the client's textures for later.
 
-Grok's review of the change found one defect, now fixed. A submitted decode counted its frame as decoded once recorded, before finishing the commands, which can still fail: on a view in a format the draw does not take, through the Rust API, or for want of memory. The frame was then used up although nothing ran. It now counts only once submitted, and `tests/gpu.rs` checks that such a view leaves the frame. A queue with room for fewer than four command buffers in flight can stall for good, since emberwave makes its two before committing them; the header says so.
+Grok's review of the change found one defect, now fixed. A submitted decode counted its frame as decoded once recorded, before finishing the commands, which can still fail: on a view in a format the draw does not take, through the Rust API, or for want of memory. The frame was then used up although nothing ran. It now counts only once submitted, and `tests/gpu.rs` checks that such a view leaves the frame. A queue with room for fewer command buffers in flight than a call makes can stall for good, since a call makes them all before committing them; the header says so (2026-10-30: a review found a call makes 6 to 18, not two, one for each pass and transition of wgpu's, and that threads sharing a queue could deadlock, #126).
 
 ### 2026-10-24 — D44: The client's own Metal textures
 

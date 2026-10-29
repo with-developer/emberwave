@@ -199,7 +199,8 @@ id<MTLCommandBuffer> commands = [queue commandBuffer];       /* the same queue, 
 `emberwave_decoder_submit_plane_textures` does the same for the planes. On an Apple M3 Max a 4K frame takes the decoding thread 0.26 ms instead of 1.3 ms, and the client's draw completes as soon as after the waiting decode, at 1080p 0.1 ms sooner. The rules of a shared queue:
 - Use the textures directly in the command buffers that read them, not through a heap or through an argument buffer without `useResource`, as Metal does not track those.
 - Commit those command buffers after the call has returned.
-- emberwave commits two command buffers a decode; a queue's default of 64 in flight is plenty. A queue made with room for fewer than four can wait for good, as emberwave makes its two before it commits them.
+- A call makes all its command buffers before it commits them: on an Apple M3 Max, 9 for a decode to a texture or to RGB, 7 to planes, 6 to plane textures and 18 for an encode, one for each pass and transition of wgpu's. A queue with room for fewer than a call needs waits for good; the default of 64 holds a few calls at a time, and the decoders and encoders of a context take turns (#126).
+- Do not call a function that waits for the GPU inside a completion handler of a command buffer of the same queue: the wait ends in a handler of emberwave's that Metal runs after that one. `emberwave_decoder_submit_texture` returns without waiting, and may.
 
 On a context of `emberwave_context_create` the submit functions refuse to work, as nothing there orders the reads.
 
