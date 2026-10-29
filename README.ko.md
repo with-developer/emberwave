@@ -91,6 +91,10 @@ emberwave-cli compare out/gradient_200x120_420.y4m testdata/gradient_200x120_420
 # --gpu는 GPU에서 인코딩
 emberwave-cli encode testdata/encoder/scene_200x120_420.source.y4m --out scene.pwv1 --bytes-per-frame 6000 --gpu
 
+# 어느 인코더의 스트림이든 원본 그림과 비교해 재기: PSNR과,
+# 인코더의 레이트 컨트롤이 최소화하는 오차
+emberwave-cli quality testdata/encoder/scene_200x120_420.source.y4m scene.pwv1
+
 # 인코더의 시간 재기, 여기서는 GPU에서
 emberwave-cli bench-encode testdata/encoder/scene_200x120_420.source.y4m --bytes-per-frame 6000 --gpu
 ```

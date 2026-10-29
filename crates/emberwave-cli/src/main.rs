@@ -16,6 +16,7 @@ mod compare;
 mod decode;
 mod encode;
 mod info;
+mod quality;
 mod stats;
 mod y4m;
 
@@ -59,6 +60,9 @@ enum Command {
     Info(info::Args),
     /// Compare two Y4M files plane by plane (PSNR)
     Compare(compare::Args),
+    /// Measure a stream against the pictures it was encoded from: PSNR and
+    /// the error the encoder's rate control minimises
+    Quality(quality::Args),
 }
 
 /// The graphics backend to run on.
@@ -193,6 +197,7 @@ fn main() -> ExitCode {
         Command::BenchEncode(args) => bench_encode::run(&args),
         Command::Info(args) => info::run(&args),
         Command::Compare(args) => compare::run(&args),
+        Command::Quality(args) => quality::run(&args),
     };
 
     match result {

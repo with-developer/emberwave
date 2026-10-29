@@ -865,3 +865,74 @@ fn a_file_without_frames_is_an_error_for_every_command() {
         );
     }
 }
+
+/// The mean weighted error that `quality` prints last.
+fn mean_weighted_error(text: &str) -> f64 {
+    let mean = text.lines().find(|line| line.starts_with("mean:")).unwrap();
+    let (_, after) = mean.split_once("weighted error ").unwrap();
+    after.split_whitespace().next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn quality_measures_a_stream_against_its_pictures() {
+    // An encoder vector at its budget, and its pictures encoded again within
+    // a quarter of it: the smaller frames are further from the pictures.
+    let source = testdata("encoder/scene_200x120_420.source.y4m");
+    let committed = testdata("encoder/scene_200x120_420.pwv1");
+    let output = cli()
+        .arg("quality")
+        .args([&source, &committed])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    for start in ["frame    0:", "frame    1:", "mean:"] {
+        let line = text.lines().find(|line| line.starts_with(start));
+        let line = line.unwrap_or_else(|| panic!("no {start} line in\n{text}"));
+        for part in [" Y ", " Cb ", " Cr ", "weighted error"] {
+            assert!(line.contains(part), "{line}");
+        }
+    }
+
+    let dir = scratch("quality");
+    let smaller = dir.join("smaller.pwv1");
+    let output = cli()
+        .arg("encode")
+        .arg(&source)
+        .arg("--out")
+        .arg(&smaller)
+        .args(["--bytes-per-frame", "1500"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = cli()
+        .arg("quality")
+        .args([&source, &smaller])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let (full, quarter) = (
+        mean_weighted_error(&text),
+        mean_weighted_error(&stdout(&output)),
+    );
+    assert!(
+        full > 0.0 && quarter > full,
+        "{full} at 6000 bytes, {quarter} at 1500"
+    );
+}
+
+#[test]
+fn quality_refuses_pictures_of_another_size() {
+    let output = cli()
+        .arg("quality")
+        .arg(testdata("encoder/scene_131x67_444.source.y4m"))
+        .arg(testdata("encoder/scene_200x120_420.pwv1"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("the pictures are 131x67 4:4:4 and the stream 200x120 4:2:0"),
+        "{}",
+        stderr(&output)
+    );
+}

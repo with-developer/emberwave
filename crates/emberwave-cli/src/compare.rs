@@ -120,7 +120,7 @@ fn max_diff(a: &[u8], b: &[u8]) -> u8 {
         .unwrap_or(0)
 }
 
-fn format_db(db: f64) -> String {
+pub fn format_db(db: f64) -> String {
     if db.is_infinite() {
         "   inf".to_owned()
     } else {

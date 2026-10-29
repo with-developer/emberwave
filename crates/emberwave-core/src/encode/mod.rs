@@ -30,7 +30,7 @@ use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES, NUM_COMPONENT
 use crate::bitstream::header::Header;
 use crate::bitstream::{
     Band, ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, Error, FrameLayout,
-    SequenceHeader, TransferFunction, YcbcrRange, YcbcrTransform,
+    FrameView, SequenceHeader, TransferFunction, YcbcrRange, YcbcrTransform,
 };
 use quant::{BandQuant, Blocks8};
 use rate::BlockCost;
@@ -97,6 +97,9 @@ pub enum EncodeError {
         /// Samples in a row.
         width: usize,
     },
+    /// A frame to measure with [`coefficient_error`] does not decode.
+    #[error("the frame does not decode: {0}")]
+    Frame(Error),
 }
 
 /// The wavelet coefficients of a picture: `[component][level][band]`,
@@ -367,6 +370,60 @@ pub(crate) fn check_strided_planes(
         }
     }
     Ok(())
+}
+
+/// How far a frame is from the picture it was encoded from, in the terms of
+/// the rate control: the squared error of the wavelet coefficients, per
+/// component, Y, Cb and Cr.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CoefficientError {
+    /// The squared error, weighted per band by the eye's contrast sensitivity
+    /// as the rate control weighs it (decision D28).
+    pub weighted: [f64; NUM_COMPONENTS],
+    /// The squared error, unweighted.
+    pub squared: [f64; NUM_COMPONENTS],
+}
+
+impl CoefficientError {
+    /// The weighted error of the three components: what the rate control
+    /// makes as small as the budget allows.
+    pub fn weighted_total(&self) -> f64 {
+        self.weighted.iter().sum()
+    }
+}
+
+/// The coefficient error of `frame` against the picture `planes`, the
+/// samples of [`Encoder::encode`] at the sizes of the frame's layout: the
+/// error the rate control makes as small as it can, so that frames of any
+/// encoder, upstream's too, can be compared in its terms. Blocks the frame
+/// does not carry count as zero coefficients, as a decoder decodes them.
+pub fn coefficient_error(
+    planes: [&[u8]; 3],
+    frame: &FrameView<'_>,
+) -> Result<CoefficientError, EncodeError> {
+    let layout = frame.layout();
+    check_planes(layout, planes)?;
+    let encoder = Encoder {
+        layout: layout.clone(),
+        signalling: Signalling::default(),
+        sequence: 0,
+    };
+    let picture = encoder.transform(planes);
+    let decoded = crate::cpu::dequant::dequantize(frame).map_err(EncodeError::Frame)?;
+    let mut error = CoefficientError::default();
+    for (component, level, band, _) in layout.bands() {
+        let c = component.index();
+        let coded = decoded.plane(component, level, band).unwrap_or_default();
+        let squared: f64 = picture[c][level][band.index()]
+            .iter()
+            .zip(coded)
+            .map(|(&a, &b)| f64::from(a - b).powi(2))
+            .sum();
+        let weight = BandQuant::new(layout.chroma(), component, level, band).weight;
+        error.weighted[c] += f64::from(weight) * squared;
+        error.squared[c] += squared;
+    }
+    Ok(error)
 }
 
 /// Splits an encoded frame into packets of at most `max_bytes` each, at

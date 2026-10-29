@@ -91,6 +91,10 @@ emberwave-cli compare out/gradient_200x120_420.y4m testdata/gradient_200x120_420
 # --gpu encodes on the GPU
 emberwave-cli encode testdata/encoder/scene_200x120_420.source.y4m --out scene.pwv1 --bytes-per-frame 6000 --gpu
 
+# Measure a stream, from any encoder, against the pictures it was encoded
+# from: PSNR, and the error that the encoder's rate control minimises
+emberwave-cli quality testdata/encoder/scene_200x120_420.source.y4m scene.pwv1
+
 # Time the encoder, on the GPU here
 emberwave-cli bench-encode testdata/encoder/scene_200x120_420.source.y4m --bytes-per-frame 6000 --gpu
 ```

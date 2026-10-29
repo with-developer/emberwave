@@ -326,3 +326,126 @@ fn chroma_planes_of_the_wrong_size_are_an_error() {
         ));
     }
 }
+
+/// The coefficient error of `frame` against `planes`, assembled as a decoder
+/// receives it.
+fn error_of(layout: &FrameLayout, planes: &[Vec<u8>; 3], frame: &[u8]) -> CoefficientError {
+    let mut assembler = FrameAssembler::new(layout.clone());
+    assembler.push_packet(frame).unwrap();
+    coefficient_error([&planes[0], &planes[1], &planes[2]], &assembler.frame()).unwrap()
+}
+
+#[test]
+fn the_coefficient_error_is_what_the_rate_control_counted() {
+    // The rate control counts each 32x32 block's distortion at the drop it
+    // chose; an 8x8 block too small ever to be coded counts for its whole
+    // weighted energy, which no choice changes. Measured from the frame
+    // instead, the sum is the same, up to the rounding of f32 sums.
+    for (width, height, chroma, budget) in [
+        (200, 120, ChromaSubsampling::Yuv420, 6000),
+        (200, 120, ChromaSubsampling::Yuv420, 300),
+        (131, 67, ChromaSubsampling::Yuv444, 4000),
+    ] {
+        let planes = chroma_planes(chroma, width, height, false);
+        let sources = [&planes[0][..], &planes[1][..], &planes[2][..]];
+        let mut encoder = Encoder::new(width, height, chroma, Signalling::default()).unwrap();
+        let frame = encoder.encode(sources, budget).unwrap();
+
+        let layout = encoder.layout().clone();
+        let bands = encoder.transform(sources);
+        let blocks = encoder.quantise(&bands);
+        let costs: Vec<BlockCost> = blocks.iter().map(|block| block.cost.clone()).collect();
+        let drops = rate::choose(&costs, ((budget - HEADER_BYTES) / 4) as u64).unwrap();
+        let mut counted: f64 = blocks
+            .iter()
+            .zip(&drops)
+            .map(|(block, &drop)| f64::from(block.cost.distortion[usize::from(drop)]))
+            .sum();
+        let mut blocks = blocks.iter();
+        for (component, level, band, band_layout) in layout.bands() {
+            let coefficients = &bands[component.index()][level][band.index()];
+            for block_y in 0..band_layout.blocks_y {
+                for block_x in 0..band_layout.blocks_x {
+                    let block = blocks.next().unwrap();
+                    for (raster, block8) in block.blocks8.iter().enumerate() {
+                        if block8.is_none() {
+                            let values = quant::gather_block8(
+                                coefficients,
+                                band_layout,
+                                block_x,
+                                block_y,
+                                raster,
+                            );
+                            let energy: f32 = values.iter().map(|v| v * v).sum();
+                            counted += f64::from(block.quant.weight * energy);
+                        }
+                    }
+                }
+            }
+        }
+
+        let measured = error_of(&layout, &planes, &frame).weighted_total();
+        assert!(
+            (measured - counted).abs() <= 1e-5 * counted,
+            "{width}x{height} {chroma:?} at {budget} bytes: measured {measured}, counted {counted}"
+        );
+    }
+}
+
+#[test]
+fn the_coefficient_error_falls_as_the_budget_grows() {
+    let (width, height) = (200, 120);
+    let planes = chroma_planes(ChromaSubsampling::Yuv420, width, height, false);
+    let mut encoder = Encoder::new(
+        width,
+        height,
+        ChromaSubsampling::Yuv420,
+        Signalling::default(),
+    )
+    .unwrap();
+    let layout = encoder.layout().clone();
+    let errors: Vec<CoefficientError> = [500, 2000, 8000, 30000]
+        .into_iter()
+        .map(|budget| {
+            let frame = encoder
+                .encode([&planes[0], &planes[1], &planes[2]], budget)
+                .unwrap();
+            error_of(&layout, &planes, &frame)
+        })
+        .collect();
+    for pair in errors.windows(2) {
+        assert!(
+            pair[1].weighted_total() < pair[0].weighted_total(),
+            "{errors:?}"
+        );
+    }
+    // Weighted and not, every component has some error at the lowest budget.
+    assert!(errors[0].weighted.iter().all(|&e| e > 0.0), "{errors:?}");
+    assert!(errors[0].squared.iter().all(|&e| e > 0.0), "{errors:?}");
+}
+
+#[test]
+fn the_coefficient_error_needs_the_frames_picture_size() {
+    let (width, height) = (64, 64);
+    let planes = chroma_planes(ChromaSubsampling::Yuv420, width, height, false);
+    let mut encoder = Encoder::new(
+        width,
+        height,
+        ChromaSubsampling::Yuv420,
+        Signalling::default(),
+    )
+    .unwrap();
+    let frame = encoder
+        .encode([&planes[0], &planes[1], &planes[2]], 4000)
+        .unwrap();
+    let mut assembler = FrameAssembler::new(encoder.layout().clone());
+    assembler.push_packet(&frame).unwrap();
+    let short = &planes[1][1..];
+    assert!(matches!(
+        coefficient_error([&planes[0], short, &planes[2]], &assembler.frame()),
+        Err(EncodeError::PlaneSize {
+            component: Component::Cb,
+            ..
+        })
+    ));
+}
