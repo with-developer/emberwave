@@ -6,7 +6,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Changed
 
-- The tools that build upstream for the test vectors, the reference decodes and the comparisons follow upstream at 7fe0e26, which fixed two faults of upstream's encoder's rate control; its decoder makes every committed reference decode byte for byte, so the vectors stay. emberwave's encoder never had the faults. Against upstream's fixed encoder, emberwave's luma PSNR at equal bytes ranges from 0.8 dB lower to 2.3 dB higher, and the README says so rather than calling it the better encoder (decision D56).
+- The tools that build upstream for the test vectors, the reference decodes and the comparisons follow upstream at 7fe0e26, which fixed two faults of upstream's encoder's rate control; its decoder makes every committed reference decode byte for byte, so the vectors stay. emberwave's encoder never had the faults. Against upstream's fixed encoder at equal bytes, emberwave's frames have 7 to 14 % less of the contrast-weighted error both encoders minimise, and luma PSNR from 0.8 dB lower to 2.3 dB higher; the README says so rather than calling it the better encoder (decision D56).
 
 ## [0.12.0] - 2026-10-29
 
