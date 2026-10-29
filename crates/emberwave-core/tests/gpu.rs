@@ -766,6 +766,116 @@ fn planes_stored_into_textures_are_the_copied_planes() {
 }
 
 #[test]
+fn frames_written_in_place_decode_as_copied_ones() {
+    // On Metal on Apple silicon the decodes that wait write a frame where the
+    // shaders read it; elsewhere, and with `shared_uploads` off, it goes
+    // through an upload buffer and copies (decision D53).
+    let context = gpu_or_return!();
+    let info = context.adapter_info();
+    let shares =
+        info.backend == wgpu::Backend::Metal && info.device_type == wgpu::DeviceType::IntegratedGpu;
+    assert_eq!(context.shares_uploads(), shares);
+    let options = GpuOptions {
+        shared_uploads: false,
+        ..GpuOptions::default()
+    };
+    let Some(copied) = create_context(&options) else {
+        return;
+    };
+    assert!(!copied.shares_uploads());
+    let color = ColorParams::default();
+    // Decodes that do not wait in between, which write through the queue.
+    for name in [
+        "noise_192x136_420",
+        "gradient_200x120_420",
+        "noise_131x67_444",
+    ] {
+        let (layout, frames) = vector_frames(name);
+        let mut shared = decoder_for(context, &layout);
+        let mut through = decoder_for(&copied, &layout);
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                shared.decode(frame).expect("decode"),
+                through.decode(frame).expect("decode"),
+                "{name}: frame {index}"
+            );
+            assert_eq!(
+                shared.decode_rgb(frame, &color).expect("RGB decode"),
+                through.decode_rgb(frame, &color).expect("RGB decode"),
+                "{name}: frame {index}, RGB"
+            );
+            let mut encoder = context.device().create_command_encoder(&Default::default());
+            shared
+                .encode_rgb(frame, &color, &mut encoder)
+                .expect("recorded decode");
+            context.queue().submit([encoder.finish()]);
+        }
+    }
+}
+
+#[test]
+fn frames_written_in_place_wait_for_the_frame_before() {
+    // A decode that does not wait, still on the GPU when the next decode,
+    // which waits, maps the buffers it reads to write its own frame into
+    // them: the first must still decode its own frame (decision D53). The
+    // frames are large enough to keep the GPU busy, and the first one grows
+    // the payload buffer.
+    let context = gpu_or_return!();
+    let options = GpuOptions {
+        shared_uploads: false,
+        ..GpuOptions::default()
+    };
+    let Some(copied) = create_context(&options) else {
+        return;
+    };
+    let layout = FrameLayout::new(1920, 1080, ChromaSubsampling::Yuv420).unwrap();
+    let frames: Vec<Vec<u8>> = (0..4)
+        .map(|seed| synthetic_frame(&layout, 0x5EED_0100 + seed, seed % 2 == 1))
+        .collect();
+    assert!(frames[0].len() > 64 * 1024, "{}", frames[0].len());
+    let color = ColorParams::default();
+    let mut reference = decoder_for(&copied, &layout);
+    let mut decoder = decoder_for(context, &layout);
+    let device = context.device();
+    for pair in frames.windows(2) {
+        let (first, second) = (&pair[0], &pair[1]);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        decoder
+            .encode_rgb(first, &color, &mut encoder)
+            .expect("recorded decode");
+        let rgba = decoder.rgba_buffer().expect("RGBA buffer");
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test readback"),
+            size: rgba.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(rgba, 0, &readback, 0, rgba.size());
+        context.queue().submit([encoder.finish()]);
+        // No wait: the next decode maps the buffers at once.
+        let planes = decoder.decode(second).expect("decode");
+        assert_eq!(planes, reference.decode(second).expect("decode"));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.expect("map"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let words = slice.get_mapped_range().expect("mapped").to_vec();
+        let rgb: Vec<u8> = words
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        assert_eq!(
+            rgb,
+            reference
+                .decode_rgb(first, &color)
+                .expect("RGB decode")
+                .data
+        );
+    }
+}
+
+#[test]
 fn without_plane_stores_the_planes_are_copied() {
     let options = GpuOptions {
         plane_stores: false,
@@ -1022,14 +1132,13 @@ fn a_device_limited_to_webgpu_guarantees_decodes_the_same() {
         return;
     };
     // Not even the stores into plane textures, which Metal's own format
-    // features allow (decision D52).
+    // features allow (decision D52), nor frames written where the shaders
+    // read them, which mappable storage buffers allow (decision D53).
     assert!(!context.stores_planes());
-    assert!(
-        !context
-            .device()
-            .features()
-            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
-    );
+    assert!(!context.shares_uploads());
+    let features = context.device().features();
+    assert!(!features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES));
+    assert!(!features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS));
 
     let (layout, frames) = vector_frames("noise_131x67_444");
     let reference = read_reference("noise_131x67_444", Reference::Fp32);

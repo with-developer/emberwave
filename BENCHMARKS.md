@@ -329,6 +329,22 @@ One round at 1080p, frame after frame, was disturbed for both, 0.54 and 0.58 ms,
 - **At 60 frames a second** the difference is within the noise of these runs: at 4K the median round gained 0.16 ms, about 5 %, while single rounds went from 0.29 ms worse to 0.40 ms better, and at 1080p nothing is measurable. Leaving out the copies had suggested about 0.3 ms at 4K. The gap to upstream at that pace (decision D48) remains for the next items of #86.
 - **The copies cost the same as before.** Timed alternately with the program built from `main`, the branch's copies took the same time frame after frame, 0.96 to 0.97 ms at 4K against 0.96 to 0.98 ms, so splitting the inverse transform into two shaders cost nothing.
 
+## Frames written where the shaders read them
+
+Since decision D53, on Apple silicon a decode that waits for its frame writes the frame's block table and payload into the buffers its shaders read, where it used to write them into an upload buffer and copy them over at the start of the frame's command buffer (D34). Measured on 2026-10-29 from 19:27 to 19:44 on the Apple M3 Max of the tables above, macOS 27.0.1, on mains power, with the code of [#104](https://github.com/with-developer/emberwave/pull/104); nobody used the Mac, but a screen recorder and other programs ran. The scratch program of the section above decoded the scene streams into Y, Cb and Cr textures, which take the stores, on two contexts in turn, a frame each: one wrote the frames in place, the other through the upload buffer (`GpuOptions::shared_uploads` off). Two runs of five rounds of 600 frames of each, the second with the order of the two reversed; mean milliseconds per frame, the lowest and the highest of the rounds:
+
+| | 1080p | 4K |
+|---|---|---|
+| Upload buffer, frame after frame | 0.40 to 0.49 | 0.87 to 0.92 |
+| In place, frame after frame | 0.39 to 0.48 | 0.85 to 0.90 |
+| Less in place | 0.004 to 0.016 | 0.013 to 0.024 |
+| Upload buffer, 60 frames a second | 1.79 to 1.96 | 2.73 to 3.07 |
+| In place, 60 frames a second | 1.67 to 1.89 | 2.66 to 2.93 |
+| Less in place, the median round (all rounds) | 0.06 (−0.05 to 0.11) | 0.14 (0.04 to 0.25) |
+
+- **At 60 frames a second** the frames written in place took less time in every round at 4K, 0.14 ms in the median round, about 5 %, and in nine rounds of ten at 1080p, 0.06 ms in the median round. The copies were small, 1.2 MB at 4K, but they were a stage of every frame, and at that pace a stage costs more than its bytes.
+- **Frame after frame** they save 0.01 to 0.02 ms, about 2 %.
+
 ## Picture quality
 
 What a frame's budget buys, on a hard picture: a 4K frame of the game Crimson Desert, grass, pines and a stone wall in daylight, from a screenshot taken in the game, a 3840x2160 PNG. It was converted to 8-bit 4:2:0 in BT.709's video range, each chroma sample the mean of its four pixels. On 2026-10-29, on the Apple M3 Max of the tables above, `emberwave-cli encode` encoded it within five budgets on the CPU, which makes the same bytes on every machine, and `emberwave-cli decode` decoded it again, built from the code of release 0.11.0. The GPU encoder (`--gpu`), on 2026-10-27 and 2026-10-29, gave the same sizes and the same PSNR to two decimals. PSNR is per plane, over the whole picture, against the 4:2:0 picture that the encoder took. `scripts/quality_figure.py` does all this from the 4:2:0 picture, prints this table and draws the README's picture, which enlarges the region that loses the most at the smallest budget. The frame itself is not in the repository (decision D49).

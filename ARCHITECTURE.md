@@ -317,7 +317,7 @@ The packed planes are copied to a mappable buffer and returned as a `Frame`. Whe
 
 | Buffer | Content | Size for 4K 4:2:0 |
 |---|---|---|
-| payload (`array<u32>`) | received blocks, padded with four zero words | grows on demand, 64 KiB at least |
+| payload (`array<u32>`) | received blocks, padded with four zero words; on Apple silicon the CPU writes them in place, with the block offsets (D53) | grows on demand, 64 KiB at least |
 | block offsets (`array<u32>`) | word offset of every block, `u32::MAX` if missing | 49 KiB |
 | pyramid (`array<f32>`) | the four bands of every level of every component, back to back | 63.6 MiB |
 | packed planes (`array<u32>`) | 8-bit planes, four pixels per word, rows padded to words | 11.9 MiB |
@@ -892,7 +892,7 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 **Context.** A 4K frame decoded to planes in about 1.05 ms on an Apple M3 Max, upstream's decoder at FP32 in 0.79 ms. The GPU times were close, 0.55 against 0.50 ms; the difference was on the CPU, which took 0.23 ms to prepare a frame: 72 µs to assemble it and 174 µs to hand its 1.2 MB of blocks to `Queue::write_buffer` (medians of 300 frames), about 7 GB/s. That is what D30 found for the encoder: `write_buffer` takes new staging memory for every call, and the first writes to it cost more than the copy (issue #45).
 
 **Decision.**
-- The decodes that wait for their frame (`decode`, `decode_rgb`, `time_frame`, and the C API's) write the block table and the payload into an upload buffer the decoder keeps, mapped for writing before each frame, which waits for nothing since the frame before is done, and copied into the decoder's buffers at the start of the frame's command buffer. It is made on the first such decode, and made again when the payload buffer grows, so a decoder that only records into the caller's command encoder never has it.
+- (On Apple silicon, superseded by D53: the frame goes straight into the buffers the shaders read.) The decodes that wait for their frame (`decode`, `decode_rgb`, `time_frame`, and the C API's) write the block table and the payload into an upload buffer the decoder keeps, mapped for writing before each frame, which waits for nothing since the frame before is done, and copied into the decoder's buffers at the start of the frame's command buffer. It is made on the first such decode, and made again when the payload buffer grows, so a decoder that only records into the caller's command encoder never has it.
 - `encode_rgb`, which records the decode into the caller's command encoder without waiting, and so cannot know when the previous frame let go of the buffer, still writes through the queue. So does the browser player, where nothing may block.
 - When a frame fails, the decoder and the encoder poll the device once, without waiting, while no loss is recorded, as `GpuContext::explain` does (D31's companion fix of #35): a destroyed device fails the mapping before anything else has polled it, and is reported as lost only after a poll.
 
@@ -1354,3 +1354,16 @@ The figures of the prototype's runs above are marked as not kept.
   - A cache of the bind groups: see above. Making them costs little next to the gain.
 
 **Consequence.** On Metal the textures hold the same planes as before, byte for byte: the tests compare them with `decode`'s planes through wgpu, and through Metal from the app's own textures, waiting and on the app's queue, and the benchmark app's plane check passes. CI's macOS jobs run the stores, the iOS Simulator's included, and those on Linux and Windows the copies. On the M3 Max a 4K frame into the textures takes 0.08 to 0.12 ms less frame after frame, 0.91 to 0.93 ms through the C API instead of 1.03 to 1.05 ms, about what leaving out the copies promised, and a 1080p frame about 0.02 ms less. At 60 frames a second the gain is within the noise of the runs: interleaved with the copies frame by frame, the median round gained 0.16 ms at 4K and nothing measurable at 1080p, less than the 0.3 ms that leaving out the copies had suggested at 4K (`BENCHMARKS.md`, "Planes stored into textures"). The gap to upstream at that pace stays with #86's next items: the copies of the upload and the CPU's preparation.
+
+### 2026-10-29 — D53: On Apple silicon a frame goes where the shaders read it
+
+**Context.** The decodes that wait for their frame write its block table and payload into an upload buffer the decoder keeps, and copy them into the buffers the shaders read at the start of the frame's command buffer (D34). On Apple silicon the CPU and the GPU share their memory, and upstream's decoder writes its frames into buffers that the GPU reads. The copies are small, 1.2 MB at 4K, but they are a stage of every frame (#86, item 2).
+
+**Decision.**
+- On Metal with an integrated GPU, as Apple silicon's is, a context asks for `MAPPABLE_PRIMARY_BUFFERS`, and the decoders make the payload and block offsets buffers mappable for writing. A decode that waits maps both, with one wait, writes the frame into them and unmaps them, also when the writing fails: no upload buffer, and no copies. The map waits for work on the GPU that still reads the buffers, a decode that did not wait. `GpuOptions::shared_uploads` turns it off, and strict WebGPU never asks; `GpuContext::shares_uploads` tells.
+- Other GPUs keep D34's upload. wgpu warns that mappable storage buffers cost a GPU with memory of its own dearly, and integrated GPUs on Vulkan and Direct3D 12 were not measured.
+- The decodes that do not wait write through the queue as before.
+- The encoder's upload of the planes (D30) stays as it is: not measured.
+- Alternative: one buffer for the table and the payload, bound twice at offsets, which would map once rather than twice. Storage bindings start at multiples of 256 bytes, and mapping a second buffer costs little next to the copies.
+
+**Consequence.** On the M3 Max, interleaved frame by frame with the upload, ten rounds (`BENCHMARKS.md`, "Frames written where the shaders read them"): at 60 frames a second a 4K frame took 0.04 to 0.25 ms less in every round, 0.14 ms in the median round, and a 1080p frame 0.06 ms less in the median round, in nine rounds of ten; frame after frame 0.01 to 0.02 ms less. The frames decode to the same planes either way, which a test compares, also with a decode that does not wait still on the GPU when the next one maps its buffers.

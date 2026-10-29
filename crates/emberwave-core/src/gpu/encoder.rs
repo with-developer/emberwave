@@ -687,7 +687,7 @@ impl Encoder {
         if self.upload_mapped {
             return Ok(());
         }
-        map_for_writing(&self.device, &self.upload)?;
+        map_for_writing(&self.device, &[&self.upload])?;
         self.upload_mapped = true;
         Ok(())
     }

@@ -35,6 +35,12 @@ pub struct GpuOptions {
     /// Without it, and elsewhere, the decoders copy the planes into the
     /// textures (decision D41). Ignored with `strict_webgpu`.
     pub plane_stores: bool,
+    /// Let the decoders write a frame where their shaders read it, on GPUs
+    /// that share their memory with the CPU: on Metal on Apple silicon,
+    /// through mappable storage buffers (decision D53). Without it, and
+    /// elsewhere, a frame goes into an upload buffer that the GPU copies from
+    /// (decision D34). Ignored with `strict_webgpu`.
+    pub shared_uploads: bool,
 }
 
 impl GpuOptions {
@@ -47,6 +53,7 @@ impl GpuOptions {
             strict_webgpu: false,
             timestamps: false,
             plane_stores: true,
+            shared_uploads: true,
         }
     }
 
@@ -133,6 +140,9 @@ pub struct GpuContext {
     timestamps: bool,
     /// Whether the decoders store planes into textures (decision D52).
     plane_stores: bool,
+    /// Whether the decoders write frames where their shaders read them
+    /// (decision D53).
+    shared_uploads: bool,
     /// Built on first use, shared by every clone of the context: the
     /// decoder's and the encoder's, so that neither compiles the other's.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
@@ -207,12 +217,15 @@ impl GpuContext {
             && !options.strict_webgpu
             && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let plane_stores = options.plane_stores && !options.strict_webgpu && stores_planes(adapter);
+        let shared_uploads =
+            options.shared_uploads && !options.strict_webgpu && shares_memory(adapter);
         let mut required_features = wgpu::Features::empty();
         required_features.set(wgpu::Features::TIMESTAMP_QUERY, timestamps);
         required_features.set(
             wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
             plane_stores,
         );
+        required_features.set(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS, shared_uploads);
         wgpu::DeviceDescriptor {
             label: Some("emberwave"),
             required_features,
@@ -231,6 +244,10 @@ impl GpuContext {
             .features()
             .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
             && stores_planes(&adapter);
+        let shared_uploads = device
+            .features()
+            .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
+            && shares_memory(&adapter);
 
         // A lost device stays lost. Errors of a lost device do not reach the
         // error scopes, so the decoders check this record before and after
@@ -250,6 +267,7 @@ impl GpuContext {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             timestamps,
             plane_stores,
+            shared_uploads,
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             lost,
@@ -329,6 +347,13 @@ impl GpuContext {
         self.plane_stores
     }
 
+    /// Whether the decoders write a frame's data where their shaders read
+    /// it, without an upload buffer and the copies from it: on Metal on Apple
+    /// silicon, unless [`GpuOptions::shared_uploads`] was off (decision D53).
+    pub fn shares_uploads(&self) -> bool {
+        self.shared_uploads
+    }
+
     /// The decoder's compute pipelines, compiled the first time they are
     /// asked for.
     pub(crate) fn pipelines(&self) -> Result<Arc<Pipelines>, GpuError> {
@@ -364,6 +389,19 @@ fn stores_planes(adapter: &wgpu::Adapter) -> bool {
         && format
             .flags
             .contains(wgpu::TextureFormatFeatureFlags::STORAGE_WRITE_ONLY)
+}
+
+/// Whether the decoders can write a frame where their shaders read it on
+/// `adapter`, once its device has mappable storage buffers: on Metal with
+/// memory that the CPU and the GPU share, as Apple silicon has (decision D53).
+/// wgpu warns that such buffers cost a GPU of its own memory dearly.
+fn shares_memory(adapter: &wgpu::Adapter) -> bool {
+    let info = adapter.get_info();
+    info.backend == wgpu::Backend::Metal
+        && info.device_type == wgpu::DeviceType::IntegratedGpu
+        && adapter
+            .features()
+            .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
 }
 
 /// After a call failed on `device`: polls it once, without waiting, while

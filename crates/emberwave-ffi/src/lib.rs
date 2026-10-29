@@ -705,6 +705,7 @@ fn gpu_options(options: &EmberwaveContextOptions) -> Result<GpuOptions, Failure>
         strict_webgpu: false,
         timestamps: false,
         plane_stores: true,
+        shared_uploads: true,
     })
 }
 
