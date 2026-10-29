@@ -33,6 +33,16 @@ These times are for frames one after the other. A stream's frames arrive 60 a se
 
 > **Status: 0.x.** The bitstream is upstream's, and the Rust and C APIs may still change between minor versions. CI tests every change on Linux with the lavapipe Vulkan driver, on macOS with Metal and on Windows with DX12 on WARP. Releases and their changes are in [`CHANGELOG.md`](CHANGELOG.md).
 
+## Picture quality
+
+<p align="center">
+  <img alt="A 4K frame of the game Crimson Desert, and a 320 by 180 region of it, a pine before a stone wall, enlarged twice: from the source, and decoded from frames within four budgets, with the bit rate at 60 frames a second and the luma PSNR of the whole frame: 322 Mbit/s, 25.8 dB; 499 Mbit/s, 27.1 dB; 816 Mbit/s, 29.9 dB; 1200 Mbit/s, 32.9 dB." src="docs/images/quality.png" width="100%">
+</p>
+
+PyroWave buys its speed with bandwidth, and how much it takes depends on the picture. This 4K frame of a game is a hard one, all grass, needles and stone. Each panel gives the bit rate at 60 frames a second and the luma PSNR over the whole frame, and shows the region that loses the most, enlarged twice. At 322 Mbit/s the needles run together and the joints of the wall blur; at 816 Mbit/s they are mostly back, and at 1.2 Gbit/s little is lost. At 322 Mbit/s the benchmarks' synthetic 4K scene keeps 42.7 dB. On this frame, a key frame of Apple's hardware HEVC encoder gets 1.9 to 3.5 dB more out of the same budget, and an HEVC stream needs key frames only at its start and after a loss. PyroWave is for wired networks with bandwidth to spare ([`BENCHMARKS.md`](BENCHMARKS.md#picture-quality)).
+
+<sub>The frame is from Crimson Desert, © Pearl Abyss. This is unofficial content: it contains copyrighted material and IP of Pearl Abyss, which neither made nor endorsed it, and it is not covered by this repository's license.</sub>
+
 ## How it works
 
 <picture>
@@ -147,7 +157,7 @@ After the release: a [browser player](https://with-developer.github.io/emberwave
 | `crates/emberwave-web`, `web/` | The browser player and its benchmark: WebAssembly module and pages |
 | `testdata/` | Test vectors and how to regenerate them |
 | `scripts/` | Test data, 4K acceptance check and benchmark scripts |
-| `docs/images/` | The README's banner and charts, drawn by `scripts/readme_figures.py` from the numbers in `BENCHMARKS.md` |
+| `docs/images/` | The README's banner and charts, drawn by `scripts/readme_figures.py` from the numbers in `BENCHMARKS.md`, and its picture of the quality, made by `scripts/quality_figure.py` |
 | `ARCHITECTURE.md` | Bitstream format, GPU pipeline and the decision log |
 | `BENCHMARKS.md` | How decode times are measured, and the results |
 | `CONTRIBUTING.md` | How to build, test and change the code |
@@ -170,7 +180,7 @@ Upstream also ships an Apple-only Metal port. emberwave aims at one portable cod
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE), which also carries the PyroWave copyright notice.
+MIT. See [`LICENSE`](LICENSE), which also carries the PyroWave copyright notice. The frame of Crimson Desert in `docs/images/quality.png` is © Pearl Abyss and not covered by the license, and it is left out of the source archives of releases.
 
 ## 한국어 요약
 
@@ -179,6 +189,7 @@ emberwave는 Themaister의 PyroWave(LAN 게임 스트리밍용 GPU 웨이블릿 
 - **현재 상태(0.x)**: 비트스트림은 업스트림 것이고, Rust·C API는 마이너 버전 사이에 바뀔 수 있습니다. 비트스트림 파서, GPU 디코더(역양자화, 역 DWT, YUV→RGB), CLI(`emberwave-cli`)가 동작합니다. 원본 인코더가 만든 스트림을 원본 디코더와 PSNR 64 dB 이상(원본 FP32 모드 기준 86 dB 이상)으로 일치하게 디코딩하고, 4K 스트림도 같은 기준을 통과합니다. CI는 Linux(lavapipe), macOS(Metal), Windows(DX12, WARP)에서 테스트를 돌립니다.
 - **빠른 시작**: Rust 1.87 이상과 GPU(없으면 Linux는 Mesa lavapipe, Windows는 내장 WARP)가 있으면 위 Quick start의 네 줄로 PNG를 얻습니다. 처음 빌드는 몇 분 걸립니다.
 - **성능**: Apple M3 Max(Metal)에서 4K 한 프레임을 약 0.9 ms(RGB 변환 포함 1.2 ms)에 디코딩하며, 같은 기계에서 원본 Metal 디코더(FP32)의 1.0~1.25배입니다(측정 회차마다 다름). 디코딩한 그림을 CPU로 읽어 오면 4K RGB가 약 2.2 ms입니다(전에는 7.5 ms). 측정 환경과 전체 수치는 위 Performance 표와 [`BENCHMARKS.md`](BENCHMARKS.md)에 있습니다.
+- **화질**: 필요한 대역폭은 그림에 따라 다릅니다. 풀·솔잎·돌벽으로 가득해 압축하기 어려운 붉은사막 4K 프레임을 초당 60프레임으로 보내면, 322 Mbit/s에서는 솔잎이 뭉개지고(프레임 전체의 luma PSNR 25.8 dB), 816 Mbit/s에서는 대부분 살아나며(29.9 dB), 1.2 Gbit/s에서는 잃는 것이 거의 없습니다(32.9 dB). 벤치마크의 합성 4K 장면은 322 Mbit/s에서도 42.7 dB입니다. 같은 프레임을 Apple 하드웨어 HEVC 인코더가 같은 예산 안의 키프레임으로 압축하면 1.9~3.5 dB 높습니다. PyroWave는 대역폭이 넉넉한 유선 네트워크용입니다([`BENCHMARKS.md`](BENCHMARKS.md#picture-quality)).
 - **릴리스**: v0.1.0이 첫 릴리스, v0.2.0이 속도 개선, v0.3.0이 브라우저 플레이어와 C API, v0.4.0이 인코더(CPU와 GPU), v0.5.0이 GPU 인코더 가속(4K 약 1.9 ms로 업스트림보다 빠름)과 기기 손실·Vulkan 로더 관련 수정, v0.6.0이 C API 인코더와 GPU 텍스처 입력 인코딩, v0.7.0이 iPhone·iPad·Mac 앱용 XCFramework, 휴대폰도 되는 브라우저 벤치마크, 디코딩 CPU 시간 단축, v0.8.0이 디코딩한 그림의 CPU 읽기 3배 가속(C API 4K RGB 7.6→2.7 ms), 텍스처 입력 인코딩 가속, 브라우저 페이지 리뷰 수정, v0.9.0이 Metal 클라이언트용 GPU 텍스처 출력(C API, M3 Max 4K 1.5 ms)과 iPhone·iPad 벤치마크 앱, v0.10.0이 Y·Cb·Cr 평면 텍스처(4K 1.0 ms), 복사로 채우는 RGB 텍스처(4K 1.5→1.3 ms), 앱의 Metal 큐에서 대기 없는 디코딩, v0.11.0이 앱 자신의 Metal 텍스처(CVPixelBuffer 등)로 디코딩과 모든 텍스처 경로를 재는 벤치마크 앱 릴리스입니다. Linux(x86_64), macOS(Apple Silicon), Windows(x86_64)용 `emberwave-cli`와 C 라이브러리(`emberwave-ffi`), iOS·macOS 앱용 `Emberwave.xcframework`를 [releases](https://github.com/with-developer/emberwave/releases)에서 받을 수 있습니다. 4K 1000프레임을 반복 디코딩해도 GPU 자원과 프로세스 메모리가 늘지 않는 것을 확인했습니다.
 - **브라우저 플레이어**: [with-developer.github.io/emberwave](https://with-developer.github.io/emberwave/)에서 `.pwv1` 파일을 열면 WebGPU로 페이지 안에서 디코딩해 재생합니다. 파일 없이 열면 페이지가 직접 그리고 인코딩한 960x540 데모 스트림을 바로 재생합니다. 파일은 어디에도 올라가지 않습니다. [벤치마크 페이지](https://with-developer.github.io/emberwave/bench.html)는 그 기기(휴대폰 포함)에서 1080p·1440p·4K 디코딩 시간을 재고 복사할 수 있는 결과를 보여 줍니다. iPhone 17(Safari)에서는 1080p 한 프레임에 2.4 ms, 4K에 8.1 ms입니다.
 - **C API**: `crates/emberwave-ffi`가 C에서 쓰는 헤더(`emberwave.h`)와 공유·정적 라이브러리를 제공합니다. 네트워크로 받은 패킷을 넣고 YUV 평면이나 RGB를 호출자 메모리로 받습니다. 인코더도 있어서(#42), 호스트는 stride가 있는 평면을 바이트 예산 안의 프레임으로 인코딩하고 패킷으로 나눕니다. 릴리스마다 3개 OS용으로 빌드해 올리고, C 예제가 CI에서 모든 테스트 벡터를 디코딩하고 인코더 소스 둘을 인코딩해 다시 디코딩합니다. iPhone·iPad·Mac 앱용으로는 정적 라이브러리를 `Emberwave.xcframework`로 묶어 릴리스에 함께 올립니다(#52). Swift에서는 `import Emberwave`로 쓰고, Swift 예제(`examples/swift`)와 iPhone·iPad용 벤치마크 앱(`examples/ios`, Xcode 프로젝트)이 있습니다. CI가 C·Swift 예제를 iOS 시뮬레이터와 Mac에서, 앱을 iOS 시뮬레이터에서 돌려 검증합니다. iPhone 17 실기기에서도 앱의 Metal 검사 3개가 통과했고, 1080p 한 프레임을 Metal 텍스처로 1.6 ms, Y·Cb·Cr 텍스처로 1.3 ms, 4K는 6.2~6.3 ms와 4.8 ms에 디코딩합니다. 같은 폰의 Safari보다 22~31% 빠릅니다. 앱은 같은 기기의 하드웨어 HEVC(VideoToolbox, Moonlight가 쓰는 경로)도 함께 잽니다. M3 Max에서 프레임을 연달아 디코딩하면 emberwave가 HEVC보다 2.2~3.9배 빠릅니다(4K 1.0 ms 대 2.6~3.4 ms). 하지만 초당 60프레임 간격으로 받으면 프레임 사이에 쉬는 GPU는 느려지고 미디어 엔진은 그렇지 않아서, 둘이 비슷해집니다. iPhone 17에서는 연달아 디코딩하면 emberwave가 1.4~1.7배 빠르지만(하루 뒤 측정에서 4K 4.5 ms 대 HEVC 6.2~6.3 ms), 초당 60프레임 간격에서는 HEVC가 1.5~2.7배 빠릅니다.

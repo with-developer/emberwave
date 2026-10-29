@@ -11,3 +11,7 @@
 # The C header is generated, and tests/header.rs compares it with cbindgen's
 # output byte for byte.
 *.h text eol=lf
+
+# The README's picture of the quality is a frame of a game, Pearl Abyss's and
+# not under this repository's license: source archives leave it out (D49).
+docs/images/quality.png export-ignore
