@@ -19,6 +19,7 @@ const { Demo, Player, Bench, packet_ends } = module;
 for (const [name, value] of [
   ["Player.create", Player?.create],
   ["Player.max_file_bytes", Player?.max_file_bytes],
+  ["Player.prototype.set_partial_share", Player?.prototype.set_partial_share],
   ["Bench.create", Bench?.create],
   ["Demo", Demo],
   ["Demo.frames", Demo?.frames],

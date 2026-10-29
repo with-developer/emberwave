@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::bitstream::consts::DECOMPOSITION_LEVELS;
+use crate::bitstream::packet::{DEFAULT_MINIMUM_PACKET_RATIO, DEFAULT_PRISTINE_BANDS};
 use crate::bitstream::{
     Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout, SequenceHeader,
 };
@@ -187,6 +188,9 @@ pub struct Decoder {
     /// [`GpuContext::id`] of the context the decoder was made on.
     context_id: u64,
     assembler: FrameAssembler,
+    /// The share of a frame's announced blocks a frame that lost packets
+    /// needs ([`set_partial_share`](Self::set_partial_share)).
+    partial_share: f32,
     buffers: BufferLayout,
 
     payload: wgpu::Buffer,
@@ -366,6 +370,7 @@ impl Decoder {
                 device: device.clone(),
                 queue: queue.clone(),
                 assembler: FrameAssembler::new(layout.clone()),
+                partial_share: DEFAULT_MINIMUM_PACKET_RATIO,
                 buffers: buffers.clone(),
                 payload,
                 payload_capacity_words,
@@ -718,10 +723,38 @@ impl Decoder {
         Ok(self.assembler.push_packet(packet)?)
     }
 
-    /// Whether the frame being received can be decoded. See
-    /// [`FrameAssembler::is_ready`].
+    /// Whether the frame being received can be decoded: all its blocks
+    /// arrived, or, with `allow_partial_frame`, every block of the coarsest
+    /// level and more than [`partial_share`](Self::partial_share) of the
+    /// blocks its start of frame header announced. See
+    /// [`FrameAssembler::is_ready_with`].
     pub fn is_ready(&self, allow_partial_frame: bool) -> bool {
-        self.assembler.is_ready(allow_partial_frame)
+        self.assembler.is_ready_with(
+            allow_partial_frame,
+            DEFAULT_PRISTINE_BANDS,
+            self.partial_share,
+            None,
+        )
+    }
+
+    /// Sets the share of a frame's announced blocks that must have arrived,
+    /// with every block of the coarsest level, for [`is_ready`](Self::is_ready)
+    /// to take a frame that lost packets: 0.9 by default, as upstream's
+    /// decoder has it. A lower share takes frames that lost more, with more
+    /// of their detail blank, where a client would skip them; 1 takes whole
+    /// frames only. Below 0 counts as 0 and above 1 as 1; NaN sets the
+    /// default again. The share stays until it is set again.
+    pub fn set_partial_share(&mut self, share: f32) {
+        self.partial_share = if share.is_nan() {
+            DEFAULT_MINIMUM_PACKET_RATIO
+        } else {
+            share.clamp(0.0, 1.0)
+        };
+    }
+
+    /// The share of [`set_partial_share`](Self::set_partial_share).
+    pub fn partial_share(&self) -> f32 {
+        self.partial_share
     }
 
     /// Discards what was received, and forgets the order of the frames: the

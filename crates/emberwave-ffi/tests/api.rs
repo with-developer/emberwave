@@ -8,7 +8,8 @@ use std::ffi::CStr;
 use std::path::PathBuf;
 use std::ptr;
 
-use emberwave_core::bitstream::{Header, Pwv1File};
+use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
+use emberwave_core::bitstream::{FrameLayout, Header, Pwv1File};
 use emberwave_core::color::ColorParams;
 use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions};
 use emberwave_ffi::*;
@@ -241,6 +242,10 @@ fn bad_arguments_are_errors_with_a_message_not_crashes() {
             EmberwaveStatus::InvalidArgument
         );
         assert!(!emberwave_decoder_is_ready(ptr::null(), true));
+        assert_eq!(
+            emberwave_decoder_set_partial_share(ptr::null_mut(), 0.5),
+            EmberwaveStatus::InvalidArgument
+        );
         assert_eq!(*emberwave_context_adapter(ptr::null()), 0);
         emberwave_decoder_clear(ptr::null_mut());
         emberwave_decoder_destroy(ptr::null_mut());
@@ -509,6 +514,75 @@ fn packets_of_another_stream_are_refused_and_clear_starts_over() {
         );
         assert!(emberwave_decoder_is_ready(decoder, false));
         emberwave_decoder_clear(decoder);
+        assert!(!emberwave_decoder_is_ready(decoder, true));
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}
+
+#[test]
+fn a_partial_frame_needs_the_share_the_caller_sets() {
+    let Some(context) = context() else {
+        return;
+    };
+    // A frame of emberwave's encoder, which sends every block of the
+    // coarsest level, without every other packet past that level.
+    let bytes = testdata("encoder/gradient_200x120_420.pwv1");
+    let decoder = decoder_for(context, &bytes);
+    let frame = frames(&bytes)[0];
+    let stream = Pwv1File::parse(&bytes).unwrap().header().stream;
+    let layout = FrameLayout::new(stream.width, stream.height, stream.chroma).unwrap();
+    let coarsest = layout
+        .bands()
+        .find(|&(_, level, _, _)| level < DECOMPOSITION_LEVELS - 1)
+        .map_or(layout.block_count(), |(_, _, _, band)| band.first_block);
+    // SAFETY: a live decoder and valid buffers.
+    unsafe {
+        for (number, packet) in emberwave_core::encode::packets(frame, 64)
+            .into_iter()
+            .enumerate()
+        {
+            let mut at = 0;
+            let first_block = loop {
+                match Header::parse(&packet[at..]) {
+                    Ok(Header::StartOfFrame(_)) => at += 8,
+                    Ok(Header::Block(block)) => break Some(block.block_index),
+                    Err(_) => break None,
+                }
+            };
+            if first_block.is_some_and(|block| block >= coarsest) && number % 2 == 1 {
+                continue;
+            }
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, packet.as_ptr(), packet.len()),
+                EmberwaveStatus::Ok
+            );
+        }
+        assert!(
+            !emberwave_decoder_is_ready(decoder, true),
+            "90 % by default"
+        );
+        for share in [-0.1, 1.5, f32::NAN] {
+            assert_eq!(
+                emberwave_decoder_set_partial_share(decoder, share),
+                EmberwaveStatus::InvalidArgument
+            );
+            assert!(!last_error().is_empty());
+        }
+        assert!(
+            !emberwave_decoder_is_ready(decoder, true),
+            "nothing changed"
+        );
+        assert_eq!(
+            emberwave_decoder_set_partial_share(decoder, 0.25),
+            EmberwaveStatus::Ok
+        );
+        assert!(emberwave_decoder_is_ready(decoder, true));
+        assert!(!emberwave_decoder_is_ready(decoder, false));
+        assert_eq!(
+            emberwave_decoder_set_partial_share(decoder, 1.0),
+            EmberwaveStatus::Ok
+        );
         assert!(!emberwave_decoder_is_ready(decoder, true));
         emberwave_decoder_destroy(decoder);
         emberwave_context_destroy(context);

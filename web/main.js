@@ -18,6 +18,7 @@ const network = document.getElementById("network");
 const asPackets = document.getElementById("packets");
 const packetBytes = document.getElementById("packet-bytes");
 const loss = document.getElementById("loss");
+const partial = document.getElementById("partial");
 
 // What playing as packets has met since it was last shown.
 const tally = { frames: 0, whole: 0, partial: 0, skipped: 0, packets: 0, lost: 0, malformed: 0 };
@@ -31,6 +32,9 @@ function resetTally() {
 // chosen share of them lost. Then draws what arrived, if enough did, and
 // returns the CPU's milliseconds for the draw, or null for a frame skipped.
 function playAsPackets(frame) {
+  // The share of its blocks a frame drawn in part needs, beside every block
+  // of the coarsest level; a stream opened anew starts at 0.9 again.
+  player.set_partial_share(Number(partial.value));
   const ends = packet_ends(frame, Number(packetBytes.value));
   const packets = [];
   let start = 0;
@@ -371,14 +375,16 @@ async function start() {
     samples.append(button);
   }
 
-  // ?packets plays as packets (?packets=0 does not), and ?loss=0.05 loses
-  // that share of them, from 0 to 1, for links to the network's view.
+  // ?packets plays as packets (?packets=0 does not), ?loss=0.05 loses that
+  // share of them, and ?partial=0.7 draws a frame in part once more than
+  // that share of its blocks are in, from 0 to 1, for links to the
+  // network's view.
   const params = new URLSearchParams(location.search);
   if (params.has("packets") && !["0", "false"].includes(params.get("packets"))) {
     asPackets.checked = true;
   }
   const lossAsked = Number(params.get("loss"));
-  if (params.has("loss") && Number.isFinite(lossAsked)) {
+  if (params.get("loss") && Number.isFinite(lossAsked)) {
     const share = Math.min(1, Math.max(0, lossAsked));
     let option = [...loss.options].find((candidate) => Number(candidate.value) === share);
     if (!option) {
@@ -386,6 +392,16 @@ async function start() {
       loss.add(option);
     }
     loss.value = option.value;
+  }
+  const partialAsked = Number(params.get("partial"));
+  if (params.get("partial") && Number.isFinite(partialAsked)) {
+    const share = Math.min(1, Math.max(0, partialAsked));
+    let option = [...partial.options].find((candidate) => Number(candidate.value) === share);
+    if (!option) {
+      option = new Option(`${+(share * 100).toFixed(2)} %`, String(share));
+      partial.add(option);
+    }
+    partial.value = option.value;
   }
 
   // ?play=NAME starts a sample straight away, for links to one; otherwise
