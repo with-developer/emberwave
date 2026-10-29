@@ -237,15 +237,25 @@ fn bad_input_is_an_error() {
             ..
         })
     ));
+    // The smallest frame is the header and the blocks of the coarsest level,
+    // which every frame carries, as small as they get: its size fits, a
+    // byte less does not.
+    let Err(EncodeError::BudgetTooSmall { budget: 7, minimum }) =
+        encoder.encode([&planes[0], &planes[1], &planes[2]], 7)
+    else {
+        panic!("a frame of seven bytes");
+    };
+    let layout = encoder.layout().clone();
+    assert!(minimum >= HEADER_BYTES + pristine_blocks(&layout) as usize * 12);
     assert!(matches!(
-        encoder.encode([&planes[0], &planes[1], &planes[2]], 7),
-        Err(EncodeError::BudgetTooSmall { budget: 7, .. })
+        encoder.encode([&planes[0], &planes[1], &planes[2]], minimum - 1),
+        Err(EncodeError::BudgetTooSmall { minimum: m, .. }) if m == minimum
     ));
-    // Eight bytes always fit: a frame of nothing but its header.
     let frame = encoder
-        .encode([&planes[0], &planes[1], &planes[2]], 8)
+        .encode([&planes[0], &planes[1], &planes[2]], minimum)
         .unwrap();
-    assert_eq!(frame.len(), 8);
+    assert!(frame.len() <= minimum);
+    decode(&layout, &frame);
     assert!(Encoder::new(191, 136, ChromaSubsampling::Yuv420, Signalling::default()).is_err());
 }
 
@@ -264,10 +274,12 @@ fn a_flat_picture_costs_almost_nothing() {
         .encode([&planes[0], &planes[1], &planes[2]], 100_000)
         .unwrap();
     // Only the LL band of each component carries anything: three blocks,
-    // whose subblocks all pay for the base bit-planes of the largest value.
-    // Upstream's encoder makes frames of this vector that size too.
-    assert!(frame.len() < 300, "{} bytes", frame.len());
-    assert_eq!(packets(&frame, HEADER_BYTES).len(), 1 + 3);
+    // whose subblocks all pay for the base bit-planes of the largest value,
+    // as in upstream's frames of this vector. The other nine blocks of the
+    // coarsest level go empty, 12 bytes each, for partial decodes.
+    assert_eq!(pristine_blocks(&layout), 12);
+    assert!(frame.len() < 300 + 9 * 12, "{} bytes", frame.len());
+    assert_eq!(packets(&frame, HEADER_BYTES).len(), 1 + 12);
     assert_eq!(decode(&layout, &frame), planes);
 }
 
@@ -278,7 +290,12 @@ fn every_budget_holds_down_to_the_byte() {
     let planes = chroma_planes(ChromaSubsampling::Yuv420, 64, 64, true);
     let mut encoder =
         Encoder::new(64, 64, ChromaSubsampling::Yuv420, Signalling::default()).unwrap();
-    for budget in (8..=260).chain(1501..=1507) {
+    let Err(EncodeError::BudgetTooSmall { minimum, .. }) =
+        encoder.encode([&planes[0], &planes[1], &planes[2]], 0)
+    else {
+        panic!("a frame of no bytes");
+    };
+    for budget in (minimum..=minimum + 252).chain(1501..=1507) {
         let frame = encoder
             .encode([&planes[0], &planes[1], &planes[2]], budget)
             .unwrap();
@@ -451,4 +468,56 @@ fn the_coefficient_error_needs_the_frames_picture_size() {
             ..
         })
     ));
+}
+
+#[test]
+fn a_frame_that_loses_finer_packets_decodes_in_part() {
+    // Flat chroma leaves the detail bands of the coarsest level at zero. The
+    // frame carries their blocks anyway, empty, so that once packets of finer
+    // levels are lost, the frame is still ready for a partial decode, which
+    // needs every block of the coarsest level (decision D58).
+    let (width, height) = (256, 160);
+    let layout = FrameLayout::new(width, height, ChromaSubsampling::Yuv420).unwrap();
+    let [luma, ..] = chroma_planes(ChromaSubsampling::Yuv420, width, height, false);
+    let (cw, ch) = layout.plane_size(Component::Cb);
+    let planes = [
+        luma,
+        vec![110u8; (cw * ch) as usize],
+        vec![150u8; (cw * ch) as usize],
+    ];
+    let mut encoder = Encoder::new(
+        width,
+        height,
+        ChromaSubsampling::Yuv420,
+        Signalling::default(),
+    )
+    .unwrap();
+    let frame = encoder
+        .encode([&planes[0], &planes[1], &planes[2]], 20_000)
+        .unwrap();
+
+    let pristine = pristine_blocks(&layout);
+    let mut whole = FrameAssembler::new(layout.clone());
+    whole.push_packet(&frame).unwrap();
+    let view = whole.frame();
+    let empty = (0..pristine)
+        .filter(|&index| view.block(index).map(<[u32]>::len) == Some(3))
+        .count();
+    assert!((0..pristine).all(|index| view.block(index).is_some()));
+    assert!(empty > 0, "no block of the coarsest level went empty");
+
+    // One packet of a finer level lost: the frame is not whole, but ready in
+    // part, and decodes.
+    let packets = packets(&frame, 160);
+    let lost = packets.len() - 2;
+    assert!(packets.len() > 20, "{} packets", packets.len());
+    let mut partial = FrameAssembler::new(layout.clone());
+    for (i, packet) in packets.iter().enumerate() {
+        if i != lost {
+            partial.push_packet(packet).unwrap();
+        }
+    }
+    assert!(!partial.is_ready(false));
+    assert!(partial.is_ready(true));
+    decode_frame(&partial.frame()).unwrap();
 }

@@ -26,7 +26,8 @@
 
 // What the rate control knows of a block (rate.rs, BlockCost).
 struct BlockCost {
-    // Size in words with 0 to 15 planes dropped; 0 when nothing is left.
+    // Size in words with 0 to 15 planes dropped; 0 when nothing is left,
+    // except for the blocks below pristine_blocks: at least EMPTY_BLOCK_WORDS.
     words: array<u32, 16>,
     // Weighted squared error of the coded 8x8 blocks with 0 to 15 planes
     // dropped.
@@ -218,6 +219,11 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         if (coded_count != 0u) {
             let bytes = HEADER_BYTES + coded_count * BLOCK8_TABLE_BYTES + plane_bytes + (signs + 7u) / 8u;
             words = (bytes + 3u) / 4u;
+        }
+        // A block a partial decode needs is sent even with nothing in it:
+        // its header and one 8x8 block of no bit-planes (pack.wgsl).
+        if (block_index < params.pristine_blocks) {
+            words = max(words, EMPTY_BLOCK_WORDS);
         }
         costs[block_index].words[drop] = words;
         costs[block_index].distortion[drop] = distortion;

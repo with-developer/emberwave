@@ -13,7 +13,7 @@ use emberwave_core::bitstream::{
     Pwv1Header,
 };
 use emberwave_core::cpu;
-use emberwave_core::encode::{Encoder, Signalling};
+use emberwave_core::encode::{EncodeError, Encoder, Signalling};
 use proptest::prelude::*;
 use proptest::sample::Index;
 
@@ -192,7 +192,17 @@ proptest! {
         });
 
         let mut encoder = Encoder::new(width, height, chroma, Signalling::default()).unwrap();
-        let frame = encoder.encode([&planes[0], &planes[1], &planes[2]], budget).unwrap();
+        let sources = [&planes[0][..], &planes[1][..], &planes[2][..]];
+        // A budget below the smallest frame, the header and the coarsest
+        // level's blocks, is refused; the smallest frame fits its own size.
+        let (frame, budget) = match encoder.encode(sources, budget) {
+            Ok(frame) => (frame, budget),
+            Err(EncodeError::BudgetTooSmall { minimum, .. }) => {
+                prop_assert!(minimum > budget);
+                (encoder.encode(sources, minimum).unwrap(), minimum)
+            }
+            Err(error) => panic!("{error}"),
+        };
         prop_assert!(frame.len() <= budget);
         let mut assembler = FrameAssembler::new(layout);
         assembler.push_packet(&frame).unwrap();

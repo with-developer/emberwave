@@ -262,8 +262,9 @@ fn a_budget_too_small_gives_the_size_of_the_smallest_frame() {
     let (status, _, minimum) = encode_c(encoder, planes, 7);
     assert_eq!(status, EmberwaveStatus::InvalidArgument);
     assert!(last_error().contains("smallest frame"), "{}", last_error());
-    // The header alone: every block may drop all it has.
-    assert_eq!(minimum, 8);
+    // The header and the blocks of the coarsest level, which every frame
+    // carries, each as small as it gets: 12 bytes at least.
+    assert!(minimum >= 8 + 12 * 12, "{minimum}");
     let (status, frame, size) = encode_c(encoder, planes, minimum);
     assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
     assert!(size <= minimum);

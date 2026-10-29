@@ -223,7 +223,9 @@ pub(crate) struct QuantParams {
     pub band_count: u32,
     pub block_count: u32,
     pub grid_width: u32,
-    pub pad: u32,
+    /// The blocks every frame carries, even empty: those below this index
+    /// (`encode::pristine_blocks`).
+    pub pristine_blocks: u32,
     pub bands: [QuantBand; MAX_BANDS],
 }
 
@@ -252,6 +254,7 @@ impl QuantParams {
         params.band_count = count as u32;
         params.block_count = layout.block_count();
         params.grid_width = grid_for(u64::from(layout.block_count())).0;
+        params.pristine_blocks = crate::encode::pristine_blocks(layout);
         params
     }
 

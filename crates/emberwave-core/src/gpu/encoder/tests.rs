@@ -503,8 +503,14 @@ fn frames_are_the_cpu_encoders_or_as_good() {
             * gpu.layout().plane_size(Component::Y).1 as usize;
         for (seed, bytes_per_sample) in [(11, 2.0), (12, 0.4), (13, 0.1), (14, 0.02)] {
             let planes = picture(gpu.layout(), seed);
-            // Every budget fits; refusals are tests/gpu_encoder.rs's.
-            let budget = HEADER_BYTES + 64 + (samples as f64 * bytes_per_sample) as usize;
+            // Every budget fits, from just above the smallest frame;
+            // refusals are tests/gpu_encoder.rs's.
+            let Err(EncodeError::BudgetTooSmall { minimum, .. }) =
+                cpu.encode(as_slices(&planes), 0)
+            else {
+                panic!("no frame fits no bytes");
+            };
+            let budget = minimum + 64 + (samples as f64 * bytes_per_sample) as usize;
             let expected = cpu
                 .encode(as_slices(&planes), budget)
                 .expect("the frame fits");

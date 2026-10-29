@@ -93,8 +93,9 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     let drop = drops[block_index];
     let words = costs[block_index].words[drop];
     let offset = offsets[block_index];
-    // Blocks that keep nothing are not sent. The rest fit the payload buffer
-    // unless the frame is larger than it, which the CPU reports.
+    // Blocks that keep nothing are not sent, but for those of the coarsest
+    // level, whose size is EMPTY_BLOCK_WORDS then. The rest fit the payload
+    // buffer unless the frame is larger than it, which the CPU reports.
     if (words == 0u || offset + words > frame.capacity_words) {
         return;
     }
@@ -166,6 +167,12 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         }
     }
     let tables_end = HEADER_BYTES + (CONTROL_WORD_BYTES + 1u) * sent;
+    // A block sent with nothing in it, which a partial decode needs: its
+    // first 8x8 block, always inside the band, with a code word and a scale
+    // of zero, no bit-planes, which `assembly` holds already.
+    if (sent == 0u) {
+        ballot = 1u;
+    }
 
     if (tid == 0u) {
         let quant_code = (band.exponent + MAX_SCALE_EXP - drop) << QUANT_MANTISSA_BITS;

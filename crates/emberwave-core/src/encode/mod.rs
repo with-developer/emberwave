@@ -28,6 +28,7 @@ use thiserror::Error;
 
 use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES, NUM_COMPONENTS};
 use crate::bitstream::header::Header;
+use crate::bitstream::packet::DEFAULT_PRISTINE_BANDS;
 use crate::bitstream::{
     Band, ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, Error, FrameLayout,
     FrameView, SequenceHeader, TransferFunction, YcbcrRange, YcbcrTransform,
@@ -100,6 +101,28 @@ pub enum EncodeError {
     /// A frame to measure with [`coefficient_error`] does not decode.
     #[error("the frame does not decode: {0}")]
     Frame(Error),
+}
+
+/// The blocks that a partial decode needs whole, which every frame carries
+/// even when they are all zero: those of the bands that
+/// [`FrameAssembler::is_ready`](crate::bitstream::FrameAssembler::is_ready)
+/// checks, the coarsest LL band and the detail bands of the coarsest
+/// levels. They come first in block index order, every level's bands
+/// before those of the next finer level, so they are the blocks below the
+/// index returned (decision D58).
+pub(crate) fn pristine_blocks(layout: &FrameLayout) -> u32 {
+    const {
+        // One band would be the coarsest LL band alone, whose blocks the
+        // detail bands of each component interleave: not a prefix.
+        // More than DECOMPOSITION_LEVELS - 1 bands, `is_ready` counts as that
+        // many, which the prefix below would overshoot.
+        assert!(DEFAULT_PRISTINE_BANDS >= 2 && DEFAULT_PRISTINE_BANDS < DECOMPOSITION_LEVELS);
+    }
+    let finest = DECOMPOSITION_LEVELS + 1 - DEFAULT_PRISTINE_BANDS;
+    layout
+        .bands()
+        .find(|&(_, level, _, _)| level < finest)
+        .map_or(layout.block_count(), |(_, _, _, band)| band.first_block)
 }
 
 /// The wavelet coefficients of a picture: `[component][level][band]`,
@@ -180,6 +203,7 @@ impl Encoder {
         self.sequence = next_sequence(self.sequence);
         let mut frame = vec![0u8; HEADER_BYTES];
         let mut total_blocks = 0u32;
+        let pristine = pristine_blocks(&self.layout);
         for (block, &drop) in blocks.iter().zip(&drops) {
             if block.cost.words[usize::from(drop)] == 0 {
                 continue;
@@ -190,6 +214,7 @@ impl Encoder {
                 drop,
                 self.sequence,
                 block.index,
+                block.index < pristine,
                 &mut frame,
             );
             total_blocks += 1;
@@ -242,6 +267,7 @@ impl Encoder {
     /// order, with its costs.
     pub(crate) fn quantise(&self, bands: &Bands) -> Vec<Block32> {
         let layout = &self.layout;
+        let pristine = pristine_blocks(layout);
         let mut blocks = Vec::with_capacity(layout.block_count() as usize);
         for (component, level, band, band_layout) in layout.bands() {
             let coefficients = &bands[component.index()][level][band.index()];
@@ -266,6 +292,9 @@ impl Encoder {
                     };
                     for drop in 0..quant::DROP_STEPS {
                         cost.words[drop] = pack::block_words(&blocks8, drop as u8);
+                        if index < pristine {
+                            cost.words[drop] = cost.words[drop].max(pack::EMPTY_BLOCK_WORDS);
+                        }
                         cost.distortion[drop] =
                             blocks8.iter().flatten().map(|b| b.distortion[drop]).sum();
                     }

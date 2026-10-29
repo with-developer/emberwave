@@ -57,7 +57,9 @@ pub(crate) fn key(distortion: f32, saving: u16) -> u16 {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BlockCost {
     /// Size in words with 0 to 15 planes dropped; 0 when nothing is left to
-    /// send. Never increases with more planes dropped.
+    /// send, except for the blocks of the coarsest level, which every frame
+    /// carries: at least `pack::EMPTY_BLOCK_WORDS` (decision D58). Never
+    /// increases with more planes dropped.
     pub words: [u16; DROP_STEPS],
     /// Weighted squared error of the coded 8x8 blocks with 0 to 15 planes
     /// dropped.

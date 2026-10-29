@@ -69,8 +69,10 @@ pub fn decode_block(
         };
 
         // An 8x8 block whose control word is zero decodes to nothing, whatever
-        // its base bit-planes say. The encoder never produces one (its ballot
-        // bit would be clear), and the reference decoder skips it too.
+        // its base bit-planes say, and the reference decoder skips it too.
+        // Upstream's encoder never produces one (its ballot bit would be
+        // clear); emberwave's does, as the only 8x8 block of a block of the
+        // coarsest level with nothing left, which it sends anyway (D58).
         if block8.control_word == 0 {
             continue;
         }
