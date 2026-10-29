@@ -23,7 +23,7 @@
 
 - **Fast.** On an Apple M3 Max, frames one after the other, a 4K frame decodes in 0.90 ms to its planes and 1.22 ms to RGB, and encodes in 1.90 ms on the GPU, from CPU memory to CPU memory. Upstream's own Metal port takes 0.80 ms to decode it at the same FP32 precision and 0.56 ms at its default FP16, and 3.2 to 3.3 ms to encode it ([`BENCHMARKS.md`](BENCHMARKS.md), 2026-10-26).
 - **Every frame stands alone.** No frame refers to another, so a lost packet costs one frame, with no wait for a keyframe. Each frame keeps to a fixed byte budget.
-- **Compatible with upstream, and a better encoder.** It decodes the streams of upstream's encoder as upstream's decoder does, at 64 dB PSNR or more, and upstream's decoder reads emberwave's streams. At the same bytes per frame, emberwave's encoder beats upstream's luma PSNR by up to 3.4 dB on the test scenes, and matches it within 0.01 dB on noise.
+- **Compatible with upstream, both ways.** It decodes the streams of upstream's encoder as upstream's decoder does, at 64 dB PSNR or more, and upstream's decoder reads emberwave's streams. At the same bytes per frame, emberwave's frames have 7 to 14 % less of the contrast-weighted error that both encoders minimise than those of upstream's encoder, with the fixes upstream made to its rate control in October 2026. In luma PSNR, emberwave's ranges from 0.8 dB below upstream's, on a gradient, to 2.3 dB above it, on a test scene, and is the same on noise.
 - **Native, in the browser and on the iPhone.** A command line tool, a [browser player](https://with-developer.github.io/emberwave/) that decodes with WebGPU in the page, opens with a demo stream it encodes itself and can play a stream packet by packet, shuffled and some of them lost, as a network delivers it, a C API with prebuilt libraries for Linux and Windows (x86_64) and macOS (Apple silicon), and an XCFramework for iPhone, iPad and Mac apps. Tested on Apple GPUs, and in CI on software Vulkan and DX12.
 
 <picture>
@@ -175,7 +175,7 @@ The GPU tests skip when there is no adapter, unless `EMBERWAVE_REQUIRE_GPU` is s
 
 ## Relationship to upstream
 
-emberwave follows PyroWave's algorithm structure and its [bitstream definition](https://github.com/Themaister/pyrowave/blob/79a3232a2199281f33f7a2e2659fc4fac62b022a/bitstream/bitstream.md), but contains no code copied from the upstream repository. Test vectors and reference output come from upstream's own encoder and decoder; see [`testdata/README.md`](testdata/README.md).
+emberwave follows PyroWave's algorithm structure and its [bitstream definition](https://github.com/Themaister/pyrowave/blob/7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b/bitstream/bitstream.md), but contains no code copied from the upstream repository. Test vectors and reference output come from upstream's own encoder and decoder; see [`testdata/README.md`](testdata/README.md).
 
 Upstream also ships an Apple-only Metal port. emberwave aims at one portable code base that additionally covers Vulkan, DX12 and the browser.
 

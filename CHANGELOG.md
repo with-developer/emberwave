@@ -2,6 +2,12 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- The tools that build upstream for the test vectors, the reference decodes and the comparisons follow upstream at 7fe0e26, which fixed two faults of upstream's encoder's rate control; its decoder makes every committed reference decode byte for byte, so the vectors stay. emberwave's encoder never had the faults. Against upstream's fixed encoder at equal bytes, emberwave's frames have 7 to 14 % less of the contrast-weighted error both encoders minimise, and luma PSNR from 0.8 dB lower to 2.3 dB higher; the README says so rather than calling it the better encoder (decision D56).
+
 ## [0.12.0] - 2026-10-29
 
 Fewer stages per frame on Apple's GPUs: the planes stored straight into Metal textures, and on Apple silicon the frames written where the shaders read them. Also HEVC timed beside emberwave on the same Mac and iPhone, timings at a stream's pace in the benchmark app, in the browser benchmark and for upstream's decoder, a browser player that opens with a stream it makes itself, and a README in English and in Korean that shows the picture quality on a frame of a game.

@@ -558,19 +558,22 @@ Rate control. For every block and every number of dropped planes the encoder kno
 
 The keys are integers found by exact comparisons, with no division and no logarithm, the weights are literals, and every sum runs in a fixed order without fused multiply-adds. The encoder therefore makes the same bytes on every system, which `tests/encoder.rs` checks against the committed vectors, and a GPU given the same sizes and distortions can make the same choices.
 
-At the same budget and frame size, decoded by upstream's FP32 decoder (Apple M3 Max, 2026-10-24, `refgen` pictures, one frame each), emberwave's encoder reaches the luma PSNR of upstream's or more:
+At the same budget and frame size, decoded by upstream's FP32 decoder (Apple M3 Max, `refgen` pictures, one frame each), the PSNR of Y, Cb and Cr in dB. Upstream's encoder is there at two commits: 79a3232, as first measured on 2026-10-24, and 7fe0e26, after its fixes to the rate control of 2026-10-26 (decision D56). The run of 2026-10-29 gave the luma of 2026-10-24 again to the hundredth, for 79a3232 and for emberwave.
 
-| Picture | Budget | Upstream | emberwave |
-|---|---|---|---|
-| 1280x720 scene, 4:2:0 | 60 kB | 33.96 dB | 37.32 dB |
-| 1280x720 scene, 4:2:0 | 150 kB | 42.32 dB | 45.04 dB |
-| 1280x720 scene, 4:2:0 | 400 kB | 50.11 dB | 50.27 dB |
-| 1920x1080 scene, 4:2:0 | 100 kB | 32.20 dB | 32.77 dB |
-| 640x360 scene, 4:4:4 | 40 kB | 39.49 dB | 42.56 dB |
-| 1280x720 gradient, 4:2:0 | 40 kB | 57.88 dB | 62.61 dB |
-| 640x360 noise, 4:2:0 | 60 and 200 kB | 11.90 and 25.79 dB | 11.95 and 25.78 dB |
+| Picture | Budget | Upstream, 79a3232 | Upstream, 7fe0e26 | emberwave |
+|---|---|---|---|---|
+| 1280x720 scene, 4:2:0 | 60 kB | 33.96, 41.48, 42.62 | 37.13, 44.16, 45.75 | 37.32, 45.09, 45.16 |
+| 1280x720 scene, 4:2:0 | 150 kB | 42.32, 49.90, 48.81 | 42.72, 52.41, 52.73 | 45.04, 54.28, 54.32 |
+| 1280x720 scene, 4:2:0 | 400 kB | 50.11, 61.20, 63.79 | 49.81, 64.42, 64.61 | 50.27, 63.20, 63.77 |
+| 1920x1080 scene, 4:2:0 | 100 kB | 32.20, 40.13, 40.94 | 32.88, 44.22, 44.69 | 32.77, 43.95, 45.12 |
+| 640x360 scene, 4:4:4 | 40 kB | 39.49, 38.96, 40.59 | 40.70, 41.95, 43.92 | 42.56, 42.44, 44.27 |
+| 1280x720 gradient, 4:2:0 | 40 kB | 57.88, 70.90, ∞ | 63.39, 65.26, 71.42 | 62.61, 65.38, 73.18 |
+| 640x360 noise, 4:2:0 | 60 kB | 11.90, 16.14, 18.52 | 11.95, 18.16, 18.12 | 11.95, 17.37, 18.11 |
+| 640x360 noise, 4:2:0 | 200 kB | 25.79, 32.71, 34.91 | 25.79, 32.71, 34.91 | 25.78, 34.76, 34.68 |
 
-Noise, which no budget compresses, comes out the same. Without the contrast weighting the encoder would gain another 0 to 6.5 dB of PSNR (decision D28).
+Next to upstream's fixed encoder, emberwave's luma is 0.78 dB lower on the gradient and 0.11 dB lower on the 1080p scene, and 0.19 to 2.32 dB higher on the other scenes; its chroma is up to 1.2 dB lower or 2.1 dB higher. Noise, which no budget compresses, comes out the same in luma. Without the contrast weighting the encoder would gain another 0 to 6.5 dB of PSNR (decision D28).
+
+PSNR is not what either encoder minimises: both minimise the squared error of the coefficients, weighted per band by the eye's contrast sensitivity (`weights.rs`, upstream's weighting). Of that error, emberwave's frames above have 7 to 14 % less than those of upstream's fixed encoder on every picture but noise, where the two are within 1 %, and 13 to 57 % less than those of upstream's encoder before the fixes. On the gradient, upstream's frame has less of it in luma's second-finest level, which PSNR counts in full and the contrast sensitivity at less, and more in Cr and in luma's coarser levels. A probe that was not kept measured it: emberwave's forward transform of each picture against the CPU decoder's dequantised bands of each frame.
 
 ### On the GPU
 
@@ -826,7 +829,7 @@ Two alternatives were rejected. Zeroing in WGSL with all invocations would bring
 - Tests: the encoder's vectors live in `testdata/encoder/` with upstream's FP32 decode of them (`scripts/gen_encoder_vectors.sh`, macOS); emberwave's decoders must match it at 80 dB (D9). The decoder's conformance vectors stay upstream-encoded. Round trips in CI use small pictures; quality against upstream's encoder is measured locally and recorded, not a CI gate.
 - New tooling: `refgen encode --source` writes the pictures it synthesises, and `--input` encodes a Y4M file with upstream's encoder, so that both encoders can be given the same pictures.
 
-**Consequence.** emberwave can make streams, at the PSNR of upstream's encoder or above at equal bytes (see [Encoder](#encoder)); a 640x360 frame takes about 7 ms on one CPU core. Turning off the contrast weighting was tried once: PSNR rose by 0 dB on the gradient, 1.6 to 4.4 dB on the 1280x720 scene, 2.8 dB at 4:4:4 and 6.5 dB on the 1920x1080 scene, as a pure squared-error allocation keeps the fine detail the weighting gives up first. The weighting stays, as upstream's does. Next is the GPU encoder, measured against this one.
+**Consequence.** emberwave can make streams, at the PSNR of upstream's encoder or above at equal bytes (see [Encoder](#encoder); since upstream's fixes of 2026-10-26, from 0.8 dB below to 2.3 dB above it in luma, decision D56); a 640x360 frame takes about 7 ms on one CPU core. Turning off the contrast weighting was tried once: PSNR rose by 0 dB on the gradient, 1.6 to 4.4 dB on the 1280x720 scene, 2.8 dB at 4:4:4 and 6.5 dB on the 1920x1080 scene, as a pure squared-error allocation keeps the fine detail the weighting gives up first. The weighting stays, as upstream's does. Next is the GPU encoder, measured against this one.
 
 ### 2026-10-24 — D29: The GPU encoder, and what it shares with the CPU's
 
@@ -1394,3 +1397,14 @@ The figures of the prototype's runs above are marked as not kept.
 - The page's packet mode shows the cost of loss in the page, with the player's own frames.
 
 **Consequence.** A browser client has what the C API's clients have to decode a stream as it arrives; the transport is the client's. A review by an agent found the colours of upstream's frames converted as full range through `open_stream`, which `set_colors` answers, and smaller faults in the page, fixed. In headless Chrome on the M3 Max, the demo played as packets of at most 1200 bytes, 38 a frame, drew every frame whole without loss, and with 5 % of the packets lost drew about a sixth of the frames whole, half in part and skipped the rest, as a lost block of the coarse bands or the start of frame header leaves nothing to draw.
+
+### 2026-10-29 — D56: Upstream at 7fe0e26, after its encoder's fixes
+
+**Context.** Upstream fixed two faults of its encoder's rate control on 2026-10-26 (e79b273, e87453a), and brought the fixes to its Metal port on 2026-10-27 (7fe0e26); neither changes the bitstream. The distortion it recorded for dropping a whole 8x8 block lacked the band's weight, which every other number of dropped planes had, so at low bit rates dropping a block looked almost free, and colour went first. And the prefix sum over its rate-distortion buckets stopped one step short, which its present weights do not reach. `refgen`, which makes the test vectors, their reference decodes and the comparisons with upstream, was pinned at 79a3232, of 2026-10-21. Upstream's other changes since: P010 input on its encoder's scaled path, and a range scale in its transform shaders that nothing sets yet.
+
+**Decision.**
+- `scripts/refgen/build.sh` and `testdata/README.md` pin 7fe0e26. Its decoder makes every committed reference decode byte for byte, at FP16 and FP32, those of `testdata/encoder/` too, so the vectors and their references stay as they are.
+- emberwave's encoder has neither fault, and nothing in it changes. `quant.rs` and `equant.wgsl` give the distortion of every number of dropped planes the band's weight, that of a block dropped whole included. The prefix sums of `scan.wgsl` cover every element, and the tests of the rate control and the packing hold the GPU's results to the CPU's sequential sums.
+- The comparison of the encoders is measured again against the fixed upstream, beside the old numbers ([Encoder](#encoder)), and the README no longer calls emberwave's encoder the better one.
+
+**Consequence.** Next to upstream's fixed encoder, emberwave's luma PSNR at equal bytes ranges from 0.8 dB lower, on the gradient, to 2.3 dB higher; before the fixes, upstream's was lower on every picture but noise, by up to 4.7 dB. Of the contrast-weighted error both encoders minimise, emberwave's frames have 7 to 14 % less than upstream's fixed encoder's on every picture but noise, the gradient included. At 4K, FP32, three alternating runs of `refgen bench-encode` put the two commits' encoders at the same time within their noise, medians of 3.29 to 3.92 ms against 3.30 to 4.30 ms, so the encode times of `BENCHMARKS.md`, measured at 79a3232, stand. Where upstream's frames have less error in a band, such as the gradient's finer luma, is a lead for the encoder's quality work of 0.14.

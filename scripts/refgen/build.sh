@@ -6,7 +6,7 @@
 # See testdata/README.md for the pinned revision and what was verified.
 
 UPSTREAM_URL=https://github.com/Themaister/pyrowave.git
-UPSTREAM_REV=79a3232a2199281f33f7a2e2659fc4fac62b022a
+UPSTREAM_REV=7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b
 
 # The repository root, from this file's location. BASH_SOURCE is empty when
 # another shell sources this file; zsh puts the file in $0 instead. A wrong
@@ -29,6 +29,10 @@ mkdir -p "$CACHE"
 
 if [ ! -d "$CACHE/pyrowave/.git" ]; then
     git clone --quiet "$UPSTREAM_URL" "$CACHE/pyrowave"
+fi
+# A checkout cloned before the pin moved lacks the pinned commit.
+if ! git -C "$CACHE/pyrowave" cat-file -e "$UPSTREAM_REV^{commit}" 2>/dev/null; then
+    git -C "$CACHE/pyrowave" fetch --quiet "$UPSTREAM_URL"
 fi
 git -C "$CACHE/pyrowave" checkout --quiet "$UPSTREAM_REV"
 
