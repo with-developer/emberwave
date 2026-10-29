@@ -4,7 +4,13 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ## [Unreleased]
 
+### Added
+
+- `emberwave-cli quality SOURCE.y4m FILE.pwv1 [--frames N]` measures a stream from any encoder against the pictures it was encoded from: per frame and over all frames, its size, the PSNR of each plane and the coefficient error that the rate control minimises, weighted per band as it weighs it. `emberwave_core::encode::coefficient_error` returns that error for a frame (decision D57).
+
 ### Changed
+
+- `EncodeError` has a new variant, `Frame`, for a frame that `coefficient_error` cannot dequantise: a `match` on it that names every variant needs an arm for it.
 
 - The tools that build upstream for the test vectors, the reference decodes and the comparisons follow upstream at 7fe0e26, which fixed two faults of upstream's encoder's rate control; its decoder makes every committed reference decode byte for byte, so the vectors stay. emberwave's encoder never had the faults. Against upstream's fixed encoder at equal bytes, emberwave's frames have 7 to 14 % less of the contrast-weighted error both encoders minimise, and luma PSNR from 0.8 dB lower to 2.3 dB higher; the README says so rather than calling it the better encoder (decision D56).
 
