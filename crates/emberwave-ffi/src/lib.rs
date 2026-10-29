@@ -978,6 +978,7 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
     if !std::ptr::eq(&*queue.device(), &*device) {
         return Err(Failure::argument("queue is a queue of another device"));
     }
+    let queue_address = Retained::as_ptr(&queue) as *const c_void as usize;
 
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::METAL;
@@ -1012,7 +1013,33 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
     // features and the limits of the descriptor, as above.
     let (device, queue) = unsafe { adapter.create_device_from_hal(open, &descriptor) }
         .map_err(|error| Failure(EmberwaveStatus::NoGpu, error.to_string()))?;
-    Ok(GpuContext::from_device(adapter, device, queue))
+    // Contexts made on one queue share its command buffers: their decoders
+    // and encoders take turns, as those of one context do (#126).
+    Ok(
+        GpuContext::from_device(adapter, device, queue)
+            .share_record_lock(queue_lock(queue_address)),
+    )
+}
+
+/// The lock of the contexts made on the Metal queue at `address`: one for
+/// each queue, for as long as a context made on it lives, and the context
+/// keeps its queue, so that no other queue takes the address meanwhile.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn queue_lock(address: usize) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, PoisonError, Weak};
+    static LOCKS: Mutex<Vec<(usize, Weak<Mutex<()>>)>> = Mutex::new(Vec::new());
+    let mut locks = LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+    locks.retain(|(_, lock)| lock.strong_count() > 0);
+    if let Some(lock) = locks
+        .iter()
+        .find(|&&(at, _)| at == address)
+        .and_then(|(_, lock)| lock.upgrade())
+    {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.push((address, Arc::downgrade(&lock)));
+    lock
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]

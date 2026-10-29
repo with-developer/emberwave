@@ -239,6 +239,15 @@ impl GpuContext {
         }
     }
 
+    /// Makes the decoders and encoders of this context take turns with those
+    /// of every context given the same `lock`, as those of one context do:
+    /// for contexts on one queue, whose command buffers they would otherwise
+    /// compete for (#126).
+    pub fn share_record_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
+        self.record_lock = lock;
+        self
+    }
+
     /// Creates a context on a device of `adapter` made with
     /// [`device_descriptor`](Self::device_descriptor), and its queue. The
     /// context takes over the device's lost callback. Without the limits of
