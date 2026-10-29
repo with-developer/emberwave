@@ -10,5 +10,6 @@ solid_160x96_420 solid 160 96 420 1 40000
 scene_200x120_420_tiny scene 200 120 420 2 300
 # Twelve frames: the sequence number wraps from 7 to 0.
 solid_64x64_420_wrap solid 64 64 420 12 4000
-# Eight bytes: frames of a start of frame header only.
-noise_64x64_444_empty noise 64 64 444 2 8
+# The smallest frames: the start of frame header and the blocks of the
+# coarsest level, which every frame carries, as small as they get.
+noise_64x64_444_smallest noise 64 64 444 2 152

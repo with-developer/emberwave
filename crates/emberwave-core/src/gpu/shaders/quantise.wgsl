@@ -28,7 +28,9 @@ struct QuantParams {
     band_count: u32,
     block_count: u32,
     grid_width: u32,
-    pad: u32,
+    // The blocks every frame carries, even empty: those below this index
+    // (src/encode/mod.rs, pristine_blocks).
+    pristine_blocks: u32,
     // Transmitted bands in block index order.
     bands: array<QuantBand, 48>,
 }
@@ -57,6 +59,9 @@ const BLOCK_SIZE: u32 = 32u;
 const DROP_STEPS: u32 = 16u;
 // The largest 8x8 scale code the encoder uses: scale 1.
 const MAX_SCALE_CODE: u32 = 6u;
+// Words of a block sent with nothing in it: its header, and the code word
+// and the scale of one 8x8 block with no bit-planes (src/encode/pack.rs).
+const EMPTY_BLOCK_WORDS: u32 = 3u;
 
 // Workgroup memory is not zeroed (decision D25): every invocation writes its
 // own element of each array before the barrier that precedes the reads.

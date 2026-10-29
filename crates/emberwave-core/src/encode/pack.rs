@@ -8,8 +8,15 @@ use crate::bitstream::consts::{
 };
 use crate::bitstream::header::BlockHeader;
 
+/// The size in words of a block sent although none of its 8x8 blocks is left
+/// to send: its header, then the code word and the scale of one 8x8 block
+/// with no bit-planes, which decodes as zeros (decision D58).
+pub(crate) const EMPTY_BLOCK_WORDS: u16 =
+    ((HEADER_BYTES + CONTROL_WORD_BYTES + QSCALE_BYTES) as u16).div_ceil(4);
+
 /// The size in words of a block with `drop` planes dropped, or 0 if none of
-/// its 8x8 blocks is left to send: what [`pack_block`] writes.
+/// its 8x8 blocks is left to send: what [`pack_block`] writes, unless it
+/// keeps the block.
 pub(crate) fn block_words(blocks8: &Blocks8, drop: u8) -> u16 {
     let (mut active, mut plane_bytes, mut signs) = (0usize, 0usize, 0usize);
     for block8 in blocks8.iter().flatten().filter(|b| b.active(drop)) {
@@ -28,13 +35,17 @@ pub(crate) fn block_words(blocks8: &Blocks8, drop: u8) -> u16 {
 }
 
 /// Appends a block with `drop` planes dropped to `out`, which must end at a
-/// multiple of four bytes. Writes nothing if none of its 8x8 blocks is left.
+/// multiple of four bytes. If none of its 8x8 blocks is left, it writes
+/// nothing, or with `keep` a block of [`EMPTY_BLOCK_WORDS`]: its first 8x8
+/// block, which is always inside the band, with no bit-planes. A 32x32 block
+/// with no 8x8 block at all should not be sent (`bitstream.md`).
 pub(crate) fn pack_block(
     blocks8: &Blocks8,
     quant: &BandQuant,
     drop: u8,
     sequence: u8,
     block_index: u32,
+    keep: bool,
     out: &mut Vec<u8>,
 ) {
     let active: Vec<(usize, &Block8)> = blocks8
@@ -44,6 +55,23 @@ pub(crate) fn pack_block(
         .filter(|(_, block8)| block8.active(drop))
         .collect();
     if active.is_empty() {
+        if keep {
+            let header = BlockHeader {
+                ballot: 1,
+                payload_words: EMPTY_BLOCK_WORDS,
+                sequence,
+                quant_code: quant.quant_code(drop),
+                block_index,
+            };
+            let (word0, word1) = header.to_words();
+            out.extend_from_slice(&word0.to_le_bytes());
+            out.extend_from_slice(&word1.to_le_bytes());
+            // A code word and a scale of zero: no planes above a base of none.
+            out.resize(
+                out.len() + usize::from(EMPTY_BLOCK_WORDS) * 4 - HEADER_BYTES,
+                0,
+            );
+        }
         return;
     }
 

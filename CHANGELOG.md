@@ -10,9 +10,10 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Changed
 
+- The encoder sends every block of the coarsest level, a block with nothing left as an empty 8x8 block of 12 bytes, so that a frame that lost packets can be decoded in part: before, a frame whose coarsest chroma detail was zero could not be, since a block never sent counts as lost (decision D58). Frames grow by 12 bytes per such block, 72 bytes in a 1080p frame of the benchmark scene.
+- The smallest frame the encoder makes is the header and those blocks at their smallest, 584 bytes for the 1080p scene: a smaller budget is `EncodeError::BudgetTooSmall`, where 8 bytes always fit before. The encoder vector `noise_64x64_444_empty` is now `noise_64x64_444_smallest`.
 - `EncodeError` has a new variant, `Frame`, for a frame that `coefficient_error` cannot dequantise: a `match` on it that names every variant needs an arm for it.
-
-- The tools that build upstream for the test vectors, the reference decodes and the comparisons follow upstream at 7fe0e26, which fixed two faults of upstream's encoder's rate control; its decoder makes every committed reference decode byte for byte, so the vectors stay. emberwave's encoder never had the faults. Against upstream's fixed encoder at equal bytes, emberwave's frames have 7 to 14 % less of the contrast-weighted error both encoders minimise, and luma PSNR from 0.8 dB lower to 2.3 dB higher; the README says so rather than calling it the better encoder (decision D56).
+- The tools that build upstream for the test vectors, the reference decodes and the comparisons follow upstream at 7fe0e26, which fixed two faults of upstream's encoder's rate control; its decoder makes every committed reference decode byte for byte, so the vectors stay. emberwave's encoder never had the faults. Against upstream's fixed encoder at equal bytes, emberwave's frames have 6.5 to 13 % less of the contrast-weighted error both encoders minimise, and luma PSNR from 0.8 dB lower to 2.3 dB higher; the README says so rather than calling it the better encoder (decision D56).
 
 ## [0.12.0] - 2026-10-29
 

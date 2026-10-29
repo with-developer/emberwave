@@ -142,8 +142,9 @@ fn the_streams_show_their_pictures() {
             "noise_192x136_420_lowrate" => 12.0,
             // 300 bytes: what is left of the coarsest bands (23.7 dB).
             "scene_200x120_420_tiny" => 20.0,
-            // Nothing but headers: mid-grey against noise (10.7 dB).
-            "noise_64x64_444_empty" => 9.0,
+            // The smallest frames: the coarsest level, at its smallest,
+            // against noise (10.7 dB).
+            "noise_64x64_444_smallest" => 9.0,
             other => panic!("no floor for {other}"),
         };
         let (layout, frames) = stream(&vector);

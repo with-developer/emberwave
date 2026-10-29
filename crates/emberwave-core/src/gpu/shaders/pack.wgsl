@@ -166,6 +166,12 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         }
     }
     let tables_end = HEADER_BYTES + (CONTROL_WORD_BYTES + 1u) * sent;
+    // A block sent with nothing in it, which a partial decode needs: its
+    // first 8x8 block, always inside the band, with a code word and a scale
+    // of zero, no bit-planes, which `assembly` holds already.
+    if (sent == 0u) {
+        ballot = 1u;
+    }
 
     if (tid == 0u) {
         let quant_code = (band.exponent + MAX_SCALE_EXP - drop) << QUANT_MANTISSA_BITS;

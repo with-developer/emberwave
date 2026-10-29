@@ -219,6 +219,11 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
             let bytes = HEADER_BYTES + coded_count * BLOCK8_TABLE_BYTES + plane_bytes + (signs + 7u) / 8u;
             words = (bytes + 3u) / 4u;
         }
+        // A block a partial decode needs is sent even with nothing in it:
+        // its header and one 8x8 block of no bit-planes (pack.wgsl).
+        if (block_index < params.pristine_blocks) {
+            words = max(words, EMPTY_BLOCK_WORDS);
+        }
         costs[block_index].words[drop] = words;
         costs[block_index].distortion[drop] = distortion;
         if (drop == 0u) {
