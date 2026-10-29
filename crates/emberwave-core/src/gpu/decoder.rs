@@ -659,9 +659,9 @@ impl Decoder {
 
     /// Whether decodes into plane textures store the planes straight into
     /// textures with the `STORAGE_BINDING` usage, from the inverse transform,
-    /// rather than copy them in: on Metal, where that saves 0.1 ms at 4K
-    /// frame after frame (decision D52). See
-    /// [`GpuContext::stores_planes`].
+    /// rather than copy them in: on Metal, where a 4K frame takes 0.08 to
+    /// 0.12 ms less on an Apple M3 Max, frame after frame (decision D52).
+    /// See [`GpuContext::stores_planes`].
     pub fn stores_planes(&self) -> bool {
         self.pipelines.idwt_planes.is_some()
     }

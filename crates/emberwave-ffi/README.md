@@ -160,7 +160,7 @@ In Swift, `Unmanaged<MTLTexture>.fromOpaque(pointer).takeUnretainedValue()` take
 - **Pointers.** The Metal pointers are borrowed, `__bridge` without a transfer. A texture keeps its `id<MTLTexture>` until it is destroyed, and a context's device stays while the context or anything made on it lives. They are `NULL` off Metal, as for a Vulkan context on a Mac.
 - **Colours.** As for `emberwave_decoder_decode_rgb`: `NULL` follows the frame, and upstream's Metal encoder signals BT.709, full range and centred chroma whatever the pictures are.
 
-A client that converts the colours itself, for high dynamic range, for its display, or for a stream that signals the wrong colours, takes the Y, Cb and Cr planes instead: three one-channel textures of the planes' sizes, chroma at half size in 4:2:0. They hold the samples of the stream, as `emberwave_decoder_decode_yuv` writes them, and are the fastest way to the GPU: on an Apple M3 Max a 4K frame takes 1.0 to 1.1 ms, and a 1080p frame 0.45 ms. In 4:2:0 they also take 1.5 bytes a pixel, where RGBA takes 4.
+A client that converts the colours itself, for high dynamic range, for its display, or for a stream that signals the wrong colours, takes the Y, Cb and Cr planes instead: three one-channel textures of the planes' sizes, chroma at half size in 4:2:0. They hold the samples of the stream, as `emberwave_decoder_decode_yuv` writes them, and are the fastest way to the GPU: on an Apple M3 Max a 4K frame takes 0.91 to 0.93 ms, and a 1080p frame 0.41 ms. In 4:2:0 they also take 1.5 bytes a pixel, where RGBA takes 4.
 
 ```c
 EmberwaveTexture *planes[3][3];   /* Y, Cb, Cr, for each frame the display may still show */
