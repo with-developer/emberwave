@@ -1686,3 +1686,35 @@ The last frame's detail, always, gains everything on a still picture and loses u
 - **Cost.** On an Apple M3 Max a 4K frame drawn from 838 of its 1037 packets decodes with read-back as fast with concealment as without, 0.93 to 0.94 ms, where its blocks keep the last frame's. Where they are zeroed, with two pictures in turn, it takes 0.05 to 0.06 ms more (a loaded machine, load 5 to 6). The first frame that conceals compiles the pass, before the decode takes its turn at the queue.
 - **What the gate misses.** A picture whose motion shows only in fine texture, which the coarsest level averages out, takes the last frame's detail out of place. A first unit test met that, with texture alone moved by two pixels; natural pictures, the game frame included, move their coarsest level too.
 - **emberwave-stream** is to turn it on, where a frame drawn in part is what a lossy link leaves when parity falls short.
+
+### 2026-10-31 — D67: The band weights stay upstream's, measured against SSIMULACRA2
+
+**Context.** [#136](https://github.com/with-developer/emberwave/issues/136) found the encoder within 1 % of the best for what it minimises: the coefficient error, weighted per band by upstream's contrast sensitivity (`weights.rs`, D28). Other weights could look better, and only a metric of perceived quality can tell. SSIMULACRA2 was chosen: it is fitted to people's scores of compressed pictures, and it compares colour as well as luma, in a perceptual colour space, at six scales. PSNR counts an error the same in every band, and MS-SSIM is usually taken of luma alone.
+
+**Measured** with a scratch tool, not kept, on the CPU encoder and decoder:
+- **Setup.**
+  - Budgets of 150, 300 and 600 kB a 1080p frame, and of other sizes in proportion.
+  - Tuned on two 1920x1080 windows of the 4K game frame of D49, a window of macOS Sonoma's wallpaper (a smooth graphic, shrunk by 3), the 1080p benchmark scene, and a synthetic desktop of panels and strokes like glyphs.
+  - Checked on the game frame's two other windows and another of the wallpaper's, then on the whole 4K game frame, the 1440p scene and two windows of the wallpaper shrunk by 2.
+  - The metric's reference is the source planes through the same conversion to RGB, so only the coding counts. The metric is rust-av's `ssimulacra2` crate, 0.5.1.
+- **Upstream's formula, other constants.** A grid of 75 points over the viewing scale (16 to 64 cycles a degree at the finest level, upstream's 32.64), the floor of the sensitivity (4 to 16, upstream's 8) and 4:2:0 chroma's factor (0.3 to 1, upstream's 0.6). Upstream's constants came within 0.35 points of the best, a chroma factor of 0.8, which cost 0.3 dB of luma PSNR.
+- **Ten free multipliers**, one per level of luma and of chroma and one for HH, by coordinate descent: 2.0 points more on the pictures they were tuned on, 1.6 on the windows held out. Half of it came at 150 kB on the game frame, which scores 3 to 28 out of 100 either way. At low budgets the set moved bits from luma to chroma, with luma PSNR down by up to 0.5 dB and luma's MS-SSIM down. At high ones it moved them from chroma to luma, with chroma PSNR down by up to 6.6 dB. Its multipliers zigzag from level to level: they fit these pictures.
+- **Three smooth parameters** instead: a tilt per level for luma, one for chroma, and chroma's weight. The best tilts chroma's weight toward its coarse levels, its four levels at 0.30, 0.84, 2.4 and 6.7 times upstream's from the finest, as the eye's sensitivity to colour falls with frequency sooner than its sensitivity to luma. Over the eight pictures it gains 0.8 points, and luma PSNR 0.26 dB. A tilt of luma as well adds 0.3 points and takes the PSNR back.
+
+| Change of SSIMULACRA2, chroma tilted | 150 kB | 300 kB | 600 kB |
+|---|---|---|---|
+| Game frame, four windows, mean | +3.3 | +0.5 | +0.5 |
+| The whole 4K game frame | +4.3 | +0.6 | +1.0 |
+| Benchmark scene, 1080p / 1440p | +0.7 / +0.2 | +0.4 / +0.4 | +0.1 / +0.1 |
+| Synthetic desktop | 0 | 0 | +0.3 |
+| Wallpaper, four windows, mean | 0 | 0 | −0.3 |
+
+**Decision.** The weights stay upstream's.
+- The best change found is worth 1.5 to 3 % of bytes where the game frame looks usable, at 600 kB a 1080p frame and scores of 65 to 76. It gains more only where the frame does not look usable either way, and it costs the wallpaper a little at high quality.
+- Its evidence is one game frame, a wallpaper and two synthetic pictures, with no photograph.
+- It would part the encoder from the weighting of upstream's encoder, by which D57's coefficient error measures every encoder.
+
+**Consequence.**
+- #136 is closed. Within its objective the encoder has under 1 % left, and measured by a metric of perceived quality, the objective itself has a few percent of bytes left.
+- If game footage of more than one frame, such as #82's, shows the chroma tilt's gain, the tilt goes into `gen_encoder_weights.py` as chroma's own sensitivity, for both encoders, and D57's measure keeps upstream's weights.
+- SSIMULACRA2 stays out of the repository. In `emberwave-cli quality` it would add a dependency, and its BSD-2-Clause notice to every release, for a study that ran once.
