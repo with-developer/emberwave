@@ -241,7 +241,7 @@ fn bad_arguments_are_errors_with_a_message_not_crashes() {
             emberwave_decoder_push_packet(ptr::null_mut(), bytes.as_ptr(), 8),
             EmberwaveStatus::InvalidArgument
         );
-        assert!(!emberwave_decoder_is_ready(ptr::null(), true));
+        assert!(!emberwave_decoder_is_ready(ptr::null(), 1));
         assert_eq!(
             emberwave_decoder_set_partial_share(ptr::null_mut(), 0.5),
             EmberwaveStatus::InvalidArgument
@@ -310,12 +310,12 @@ fn planes_through_the_c_api_equal_the_rust_decoder() {
                     emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
                     EmberwaveStatus::Ok
                 );
-                assert!(emberwave_decoder_is_ready(decoder, false));
+                assert!(emberwave_decoder_is_ready(decoder, 0));
                 let [y, cb, cr] = &mut targets;
                 let status =
                     emberwave_decoder_decode_yuv(decoder, y.plane(), cb.plane(), cr.plane());
                 assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
-                assert!(!emberwave_decoder_is_ready(decoder, false));
+                assert!(!emberwave_decoder_is_ready(decoder, 0));
             }
 
             let expected = rust.decode(frame).unwrap();
@@ -452,7 +452,7 @@ fn a_bad_target_is_refused_before_the_frame_is_used() {
         );
 
         // The frame is still there to decode.
-        assert!(emberwave_decoder_is_ready(decoder, false));
+        assert!(emberwave_decoder_is_ready(decoder, 0));
         assert_eq!(
             emberwave_decoder_decode_yuv(decoder, y.plane(), cb.plane(), cr.plane()),
             EmberwaveStatus::Ok
@@ -506,15 +506,15 @@ fn packets_of_another_stream_are_refused_and_clear_starts_over() {
             EmberwaveStatus::Bitstream
         );
         assert!(!last_error().is_empty());
-        assert!(!emberwave_decoder_is_ready(decoder, true));
+        assert!(!emberwave_decoder_is_ready(decoder, 1));
 
         assert_eq!(
             emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
             EmberwaveStatus::Ok
         );
-        assert!(emberwave_decoder_is_ready(decoder, false));
+        assert!(emberwave_decoder_is_ready(decoder, 0));
         emberwave_decoder_clear(decoder);
-        assert!(!emberwave_decoder_is_ready(decoder, true));
+        assert!(!emberwave_decoder_is_ready(decoder, 1));
         emberwave_decoder_destroy(decoder);
         emberwave_context_destroy(context);
     }
@@ -558,10 +558,7 @@ fn a_partial_frame_needs_the_share_the_caller_sets() {
                 EmberwaveStatus::Ok
             );
         }
-        assert!(
-            !emberwave_decoder_is_ready(decoder, true),
-            "90 % by default"
-        );
+        assert!(!emberwave_decoder_is_ready(decoder, 1), "90 % by default");
         for share in [-0.1, 1.5, f32::NAN] {
             assert_eq!(
                 emberwave_decoder_set_partial_share(decoder, share),
@@ -569,21 +566,21 @@ fn a_partial_frame_needs_the_share_the_caller_sets() {
             );
             assert!(!last_error().is_empty());
         }
-        assert!(
-            !emberwave_decoder_is_ready(decoder, true),
-            "nothing changed"
-        );
+        assert!(!emberwave_decoder_is_ready(decoder, 1), "nothing changed");
         assert_eq!(
             emberwave_decoder_set_partial_share(decoder, 0.25),
             EmberwaveStatus::Ok
         );
-        assert!(emberwave_decoder_is_ready(decoder, true));
-        assert!(!emberwave_decoder_is_ready(decoder, false));
+        assert!(emberwave_decoder_is_ready(decoder, 1));
+        assert!(!emberwave_decoder_is_ready(decoder, 0));
+        // Any value but 0 allows a partial frame, as C's truth does.
+        assert!(emberwave_decoder_is_ready(decoder, 2));
+        assert!(emberwave_decoder_is_ready(decoder, u32::MAX));
         assert_eq!(
             emberwave_decoder_set_partial_share(decoder, 1.0),
             EmberwaveStatus::Ok
         );
-        assert!(!emberwave_decoder_is_ready(decoder, true));
+        assert!(!emberwave_decoder_is_ready(decoder, 1));
         emberwave_decoder_destroy(decoder);
         emberwave_context_destroy(context);
     }
@@ -715,7 +712,7 @@ fn a_texture_that_does_not_fit_is_refused_before_the_frame_is_used() {
         );
 
         // The frame is still there to decode.
-        assert!(emberwave_decoder_is_ready(decoder, false));
+        assert!(emberwave_decoder_is_ready(decoder, 0));
         assert_eq!(
             emberwave_decoder_decode_texture(decoder, ptr::null(), fits),
             EmberwaveStatus::Ok,
@@ -842,7 +839,7 @@ fn plane_textures_that_do_not_fit_are_refused_before_the_frame_is_used() {
         assert!(last_error().contains("Y plane"), "{}", last_error());
 
         // The frame is still there to decode.
-        assert!(emberwave_decoder_is_ready(decoder, false));
+        assert!(emberwave_decoder_is_ready(decoder, 0));
         assert_eq!(
             emberwave_decoder_decode_plane_textures(decoder, y, cb, cr),
             EmberwaveStatus::Ok,
@@ -897,7 +894,7 @@ fn a_decode_without_a_wait_needs_the_callers_own_queue() {
             emberwave_decoder_submit_plane_textures(decoder, y, cb, cr),
             EmberwaveStatus::InvalidArgument
         );
-        assert!(emberwave_decoder_is_ready(decoder, false));
+        assert!(emberwave_decoder_is_ready(decoder, 0));
         assert_eq!(
             emberwave_decoder_decode_texture(decoder, ptr::null(), picture),
             EmberwaveStatus::Ok

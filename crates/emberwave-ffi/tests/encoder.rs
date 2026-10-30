@@ -652,7 +652,7 @@ fn the_c_decoder_shows_the_c_encoders_pictures() {
                 assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
             }
             // SAFETY: a live decoder.
-            assert!(unsafe { emberwave_decoder_is_ready(decoder, false) });
+            assert!(unsafe { emberwave_decoder_is_ready(decoder, 0) });
             let mut decoded: Vec<Vec<u8>> = (0..3)
                 .map(|plane| {
                     let (w, h) = layout.plane_size(Component::ALL[plane]);

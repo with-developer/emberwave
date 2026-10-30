@@ -1,7 +1,7 @@
 //! Creating the wgpu device.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::GpuError;
 use super::decoder::PLANE_FORMAT;
@@ -151,6 +151,13 @@ pub struct GpuContext {
     /// Why the device was lost, once it has been; shared with the decoders
     /// and the encoders.
     lost: Arc<Mutex<Option<String>>>,
+    /// On a queue of the caller's, held by a decoder or an encoder while it
+    /// makes and submits command buffers, and never while it waits for the
+    /// GPU (decision D60): calls that each held some uncommitted while they
+    /// waited for more could wait for good on a queue with room for few
+    /// (#126). `None` on a queue of wgpu's, with room for 2048, where the
+    /// turns would only cost threads that share a context their overlap.
+    pub(crate) record_lock: Option<Arc<Mutex<()>>>,
 }
 
 impl GpuContext {
@@ -235,6 +242,16 @@ impl GpuContext {
         }
     }
 
+    /// Makes the decoders and encoders of this context take turns at making
+    /// and submitting command buffers with each other and with those of
+    /// every context given the same `lock`: for contexts made on one queue
+    /// of the caller's, with `wgpu::Adapter::create_device_from_hal`, whose
+    /// room for command buffers they share (#126, decision D60).
+    pub fn share_record_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
+        self.record_lock = Some(lock);
+        self
+    }
+
     /// Creates a context on a device of `adapter` made with
     /// [`device_descriptor`](Self::device_descriptor), and its queue. The
     /// context takes over the device's lost callback. Without the limits of
@@ -272,6 +289,7 @@ impl GpuContext {
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             lost,
+            record_lock: None,
         }
     }
 
@@ -416,6 +434,13 @@ pub(crate) fn notice_loss(device: &wgpu::Device, lost: &Mutex<Option<String>>) {
     if !recorded {
         let _ = device.poll(wgpu::PollType::Poll);
     }
+}
+
+/// Takes the turn at making and submitting command buffers of `lock`, the
+/// record lock of a context on a queue of the caller's, if there is one
+/// (decision D60).
+pub(crate) fn take_turn(lock: Option<&Mutex<()>>) -> Option<MutexGuard<'_, ()>> {
+    lock.map(|lock| lock.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// The value in `cache`, which `build` makes if there is none yet.

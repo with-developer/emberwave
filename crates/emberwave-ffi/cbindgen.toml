@@ -14,7 +14,10 @@ header = """/*
  *   destroying NULL does nothing.
  * - A context may be used by several threads at once. A decoder or an
  *   encoder may move between threads, but only one thread may use it at a
- *   time.
+ *   time. A context keeps a few hundred bytes for every thread that has
+ *   called it or its decoders and encoders, until they are all destroyed,
+ *   as wgpu keeps its error scopes by thread: call from a pool of threads,
+ *   not from new ones without end.
  * - A panic inside emberwave is reported as EMBERWAVE_STATUS_INTERNAL.
  *   Destroy the object it happened in.
  */"""

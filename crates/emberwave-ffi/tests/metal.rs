@@ -547,6 +547,166 @@ fn decode_on_the_app_queue(
     }
 }
 
+/// A context, to hand to another thread: the C API lets several use one.
+struct Shared(*mut EmberwaveContext);
+
+// SAFETY: a context may be used by several threads at once.
+unsafe impl Send for Shared {}
+
+#[test]
+fn calls_on_one_app_queue_take_turns_at_its_command_buffers() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no Metal device"
+        );
+        return;
+    };
+    // Room for an encode's 18 command buffers, the most a call makes, but
+    // not for two calls at once (#126, decision D60).
+    let queue = device
+        .newCommandQueueWithMaxCommandBufferCount(24)
+        .expect("a command queue");
+    let contexts: Vec<Shared> = (0..2)
+        .map(|_| {
+            let mut context = ptr::null_mut();
+            // SAFETY: a Metal device and its queue, and a pointer to store
+            // the context in.
+            let status = unsafe {
+                emberwave_context_create_metal(
+                    Retained::as_ptr(&device).cast_mut().cast(),
+                    Retained::as_ptr(&queue).cast_mut().cast(),
+                    &mut context,
+                )
+            };
+            assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+            Shared(context)
+        })
+        .collect();
+    let bytes = testdata("noise_192x136_420.pwv1");
+    let file = Pwv1File::parse(&bytes).unwrap();
+    let frame = file.frames().next().unwrap().unwrap().to_vec();
+
+    // On each context a thread that encodes and one that decodes, each into
+    // its own objects, all at once.
+    let (done, finished) = std::sync::mpsc::channel();
+    let mut threads = Vec::new();
+    for context in &contexts {
+        for encodes in [true, false] {
+            let context = Shared(context.0);
+            let frame = frame.clone();
+            let done = done.clone();
+            threads.push(std::thread::spawn(move || {
+                let context = context;
+                if encodes {
+                    encode_on(context.0);
+                } else {
+                    decode_on(context.0, &frame);
+                }
+                let _ = done.send(());
+            }));
+        }
+    }
+    // Each thread is done in a second or two; one that waits for good waits
+    // for command buffers that the others hold uncommitted, and they for its.
+    for _ in &threads {
+        finished
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("calls on one queue waited for each other's command buffers (#126)");
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    for context in contexts {
+        // SAFETY: a live context, which no thread uses any more.
+        unsafe { emberwave_context_destroy(context.0) };
+    }
+}
+
+/// Encodes a 192x136 picture 20 times with an encoder of `context`.
+fn encode_on(context: *mut EmberwaveContext) {
+    let (width, height) = (192, 136);
+    let y: Vec<u8> = (0..width * height).map(|i| (i * 7 % 251) as u8).collect();
+    let chroma = vec![128u8; width * height / 4];
+    let mut frame = vec![0u8; 100_000];
+    // SAFETY: a live context, planes of the sizes and strides passed, a
+    // frame buffer of `budget` bytes, and pointers to store results in.
+    unsafe {
+        let mut encoder = ptr::null_mut();
+        assert_eq!(
+            emberwave_encoder_create(
+                context,
+                width as u32,
+                height as u32,
+                EMBERWAVE_CHROMA_420,
+                ptr::null(),
+                &mut encoder
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        let plane = |data: &[u8], stride| EmberwaveSourcePlane {
+            data: data.as_ptr(),
+            stride,
+        };
+        for _ in 0..20 {
+            let mut size = 0;
+            assert_eq!(
+                emberwave_encoder_encode(
+                    encoder,
+                    plane(&y, width),
+                    plane(&chroma, width / 2),
+                    plane(&chroma, width / 2),
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    &mut size
+                ),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+        }
+        emberwave_encoder_destroy(encoder);
+    }
+}
+
+/// Decodes `frame`, 192x136 4:2:0, 20 times into a texture with a decoder of
+/// `context`: by turns a decode that waits and one that does not.
+fn decode_on(context: *mut EmberwaveContext, frame: &[u8]) {
+    // SAFETY: a live context, a frame of the length passed, and pointers to
+    // store results in.
+    unsafe {
+        let mut decoder = ptr::null_mut();
+        assert_eq!(
+            emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        let mut texture = ptr::null_mut();
+        assert_eq!(
+            emberwave_texture_create(decoder, EMBERWAVE_TEXTURE_BGRA8, &mut texture),
+            EmberwaveStatus::Ok
+        );
+        for round in 0..20 {
+            emberwave_decoder_clear(decoder);
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok
+            );
+            let status = if round % 2 == 0 {
+                emberwave_decoder_decode_texture(decoder, ptr::null(), texture)
+            } else {
+                emberwave_decoder_submit_texture(decoder, ptr::null(), texture)
+            };
+            assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        }
+        emberwave_texture_destroy(texture);
+        emberwave_decoder_destroy(decoder);
+    }
+}
+
 /// A texture of the app's own, made as a `CVMetalTextureCache` makes one:
 /// shared storage, `usage`, and tracked unless `untracked`, as a heap's are.
 fn app_texture(
@@ -850,7 +1010,7 @@ fn into_app_textures(
             last_error()
         );
         assert!(
-            emberwave_decoder_is_ready(decoder, false),
+            emberwave_decoder_is_ready(decoder, 0),
             "the frame is still there"
         );
         for texture in twice {

@@ -1,8 +1,9 @@
 //! Buffers, bind groups and read-backs: what the decoder and the encoder share.
 
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
+use super::context::take_turn;
 use super::error::GpuError;
 use super::pipelines::with_error_scope;
 
@@ -249,13 +250,16 @@ impl StageQueries {
     /// The timestamps are resolved here, in a submission of their own. With
     /// the work, in its command buffer, Metal now and then resolved the last
     /// stages before their timestamps were written, and gave the previous
-    /// frame's or an end before the beginning.
+    /// frame's or an end before the beginning. The submission takes its turn
+    /// with `record_lock`, the context's, if it has one (decision D60).
     pub(crate) fn read(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        record_lock: Option<&Mutex<()>>,
     ) -> Result<Option<Vec<Option<Duration>>>, GpuError> {
         let bytes = u64::from(2 * self.stages) * 8;
+        let recording = take_turn(record_lock);
         with_error_scope(device, || {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("timestamps"),
@@ -264,6 +268,7 @@ impl StageQueries {
             encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, bytes);
             queue.submit([encoder.finish()]);
         })?;
+        drop(recording);
         let bytes = read_back(device, &self.readback, bytes)?;
         let ticks: Vec<u64> = bytes
             .chunks_exact(8)
