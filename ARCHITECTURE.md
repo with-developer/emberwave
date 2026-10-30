@@ -535,6 +535,9 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_encoder_encode` | Encode planes from the caller's memory, with the caller's strides, into a frame of at most the budget, written into the caller's buffer of that size |
 | `emberwave_texture_from_metal_source`, `_from_vulkan_source` | The host's own texture or image of a plane of the pictures to encode, or of Cb and Cr interleaved as in NV12 (D62) |
 | `emberwave_encoder_encode_textures`, `_encode_textures_vulkan` | Encode a picture from textures of its planes into the bytes of the same picture in CPU memory; on Vulkan with semaphores (D62) |
+| `emberwave_context_create_d3d12`, `emberwave_d3d12_fence_open`, `_destroy` | A context on the Direct3D 12 adapter of a LUID, and the client's shared fences opened on its device (D63) |
+| `emberwave_texture_from_d3d12`, `_d3d12_plane`, `_d3d12_source` | The client's textures, shared through NT handles, for a decoder's picture or plane or an encoder's plane (D63) |
+| `emberwave_decoder_submit_texture_d3d12`, `_submit_plane_textures_d3d12`, `emberwave_encoder_encode_textures_d3d12` | Decodes and encodes on such textures, with fences to wait for and to signal, leaving them in `D3D12_RESOURCE_STATE_COMMON` (D63) |
 | `emberwave_frame_packets` | Where a frame splits into packets of a given size, at its blocks |
 | `emberwave_version`, `emberwave_last_error` | The version, and the message of the last failure on the calling thread |
 
@@ -544,7 +547,7 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 
 For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
-The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` puts the Y, Cb and Cr planes into three textures for a client that converts the colours itself; on Metal the inverse transform stores them there, in 0.91 to 0.93 ms for the 4K frame (D41, D52). On a context made on the client's own device and queue, the submit functions do the same without waiting, and Metal orders the client's reads after them (D43). The client's own textures, such as those of `CVPixelBuffer`s for an `AVSampleBufferDisplayLayer`, take the decodes as well (D44). On Linux, Android and 64-bit Windows a context runs on the client's own Vulkan device and queue, with the client's images, and semaphores where Metal has its queue's order (D61). A host encodes pictures from textures, Metal's or Vulkan's, as a screen capture holds them (D62). Direct3D 12 handles are later work.
+The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` puts the Y, Cb and Cr planes into three textures for a client that converts the colours itself; on Metal the inverse transform stores them there, in 0.91 to 0.93 ms for the 4K frame (D41, D52). On a context made on the client's own device and queue, the submit functions do the same without waiting, and Metal orders the client's reads after them (D43). The client's own textures, such as those of `CVPixelBuffer`s for an `AVSampleBufferDisplayLayer`, take the decodes as well (D44). On Linux, Android and 64-bit Windows a context runs on the client's own Vulkan device and queue, with the client's images, and semaphores where Metal has its queue's order (D61). A host encodes pictures from textures, Metal's or Vulkan's, as a screen capture holds them (D62). On Windows, the client's Direct3D 12 or Direct3D 11 textures and fences come through shared NT handles to a device of emberwave's own on the same adapter (D63).
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
 
@@ -1565,3 +1568,31 @@ Direct3D 12 through shared handles follows, and the encoder's input from the cal
   - A timeline wait signalled from another thread during the call holds the encode back.
   - Binary semaphores order the encode between the client's copies.
 - **Left for later.** RGB pictures, the format of most captures, need a conversion in the gather pass. Direct3D 12 shared handles follow.
+
+### 2026-10-30 — D63: Textures and fences shared with Direct3D
+
+**Context.** #115 decided how Direct3D 12 clients and hosts share pictures with emberwave (D61, item 4). wgpu cannot run on a caller's `ID3D12Device`, so the caller's textures and fences come through shared NT handles, opened on emberwave's own device. That covers Direct3D 11 textures made with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` too, as Sunshine-like hosts have them. Keyed mutexes are out of scope. wgpu-hal 30 opens the way:
+- `Device::raw_device` gives the device that `OpenSharedHandle` runs on.
+- `Device::texture_from_raw` wraps a resource.
+- `Queue::add_wait_fence` and `add_signal_fence` put a `Wait` before a submission's command lists and a `Signal` after them, as `add_wait_semaphore` does on Vulkan.
+
+**Decision.**
+- **The adapter.** `emberwave_context_create_d3d12` takes the LUID of the caller's adapter, as `ID3D12Device::GetAdapterLuid` or `IDXGIAdapter::GetDesc` gives it, and makes the context on wgpu's Direct3D 12 adapter of that LUID. A shared handle opens only on the adapter that made it.
+- **Fences.** `emberwave_d3d12_fence_open` opens the caller's shared fence once, on the context's device. An `EmberwaveD3D12Sync` names a fence and a value to wait for, and a fence and a value to signal, as `EmberwaveVulkanSync` names semaphores.
+- **Textures.** `emberwave_texture_from_d3d12`, `_plane` and `_source` open the shared resource and check it from its own description: dimension, size, levels, layers, samples, format, and the flags that deny sampling or allow drawing. On Vulkan the caller has to describe its image; here the resource describes itself.
+- **COMMON at every hand-over.** A texture shared between devices is in `D3D12_RESOURCE_STATE_COMMON` when it changes hands.
+  - The texture comes in as wgpu's `UNINITIALIZED`, which wgpu-hal maps to COMMON on Direct3D 12. wgpu takes a texture made from the caller's handle as initialised and never clears it.
+  - Every call that uses the texture ends, before its signal, with a transition of the caller's textures to wgpu's `PRESENT`, also COMMON on Direct3D 12. `SubmissionHooks` gained a `record` step that adds the transition to the call's own commands.
+  - The calls without fences would leave the textures in other states, so they refuse shared textures. Only the `_d3d12` calls take them: `emberwave_decoder_submit_texture_d3d12`, `_submit_plane_textures_d3d12`, and `emberwave_encoder_encode_textures_d3d12`, which waits as every encode does.
+- **Turns.** wgpu-hal keeps one list of pending fences per queue, and the next submission takes it all. Two calls on one context could each add their fences and then submit, and the first submission would signal the second call's fence before that call's work. A context of `emberwave_context_create_d3d12` therefore takes turns at its queue (D60). The turn spans a call from its first command to its submission, so a call's fences go with its own submission alone.
+- **Lifetime.** wgpu's texture holds a reference to the caller's resource, and drops it once the texture is destroyed and the GPU is done with it, so no release callback is needed. The caller closes its handles when it likes.
+- **Dependencies.** The `windows` crate 0.62 and `pollster` on Windows, both already used by wgpu's Direct3D 12 backend and the core, at the same versions.
+
+**Consequence.**
+- **Tests.** `tests/d3d12.rs` runs in Windows CI on WARP, Direct3D's software adapter. A Direct3D 11 device stands for a host or a client: it shares textures and a fence through NT handles, and orders its own work with `ID3D11DeviceContext4::Wait` and `Signal`.
+  - Pictures, copied at 192 pixels wide and drawn at 200, and planes decode into its textures, and read back after the fence as the decodes that wait give them.
+  - Planes, and NV12's layout of Y with Cb and Cr interleaved, encode from its textures into the bytes of the same pictures in CPU memory.
+  - Formats and sizes that do not fit are refused, a handle that is not a fence's is refused, a LUID of no adapter is refused, and the calls without fences refuse shared textures.
+- **Not tested.** A hardware adapter, another process, and a Direct3D 12 device of the caller's.
+- **NV12 resources.** Textures of `DXGI_FORMAT_NV12` itself, which hosts that convert for hardware encoders have, need wgpu's `TEXTURE_FORMAT_NV12` and views of its planes (D32). That is left for later, beside RGB pictures converted in the gather pass.
+
