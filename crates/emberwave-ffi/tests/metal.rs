@@ -1586,6 +1586,9 @@ fn an_encode_on_the_app_queue_reads_what_the_app_committed_before() {
     let first = source_picture(size, chroma, 1);
     let second = source_picture(size, chroma, 2);
     app.fill(&first);
+    // Both encoders' first frame, so that the sequence numbers agree; made
+    // before the app's command buffer, which holds up the queue.
+    let expected = encoded_from_memory(memory, &second, widths);
 
     // The app's command buffer copies the second picture into the textures
     // once an event is signalled, and is committed before the encode.
@@ -1636,8 +1639,6 @@ fn an_encode_on_the_app_queue_reads_what_the_app_committed_before() {
         unsafe { &*signal.0 }.setSignaledValue(1);
     });
 
-    // Both encoders' first frame, so that the sequence numbers agree.
-    let expected = encoded_from_memory(memory, &second, widths);
     let frame = encoded_from_textures(encoder, [y, cb, cr]);
     // The encode waited for the copy, which waited for the event.
     assert_eq!(event.signaledValue(), 1, "the encode ended before the copy");

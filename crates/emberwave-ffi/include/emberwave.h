@@ -323,9 +323,10 @@ typedef struct EmberwaveVulkanImage {
   // Called with `user` once emberwave and the GPU are done with the
   // image, after the texture is destroyed and the work of every decode
   // into it or encode from it has completed: from then on the caller may
-  // destroy the image and free its memory. From any thread, perhaps during another call of
-  // emberwave's on the context, or in the destroy of its last decoder,
-  // encoder or context. `NULL` if the caller knows that moment otherwise.
+  // destroy the image and free its memory. From any thread, perhaps
+  // during another call of emberwave's on the context, or in the destroy
+  // of its last decoder, encoder or context. `NULL` if the caller knows
+  // that moment otherwise.
   void (*release)(void *user);
   // Passed to `release`.
   void *user;
@@ -802,10 +803,16 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures_vulkan(struct Ember
 // `signal_semaphore` once the GPU has read the images and made the frame,
 // for the caller's work on other queues that writes them again. The call
 // waits for the GPU as the other encodes do, so it returns only once its
-// wait is met: by work submitted before the call, or from another thread.
-// Keep the semaphores until the work that signals them has completed. When
-// the call fails, the semaphores may or may not have been waited for and
-// signalled.
+// wait is met: by work submitted to the context's queue before the call,
+// by work on another queue, or by `vkSignalSemaphore` on another thread.
+// Work submitted to the context's queue after the call began runs only
+// after the encode, which waits at every stage, so it cannot meet the
+// wait. Keep the semaphores until the work that signals them has
+// completed. When the call fails, the semaphores may or may not have been
+// waited for and signalled. A budget too small for the smallest frame
+// shows only once the GPU has encoded the picture: the semaphores have been
+// waited for and signalled then, so a retry takes others, or new timeline
+// values.
 //
 // # Safety
 //
@@ -1367,8 +1374,10 @@ enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
 // with the planes' sizes: the caller's, from
 // `emberwave_texture_from_metal_source` or
 // `emberwave_texture_from_vulkan_source`, or textures that decodes put
-// planes into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT` and encode
-// nothing, as does a budget too small, as for `emberwave_encoder_encode`.
+// planes into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any
+// work on the GPU. A budget too small gives it too, as for
+// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
+// frame then, and the sequence number does not move.
 //
 // Waits for the GPU: when it returns, the GPU has read the textures, and
 // the caller may write them again or hand them back to a capture's pool.

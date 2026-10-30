@@ -412,7 +412,18 @@ enum Holds {
 }
 
 impl Holds {
-    /// The texture's size in pictures of `layout`.
+    /// The texture's size in pictures of `layout`. Read where textures of
+    /// the caller's are wrapped, as `Wrapping` is.
+    #[cfg_attr(
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "android",
+            all(windows, target_pointer_width = "64")
+        )),
+        allow(dead_code)
+    )]
     fn size(self, layout: &FrameLayout) -> (u32, u32) {
         match self {
             Self::Picture => (layout.width(), layout.height()),
@@ -434,7 +445,18 @@ impl Holds {
 }
 
 /// What a texture of the caller's is wrapped for: a decoder that fills it,
-/// or an encoder that reads it.
+/// or an encoder that reads it. Read where textures of the caller's are
+/// wrapped: Metal's and Vulkan's.
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android",
+        all(windows, target_pointer_width = "64")
+    )),
+    allow(dead_code)
+)]
 struct Wrapping<'a> {
     device: &'a wgpu::Device,
     context_id: u64,
@@ -451,6 +473,16 @@ struct Wrapping<'a> {
     stores_planes: bool,
 }
 
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android",
+        all(windows, target_pointer_width = "64")
+    )),
+    allow(dead_code)
+)]
 impl<'a> Wrapping<'a> {
     /// For the decodes of `decoder`, into the picture or `plane`.
     fn decoder(decoder: &'a EmberwaveDecoder, plane: Option<Component>) -> Self {
@@ -1321,9 +1353,10 @@ pub struct EmberwaveVulkanImage {
     /// Called with `user` once emberwave and the GPU are done with the
     /// image, after the texture is destroyed and the work of every decode
     /// into it or encode from it has completed: from then on the caller may
-    /// destroy the image and free its memory. From any thread, perhaps during another call of
-    /// emberwave's on the context, or in the destroy of its last decoder,
-    /// encoder or context. `NULL` if the caller knows that moment otherwise.
+    /// destroy the image and free its memory. From any thread, perhaps
+    /// during another call of emberwave's on the context, or in the destroy
+    /// of its last decoder, encoder or context. `NULL` if the caller knows
+    /// that moment otherwise.
     pub release: Option<unsafe extern "C" fn(user: *mut c_void)>,
     /// Passed to `release`.
     pub user: *mut c_void,
@@ -1905,10 +1938,16 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_vulkan(
 /// `signal_semaphore` once the GPU has read the images and made the frame,
 /// for the caller's work on other queues that writes them again. The call
 /// waits for the GPU as the other encodes do, so it returns only once its
-/// wait is met: by work submitted before the call, or from another thread.
-/// Keep the semaphores until the work that signals them has completed. When
-/// the call fails, the semaphores may or may not have been waited for and
-/// signalled.
+/// wait is met: by work submitted to the context's queue before the call,
+/// by work on another queue, or by `vkSignalSemaphore` on another thread.
+/// Work submitted to the context's queue after the call began runs only
+/// after the encode, which waits at every stage, so it cannot meet the
+/// wait. Keep the semaphores until the work that signals them has
+/// completed. When the call fails, the semaphores may or may not have been
+/// waited for and signalled. A budget too small for the smallest frame
+/// shows only once the GPU has encoded the picture: the semaphores have been
+/// waited for and signalled then, so a retry takes others, or new timeline
+/// values.
 ///
 /// # Safety
 ///
@@ -4111,8 +4150,10 @@ pub unsafe extern "C" fn emberwave_encoder_encode(
 /// with the planes' sizes: the caller's, from
 /// `emberwave_texture_from_metal_source` or
 /// `emberwave_texture_from_vulkan_source`, or textures that decodes put
-/// planes into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT` and encode
-/// nothing, as does a budget too small, as for `emberwave_encoder_encode`.
+/// planes into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any
+/// work on the GPU. A budget too small gives it too, as for
+/// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
+/// frame then, and the sequence number does not move.
 ///
 /// Waits for the GPU: when it returns, the GPU has read the textures, and
 /// the caller may write them again or hand them back to a capture's pool.
