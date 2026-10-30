@@ -425,7 +425,7 @@ impl Holds {
             target_os = "ios",
             target_os = "linux",
             target_os = "android",
-            all(windows, target_pointer_width = "64")
+            windows
         )),
         allow(dead_code)
     )]
@@ -451,14 +451,14 @@ impl Holds {
 
 /// What a texture of the caller's is wrapped for: a decoder that fills it,
 /// or an encoder that reads it. Read where textures of the caller's are
-/// wrapped: Metal's and Vulkan's.
+/// wrapped: Metal's, Vulkan's and Direct3D's.
 #[cfg_attr(
     not(any(
         target_os = "macos",
         target_os = "ios",
         target_os = "linux",
         target_os = "android",
-        all(windows, target_pointer_width = "64")
+        windows
     )),
     allow(dead_code)
 )]
@@ -484,7 +484,7 @@ struct Wrapping<'a> {
         target_os = "ios",
         target_os = "linux",
         target_os = "android",
-        all(windows, target_pointer_width = "64")
+        windows
     )),
     allow(dead_code)
 )]
