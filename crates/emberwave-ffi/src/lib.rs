@@ -30,7 +30,7 @@ use emberwave_core::bitstream::{
     ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, Error as BitstreamError,
     FrameLayout, Header, Pwv1Header, SequenceHeader, TransferFunction, YcbcrRange, YcbcrTransform,
 };
-use emberwave_core::color::{ColorMatrix, ColorParams};
+use emberwave_core::color::{ColorMatrix, ColorParams, RgbOrder};
 use emberwave_core::encode::{self, EncodeError, Signalling};
 use emberwave_core::gpu::{
     Decoder, Encoder, GpuContext, GpuError, GpuOptions, QueueTurns, TexturePicture,
@@ -135,6 +135,17 @@ pub const EMBERWAVE_PLANE_CR: u32 = 2;
 /// `emberwave_texture_from_metal_source` and
 /// `emberwave_texture_from_vulkan_source` (decision D62).
 pub const EMBERWAVE_PLANE_CBCR: u32 = 3;
+/// The whole picture as R', G' and B', in one texture of four unsigned
+/// normalised 8-bit channels whose fourth is not read, as screen captures
+/// hold their pictures: `MTLPixelFormatBGRA8Unorm` or
+/// `MTLPixelFormatRGBA8Unorm` in Metal, `VK_FORMAT_B8G8R8A8_UNORM` or
+/// `VK_FORMAT_R8G8B8A8_UNORM` in Vulkan, `DXGI_FORMAT_B8G8R8A8_UNORM` or
+/// `DXGI_FORMAT_R8G8B8A8_UNORM` in Direct3D. Only for the textures encoders
+/// read (`emberwave_texture_from_metal_source`,
+/// `emberwave_texture_from_vulkan_source`,
+/// `emberwave_texture_from_d3d12_source`), which convert it to Y'CbCr as
+/// they read it (decision D65).
+pub const EMBERWAVE_PLANE_RGB: u32 = 4;
 
 /// How `emberwave_context_create` chooses the GPU.
 #[repr(C)]
@@ -1800,18 +1811,20 @@ pub unsafe extern "C" fn emberwave_texture_from_vulkan_plane(
 /// `emberwave_context_create_vulkan` (decision D62); for an encoder on
 /// another context, `EMBERWAVE_STATUS_INVALID_ARGUMENT`. `plane` is
 /// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR` for an
-/// image in `VK_FORMAT_R8_UNORM`, or `EMBERWAVE_PLANE_CBCR` for one in
-/// `VK_FORMAT_R8G8_UNORM` with Cb and Cr interleaved.
+/// image in `VK_FORMAT_R8_UNORM`, `EMBERWAVE_PLANE_CBCR` for one in
+/// `VK_FORMAT_R8G8_UNORM` with Cb and Cr interleaved, or
+/// `EMBERWAVE_PLANE_RGB` for the whole picture in `VK_FORMAT_B8G8R8A8_UNORM`
+/// or `VK_FORMAT_R8G8B8A8_UNORM` (decision D65).
 ///
 /// The image is on the context's device, 2D, of one level, layer and
 /// sample, with optimal tiling and exclusive sharing on the context's queue
 /// family, of the plane's size as `emberwave_encoder_info` gives it (that of
-/// Cb for `EMBERWAVE_PLANE_CBCR`), and as `image` describes it. Its usage
-/// has `VK_IMAGE_USAGE_SAMPLED_BIT`, and its layout is
-/// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, which it is in whenever an
-/// encode reads it: from the first encode on, the caller's barriers start
-/// from that layout and return the image to it before the next encode. An
-/// image that is not as above where `image` says so gives
+/// Cb for `EMBERWAVE_PLANE_CBCR`, the picture's for `EMBERWAVE_PLANE_RGB`),
+/// and as `image` describes it. Its usage has `VK_IMAGE_USAGE_SAMPLED_BIT`,
+/// and its layout is `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, which it is
+/// in whenever an encode reads it: from the first encode on, the caller's
+/// barriers start from that layout and return the image to it before the
+/// next encode. An image that is not as above where `image` says so gives
 /// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is then `NULL`.
 ///
 /// emberwave never destroys the image, nor frees its memory: keep both
@@ -1989,7 +2002,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_vulkan(
     )
 }
 
-/// Encodes the picture whose planes are in the textures `y`, `cb` and `cr`,
+/// Encodes the picture in the textures `y`, `cb` and `cr`, or in RGB in `y`,
 /// as `emberwave_encoder_encode_textures` does, with the semaphores of
 /// `sync` on its submission, on a context of
 /// `emberwave_context_create_vulkan` (decision D62). Elsewhere
@@ -2239,11 +2252,14 @@ pub unsafe extern "C" fn emberwave_texture_from_d3d12_plane(
 /// holds a plane of a picture for the encodes of `encoder` to read, from the
 /// NT handle `handle`, as `emberwave_texture_from_d3d12` does for a decoder
 /// (decision D63): `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
-/// `EMBERWAVE_PLANE_CR` for a texture in `DXGI_FORMAT_R8_UNORM`, or
+/// `EMBERWAVE_PLANE_CR` for a texture in `DXGI_FORMAT_R8_UNORM`,
 /// `EMBERWAVE_PLANE_CBCR` for one in `DXGI_FORMAT_R8G8_UNORM` with Cb and Cr
-/// interleaved, of the plane's size as `emberwave_encoder_info` gives it (that
-/// of Cb for `EMBERWAVE_PLANE_CBCR`). The texture can be sampled. Only
-/// `emberwave_encoder_encode_textures_d3d12` takes it.
+/// interleaved, or `EMBERWAVE_PLANE_RGB` for the whole picture in
+/// `DXGI_FORMAT_B8G8R8A8_UNORM` or `DXGI_FORMAT_R8G8B8A8_UNORM`, as a
+/// desktop duplication gives it (decision D65), of the plane's size as
+/// `emberwave_encoder_info` gives it (that of Cb for `EMBERWAVE_PLANE_CBCR`,
+/// the picture's for `EMBERWAVE_PLANE_RGB`). The texture can be sampled.
+/// Only `emberwave_encoder_encode_textures_d3d12` takes it.
 ///
 /// # Safety
 ///
@@ -2379,7 +2395,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_d3d12(
     )
 }
 
-/// Encodes the picture whose planes are in the textures `y`, `cb` and `cr`,
+/// Encodes the picture in the textures `y`, `cb` and `cr`, or in RGB in `y`,
 /// as `emberwave_encoder_encode_textures` does, with the fences of `sync`, on
 /// a context of `emberwave_context_create_d3d12` (decision D63); elsewhere
 /// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
@@ -4226,19 +4242,23 @@ pub unsafe extern "C" fn emberwave_texture_from_metal_plane(
 /// `CVPixelBuffer` from a `CVMetalTextureCache`, as a screen capture gives
 /// them, or one the caller drew. `plane` is `EMBERWAVE_PLANE_Y`,
 /// `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR` for a texture in
-/// `MTLPixelFormatR8Unorm`, or `EMBERWAVE_PLANE_CBCR` for one in
+/// `MTLPixelFormatR8Unorm`, `EMBERWAVE_PLANE_CBCR` for one in
 /// `MTLPixelFormatRG8Unorm` with Cb and Cr interleaved, as the second plane
-/// of an NV12 pixel buffer holds them. Only on iPhones, iPads and Macs;
-/// elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not `NULL`.
+/// of an NV12 pixel buffer holds them, or `EMBERWAVE_PLANE_RGB` for the
+/// whole picture in `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm`,
+/// as a BGRA pixel buffer holds it (decision D65). Only on iPhones, iPads and
+/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+/// `NULL`.
 ///
 /// The texture is on the device of the encoder's context
 /// (`emberwave_context_metal_device`), 2D, of one level, layer and sample,
 /// not a view of another texture nor memoryless, of the plane's size as
 /// `emberwave_encoder_info` gives it (that of Cb for
-/// `EMBERWAVE_PLANE_CBCR`), and has `MTLTextureUsageShaderRead`. A texture
-/// that is not gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is
-/// then `NULL`. On a context that does not run on Metal, a Vulkan context on
-/// a Mac included, no texture is on the context's Metal device.
+/// `EMBERWAVE_PLANE_CBCR`, the picture's for `EMBERWAVE_PLANE_RGB`), and has
+/// `MTLTextureUsageShaderRead`. A texture that is not gives
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is then `NULL`. On a
+/// context that does not run on Metal, a Vulkan context on a Mac included, no
+/// texture is on the context's Metal device.
 ///
 /// emberwave keeps a reference to `metal` until the texture is destroyed.
 /// A texture may be wrapped for one encode and destroyed after it, as the
@@ -4281,12 +4301,13 @@ pub unsafe extern "C" fn emberwave_texture_from_metal_source(
 fn source_holds(plane: u32) -> Result<Holds, Failure> {
     match plane {
         EMBERWAVE_PLANE_CBCR => Ok(Holds::Chroma),
+        EMBERWAVE_PLANE_RGB => Ok(Holds::Picture),
         EMBERWAVE_PLANE_Y | EMBERWAVE_PLANE_CB | EMBERWAVE_PLANE_CR => {
             plane_component(plane).map(Holds::Plane)
         }
         other => Err(Failure::argument(format!(
-            "plane is {other}, not EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR \
-             or EMBERWAVE_PLANE_CBCR"
+            "plane is {other}, not EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR, \
+             EMBERWAVE_PLANE_CBCR or EMBERWAVE_PLANE_RGB"
         ))),
     }
 }
@@ -5076,16 +5097,81 @@ pub unsafe extern "C" fn emberwave_encoder_encode(
     )
 }
 
+/// Encodes a picture of R', G' and B' in the caller's memory, as screen
+/// captures and renderers hold them, as `emberwave_encoder_encode` encodes
+/// one of Y', Cb and Cr: `rgb.data` points to its first row of four bytes a
+/// pixel, red first for `EMBERWAVE_TEXTURE_RGBA8` in `format` and blue first
+/// for `EMBERWAVE_TEXTURE_BGRA8`, the fourth byte not read, and the rows are
+/// `rgb.stride` bytes apart. The picture goes to the GPU as it is and is
+/// converted there by the matrix, range and chroma siting of the encoder's
+/// signalling, into the frame of the same picture in a texture (decision
+/// D65), which encodes faster: `emberwave_encoder_encode_textures` with a
+/// texture of `EMBERWAVE_PLANE_RGB`. Waits for the GPU, and fails as
+/// `emberwave_encoder_encode` does.
+///
+/// # Safety
+///
+/// `encoder` is a live encoder that no other thread is using. `rgb.data`
+/// points to `rgb.stride * (height - 1) + 4 * width` readable bytes, at the
+/// size `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
+/// may be written, and `size` to a `size_t`; neither overlaps the picture or
+/// the other.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_encoder_encode_rgb(
+    encoder: *mut EmberwaveEncoder,
+    rgb: EmberwaveSourcePlane,
+    format: u32,
+    frame: *mut u8,
+    budget: usize,
+    size: *mut usize,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { frame_arguments(frame, budget, size) }?;
+            // SAFETY: as the caller promises.
+            let encoder = unsafe { live_encoder(encoder) }?;
+            let order = rgb_order(format)?;
+            let layout = encoder.encoder.layout();
+            let (width, height) = (layout.width() as usize, layout.height() as usize);
+            // SAFETY: as the caller promises.
+            let picture = unsafe { source_plane(&rgb, "rgb", 4 * width, height) }?;
+            let encoded = encoder
+                .encoder
+                .encode_rgb(picture, rgb.stride, order, budget);
+            // SAFETY: as the caller promises.
+            unsafe { deliver(encoded, frame, size) }
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { encoder_lost(encoder) },
+    )
+}
+
+/// The order of an RGB picture's bytes that an `EMBERWAVE_TEXTURE_*` value
+/// names.
+fn rgb_order(format: u32) -> Result<RgbOrder, Failure> {
+    match format {
+        EMBERWAVE_TEXTURE_RGBA8 => Ok(RgbOrder::Rgba),
+        EMBERWAVE_TEXTURE_BGRA8 => Ok(RgbOrder::Bgra),
+        other => Err(Failure::argument(format!(
+            "format is {other}, not EMBERWAVE_TEXTURE_RGBA8 or EMBERWAVE_TEXTURE_BGRA8"
+        ))),
+    }
+}
+
 /// Encodes the picture whose planes are in textures on the GPU, as
 /// `emberwave_encoder_encode` encodes one in CPU memory and into the same
 /// bytes (decision D62): `y` holds the Y plane, and `cb` and `cr` the Cb and
 /// Cr planes, or `cb` both of them interleaved (`EMBERWAVE_PLANE_CBCR`) with
-/// `cr` `NULL`. The textures are textures of planes on the encoder's context
-/// with the planes' sizes: the caller's, from
-/// `emberwave_texture_from_metal_source` or
+/// `cr` `NULL`. Or `y` holds the whole picture in RGB
+/// (`EMBERWAVE_PLANE_RGB`), with `cb` and `cr` `NULL`: the encoder converts
+/// it to Y'CbCr as it reads it, as `emberwave_encoder_encode_rgb` does a
+/// picture in CPU memory and into the same bytes (decision D65). The
+/// textures are on the encoder's context, with the sizes of what they hold:
+/// the caller's, from `emberwave_texture_from_metal_source` or
 /// `emberwave_texture_from_vulkan_source`, or textures that decodes put
-/// planes into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any
-/// work on the GPU. A budget too small gives it too, as for
+/// planes or pictures into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT`
+/// before any work on the GPU. A budget too small gives it too, as for
 /// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
 /// frame then, and the sequence number does not move.
 ///
@@ -5211,6 +5297,23 @@ unsafe fn source_picture<'a>(
     cr: *const EmberwaveTexture,
     context_id: u64,
 ) -> Result<TexturePicture<'a>, Failure> {
+    // SAFETY: as the caller promises.
+    let rgb = unsafe { y.as_ref() }.filter(|texture| texture.holds == Holds::Picture);
+    if let Some(rgb) = rgb {
+        // Not wgpu's device equality, which devices of two contexts can pass
+        // (GpuContext::id).
+        if rgb.context_id != context_id {
+            return Err(Failure::argument(
+                "y is on the GPU device of another context",
+            ));
+        }
+        if !cb.is_null() || !cr.is_null() {
+            return Err(Failure::argument(
+                "cb or cr is not NULL, though y holds the picture in RGB",
+            ));
+        }
+        return Ok(TexturePicture::Rgb(&rgb.view));
+    }
     // SAFETY: as the caller promises.
     let luma = unsafe { plane_texture(y, Component::Y, "y", context_id) }?;
     // SAFETY: as the caller promises.

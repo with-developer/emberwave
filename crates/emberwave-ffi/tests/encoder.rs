@@ -12,6 +12,7 @@ use emberwave_core::bitstream::{
     ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, FrameLayout, Header, Pwv1File,
     TransferFunction, YcbcrRange, YcbcrTransform,
 };
+use emberwave_core::color::{ColorMatrix, ColorParams, RgbOrder, rgb_to_ycbcr8};
 use emberwave_core::encode::{self, Signalling};
 use emberwave_core::gpu::{Encoder, GpuContext, GpuOptions};
 use emberwave_ffi::*;
@@ -874,7 +875,14 @@ fn textures_an_encode_cannot_read_are_refused() {
     refused([y, cb, none], "cr is NULL");
     refused([cb, y, cr], "y is not a texture for the Y plane");
     refused([y, cr, cb], "cb is not a texture for the Cb plane");
-    refused([picture, cb, cr], "y is not a texture for the Y plane");
+    refused(
+        [picture, cb, cr],
+        "cb or cr is not NULL, though y holds the picture in RGB",
+    );
+    refused(
+        [picture, cb, none],
+        "cb or cr is not NULL, though y holds the picture in RGB",
+    );
     refused([elsewhere_y, cb, cr], "another context");
     // Of another picture size: the encoder's own check.
     refused([other_y, cb, cr], "texture");
@@ -928,6 +936,261 @@ fn textures_an_encode_cannot_read_are_refused() {
         emberwave_decoder_destroy(elsewhere);
         emberwave_encoder_destroy(encoder);
         emberwave_context_destroy(other_context);
+        emberwave_context_destroy(context);
+    }
+}
+
+/// A picture of `width` x `height` pixels in RGB, four bytes each in
+/// `order`, rows `stride` bytes apart with 0xEE between them: gradients,
+/// edges and noise.
+fn rgb_picture(width: u32, height: u32, stride: usize, order: RgbOrder) -> Vec<u8> {
+    let (width, height) = (width as usize, height as usize);
+    let mut state = 0x9E37_79B9_u32;
+    let mut bytes = vec![0xEE; stride * (height - 1) + 4 * width];
+    for y in 0..height {
+        for x in 0..width {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let [r, g, b] = if (x / 9 + y / 7) % 2 == 0 {
+                [(x * 255 / width) as u8, (y * 255 / height) as u8, 200]
+            } else {
+                [state as u8, (state >> 8) as u8, (state >> 16) as u8]
+            };
+            let pixel = match order {
+                RgbOrder::Rgba => [r, g, b, (state >> 24) as u8],
+                RgbOrder::Bgra => [b, g, r, (state >> 24) as u8],
+            };
+            bytes[y * stride + 4 * x..][..4].copy_from_slice(&pixel);
+        }
+    }
+    bytes
+}
+
+/// Encodes a picture in RGB in CPU memory through the C API: the status, and
+/// the frame or, after a failure, what the size out-parameter holds.
+fn encode_rgb_c(
+    encoder: *mut EmberwaveEncoder,
+    rgb: EmberwaveSourcePlane,
+    format: u32,
+    budget: usize,
+) -> (EmberwaveStatus, Vec<u8>, usize) {
+    let mut frame = vec![0u8; budget];
+    let mut size = usize::MAX;
+    // SAFETY: a live encoder, a picture of its size or NULL, and a frame of
+    // `budget` bytes.
+    let status = unsafe {
+        emberwave_encoder_encode_rgb(encoder, rgb, format, frame.as_mut_ptr(), budget, &mut size)
+    };
+    if status == EmberwaveStatus::Ok {
+        frame.truncate(size);
+    } else {
+        frame.clear();
+    }
+    (status, frame, size)
+}
+
+#[test]
+fn pictures_in_rgb_encode_as_the_planes_they_convert_to() {
+    // RGB in CPU memory in either order, with bytes between the rows,
+    // encodes to the frame of the planes that rgb_to_ycbcr8 makes of it with
+    // the encoder's signalling (decision D65).
+    let Some(context) = context() else {
+        return;
+    };
+    let other = EmberwaveSignalling {
+        matrix: EMBERWAVE_MATRIX_BT2020,
+        range: EMBERWAVE_RANGE_FULL,
+        chroma_siting: EMBERWAVE_SITING_LEFT,
+        primaries: EMBERWAVE_PRIMARIES_BT2020,
+        transfer: EMBERWAVE_TRANSFER_PQ,
+        reserved: [0; 3],
+    };
+    let other_params = ColorParams {
+        matrix: ColorMatrix::Bt2020,
+        range: YcbcrRange::Full,
+        chroma_siting: ChromaSiting::Left,
+    };
+    for (width, height, chroma) in SHAPES {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        for (signalling, params) in [(None, ColorParams::default()), (Some(&other), other_params)] {
+            let row = 4 * width as usize;
+            let rgba = rgb_picture(width, height, row, RgbOrder::Rgba);
+            let planes =
+                rgb_to_ycbcr8(&rgba, row, RgbOrder::Rgba, width, height, chroma, &params).unwrap();
+            let from_planes = encoder_for(context, &layout, signalling);
+            let mut storage = Vec::new();
+            let (status, expected, _) = encode_c(
+                from_planes,
+                source_planes(&layout, &planes, 0, &mut storage),
+                9_000,
+            );
+            assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+            for (format, order) in [
+                (EMBERWAVE_TEXTURE_RGBA8, RgbOrder::Rgba),
+                (EMBERWAVE_TEXTURE_BGRA8, RgbOrder::Bgra),
+            ] {
+                let from_rgb = encoder_for(context, &layout, signalling);
+                let stride = row + 8;
+                let bytes = rgb_picture(width, height, stride, order);
+                let rgb = EmberwaveSourcePlane {
+                    data: bytes.as_ptr(),
+                    stride,
+                };
+                let (status, frame, _) = encode_rgb_c(from_rgb, rgb, format, 9_000);
+                assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+                assert!(
+                    frame == expected,
+                    "{width}x{height} {chroma:?} {order:?} {signalling:?}"
+                );
+                // SAFETY: live, destroyed once.
+                unsafe { emberwave_encoder_destroy(from_rgb) };
+            }
+            // SAFETY: live, destroyed once.
+            unsafe { emberwave_encoder_destroy(from_planes) };
+        }
+    }
+    // SAFETY: live, destroyed once.
+    unsafe { emberwave_context_destroy(context) };
+}
+
+#[test]
+fn a_picture_a_decode_left_in_a_texture_encodes_as_the_same_picture_in_memory() {
+    // A decode's picture texture is an RGB picture like any other for an
+    // encoder: it encodes as the bytes of the same decode in CPU memory do.
+    let Some(context) = context() else {
+        return;
+    };
+    for (width, height, chroma) in SHAPES {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let maker = encoder_for(context, &layout, None);
+        let mut storage = Vec::new();
+        let (status, frame, _) = encode_c(
+            maker,
+            source_planes(&layout, &picture(&layout, 6), 0, &mut storage),
+            9_000,
+        );
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        let decoder = decoder_for(context, &layout);
+        let (w, h) = (width as usize, height as usize);
+        let mut rgb = vec![0u8; 3 * w * h];
+        for format in [EMBERWAVE_TEXTURE_RGBA8, EMBERWAVE_TEXTURE_BGRA8] {
+            let mut texture = ptr::null_mut();
+            // SAFETY: a live decoder, its texture, a frame of the length
+            // passed, and a picture of its size.
+            unsafe {
+                let status = emberwave_texture_create(decoder, format, &mut texture);
+                assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+                for into_texture in [true, false] {
+                    emberwave_decoder_clear(decoder);
+                    let status =
+                        emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len());
+                    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+                    let status = if into_texture {
+                        emberwave_decoder_decode_texture(decoder, ptr::null(), texture)
+                    } else {
+                        let plane = EmberwavePlane {
+                            data: rgb.as_mut_ptr(),
+                            stride: 3 * w,
+                        };
+                        emberwave_decoder_decode_rgb(decoder, ptr::null(), plane)
+                    };
+                    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+                }
+            }
+            let rgba: Vec<u8> = rgb
+                .chunks_exact(3)
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
+                .collect();
+            let (from_texture, from_memory) = (
+                encoder_for(context, &layout, None),
+                encoder_for(context, &layout, None),
+            );
+            let (status, frame, _) = encode_textures_c(
+                from_texture,
+                [texture, ptr::null_mut(), ptr::null_mut()].map(|t| t.cast_const()),
+                9_000,
+            );
+            assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+            let picture = EmberwaveSourcePlane {
+                data: rgba.as_ptr(),
+                stride: 4 * w,
+            };
+            let (status, expected, _) =
+                encode_rgb_c(from_memory, picture, EMBERWAVE_TEXTURE_RGBA8, 9_000);
+            assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+            assert!(
+                frame == expected,
+                "{width}x{height} {chroma:?} format {format}"
+            );
+            // SAFETY: live, destroyed once each.
+            unsafe {
+                emberwave_texture_destroy(texture);
+                emberwave_encoder_destroy(from_texture);
+                emberwave_encoder_destroy(from_memory);
+            }
+        }
+        // SAFETY: live, destroyed once each.
+        unsafe {
+            emberwave_decoder_destroy(decoder);
+            emberwave_encoder_destroy(maker);
+        }
+    }
+    // SAFETY: live, destroyed once.
+    unsafe { emberwave_context_destroy(context) };
+}
+
+#[test]
+fn rgb_pictures_an_encode_cannot_read_are_refused() {
+    let Some(context) = context() else {
+        return;
+    };
+    let layout = FrameLayout::new(64, 32, ChromaSubsampling::Yuv420).unwrap();
+    let encoder = encoder_for(context, &layout, None);
+    let bytes = rgb_picture(64, 32, 256, RgbOrder::Bgra);
+    let refused = |rgb: EmberwaveSourcePlane, format: u32, says: &str| {
+        let (status, frame, size) = encode_rgb_c(encoder, rgb, format, 9_000);
+        assert_eq!(status, EmberwaveStatus::InvalidArgument, "{says}");
+        assert!(frame.is_empty() && size == 0, "{says}");
+        let error = last_error();
+        assert!(error.contains(says), "{says}: {error}");
+    };
+    let good = EmberwaveSourcePlane {
+        data: bytes.as_ptr(),
+        stride: 256,
+    };
+    refused(
+        good,
+        7,
+        "format is 7, not EMBERWAVE_TEXTURE_RGBA8 or EMBERWAVE_TEXTURE_BGRA8",
+    );
+    refused(
+        EmberwaveSourcePlane {
+            data: ptr::null(),
+            stride: 256,
+        },
+        EMBERWAVE_TEXTURE_BGRA8,
+        "rgb.data is NULL",
+    );
+    refused(
+        EmberwaveSourcePlane {
+            data: bytes.as_ptr(),
+            stride: 255,
+        },
+        EMBERWAVE_TEXTURE_BGRA8,
+        "rgb.stride is 255, less than the 256 bytes of a row",
+    );
+    // The arguments are checked before anything is encoded: the next frame
+    // is the first.
+    let (status, frame, _) = encode_rgb_c(encoder, good, EMBERWAVE_TEXTURE_BGRA8, 9_000);
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    let Header::StartOfFrame(header) = Header::parse(&frame).unwrap() else {
+        panic!("a start of frame header");
+    };
+    assert_eq!(header.sequence, 1);
+    // SAFETY: live, destroyed once each.
+    unsafe {
+        emberwave_encoder_destroy(encoder);
         emberwave_context_destroy(context);
     }
 }

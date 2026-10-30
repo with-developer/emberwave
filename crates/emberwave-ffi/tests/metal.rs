@@ -1566,6 +1566,117 @@ fn the_apps_own_textures_are_encoded_as_planes_and_as_nv12() {
     }
 }
 
+/// A picture of `width` x `height` pixels in BGRA, as a capture's pixel
+/// buffer holds it, its alpha varied: gradients and noise.
+fn bgra_picture((width, height): (usize, usize), seed: u32) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    (0..width * height)
+        .flat_map(|i| {
+            let (x, y) = (i % width, i / width);
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let noise = (state >> 26) as usize;
+            [
+                (40 + y * 150 / height + noise) as u8,
+                (20 + x * 200 / width) as u8,
+                (230 - x * 100 / width - noise) as u8,
+                state as u8,
+            ]
+        })
+        .collect()
+}
+
+/// The frame of a picture of BGRA bytes encoded from CPU memory by
+/// `encoder`.
+fn encoded_from_bgra(encoder: *mut EmberwaveEncoder, bgra: &[u8], width: usize) -> Vec<u8> {
+    let mut frame = vec![0u8; 9_000];
+    let mut size = 0;
+    let rgb = EmberwaveSourcePlane {
+        data: bgra.as_ptr(),
+        stride: 4 * width,
+    };
+    // SAFETY: a live encoder, a picture of its size, and a frame of the
+    // length passed.
+    let status = unsafe {
+        emberwave_encoder_encode_rgb(
+            encoder,
+            rgb,
+            EMBERWAVE_TEXTURE_BGRA8,
+            frame.as_mut_ptr(),
+            frame.len(),
+            &mut size,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    frame.truncate(size);
+    frame
+}
+
+#[test]
+fn the_apps_own_bgra_textures_are_encoded_as_rgb() {
+    // A capture's BGRA pixel buffer, or a picture the app drew, encodes as
+    // the same bytes in CPU memory (decision D65).
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no Metal device"
+        );
+        return;
+    };
+    let queue = device.newCommandQueue().expect("a command queue");
+    let context = metal_context(&device, &queue).0;
+    for (size, code) in [
+        ((192, 136), EMBERWAVE_CHROMA_420),
+        ((131, 67), EMBERWAVE_CHROMA_444),
+    ] {
+        let usage = MTLTextureUsage::ShaderRead;
+        let texture = app_texture(&device, MTLPixelFormat::BGRA8Unorm, size, usage, false);
+        let memory = encoder_of(context, size, code);
+        let from_texture = encoder_of(context, size, code);
+        let wrapped = source(from_texture, EMBERWAVE_PLANE_RGB, &texture).unwrap();
+        for seed in 0..2 {
+            let bgra = bgra_picture(size, seed);
+            fill(&texture, &bgra, 4 * size.0);
+            let expected = encoded_from_bgra(memory, &bgra, size.0);
+            let frame =
+                encoded_from_textures(from_texture, [wrapped, ptr::null_mut(), ptr::null_mut()])
+                    .unwrap();
+            assert!(frame == expected, "{size:?} picture {seed}");
+        }
+        // SAFETY: live objects, destroyed once each.
+        unsafe {
+            emberwave_texture_destroy(wrapped);
+            emberwave_encoder_destroy(memory);
+            emberwave_encoder_destroy(from_texture);
+        }
+    }
+
+    // An sRGB texture, whose reads would undo the transfer function, and a
+    // texture of another size are refused when they are wrapped.
+    let size = (192, 136);
+    let encoder = encoder_of(context, size, EMBERWAVE_CHROMA_420);
+    let usage = MTLTextureUsage::ShaderRead;
+    let srgb = app_texture(&device, MTLPixelFormat::BGRA8Unorm_sRGB, size, usage, false);
+    let small = app_texture(&device, MTLPixelFormat::RGBA8Unorm, (96, 68), usage, false);
+    for (texture, says) in [
+        (
+            &srgb,
+            "not MTLPixelFormatBGRA8Unorm or MTLPixelFormatRGBA8Unorm",
+        ),
+        (&small, "rather than the picture's 192x136"),
+    ] {
+        let (status, error) = source(encoder, EMBERWAVE_PLANE_RGB, texture).unwrap_err();
+        assert_eq!(status, EmberwaveStatus::InvalidArgument, "{error}");
+        assert!(error.contains(says), "{says}: {error}");
+    }
+    // SAFETY: live objects, destroyed once each.
+    unsafe {
+        emberwave_encoder_destroy(encoder);
+        emberwave_context_destroy(context);
+    }
+}
+
 #[test]
 fn an_encode_on_the_app_queue_reads_what_the_app_committed_before() {
     let Some(device) = MTLCreateSystemDefaultDevice() else {

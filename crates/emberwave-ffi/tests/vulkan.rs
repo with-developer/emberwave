@@ -2254,6 +2254,134 @@ fn the_callers_images_are_encoded_as_planes_and_as_nv12() {
     }
 }
 
+/// A picture of `size` in BGRA, as a capture holds it, its fourth byte
+/// varied: gradients and noise, different for each `seed`.
+fn bgra_picture((width, height): (u32, u32), seed: u32) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    (0..width * height)
+        .flat_map(|i| {
+            let (x, y) = (i % width, i / width);
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let noise = state >> 26;
+            [
+                (40 + y * 150 / height + noise) as u8,
+                (20 + x * 200 / width) as u8,
+                (230 - x * 100 / width - noise) as u8,
+                state as u8,
+            ]
+        })
+        .collect()
+}
+
+/// The frame of a picture of BGRA bytes, `width` pixels a row, encoded from
+/// CPU memory by `encoder`.
+fn encoded_from_bgra(encoder: *mut EmberwaveEncoder, bgra: &[u8], width: u32) -> Vec<u8> {
+    let mut frame = vec![0u8; 9_000];
+    let mut size = 0;
+    let rgb = EmberwaveSourcePlane {
+        data: bgra.as_ptr(),
+        stride: 4 * width as usize,
+    };
+    // SAFETY: a live encoder, a picture of its size, and a frame of the
+    // length passed.
+    let status = unsafe {
+        emberwave_encoder_encode_rgb(
+            encoder,
+            rgb,
+            EMBERWAVE_TEXTURE_BGRA8,
+            frame.as_mut_ptr(),
+            frame.len(),
+            &mut size,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    frame.truncate(size);
+    frame
+}
+
+#[test]
+fn the_callers_bgra_images_are_encoded_as_rgb() {
+    // A picture in VK_FORMAT_B8G8R8A8_UNORM, as a capture or a renderer
+    // holds it, encodes as the same bytes in CPU memory, also with the
+    // semaphores of encode_textures_vulkan (decision D65).
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let format = vk::Format::B8G8R8A8_UNORM;
+    let readable = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    for (size, code) in [
+        ((192, 136), EMBERWAVE_CHROMA_420),
+        ((131, 67), EMBERWAVE_CHROMA_444),
+    ] {
+        let image = client.image(&device, format, size, SOURCE_USAGE);
+        let memory = encoder_of(context, size, code);
+        let from_image = encoder_of(context, size, code);
+        let wrapped = source(
+            from_image,
+            &image,
+            format,
+            SOURCE_USAGE,
+            readable,
+            EMBERWAVE_PLANE_RGB,
+        )
+        .unwrap();
+        let mut from = vk::ImageLayout::UNDEFINED;
+        for seed in 0..2 {
+            let bgra = bgra_picture(size, seed);
+            client
+                .upload(&device, &[(&image, &bgra)], from, None, None)
+                .finish(&device);
+            from = readable;
+            let expected = encoded_from_bgra(memory, &bgra, size.0);
+            let sync = EmberwaveVulkanSync::default();
+            let frame = encoded_from_images(
+                from_image,
+                [wrapped, ptr::null_mut(), ptr::null_mut()],
+                (seed == 1).then_some(&sync),
+            )
+            .unwrap();
+            assert!(frame == expected, "{size:?} picture {seed}");
+        }
+
+        // An sRGB image, whose reads would undo the transfer function, is
+        // refused.
+        if code == EMBERWAVE_CHROMA_420 {
+            let (status, error) = source(
+                from_image,
+                &image,
+                vk::Format::B8G8R8A8_SRGB,
+                SOURCE_USAGE,
+                readable,
+                EMBERWAVE_PLANE_RGB,
+            )
+            .unwrap_err();
+            assert_eq!(status, EmberwaveStatus::InvalidArgument);
+            assert!(
+                error.contains("not VK_FORMAT_B8G8R8A8_UNORM or VK_FORMAT_R8G8B8A8_UNORM"),
+                "{error}"
+            );
+        }
+        // SAFETY: live objects, destroyed once each; the GPU is done with
+        // the image, as every encode waits for it.
+        unsafe {
+            emberwave_texture_destroy(wrapped);
+            emberwave_encoder_destroy(memory);
+            emberwave_encoder_destroy(from_image);
+            device.destroy_image(image.image, None);
+            device.free_memory(image.memory, None);
+        }
+    }
+    // SAFETY: a live context and device, which nothing uses any more.
+    unsafe {
+        emberwave_context_destroy(context);
+        device.destroy_device(None);
+    }
+}
+
 #[test]
 fn semaphores_hold_the_encode_back_until_the_picture_is_written() {
     let Some(client) = Client::new() else {
