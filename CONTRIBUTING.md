@@ -16,6 +16,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+CI runs two more lints, for code that builds only without the `gpu` feature or only for the browser, and a check on Rust 1.87. The lints need the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`):
+
+```sh
+cargo clippy -p emberwave-core --no-default-features --all-targets -- -D warnings
+cargo clippy --target wasm32-unknown-unknown -p emberwave-web -p emberwave-core -- -D warnings
+```
+
 ## Tests
 
 | Suite | Where | What it checks |

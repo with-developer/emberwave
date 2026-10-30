@@ -182,17 +182,21 @@ typedef struct EmberwaveEncoder EmberwaveEncoder;
 // with the picture, `emberwave_decoder_decode_texture` and
 // `emberwave_decoder_submit_texture`, or with one of its planes,
 // `emberwave_decoder_decode_plane_textures` and
-// `emberwave_decoder_submit_plane_textures`, for the caller's graphics API
-// to read on the GPU. emberwave makes it (`emberwave_texture_create`,
-// `emberwave_texture_create_plane`), or wraps a Metal texture or a Vulkan
+// `emberwave_decoder_submit_plane_textures`, and their `_vulkan` and
+// `_d3d12` forms, for the caller's graphics API to read on the GPU.
+// emberwave makes it (`emberwave_texture_create`,
+// `emberwave_texture_create_plane`), wraps a Metal texture or a Vulkan
 // image of the caller's (`emberwave_texture_from_metal`,
 // `emberwave_texture_from_metal_plane`, `emberwave_texture_from_vulkan`,
-// `emberwave_texture_from_vulkan_plane`).
+// `emberwave_texture_from_vulkan_plane`), or opens a Direct3D texture the
+// caller shares (`emberwave_texture_from_d3d12`,
+// `emberwave_texture_from_d3d12_plane`).
 //
 // Or a texture of the caller's that holds a plane of a picture to encode,
-// for `emberwave_encoder_encode_textures` to read
-// (`emberwave_texture_from_metal_source`,
-// `emberwave_texture_from_vulkan_source`, decision D62). A texture of a
+// for `emberwave_encoder_encode_textures` and its `_vulkan` and `_d3d12`
+// forms to read (`emberwave_texture_from_metal_source`,
+// `emberwave_texture_from_vulkan_source`,
+// `emberwave_texture_from_d3d12_source`, decision D62). A texture of a
 // plane serves the decoders and encoders of its context whose pictures
 // have planes of its size, so planes a decode put into textures can be
 // encoded again.
@@ -222,6 +226,24 @@ typedef struct EmberwaveEncoder EmberwaveEncoder;
 //   until a decode that waits returns, or until a command buffer that uses
 //   the texture, committed to the queue after a decode that does not wait,
 //   has completed.
+// - On a context of `emberwave_context_create_vulkan`, emberwave works on
+//   the caller's queue. A decode that waits returns once the GPU has
+//   written the image, and nothing orders the next decode after the
+//   caller's reads: keep images in turn, as on a context of emberwave's own
+//   queue. The decodes that do not wait,
+//   `emberwave_decoder_submit_texture_vulkan` and
+//   `emberwave_decoder_submit_plane_textures_vulkan`, take semaphores: one
+//   that the decode waits for, signalled when the caller's reads of the
+//   image end, and one that the caller's reads wait for. With them one
+//   image takes every frame. Between calls an image is in
+//   `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL` (decision D61).
+// - On a context of `emberwave_context_create_d3d12`, a texture the caller
+//   shares from Direct3D takes only the `_d3d12` calls, ordered by the
+//   fences of their `EmberwaveD3D12Sync`: one that the call's work waits
+//   for, signalled when the caller's reads end, and one it signals when the
+//   texture holds the picture. With them one texture takes every frame. The
+//   other calls refuse such a texture with
+//   `EMBERWAVE_STATUS_INVALID_ARGUMENT` (decision D63).
 typedef struct EmberwaveTexture EmberwaveTexture;
 
 // What emberwave needs a Vulkan device of the caller's to have enabled:
@@ -597,7 +619,8 @@ enum EmberwaveStatus emberwave_vulkan_instance_extensions(EmberwaveVkGetInstance
 // `emberwave_vulkan_requirements_extensions` gives, and the features, which
 // `emberwave_vulkan_requirements_features` gives. Make the device with
 // them, and with whatever else the caller needs. Only where wgpu runs on
-// Vulkan, on Linux, Android and Windows; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+// Vulkan, on Linux, Android and 64-bit Windows; elsewhere
+// `EMBERWAVE_STATUS_NO_GPU`.
 // `EMBERWAVE_STATUS_NO_GPU` too for a physical device wgpu cannot use.
 //
 // # Safety
@@ -650,15 +673,16 @@ void emberwave_vulkan_requirements_destroy(struct EmberwaveVulkanRequirements *r
 // Creates a context on the caller's own Vulkan device, for emberwave to
 // work on the caller's queue (decision D61). The device keeps belonging to
 // the caller, who destroys it after the context and everything made on it.
-// Only where wgpu runs on Vulkan, on Linux, Android and Windows; elsewhere
-// `EMBERWAVE_STATUS_NO_GPU`.
+// Only where wgpu runs on Vulkan, on Linux, Android and 64-bit Windows;
+// elsewhere `EMBERWAVE_STATUS_NO_GPU`.
 //
 // The device must have been made with the extensions and the features of
-// `emberwave_vulkan_requirements_create`: a lacking extension is
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and a lacking feature undefined
-// behaviour, as Vulkan cannot tell which were enabled. So is a queue family
-// without graphics and compute, a queue it does not have, and an instance
-// whose `apiVersion` is below the physical device's, up to 1.3.
+// `emberwave_vulkan_requirements_create`. A lacking extension is
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and so are a queue family without
+// graphics and compute, a queue index past the family's queues, and an
+// instance whose `apiVersion` is below the physical device's, up to 1.3. A
+// lacking feature is undefined behaviour, as Vulkan cannot tell which were
+// enabled.
 //
 // The queue is shared:
 // - emberwave submits to it during its calls. Either nothing else uses the
@@ -673,9 +697,11 @@ void emberwave_vulkan_requirements_destroy(struct EmberwaveVulkanRequirements *r
 //   where the device has one, needs neither.
 // - The decoders and encoders of every context made on the queue take
 //   turns at it, as on Metal (decision D60).
-// - The decodes that wait return once the GPU is done. The decodes that do
-//   not wait, `emberwave_decoder_submit_texture` and
-//   `emberwave_decoder_submit_plane_textures`, are for Metal contexts only.
+// - The decodes that wait return once the GPU is done. Those that do not
+//   wait are `emberwave_decoder_submit_texture_vulkan` and
+//   `emberwave_decoder_submit_plane_textures_vulkan`, which order the work
+//   with semaphores; `emberwave_decoder_submit_texture` and
+//   `emberwave_decoder_submit_plane_textures` are for Metal contexts only.
 //
 // # Safety
 //
@@ -1077,8 +1103,9 @@ enum EmberwaveStatus emberwave_encoder_encode_textures_d3d12(struct EmberwaveEnc
 // # Safety
 //
 // `context` is `NULL`, or a context from `emberwave_context_create`,
-// `emberwave_context_create_metal` or `emberwave_context_create_vulkan`
-// that has not been destroyed and that no other thread is using.
+// `emberwave_context_create_metal`, `emberwave_context_create_vulkan` or
+// `emberwave_context_create_d3d12` that has not been destroyed and that no
+// other thread is using.
 void emberwave_context_destroy(struct EmberwaveContext *context);
 
 // The name and backend of the context's GPU, such as
@@ -1415,15 +1442,19 @@ void emberwave_texture_destroy(struct EmberwaveTexture *texture);
 // The call does not wait for the caller's GPU work that still reads the
 // texture. Whether something orders the decode after that work, and so how
 // many textures the caller keeps in turn, depends on the context and the
-// texture: see `EmberwaveTexture`. In short, on a context of
-// `emberwave_context_create` keep three, and on one of
-// `emberwave_context_create_metal` one tracked texture does.
+// texture: see `EmberwaveTexture`. In short, with the decodes that wait,
+// keep three on any context but one of `emberwave_context_create_metal`,
+// where one tracked texture does. With the decodes that do not wait, one
+// texture does: on Metal through the queue, on Vulkan and Direct3D through
+// semaphores and fences.
 //
-// `texture` is a texture of the picture from `emberwave_texture_create` or
-// `emberwave_texture_from_metal`, on a decoder of the same context and
-// picture size. `NULL`, a texture of a plane, of another context's device or
-// of another picture size gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` and
-// leaves the frame to decode.
+// `texture` is a texture of the picture from `emberwave_texture_create`,
+// `emberwave_texture_from_metal` or `emberwave_texture_from_vulkan`, on a
+// decoder of the same context and picture size. `NULL`, a texture of a
+// plane, of another context's device or of another picture size gives
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode, as
+// does a texture shared from Direct3D, which takes
+// `emberwave_decoder_submit_texture_d3d12`.
 //
 // On a context of `emberwave_context_create_metal`, do not call it inside a
 // completion handler of a command buffer of the context's queue: the wait
@@ -1445,10 +1476,14 @@ enum EmberwaveStatus emberwave_decoder_decode_texture(struct EmberwaveDecoder *d
 // caller's command buffers committed to it after this call returns see the
 // picture, and the decode waits for those committed before it that still
 // read the texture, so one texture takes every frame (see
-// `EmberwaveTexture`). A decoder of a context of `emberwave_context_create`,
-// or a texture Metal does not track, gives
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, as nothing there would order the
-// caller's reads after the decode.
+// `EmberwaveTexture`). A decoder of any other context, or a texture Metal
+// does not track, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`, as nothing
+// there would order the caller's reads after the decode. On a context of
+// `emberwave_context_create_vulkan` the decode that does not wait is
+// `emberwave_decoder_submit_texture_vulkan`, and on one of
+// `emberwave_context_create_d3d12` it is
+// `emberwave_decoder_submit_texture_d3d12`: they order the work with
+// semaphores and fences.
 //
 // The queue orders only command buffers that use the texture. Hand the
 // picture to anything else that reads its memory, such as an
@@ -1471,7 +1506,9 @@ enum EmberwaveStatus emberwave_decoder_submit_texture(struct EmberwaveDecoder *d
 // `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
 // the work is on the queue, as `emberwave_decoder_submit_texture` does: only
 // for a decoder whose context was made by `emberwave_context_create_metal`,
-// and textures whose hazards Metal tracks.
+// and textures whose hazards Metal tracks. Vulkan and Direct3D contexts have
+// `emberwave_decoder_submit_plane_textures_vulkan` and
+// `emberwave_decoder_submit_plane_textures_d3d12`.
 //
 // # Safety
 //
@@ -1496,11 +1533,14 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures(struct EmberwaveDec
 // them in otherwise (decision D52). Blocks that did not arrive decode as
 // zeros, or are concealed (`emberwave_decoder_set_concealment`).
 //
-// Each texture is one for that plane, from `emberwave_texture_create_plane`
-// or `emberwave_texture_from_metal_plane`, on a decoder of the same context,
+// Each texture is one for that plane, from `emberwave_texture_create_plane`,
+// `emberwave_texture_from_metal_plane` or
+// `emberwave_texture_from_vulkan_plane`, on a decoder of the same context,
 // picture size and chroma format, and no Metal texture serves two planes.
 // Another, a texture of the RGB picture included, gives
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode. As
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode, as
+// does a texture shared from Direct3D, which takes
+// `emberwave_decoder_submit_plane_textures_d3d12`. As
 // with `emberwave_decoder_decode_texture`, the call does not wait for the
 // caller's GPU work that still reads the textures, and how many sets of
 // three to keep in turn depends on the context and the textures: see
@@ -1662,7 +1702,8 @@ enum EmberwaveStatus emberwave_encoder_encode_rgb(struct EmberwaveEncoder *encod
 // the caller's, from `emberwave_texture_from_metal_source` or
 // `emberwave_texture_from_vulkan_source`, or textures that decodes put
 // planes or pictures into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT`
-// before any work on the GPU. A budget too small gives it too, as for
+// before any work on the GPU, textures shared from Direct3D included, which
+// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives it too, as for
 // `emberwave_encoder_encode`, once the GPU has encoded the picture: no
 // frame then, and the sequence number does not move.
 //

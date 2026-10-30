@@ -183,8 +183,11 @@ enum Output {
 
 /// Decodes PyroWave frames of one size and chroma format on the GPU.
 ///
-/// All GPU memory is allocated up front and reused for every frame, apart from
-/// the payload buffer which grows when a frame needs more room.
+/// The memory every decode uses is allocated up front and reused for every
+/// frame, and the payload buffer grows when a frame needs more room. What
+/// only some decodes need, such as the read-back buffer, the RGB picture or
+/// what concealment keeps, is made by the first decode that needs it and then
+/// reused.
 pub struct Decoder {
     device: wgpu::Device,
     queue: wgpu::Queue,
