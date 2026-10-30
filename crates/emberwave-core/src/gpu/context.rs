@@ -592,7 +592,11 @@ pub(crate) fn take_turn<'a>(
 }
 
 /// Submits `buffers` to `queue`, under the caller's lock of the queue if
-/// `turns` has one (decision D61). Called during a turn.
+/// `turns` has one (decision D61). Called during a turn. wgpu-core submits
+/// on its own in two places, outside this: `Queue::on_submitted_work_done`,
+/// and `Buffer::map_async` of a buffer that a write through the queue is
+/// pending for. emberwave reaches neither; a change that does needs the
+/// caller's lock there too.
 pub(crate) fn submit(
     queue: &wgpu::Queue,
     turns: Option<&QueueTurns>,

@@ -218,14 +218,16 @@ typedef struct EmberwaveContextOptions {
 // the 64-bit systems emberwave runs on.
 typedef void (*(*EmberwaveVkGetInstanceProcAddr)(void *instance, const char *name))(void);
 
-// A Vulkan instance of the caller's (decision D61).
+// A Vulkan instance of the caller's (decision D61), made with the
+// extensions of `emberwave_vulkan_instance_extensions` among its own.
 typedef struct EmberwaveVulkanInstance {
   // `vkGetInstanceProcAddr` of the loader the instance was made with.
   EmberwaveVkGetInstanceProcAddr get_instance_proc_addr;
   // The `VkInstance`.
   void *instance;
   // The `apiVersion` the instance was made with, such as
-  // `VK_API_VERSION_1_3`.
+  // `VK_API_VERSION_1_3`: at least the physical device's, up to 1.3,
+  // which wgpu uses.
   uint32_t api_version;
   // The instance extensions it was made with: `extension_count` names, or
   // `NULL` for none.
@@ -250,7 +252,8 @@ typedef struct EmberwaveVulkanDevice {
   const char *const *extensions;
   // How many names `extensions` holds.
   uint32_t extension_count;
-  // The family of the queue emberwave submits to.
+  // The family of the queue emberwave submits to, one with graphics and
+  // compute, which wgpu records work for.
   uint32_t queue_family_index;
   // Which queue of that family, as for `vkGetDeviceQueue`.
   uint32_t queue_index;
@@ -259,7 +262,9 @@ typedef struct EmberwaveVulkanDevice {
   // emberwave calls it with `user` around each submission, and while it
   // lets go of the queue, never twice without `unlock_queue` between,
   // from any thread. `NULL`, with `unlock_queue` `NULL` too, if nothing
-  // else uses the queue during emberwave's calls.
+  // else uses the queue during emberwave's calls. Every context on one
+  // queue takes the same `lock_queue`, `unlock_queue` and `user`, which
+  // stay valid until everything made on those contexts is destroyed.
   void (*lock_queue)(void *user);
   // Frees the caller's lock of the queue that `lock_queue` took.
   void (*unlock_queue)(void *user);
@@ -474,6 +479,27 @@ enum EmberwaveStatus emberwave_context_create_metal(void *device,
                                                     void *queue,
                                                     struct EmberwaveContext **context);
 
+// The instance extensions that wgpu uses, of those the loader of
+// `get_instance_proc_addr` offers: make the instance with them among its
+// own (decision D61). wgpu uses only those enabled, and without
+// `VK_KHR_get_physical_device_properties2` it learns less of a device and
+// uses fewer of its features. `VK_KHR_surface` goes with the
+// `VK_KHR_swapchain` that `emberwave_vulkan_requirements_create` lists on
+// devices that have it. With `names` `NULL`, stores their number in
+// `*count`; otherwise writes them to `names`, which has room for `*count`,
+// or gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the number needed in
+// `*count` if that is too few. The names stay valid as long as the process.
+// Only where wgpu runs on Vulkan; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+//
+// # Safety
+//
+// `get_instance_proc_addr` is `NULL` or a loader's `vkGetInstanceProcAddr`,
+// `count` points to a `uint32_t`, and `names` is `NULL` or points to
+// `*count` pointers that may be written.
+enum EmberwaveStatus emberwave_vulkan_instance_extensions(EmberwaveVkGetInstanceProcAddr get_instance_proc_addr,
+                                                          const char **names,
+                                                          uint32_t *count);
+
 // Lists what a Vulkan device of the caller's must have enabled for
 // `emberwave_context_create_vulkan`, on the physical device
 // `physical_device` of `instance` (decision D61): the extensions, which
@@ -493,9 +519,9 @@ enum EmberwaveStatus emberwave_vulkan_requirements_create(const struct Emberwave
                                                           void *physical_device,
                                                           struct EmberwaveVulkanRequirements **requirements);
 
-// The names of the device extensions in `requirements`, which stay valid as
-// long as the process: `*count` of them. `NULL`, and a count of 0, for
-// `NULL`.
+// The names of the device extensions in `requirements`: `*count` of them,
+// in an array that lives as long as `requirements`, of names that live as
+// long as the process. `NULL`, and a count of 0, for `NULL`.
 //
 // # Safety
 //
@@ -506,7 +532,10 @@ const char *const *emberwave_vulkan_requirements_extensions(const struct Emberwa
 
 // The features in `requirements`: a `VkPhysicalDeviceFeatures2` whose
 // `features`, and the structures of its `pNext` chain, have `VK_TRUE` for
-// each feature emberwave needs. Set the same members to `VK_TRUE` in the
+// each feature emberwave needs. They are what wgpu enables on a device of
+// its own on that physical device, and then counts on: some, such as
+// `robustBufferAccess`, for its own sake, others, such as the robustness of
+// images, for the bounds checks of the shaders it compiles. Set the same members to `VK_TRUE` in the
 // structures that make the device, or chain copies of the structures the
 // caller's chain lacks; where the caller's chain has
 // `VkPhysicalDeviceVulkan11Features`, `VkPhysicalDeviceVulkan12Features` or
@@ -536,16 +565,21 @@ void emberwave_vulkan_requirements_destroy(struct EmberwaveVulkanRequirements *r
 // The device must have been made with the extensions and the features of
 // `emberwave_vulkan_requirements_create`: a lacking extension is
 // `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and a lacking feature undefined
-// behaviour, as Vulkan cannot tell which were enabled.
+// behaviour, as Vulkan cannot tell which were enabled. So is a queue family
+// without graphics and compute, a queue it does not have, and an instance
+// whose `apiVersion` is below the physical device's, up to 1.3.
 //
 // The queue is shared:
 // - emberwave submits to it during its calls. Either nothing else uses the
 //   queue during those, or the caller gives `lock_queue` and
 //   `unlock_queue`, which emberwave holds around each submission, and
-//   while it lets go of the queue in a destroy. Do not call emberwave while
-//   holding that lock, and give every context made on one queue the same
-//   callbacks. A second queue of the family, where the device has one,
-//   needs neither.
+//   around each destroy of a context, decoder or encoder. The destroy that
+//   lets go of the last hold on the queue waits for the queue to be idle
+//   meanwhile, which holds up the caller's own submissions until it is. Do
+//   not call emberwave while holding that lock; a context on a queue that
+//   has contexts with other callbacks is
+//   `EMBERWAVE_STATUS_INVALID_ARGUMENT`. A second queue of the family,
+//   where the device has one, needs neither.
 // - The decoders and encoders of every context made on the queue take
 //   turns at it, as on Metal (decision D60).
 // - The decodes that wait return once the GPU is done. The decodes that do
@@ -678,9 +712,9 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures_vulkan(struct Ember
 //
 // # Safety
 //
-// `context` is `NULL`, or a context from `emberwave_context_create` or
-// `emberwave_context_create_metal` that has not been destroyed and that no
-// other thread is using.
+// `context` is `NULL`, or a context from `emberwave_context_create`,
+// `emberwave_context_create_metal` or `emberwave_context_create_vulkan`
+// that has not been destroyed and that no other thread is using.
 void emberwave_context_destroy(struct EmberwaveContext *context);
 
 // The name and backend of the context's GPU, such as

@@ -937,6 +937,86 @@ fn a_metal_context_needs_a_device_and_a_queue() {
 }
 
 #[test]
+fn vulkan_contexts_need_their_handles_and_vulkan() {
+    let mut context = ptr::null_mut();
+    let mut requirements = ptr::null_mut();
+    let mut count = 7;
+    // SAFETY: NULL where the test means it, and pointers to store results in.
+    unsafe {
+        assert_eq!(
+            emberwave_context_create_vulkan(ptr::null(), &mut context),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(context.is_null());
+        assert_eq!(
+            emberwave_vulkan_requirements_create(ptr::null(), ptr::null_mut(), &mut requirements),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(requirements.is_null());
+        assert_eq!(
+            emberwave_vulkan_instance_extensions(None, ptr::null_mut(), ptr::null_mut()),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(emberwave_vulkan_requirements_extensions(ptr::null(), &mut count).is_null());
+        assert_eq!(count, 0);
+        assert!(emberwave_vulkan_requirements_features(ptr::null()).is_null());
+        emberwave_vulkan_requirements_destroy(ptr::null_mut());
+    }
+    // Where wgpu does not run on Vulkan, the handles are not even looked at.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        all(windows, target_pointer_width = "64")
+    )))]
+    {
+        unsafe extern "C" fn nothing(
+            _instance: *mut std::ffi::c_void,
+            _name: *const std::ffi::c_char,
+        ) -> Option<unsafe extern "C" fn()> {
+            None
+        }
+        let mut marker = 0u8;
+        let anything = std::ptr::from_mut(&mut marker).cast::<std::ffi::c_void>();
+        let instance = EmberwaveVulkanInstance {
+            get_instance_proc_addr: Some(nothing),
+            instance: anything,
+            api_version: 0,
+            extensions: ptr::null(),
+            extension_count: 0,
+        };
+        let device = EmberwaveVulkanDevice {
+            instance,
+            physical_device: anything,
+            device: anything,
+            extensions: ptr::null(),
+            extension_count: 0,
+            queue_family_index: 0,
+            queue_index: 0,
+            lock_queue: None,
+            unlock_queue: None,
+            user: ptr::null_mut(),
+        };
+        // SAFETY: never dereferenced where there is no Vulkan.
+        unsafe {
+            assert_eq!(
+                emberwave_vulkan_requirements_create(&instance, anything, &mut requirements),
+                EmberwaveStatus::NoGpu
+            );
+            assert!(requirements.is_null());
+            assert_eq!(
+                emberwave_context_create_vulkan(&device, &mut context),
+                EmberwaveStatus::NoGpu
+            );
+            assert!(context.is_null());
+            assert_eq!(
+                emberwave_vulkan_instance_extensions(Some(nothing), ptr::null_mut(), &mut count),
+                EmberwaveStatus::NoGpu
+            );
+        }
+    }
+}
+
+#[test]
 fn metal_textures_of_the_callers_own_need_metal() {
     let Some(context) = context() else {
         return;

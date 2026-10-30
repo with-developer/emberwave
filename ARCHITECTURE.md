@@ -1493,10 +1493,13 @@ The queues wgpu makes itself have room for 4096 command buffers.
 6. **The portability rule.** These are optional entry points beside the portable API, each behind its platform's `cfg`.
 
 This first step is the context:
-- **What to enable.** `emberwave_vulkan_requirements_create` lists the device extensions and features that wgpu needs for emberwave's device descriptor on the caller's instance and physical device (`required_device_extensions`, `physical_device_features`). The features come as a `VkPhysicalDeviceFeatures2` chain of wgpu's own structures, for the caller to merge into its own.
+- **What to enable.**
+  - `emberwave_vulkan_instance_extensions` lists the instance extensions wgpu uses (`desired_extensions`). Without `VK_KHR_get_physical_device_properties2` wgpu learns less of a device and uses fewer features. `VK_KHR_surface` goes with the `VK_KHR_swapchain` that wgpu asks of devices that have it.
+  - `emberwave_vulkan_requirements_create` lists the device extensions and features that wgpu needs for emberwave's device descriptor on the caller's instance and physical device (`required_device_extensions`, `physical_device_features`). The features come as a `VkPhysicalDeviceFeatures2` chain of wgpu's own structures, which it enables on its own devices and counts on, for the caller to merge into its own.
+  - An instance whose `apiVersion` is below the physical device's, up to 1.3, which wgpu uses, is refused. So is a queue family without graphics and compute, which wgpu records work for, and a queue index past the family's count.
 - **The context.** `emberwave_context_create_vulkan` makes wgpu's instance, adapter and device from the caller's handles. Given drop callbacks, wgpu leaves the instance and the device to the caller. A device that lacks a listed extension is refused; features cannot be checked.
-- **The queue lock.** The caller's callbacks become a `CallerQueueLock` of the turns of D60 (`QueueTurns::with_caller_lock`). emberwave holds it around each of its submissions, and while it lets go of a context, decoder or encoder, since wgpu-core's `Queue::drop` waits for the queue to be idle. Contexts made on one `VkQueue` share their turns.
-- **Where.** Only where wgpu runs on Vulkan: Linux, Android and Windows. Elsewhere the calls give `EMBERWAVE_STATUS_NO_GPU`, as the Metal ones do off Apple's systems.
+- **The queue lock.** The caller's callbacks become a `CallerQueueLock` of the turns of D60 (`QueueTurns::with_caller_lock`). emberwave holds it around each of its submissions, and around each destroy of a context, decoder or encoder, since wgpu-core's `Queue::drop` waits for the queue to be idle. Contexts made on one `VkQueue` share their turns, and with them the first context's callbacks. A context on that queue with other callbacks, or none, is refused before wgpu makes anything on the queue: the watched test caught a refusal that came after, whose wgpu queue waited for the queue to be idle without the lock as it went.
+- **Where.** Only where wgpu runs on Vulkan: Linux, Android and 64-bit Windows. 32-bit Windows is left out, as Vulkan's calling convention there is not C's. Elsewhere the calls give `EMBERWAVE_STATUS_NO_GPU`, as the Metal ones do off Apple's systems.
 
 The second step is the images:
 - **emberwave's textures.** `emberwave_texture_vulkan` gives the `VkImage` of a texture on such a context, and only there: the image of a context of emberwave's own is on another device.
@@ -1507,10 +1510,11 @@ The second step is the images:
 Direct3D 12 through shared handles follows, and the encoder's input from the caller's images.
 
 **Consequence.**
-- **Tests.** `tests/vulkan.rs` makes an instance and a device as a client would, with exactly what emberwave lists, on Linux CI's lavapipe.
-  - A context on that device decodes and encodes byte for byte as one of emberwave's own.
-  - Two contexts on one queue, each used from a thread, hold the client's lock around every submission and free it every time.
+- **Tests.** `tests/vulkan.rs` makes an instance and a device as a client would, with exactly what emberwave lists, on Linux CI's lavapipe. The validation layer, which CI installs, checks every use of the device, and any error it reports fails the test. One is left out, as it is wgpu's: naga 30 decorates arrays in workgroup memory with `ArrayStride`, which the layer's SPIR-V validator of 2025 rejects (VUID-StandaloneSpirv-None-10684) and drivers ignore.
+  - A context on that device decodes and encodes byte for byte as one of emberwave's own on Vulkan.
+  - Two contexts on one queue, each used from a thread: every `vkQueueSubmit` and `vkQueueWaitIdle` of emberwave's, which the test watches through the `vkGetInstanceProcAddr` it hands emberwave, ran with the client's lock held on the calling thread. A third context with another lock, or none, is refused.
   - A device without the listed extensions is refused.
+  - The tests run one at a time, against the loaders of D31.
   - A real driver's behaviour and a second process are not tested.
 - **The type check.** On macOS the Vulkan code type-checks only with wgpu's `vulkan-portability`, which the workspace does not enable: CI's Linux and Windows jobs compile it.
 - **The second step's tests.** On lavapipe the test decodes every frame of a test vector into images of its own without waiting, and checks the bytes against the decodes that wait. For the picture it signals a timeline semaphore; the planes are read back on the GPU after a wait for it. An emberwave texture's image is read after a decode that waits, and images that a decode cannot fill or leave readable are refused.
