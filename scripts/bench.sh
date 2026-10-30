@@ -95,6 +95,14 @@ for entry in $ENCODE; do
     measure "$OUT/$source.encode-gpu-textures.json" \
         "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --gpu --textures \
         --frames "$FRAMES" --json
+    # The same pictures in BGRA, as captures hold them, in CPU memory and in
+    # textures (decision D65).
+    measure "$OUT/$source.encode-gpu-bgra.json" \
+        "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --gpu --rgb \
+        --frames "$FRAMES" --json
+    measure "$OUT/$source.encode-gpu-bgra-textures.json" \
+        "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --gpu --rgb --textures \
+        --frames "$FRAMES" --json
     measure "$OUT/$source.encode-cpu.json" \
         "$CLI" bench-encode "$input" --bytes-per-frame "$budget" --frames "$CPU_FRAMES" --json
     if [ "$UPSTREAM" = 1 ]; then
