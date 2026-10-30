@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.14.0] - 2026-10-31
+
+The GPU shared with clients and hosts on every platform. A context runs on the caller's own Vulkan device and decodes into its images with semaphores; on Windows, textures and fences of Direct3D 12 and Direct3D 11 devices come through shared NT handles. Hosts encode pictures that are in their own textures, Metal's, Vulkan's or Direct3D's, as a screen capture holds them, NV12's layout included. Each release also has the XCFramework in the archive a Swift package takes.
 
 ### Added
 

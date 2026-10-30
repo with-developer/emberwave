@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/with-developer/emberwave"
@@ -17,7 +17,7 @@ rust-version = "1.87"
 publish = false
 
 [workspace.dependencies]
-emberwave-core = { path = "crates/emberwave-core", version = "0.13.0" }
+emberwave-core = { path = "crates/emberwave-core", version = "0.14.0" }
 thiserror = "2"
 proptest = "1"
 # Native backends only: GLES would need EGL and the browser backend is for the
