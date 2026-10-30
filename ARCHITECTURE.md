@@ -1562,7 +1562,7 @@ Direct3D 12 through shared handles follows, and the encoder's input from the cal
 - **Every system CI runs.** Planes that a decode left in textures encode into the bytes of the same planes encoded from CPU memory, in 4:2:0 and 4:4:4.
 - **Metal.**
   - The app's R8 and RG8 textures, wrapped once and filled with picture after picture, encode into the bytes of the same pictures in CPU memory. That holds as three planes and as NV12's layout, on emberwave's queue and on the app's.
-  - On the app's queue, an encode reads what a blit committed before the call wrote, though an event held the blit back until the call had begun. With the context on emberwave's own queue the same test fails, as nothing orders the two.
+  - On the app's queue, an encode reads what a blit committed before the call wrote, though an event held the blit back until the call had begun. With the context on emberwave's own queue the same test fails, as nothing orders the two. In a probe of the review, untracked textures were ordered the same way on the app's queue, by the queue's wait for the event; the docs keep to tracked textures, which Metal promises to order.
 - **lavapipe, under the validation layer.**
   - Images the client copied into are encoded without semaphores: after a copy that completed, and after one submitted before the call with its barrier.
   - A timeline wait signalled from another thread during the call holds the encode back.

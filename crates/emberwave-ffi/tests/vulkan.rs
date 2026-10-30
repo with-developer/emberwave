@@ -2281,11 +2281,16 @@ fn semaphores_hold_the_encode_back_until_the_picture_is_written() {
             None,
         )
         .finish(&device);
+    // First, so that the signal below does not come while the pipelines
+    // are still being made.
+    let expected = encoded_from_memory(memory, &first, widths);
     let gate = client.timeline(&device);
     let read = client.timeline(&device);
+    let (go, call_begins) = std::sync::mpsc::channel::<()>();
     let signaller = {
         let device = device.clone();
         std::thread::spawn(move || {
+            call_begins.recv().expect("the call begins");
             std::thread::sleep(std::time::Duration::from_millis(300));
             // SAFETY: a timeline semaphore of the device, which the test
             // keeps until this thread ends.
@@ -2303,7 +2308,7 @@ fn semaphores_hold_the_encode_back_until_the_picture_is_written() {
         signal_value: 1,
         flags: EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE,
     };
-    let expected = encoded_from_memory(memory, &first, widths);
+    go.send(()).expect("the signaller waits");
     let frame = encoded_from_images(encoder, [y, cb, cr], Some(&sync));
     // SAFETY: timeline semaphores of the device.
     let (gate_value, read_value) = unsafe {
