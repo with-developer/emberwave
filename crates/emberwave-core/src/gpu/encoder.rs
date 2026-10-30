@@ -26,7 +26,9 @@ use crate::encode::{
     stream_header,
 };
 
-use super::context::{GpuContext, QueueTurns, notice_loss, submit, take_turn};
+use super::context::{
+    AfterSubmit, GpuContext, QueueTurns, SubmissionHooks, notice_loss, submit, take_turn,
+};
 use super::error::GpuError;
 use super::layout::{
     BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
@@ -138,6 +140,8 @@ const SUMMARY_BYTES: u64 = std::mem::size_of::<RateSummary>() as u64 + 8;
 pub struct Encoder {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// [`GpuContext::id`] of the context the encoder was made on.
+    context_id: u64,
     layout: FrameLayout,
     buffers: BufferLayout,
     signalling: Signalling,
@@ -417,6 +421,7 @@ impl Encoder {
                     .then(|| StageQueries::new(&device, &queue, TIMED_STAGES)),
                 lost: context.lost_record(),
                 turns: context.turns.clone(),
+                context_id: context.id(),
             }
         })
         .map_err(|error| context.explain(error));
@@ -442,6 +447,20 @@ impl Encoder {
         self.lost.lock().ok().and_then(|lost| lost.clone())
     }
 
+    /// The GPU device the encoder runs on.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// [`GpuContext::id`] of the context the encoder was made on: an object
+    /// made on a context of another id is on another device, whatever
+    /// comparing devices says. [`encode_textures`](Self::encode_textures)
+    /// cannot tell from a texture view which device it is on, as
+    /// [`TexturePicture`] says: the caller keeps track.
+    pub fn context_id(&self) -> u64 {
+        self.context_id
+    }
+
     /// Encodes one picture into a frame of at most `budget` bytes: a start of
     /// frame header and the coded blocks in block index order, as a PWV1 file
     /// stores a frame and as [`crate::encode::Encoder::encode`] makes it.
@@ -451,7 +470,7 @@ impl Encoder {
     /// the budget is [`GpuError::Encode`]. It waits for the GPU, so it cannot
     /// run in a browser, where nothing may block.
     pub fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, GpuError> {
-        self.run_encode(Input::Planes(planes, None), budget, false)
+        self.run_encode(Input::Planes(planes, None), budget, false, None)
             .map(|(frame, _)| frame)
     }
 
@@ -467,7 +486,7 @@ impl Encoder {
         strides: [usize; 3],
         budget: usize,
     ) -> Result<Vec<u8>, GpuError> {
-        self.run_encode(Input::Planes(planes, Some(strides)), budget, false)
+        self.run_encode(Input::Planes(planes, Some(strides)), budget, false, None)
             .map(|(frame, _)| frame)
     }
 
@@ -480,7 +499,7 @@ impl Encoder {
         planes: [&[u8]; 3],
         budget: usize,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
-        self.run_encode(Input::Planes(planes, None), budget, true)
+        self.run_encode(Input::Planes(planes, None), budget, true, None)
     }
 
     /// Encodes a picture that is in GPU memory already, as textures on the
@@ -495,7 +514,21 @@ impl Encoder {
         picture: TexturePicture<'_>,
         budget: usize,
     ) -> Result<Vec<u8>, GpuError> {
-        self.run_encode(Input::Textures(picture), budget, false)
+        self.run_encode(Input::Textures(picture), budget, false, None)
+            .map(|(frame, _)| frame)
+    }
+
+    /// As [`encode_textures`](Self::encode_textures), with `hooks` around
+    /// the submission: for what the submission must carry for the caller's
+    /// graphics API, such as a Vulkan semaphore to wait on before the
+    /// textures are read (decision D62).
+    pub fn encode_textures_with(
+        &mut self,
+        picture: TexturePicture<'_>,
+        budget: usize,
+        hooks: &mut dyn SubmissionHooks,
+    ) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(Input::Textures(picture), budget, false, Some(hooks))
             .map(|(frame, _)| frame)
     }
 
@@ -506,7 +539,7 @@ impl Encoder {
         picture: TexturePicture<'_>,
         budget: usize,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
-        self.run_encode(Input::Textures(picture), budget, true)
+        self.run_encode(Input::Textures(picture), budget, true, None)
     }
 
     fn run_encode(
@@ -514,9 +547,10 @@ impl Encoder {
         input: Input<'_>,
         budget: usize,
         timed: bool,
+        hooks: Option<&mut dyn SubmissionHooks>,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
         self.check_device()?;
-        let outcome = self.encode_on_device(input, budget, timed);
+        let outcome = self.encode_on_device(input, budget, timed, hooks);
         // As in the decoder: a failure on a device that was lost meanwhile
         // is the loss, and whatever came back is not to be trusted.
         if outcome.is_err() {
@@ -533,6 +567,7 @@ impl Encoder {
         input: Input<'_>,
         budget: usize,
         timed: bool,
+        hooks: Option<&mut dyn SubmissionHooks>,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
         let prepare_start = Instant::now();
         // The planes in the upload buffer, or a pass that gathers them from
@@ -565,6 +600,12 @@ impl Encoder {
         // the GPU to map its buffer, so it comes first.
         let turns = self.turns.clone();
         let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
+        // After the turn, so that it ends first (see AfterSubmit).
+        let mut after = AfterSubmit {
+            hooks,
+            queue: self.queue.clone(),
+            submitted: false,
+        };
         with_error_scope(&self.device, || {
             self.queue
                 .write_buffer(&self.frame_params, 0, bytemuck::bytes_of(&params));
@@ -573,7 +614,7 @@ impl Encoder {
 
         let queries = self.timestamps.as_ref().filter(|_| timed);
         let gpu_start = Instant::now();
-        with_error_scope(&self.device, || {
+        let submitted = with_error_scope(&self.device, || {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -588,8 +629,14 @@ impl Encoder {
             self.encode_rate_control(&mut encoder, queries);
             self.encode_packing(&mut encoder, queries);
             self.encode_read_back(&mut encoder, capacity_words);
+            if let Some(hooks) = after.hooks.as_deref_mut() {
+                hooks.before_submit(&self.queue);
+            }
             submit(&self.queue, turns.as_deref(), [encoder.finish()]);
-        })?;
+        });
+        after.submitted = submitted.is_ok();
+        drop(after);
+        submitted?;
         recording.submitted();
         drop(recording);
         let data = read_back(

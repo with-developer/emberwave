@@ -17,11 +17,12 @@ mod pipelines;
 mod resources;
 
 pub use context::{
-    BACKEND_ENV, CallerQueueLock, GpuContext, GpuOptions, QueueTurn, QueueTurns, parse_backends,
+    BACKEND_ENV, CallerQueueLock, GpuContext, GpuOptions, QueueTurn, QueueTurns, SubmissionHooks,
+    parse_backends,
 };
 pub use decoder::{
-    Decoder, Frame, FramePlane, PLANE_FORMAT, RgbFrame, StageTimings, SubmissionHooks,
-    TEXTURE_FORMATS, TimedOutput, Timings,
+    Decoder, Frame, FramePlane, PLANE_FORMAT, RgbFrame, StageTimings, TEXTURE_FORMATS, TimedOutput,
+    Timings,
 };
 pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
 pub use error::GpuError;

@@ -11,13 +11,14 @@ use std::ptr;
 
 use emberwave_core::bitstream::Pwv1File;
 use emberwave_ffi::*;
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLHazardTrackingMode, MTLOrigin, MTLPixelFormat,
-    MTLResource, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
-    MTLTextureUsage,
+    MTLRegion, MTLResource, MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -1238,5 +1239,418 @@ fn into_app_textures(
             emberwave_texture_destroy(texture);
         }
         emberwave_decoder_destroy(decoder);
+    }
+}
+
+/// A picture of `width` x `height` with chroma planes of `chroma` (width
+/// and height), gradients and noise, different for each `seed`: Y, Cb and
+/// Cr.
+fn source_picture(
+    (width, height): (usize, usize),
+    chroma: (usize, usize),
+    seed: u32,
+) -> [Vec<u8>; 3] {
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    std::array::from_fn(|plane| {
+        let (w, h) = if plane == 0 { (width, height) } else { chroma };
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let value = 30 + x * 140 / w + y * 50 / h + (state >> 28) as usize;
+                (value + 25 * plane).min(255) as u8
+            })
+            .collect()
+    })
+}
+
+/// Cb and Cr interleaved, as NV12's second plane holds them.
+fn interleaved(cb: &[u8], cr: &[u8]) -> Vec<u8> {
+    cb.iter().zip(cr).flat_map(|(&b, &r)| [b, r]).collect()
+}
+
+/// Writes `bytes`, rows of `row` bytes, into the shared texture `texture`
+/// from the CPU.
+fn fill(texture: &ProtocolObject<dyn MTLTexture>, bytes: &[u8], row: usize) {
+    let region = MTLRegion {
+        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+        size: MTLSize {
+            width: texture.width(),
+            height: texture.height(),
+            depth: 1,
+        },
+    };
+    assert_eq!(bytes.len(), row * texture.height());
+    // SAFETY: a texture of shared storage that no GPU work uses now, and
+    // `bytes` holds all its rows.
+    unsafe {
+        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+            region,
+            0,
+            std::ptr::NonNull::new(bytes.as_ptr().cast_mut().cast()).unwrap(),
+            row,
+        );
+    }
+}
+
+/// An encoder of `context` for pictures of `size` in `chroma`.
+fn encoder_of(
+    context: *mut EmberwaveContext,
+    (width, height): (usize, usize),
+    chroma: u32,
+) -> *mut EmberwaveEncoder {
+    let mut encoder = ptr::null_mut();
+    // SAFETY: a live context, and a pointer to store the encoder in.
+    let status = unsafe {
+        emberwave_encoder_create(
+            context,
+            width as u32,
+            height as u32,
+            chroma,
+            ptr::null(),
+            &mut encoder,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    encoder
+}
+
+/// The frame of `planes` encoded from CPU memory by `encoder`.
+fn encoded_from_memory(
+    encoder: *mut EmberwaveEncoder,
+    planes: &[Vec<u8>; 3],
+    widths: [usize; 3],
+) -> Vec<u8> {
+    let mut frame = vec![0u8; 9_000];
+    let mut size = 0;
+    let [y, cb, cr] = [0, 1, 2].map(|plane| EmberwaveSourcePlane {
+        data: planes[plane].as_ptr(),
+        stride: widths[plane],
+    });
+    // SAFETY: a live encoder, planes of its sizes, and a frame of the length
+    // passed.
+    let status = unsafe {
+        emberwave_encoder_encode(
+            encoder,
+            y,
+            cb,
+            cr,
+            frame.as_mut_ptr(),
+            frame.len(),
+            &mut size,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    frame.truncate(size);
+    frame
+}
+
+/// Encodes from `textures` with `encoder`: the frame, or the status and the
+/// error.
+fn encoded_from_textures(
+    encoder: *mut EmberwaveEncoder,
+    [y, cb, cr]: [*mut EmberwaveTexture; 3],
+) -> Result<Vec<u8>, (EmberwaveStatus, String)> {
+    let mut frame = vec![0u8; 9_000];
+    let mut size = 0;
+    // SAFETY: a live encoder, textures that are NULL or live, and a frame of
+    // the length passed.
+    let status = unsafe {
+        emberwave_encoder_encode_textures(
+            encoder,
+            y,
+            cb,
+            cr,
+            frame.as_mut_ptr(),
+            frame.len(),
+            &mut size,
+        )
+    };
+    if status != EmberwaveStatus::Ok {
+        return Err((status, last_error()));
+    }
+    frame.truncate(size);
+    Ok(frame)
+}
+
+/// Wraps the app's texture `metal` for `plane` of the pictures of
+/// `encoder`.
+fn source(
+    encoder: *mut EmberwaveEncoder,
+    plane: u32,
+    metal: &Retained<ProtocolObject<dyn MTLTexture>>,
+) -> Result<*mut EmberwaveTexture, (EmberwaveStatus, String)> {
+    let mut texture = ptr::null_mut();
+    // SAFETY: a live encoder, an id<MTLTexture>, and a pointer to store the
+    // texture in.
+    let status =
+        unsafe { emberwave_texture_from_metal_source(encoder, plane, raw(metal), &mut texture) };
+    if status == EmberwaveStatus::Ok {
+        Ok(texture)
+    } else {
+        assert!(texture.is_null());
+        Err((status, last_error()))
+    }
+}
+
+/// The app's textures of a picture: Y, Cb and Cr in `MTLPixelFormatR8Unorm`,
+/// and Cb and Cr interleaved in `MTLPixelFormatRG8Unorm`, as the planes of
+/// an NV12 pixel buffer from a `CVMetalTextureCache` are.
+struct AppPicture {
+    planes: [Retained<ProtocolObject<dyn MTLTexture>>; 3],
+    chroma: Retained<ProtocolObject<dyn MTLTexture>>,
+}
+
+impl AppPicture {
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        size: (usize, usize),
+        chroma: (usize, usize),
+    ) -> Self {
+        let usage = MTLTextureUsage::ShaderRead;
+        let r8 = |size| app_texture(device, MTLPixelFormat::R8Unorm, size, usage, false);
+        Self {
+            planes: [r8(size), r8(chroma), r8(chroma)],
+            chroma: app_texture(device, MTLPixelFormat::RG8Unorm, chroma, usage, false),
+        }
+    }
+
+    /// Writes `picture` into the textures from the CPU.
+    fn fill(&self, picture: &[Vec<u8>; 3]) {
+        for (texture, samples) in self.planes.iter().zip(picture) {
+            fill(texture, samples, texture.width());
+        }
+        fill(
+            &self.chroma,
+            &interleaved(&picture[1], &picture[2]),
+            self.chroma.width() * 2,
+        );
+    }
+
+    /// The textures wrapped for `encoder`: Y, Cb, Cr and Cb and Cr
+    /// interleaved.
+    fn wrapped(&self, encoder: *mut EmberwaveEncoder) -> [*mut EmberwaveTexture; 4] {
+        let planes = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR];
+        let [y, cb, cr] = [0, 1, 2].map(|i| source(encoder, planes[i], &self.planes[i]).unwrap());
+        let cbcr = source(encoder, EMBERWAVE_PLANE_CBCR, &self.chroma).unwrap();
+        [y, cb, cr, cbcr]
+    }
+}
+
+#[test]
+fn the_apps_own_textures_are_encoded_as_planes_and_as_nv12() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no Metal device"
+        );
+        return;
+    };
+    let queue = device.newCommandQueue().expect("a command queue");
+    let mut own = ptr::null_mut();
+    // SAFETY: NULL options and a pointer to store the context in.
+    let status = unsafe { emberwave_context_create(ptr::null(), &mut own) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    // SAFETY: a live context.
+    let own_device = unsafe { emberwave_context_metal_device(own) };
+    // On emberwave's own queue, where the app's writes have completed, and
+    // on the app's.
+    let mut contexts = vec![(metal_context(&device, &queue).0, device.clone())];
+    if !own_device.is_null() {
+        // SAFETY: an id<MTLDevice>, which the context keeps.
+        let own_device: &ProtocolObject<dyn MTLDevice> = unsafe { &*own_device.cast() };
+        contexts.push((own, own_device.retain()));
+    }
+    for (context, device) in &contexts {
+        for (size, chroma, code) in [
+            ((192, 136), (96, 68), EMBERWAVE_CHROMA_420),
+            ((131, 67), (131, 67), EMBERWAVE_CHROMA_444),
+        ] {
+            let widths = [size.0, chroma.0, chroma.0];
+            let app = AppPicture::new(device, size, chroma);
+            let memory = encoder_of(*context, size, code);
+            let as_planes = encoder_of(*context, size, code);
+            let as_nv12 = encoder_of(*context, size, code);
+            let [y, cb, cr, cbcr] = app.wrapped(as_planes);
+            // Wrapped once, the textures take picture after picture.
+            for seed in 0..2 {
+                let picture = source_picture(size, chroma, seed);
+                app.fill(&picture);
+                let expected = encoded_from_memory(memory, &picture, widths);
+                let frame = encoded_from_textures(as_planes, [y, cb, cr]).unwrap();
+                assert!(frame == expected, "{size:?} planes, picture {seed}");
+                let frame = encoded_from_textures(as_nv12, [y, cbcr, ptr::null_mut()]).unwrap();
+                assert!(frame == expected, "{size:?} NV12, picture {seed}");
+            }
+            // SAFETY: live objects, destroyed once each.
+            unsafe {
+                for texture in [y, cb, cr, cbcr] {
+                    emberwave_texture_destroy(texture);
+                }
+                for encoder in [memory, as_planes, as_nv12] {
+                    emberwave_encoder_destroy(encoder);
+                }
+            }
+        }
+    }
+
+    // What an encode cannot read is refused when it is wrapped, or when it
+    // is encoded.
+    let (context, device) = &contexts[0];
+    let size = (192, 136);
+    let encoder = encoder_of(*context, size, EMBERWAVE_CHROMA_420);
+    let app = AppPicture::new(device, size, (96, 68));
+    let refused = |plane, metal: &Retained<_>, says: &str| {
+        let (status, error) = source(encoder, plane, metal).unwrap_err();
+        assert_eq!(status, EmberwaveStatus::InvalidArgument, "{error}");
+        assert!(error.contains(says), "{says}: {error}");
+    };
+    refused(
+        EMBERWAVE_PLANE_CBCR,
+        &app.planes[1],
+        "MTLPixelFormatRG8Unorm",
+    );
+    refused(EMBERWAVE_PLANE_Y, &app.chroma, "MTLPixelFormatR8Unorm");
+    refused(
+        EMBERWAVE_PLANE_Y,
+        &app.planes[1],
+        "rather than the plane's 192x136",
+    );
+    refused(
+        EMBERWAVE_PLANE_CBCR,
+        &app.planes[0],
+        "MTLPixelFormatRG8Unorm",
+    );
+    let unreadable = app_texture(
+        device,
+        MTLPixelFormat::R8Unorm,
+        size,
+        MTLTextureUsage::ShaderWrite,
+        false,
+    );
+    refused(EMBERWAVE_PLANE_Y, &unreadable, "MTLTextureUsageShaderRead");
+    let [y, cb, cr, cbcr] = app.wrapped(encoder);
+    let (status, error) = encoded_from_textures(encoder, [y, cbcr, cr]).unwrap_err();
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(error.contains("cr is not NULL"), "{error}");
+    let (status, error) = encoded_from_textures(encoder, [cbcr, cb, cr]).unwrap_err();
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(
+        error.contains("y is not a texture for the Y plane"),
+        "{error}"
+    );
+    // Nor do decodes take Cb and Cr interleaved.
+    let mut decoder = ptr::null_mut();
+    // SAFETY: a live context and decoder, live textures, and a pointer to
+    // store the decoder in.
+    unsafe {
+        let status =
+            emberwave_decoder_create(*context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder);
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        let status = emberwave_decoder_decode_plane_textures(decoder, y, cbcr, cr);
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(last_error().contains("cb is not a texture for the Cb plane"));
+        emberwave_decoder_destroy(decoder);
+        for texture in [y, cb, cr, cbcr] {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_encoder_destroy(encoder);
+        for (context, _) in contexts {
+            emberwave_context_destroy(context);
+        }
+        if own_device.is_null() {
+            emberwave_context_destroy(own);
+        }
+    }
+}
+
+#[test]
+fn an_encode_on_the_app_queue_reads_what_the_app_committed_before() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no Metal device"
+        );
+        return;
+    };
+    let queue = device.newCommandQueue().expect("a command queue");
+    let context = metal_context(&device, &queue).0;
+    let (size, chroma) = ((192, 136), (96, 68));
+    let widths = [size.0, chroma.0, chroma.0];
+    let memory = encoder_of(context, size, EMBERWAVE_CHROMA_420);
+    let encoder = encoder_of(context, size, EMBERWAVE_CHROMA_420);
+    let app = AppPicture::new(&device, size, chroma);
+    let [y, cb, cr, cbcr] = app.wrapped(encoder);
+    let first = source_picture(size, chroma, 1);
+    let second = source_picture(size, chroma, 2);
+    app.fill(&first);
+
+    // The app's command buffer copies the second picture into the textures
+    // once an event is signalled, and is committed before the encode.
+    let staged: Vec<u8> = second.concat();
+    let buffer = device
+        .newBufferWithLength_options(staged.len(), MTLResourceOptions::StorageModeShared)
+        .expect("a buffer");
+    // SAFETY: a buffer of shared storage of `staged.len()` bytes, which no
+    // GPU work uses yet.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            staged.as_ptr(),
+            buffer.contents().as_ptr().cast::<u8>(),
+            staged.len(),
+        );
+    }
+    let event = device.newSharedEvent().expect("a shared event");
+    let commands = queue.commandBuffer().expect("a command buffer");
+    commands.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+    let blit = commands.blitCommandEncoder().expect("a blit encoder");
+    let mut offset = 0;
+    for (texture, samples) in app.planes.iter().zip(&second) {
+        let (width, height) = (texture.width(), texture.height());
+        // SAFETY: the buffer holds the plane's rows at `offset`, and the
+        // texture is on the buffer's device.
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                &buffer,
+                offset,
+                width,
+                width * height,
+                MTLSize { width, height, depth: 1 },
+                texture,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        }
+        offset += samples.len();
+    }
+    blit.endEncoding();
+    commands.commit();
+    let signal = Shared(Retained::as_ptr(&event).cast_mut());
+    let signaller = std::thread::spawn(move || {
+        let signal = signal;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // SAFETY: the event, which the test keeps until this thread ends.
+        unsafe { &*signal.0 }.setSignaledValue(1);
+    });
+
+    // Both encoders' first frame, so that the sequence numbers agree.
+    let expected = encoded_from_memory(memory, &second, widths);
+    let frame = encoded_from_textures(encoder, [y, cb, cr]);
+    // The encode waited for the copy, which waited for the event.
+    assert_eq!(event.signaledValue(), 1, "the encode ended before the copy");
+    signaller.join().unwrap();
+    assert!(frame.unwrap() == expected, "the picture the app copied in");
+
+    // SAFETY: live objects, destroyed once each; the GPU is done with them.
+    unsafe {
+        for texture in [y, cb, cr, cbcr] {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_encoder_destroy(memory);
+        emberwave_encoder_destroy(encoder);
+        emberwave_context_destroy(context);
     }
 }

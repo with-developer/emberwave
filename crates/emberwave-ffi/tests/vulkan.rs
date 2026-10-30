@@ -905,7 +905,11 @@ impl Client {
                 memory,
                 width,
                 height,
-                texel: if format == vk::Format::R8_UNORM { 1 } else { 4 },
+                texel: match format {
+                    vk::Format::R8_UNORM => 1,
+                    vk::Format::R8G8_UNORM => 2,
+                    _ => 4,
+                },
             }
         }
     }
@@ -1746,4 +1750,703 @@ fn a_wrapped_image_is_drawn_into_and_released() {
         device.free_memory(picture.memory, None);
         device.destroy_device(None);
     }
+}
+
+/// A copy of pictures into images of the client's, submitted, with what it
+/// needs until it has completed.
+struct Upload {
+    fence: vk::Fence,
+    pool: vk::CommandPool,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl Upload {
+    /// Waits for the copy and frees what it used.
+    fn finish(self, device: &ash::Device) {
+        // SAFETY: objects of the device, which the GPU is done with once the
+        // fence is signalled.
+        unsafe {
+            device
+                .wait_for_fences(&[self.fence], true, TEN_SECONDS)
+                .expect("copied within ten seconds");
+            device.destroy_fence(self.fence, None);
+            device.destroy_command_pool(self.pool, None);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+impl Client {
+    /// Copies each of `pictures`, tightly packed rows, into its image on the
+    /// GPU, from the layout `from` to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    /// the writes made visible to the compute shaders of later commands on the
+    /// queue. The submission waits for the binary semaphore `wait` and
+    /// signals `signal`, if given, and is not waited for.
+    fn upload(
+        &self,
+        device: &ash::Device,
+        pictures: &[(&Image, &[u8])],
+        from: vk::ImageLayout,
+        wait: Option<vk::Semaphore>,
+        signal: Option<vk::Semaphore>,
+    ) -> Upload {
+        let bytes: Vec<u8> = pictures
+            .iter()
+            .flat_map(|(_, samples)| samples.iter().copied())
+            .collect();
+        // SAFETY: valid descriptions of a buffer, its memory, a command pool
+        // and buffer of the queue's family; each image is in the layout the
+        // first barrier names and as large as its samples; the caller frees
+        // everything made once the fence is signalled.
+        unsafe {
+            let buffer = device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(bytes.len() as u64)
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC),
+                    None,
+                )
+                .expect("a buffer");
+            let needs = device.get_buffer_memory_requirements(buffer);
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(needs.size)
+                        .memory_type_index(self.memory_type(
+                            needs.memory_type_bits,
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )),
+                    None,
+                )
+                .expect("memory");
+            device.bind_buffer_memory(buffer, memory, 0).expect("bound");
+            let mapped = device
+                .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
+                .expect("mapped");
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+            device.unmap_memory(memory);
+
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(self.family),
+                    None,
+                )
+                .expect("a command pool");
+            let commands = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .command_buffer_count(1),
+                )
+                .expect("a command buffer")[0];
+            device
+                .begin_command_buffer(commands, &vk::CommandBufferBeginInfo::default())
+                .expect("begun");
+            let whole = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            let barrier = |image, from, to, src_access, dst_access| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(from)
+                    .new_layout(to)
+                    .src_access_mask(src_access)
+                    .dst_access_mask(dst_access)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(whole)
+            };
+            // After the reads of earlier work, the encodes' among them.
+            let before: Vec<_> = pictures
+                .iter()
+                .map(|(image, _)| {
+                    barrier(
+                        image.image,
+                        from,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                })
+                .collect();
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &before,
+            );
+            let mut offset = 0;
+            for (image, samples) in pictures {
+                device.cmd_copy_buffer_to_image(
+                    commands,
+                    buffer,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: image.width,
+                            height: image.height,
+                            depth: 1,
+                        })],
+                );
+                assert_eq!(
+                    samples.len(),
+                    (image.width * image.height * image.texel) as usize
+                );
+                offset += samples.len() as u64;
+            }
+            let after: Vec<_> = pictures
+                .iter()
+                .map(|(image, _)| {
+                    barrier(
+                        image.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                    )
+                })
+                .collect();
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &after,
+            );
+            device.end_command_buffer(commands).expect("ended");
+
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .expect("a fence");
+            let buffers = [commands];
+            let waits: Vec<vk::Semaphore> = wait.into_iter().collect();
+            let signals: Vec<vk::Semaphore> = signal.into_iter().collect();
+            let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(&buffers)
+                .wait_semaphores(&waits)
+                .wait_dst_stage_mask(&stages)
+                .signal_semaphores(&signals);
+            let queue = device.get_device_queue(self.family, 0);
+            device
+                .queue_submit(queue, &[submit], fence)
+                .expect("submitted");
+            Upload {
+                fence,
+                pool,
+                buffer,
+                memory,
+            }
+        }
+    }
+}
+
+/// The images of a picture to encode: Y, Cb and Cr in VK_FORMAT_R8_UNORM,
+/// and Cb and Cr interleaved in VK_FORMAT_R8G8_UNORM.
+struct SourceImages {
+    planes: [Image; 3],
+    chroma: Image,
+}
+
+/// The usage of the images of the pictures to encode: sampled by the
+/// encodes, and copied into by the client.
+const SOURCE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
+);
+
+impl SourceImages {
+    fn new(client: &Client, device: &ash::Device, size: (u32, u32), chroma: (u32, u32)) -> Self {
+        let r8 = |size| client.image(device, vk::Format::R8_UNORM, size, SOURCE_USAGE);
+        Self {
+            planes: [r8(size), r8(chroma), r8(chroma)],
+            chroma: client.image(device, vk::Format::R8G8_UNORM, chroma, SOURCE_USAGE),
+        }
+    }
+
+    /// What `upload` takes to copy `picture`, its planes and Cb and Cr
+    /// interleaved in `chroma`, into the images.
+    fn pictures<'a>(
+        &'a self,
+        picture: &'a [Vec<u8>; 3],
+        chroma: &'a [u8],
+    ) -> [(&'a Image, &'a [u8]); 4] {
+        [
+            (&self.planes[0], &picture[0]),
+            (&self.planes[1], &picture[1]),
+            (&self.planes[2], &picture[2]),
+            (&self.chroma, chroma),
+        ]
+    }
+
+    /// The images wrapped for `encoder`: Y, Cb, Cr and Cb and Cr
+    /// interleaved.
+    fn wrapped(&self, encoder: *mut EmberwaveEncoder) -> [*mut EmberwaveTexture; 4] {
+        let planes = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR];
+        let [y, cb, cr] = [0, 1, 2].map(|i| {
+            source(
+                encoder,
+                &self.planes[i],
+                vk::Format::R8_UNORM,
+                SOURCE_USAGE,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                planes[i],
+            )
+            .unwrap()
+        });
+        let cbcr = source(
+            encoder,
+            &self.chroma,
+            vk::Format::R8G8_UNORM,
+            SOURCE_USAGE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            EMBERWAVE_PLANE_CBCR,
+        )
+        .unwrap();
+        [y, cb, cr, cbcr]
+    }
+
+    fn destroy(self, device: &ash::Device) {
+        // SAFETY: images of the device that nothing uses any more.
+        unsafe {
+            for image in self.planes.into_iter().chain([self.chroma]) {
+                device.destroy_image(image.image, None);
+                device.free_memory(image.memory, None);
+            }
+        }
+    }
+}
+
+/// Wraps `image` for `plane` of the pictures of `encoder`.
+fn source(
+    encoder: *mut EmberwaveEncoder,
+    image: &Image,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    layout: vk::ImageLayout,
+    plane: u32,
+) -> Result<*mut EmberwaveTexture, (EmberwaveStatus, String)> {
+    let described = EmberwaveVulkanImage {
+        image: image.image.as_raw(),
+        format: format.as_raw() as u32,
+        usage: usage.as_raw(),
+        layout: layout.as_raw() as u32,
+        release: None,
+        user: ptr::null_mut(),
+    };
+    let mut texture = ptr::null_mut();
+    // SAFETY: a live encoder, an image made as described, and a pointer to
+    // store the texture in.
+    let status =
+        unsafe { emberwave_texture_from_vulkan_source(encoder, plane, &described, &mut texture) };
+    if status == EmberwaveStatus::Ok {
+        Ok(texture)
+    } else {
+        assert!(texture.is_null());
+        Err((status, last_error()))
+    }
+}
+
+/// A picture of `size` with chroma planes of `chroma`, gradients and noise,
+/// different for each `seed`: Y, Cb and Cr.
+fn source_picture(size: (u32, u32), chroma: (u32, u32), seed: u32) -> [Vec<u8>; 3] {
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    std::array::from_fn(|plane| {
+        let (w, h) = if plane == 0 { size } else { chroma };
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let value = 30 + x * 140 / w + y * 50 / h + (state >> 28);
+                (value + 25 * plane as u32).min(255) as u8
+            })
+            .collect()
+    })
+}
+
+/// Cb and Cr interleaved, as NV12's second plane holds them.
+fn interleaved(picture: &[Vec<u8>; 3]) -> Vec<u8> {
+    picture[1]
+        .iter()
+        .zip(&picture[2])
+        .flat_map(|(&b, &r)| [b, r])
+        .collect()
+}
+
+/// An encoder of `context` for pictures of `size` in `chroma`.
+fn encoder_of(
+    context: *mut EmberwaveContext,
+    (width, height): (u32, u32),
+    chroma: u32,
+) -> *mut EmberwaveEncoder {
+    let mut encoder = ptr::null_mut();
+    // SAFETY: a live context, and a pointer to store the encoder in.
+    let status = unsafe {
+        emberwave_encoder_create(context, width, height, chroma, ptr::null(), &mut encoder)
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    encoder
+}
+
+/// The frame of `picture` encoded from CPU memory by `encoder`.
+fn encoded_from_memory(
+    encoder: *mut EmberwaveEncoder,
+    picture: &[Vec<u8>; 3],
+    widths: [u32; 3],
+) -> Vec<u8> {
+    let mut frame = vec![0u8; 9_000];
+    let mut size = 0;
+    let [y, cb, cr] = [0, 1, 2].map(|plane| EmberwaveSourcePlane {
+        data: picture[plane].as_ptr(),
+        stride: widths[plane] as usize,
+    });
+    // SAFETY: a live encoder, planes of its sizes, and a frame of the length
+    // passed.
+    let status = unsafe {
+        emberwave_encoder_encode(
+            encoder,
+            y,
+            cb,
+            cr,
+            frame.as_mut_ptr(),
+            frame.len(),
+            &mut size,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    frame.truncate(size);
+    frame
+}
+
+/// Encodes from `textures` with `encoder`, with `sync` if given: the frame,
+/// or the status and the error.
+fn encoded_from_images(
+    encoder: *mut EmberwaveEncoder,
+    [y, cb, cr]: [*mut EmberwaveTexture; 3],
+    sync: Option<&EmberwaveVulkanSync>,
+) -> Result<Vec<u8>, (EmberwaveStatus, String)> {
+    let mut frame = vec![0u8; 9_000];
+    let mut size = 0;
+    // SAFETY: a live encoder, textures that are NULL or live, a sync that is
+    // NULL or holds semaphores of the device, and a frame of the length
+    // passed.
+    let status = unsafe {
+        match sync {
+            Some(sync) => emberwave_encoder_encode_textures_vulkan(
+                encoder,
+                y,
+                cb,
+                cr,
+                sync,
+                frame.as_mut_ptr(),
+                frame.len(),
+                &mut size,
+            ),
+            None => emberwave_encoder_encode_textures(
+                encoder,
+                y,
+                cb,
+                cr,
+                frame.as_mut_ptr(),
+                frame.len(),
+                &mut size,
+            ),
+        }
+    };
+    if status != EmberwaveStatus::Ok {
+        return Err((status, last_error()));
+    }
+    frame.truncate(size);
+    Ok(frame)
+}
+
+#[test]
+fn the_callers_images_are_encoded_as_planes_and_as_nv12() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    for (size, chroma, code) in [
+        ((192, 136), (96, 68), EMBERWAVE_CHROMA_420),
+        ((131, 67), (131, 67), EMBERWAVE_CHROMA_444),
+    ] {
+        let widths = [size.0, chroma.0, chroma.0];
+        let images = SourceImages::new(&client, &device, size, chroma);
+        let memory = encoder_of(context, size, code);
+        let as_planes = encoder_of(context, size, code);
+        let as_nv12 = encoder_of(context, size, code);
+        let [y, cb, cr, cbcr] = images.wrapped(as_planes);
+        let mut from = vk::ImageLayout::UNDEFINED;
+        for seed in 0..3 {
+            let picture = source_picture(size, chroma, seed);
+            let chroma_samples = interleaved(&picture);
+            let upload = client.upload(
+                &device,
+                &images.pictures(&picture, &chroma_samples),
+                from,
+                None,
+                None,
+            );
+            from = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            // The first two copies have completed before the encodes; the
+            // last goes to the queue before them, with its barrier.
+            let pending = if seed < 2 {
+                upload.finish(&device);
+                None
+            } else {
+                Some(upload)
+            };
+            let expected = encoded_from_memory(memory, &picture, widths);
+            let frame = encoded_from_images(as_planes, [y, cb, cr], None).unwrap();
+            assert!(frame == expected, "{size:?} planes, picture {seed}");
+            let frame = encoded_from_images(
+                as_nv12,
+                [y, cbcr, ptr::null_mut()],
+                Some(&Default::default()),
+            )
+            .unwrap();
+            assert!(frame == expected, "{size:?} NV12, picture {seed}");
+            if let Some(upload) = pending {
+                upload.finish(&device);
+            }
+        }
+        // SAFETY: live objects, destroyed once each.
+        unsafe {
+            for texture in [y, cb, cr, cbcr] {
+                emberwave_texture_destroy(texture);
+            }
+            for encoder in [memory, as_planes, as_nv12] {
+                emberwave_encoder_destroy(encoder);
+            }
+        }
+        images.destroy(&device);
+    }
+    // SAFETY: a live context and device, which nothing uses any more.
+    unsafe {
+        emberwave_context_destroy(context);
+        device.destroy_device(None);
+    }
+}
+
+#[test]
+fn semaphores_hold_the_encode_back_until_the_picture_is_written() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let (size, chroma) = ((192, 136), (96, 68));
+    let widths = [size.0, chroma.0, chroma.0];
+    let images = SourceImages::new(&client, &device, size, chroma);
+    let memory = encoder_of(context, size, EMBERWAVE_CHROMA_420);
+    let encoder = encoder_of(context, size, EMBERWAVE_CHROMA_420);
+    let [y, cb, cr, cbcr] = images.wrapped(encoder);
+
+    // A timeline wait: the encode reads the picture only once the client
+    // signals, from another thread, after the call has begun.
+    let first = source_picture(size, chroma, 1);
+    let chroma_samples = interleaved(&first);
+    client
+        .upload(
+            &device,
+            &images.pictures(&first, &chroma_samples),
+            vk::ImageLayout::UNDEFINED,
+            None,
+            None,
+        )
+        .finish(&device);
+    let gate = client.timeline(&device);
+    let read = client.timeline(&device);
+    let signaller = {
+        let device = device.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            // SAFETY: a timeline semaphore of the device, which the test
+            // keeps until this thread ends.
+            unsafe {
+                device
+                    .signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(gate).value(1))
+                    .expect("signalled");
+            }
+        })
+    };
+    let sync = EmberwaveVulkanSync {
+        wait_semaphore: gate.as_raw(),
+        wait_value: 1,
+        signal_semaphore: read.as_raw(),
+        signal_value: 1,
+        flags: EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE,
+    };
+    let expected = encoded_from_memory(memory, &first, widths);
+    let frame = encoded_from_images(encoder, [y, cb, cr], Some(&sync));
+    // SAFETY: timeline semaphores of the device.
+    let (gate_value, read_value) = unsafe {
+        (
+            device.get_semaphore_counter_value(gate).unwrap(),
+            device.get_semaphore_counter_value(read).unwrap(),
+        )
+    };
+    signaller.join().unwrap();
+    assert_eq!(
+        gate_value, 1,
+        "the encode ended before its wait was signalled"
+    );
+    assert!(
+        frame.unwrap() == expected,
+        "the picture after the timeline wait"
+    );
+    assert_eq!(read_value, 1, "the encode signalled its semaphore");
+
+    // Binary semaphores: the client's copy of the next picture signals the
+    // one the encode waits for, and its next copy waits for the one the
+    // encode signals.
+    let copied = client.binary(&device);
+    let done = client.binary(&device);
+    let second = source_picture(size, chroma, 2);
+    let chroma_samples = interleaved(&second);
+    let upload = client.upload(
+        &device,
+        &images.pictures(&second, &chroma_samples),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        None,
+        Some(copied),
+    );
+    let sync = EmberwaveVulkanSync {
+        wait_semaphore: copied.as_raw(),
+        signal_semaphore: done.as_raw(),
+        ..Default::default()
+    };
+    let expected = encoded_from_memory(memory, &second, widths);
+    let frame = encoded_from_images(encoder, [y, cbcr, ptr::null_mut()], Some(&sync)).unwrap();
+    assert!(frame == expected, "the picture after the binary semaphores");
+    upload.finish(&device);
+    let third = source_picture(size, chroma, 3);
+    let chroma_samples = interleaved(&third);
+    client
+        .upload(
+            &device,
+            &images.pictures(&third, &chroma_samples),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            Some(done),
+            None,
+        )
+        .finish(&device);
+    let expected = encoded_from_memory(memory, &third, widths);
+    let frame = encoded_from_images(encoder, [y, cb, cr], None).unwrap();
+    assert!(
+        frame == expected,
+        "the picture the client copied after the encode"
+    );
+
+    // Flags it does not know.
+    let sync = EmberwaveVulkanSync {
+        flags: 1 << 7,
+        ..Default::default()
+    };
+    let (status, error) = encoded_from_images(encoder, [y, cb, cr], Some(&sync)).unwrap_err();
+    assert_eq!(status, EmberwaveStatus::InvalidArgument, "{error}");
+
+    // SAFETY: live objects, which nothing uses any more; the GPU is done
+    // with them once the context is destroyed.
+    unsafe {
+        for texture in [y, cb, cr, cbcr] {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_encoder_destroy(memory);
+        emberwave_encoder_destroy(encoder);
+        emberwave_context_destroy(context);
+        for semaphore in [gate, read, copied, done] {
+            device.destroy_semaphore(semaphore, None);
+        }
+    }
+    images.destroy(&device);
+    // SAFETY: a device that nothing uses any more.
+    unsafe { device.destroy_device(None) };
+}
+
+#[test]
+fn images_an_encode_cannot_read_are_refused() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let (size, chroma) = ((192, 136), (96, 68));
+    let images = SourceImages::new(&client, &device, size, chroma);
+    let encoder = encoder_of(context, size, EMBERWAVE_CHROMA_420);
+    let readable = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    let refused = |image: &Image, format, usage, layout, plane, says: &str| {
+        let (status, error) = source(encoder, image, format, usage, layout, plane).unwrap_err();
+        assert_eq!(status, EmberwaveStatus::InvalidArgument, "{error}");
+        assert!(error.contains(says), "{says}: {error}");
+    };
+    let (r8, rg8) = (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM);
+    let y = &images.planes[0];
+    refused(
+        y,
+        rg8,
+        SOURCE_USAGE,
+        readable,
+        EMBERWAVE_PLANE_Y,
+        "not VK_FORMAT_R8_UNORM",
+    );
+    refused(
+        &images.chroma,
+        r8,
+        SOURCE_USAGE,
+        readable,
+        EMBERWAVE_PLANE_CBCR,
+        "not VK_FORMAT_R8G8_UNORM",
+    );
+    refused(
+        y,
+        r8,
+        vk::ImageUsageFlags::TRANSFER_DST,
+        readable,
+        EMBERWAVE_PLANE_Y,
+        "VK_IMAGE_USAGE_SAMPLED_BIT",
+    );
+    refused(
+        y,
+        r8,
+        SOURCE_USAGE,
+        vk::ImageLayout::UNDEFINED,
+        EMBERWAVE_PLANE_Y,
+        "the layout an encode reads it in",
+    );
+    refused(
+        y,
+        r8,
+        SOURCE_USAGE,
+        vk::ImageLayout::GENERAL,
+        EMBERWAVE_PLANE_Y,
+        "the layout an encode reads it in",
+    );
+    refused(y, r8, SOURCE_USAGE, readable, 9, "EMBERWAVE_PLANE_CBCR");
+    // SAFETY: live objects, destroyed once each, which the GPU never used.
+    unsafe {
+        emberwave_encoder_destroy(encoder);
+        emberwave_context_destroy(context);
+    }
+    images.destroy(&device);
+    // SAFETY: a device that nothing uses any more.
+    unsafe { device.destroy_device(None) };
 }
