@@ -27,6 +27,18 @@ pub use decoder::{
 pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
 pub use error::GpuError;
 
+// What the docs and the C API promise: a context is shared by threads, and
+// decoders and encoders move between them. In a browser wgpu's objects stay
+// on their thread.
+#[cfg(not(target_arch = "wasm32"))]
+const _: () = {
+    const fn shared<T: Send + Sync>() {}
+    const fn movable<T: Send>() {}
+    shared::<GpuContext>();
+    movable::<Decoder>();
+    movable::<Encoder>();
+};
+
 /// The WGSL sources of the pipeline stages, for offline validation.
 pub mod shader_sources {
     /// Coefficient decoding and dequantisation.

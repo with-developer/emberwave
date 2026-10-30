@@ -2,6 +2,24 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `EMBERWAVE_VERSION`, with `EMBERWAVE_VERSION_MAJOR`, `_MINOR` and `_PATCH`, in the C header, and `emberwave_version_number()` in the library, so that a program can tell the library it runs with from the header it was built with (decision D69, [#152](https://github.com/with-developer/emberwave/issues/152)).
+- The C API's statuses `EMBERWAVE_STATUS_UNSUPPORTED`, for a call the system lacks, and `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, for an output array, a plane or an encode's budget that is too small. Later versions may add more: treat any status but `EMBERWAVE_STATUS_OK` as a failure.
+
+### Changed
+
+- The C API's structs passed by pointer start with `struct_size`, which the caller sets to `sizeof` the struct before each call, for the structs it passes and those it gets filled in (decision D69). From now on a struct can grow by a member without breaking programs. The structs are `EmberwaveContextOptions`, `EmberwaveStreamInfo`, `EmberwaveFrameInfo`, `EmberwaveColor` and `EmberwaveSignalling`, whose `reserved` words go, and `EmberwaveVulkanInstance`, `EmberwaveVulkanDevice`, `EmberwaveVulkanImage`, `EmberwaveVulkanSync` and `EmberwaveD3D12Sync`. `EmberwaveVulkanDevice` points to its instance instead of holding it.
+- `EmberwavePlane` and `EmberwaveSourcePlane` have `size`, the bytes at `data`, which the calls check.
+- Two statuses moved:
+  - a call the system lacks, such as Metal's off Apple's systems, gives `EMBERWAVE_STATUS_UNSUPPORTED`, not `EMBERWAVE_STATUS_NO_GPU`;
+  - an encode's budget, the array of `emberwave_frame_packets` or a decode's plane that is too small gives `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, not `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+- `emberwave_decoder_submit_texture` and `emberwave_decoder_submit_plane_textures`, which only Metal has, are now `emberwave_decoder_submit_texture_metal` and `emberwave_decoder_submit_plane_textures_metal`.
+- `emberwave_vulkan_instance_extensions` takes the capacity of `names` apart from the count it stores, as `emberwave_frame_packets` does.
+- The calls on the caller's Metal, Vulkan and Direct3D objects are provisional: until a client has used them, a minor version may change them.
+
 ## [0.16.0] - 2026-10-31
 
 Still pictures keep their detail through lost packets, and the wavelet transforms take less GPU time. A decoder that conceals, which a client turns on, fills the blocks of detail that a frame drawn in part lacks with the last frame's, wherever the coarsest level shows that the picture has not moved: in Rust, through the C API and in the browser player. The transforms read their rows straight from the bands, with the same output to the byte: on an Apple M3 Max a 4K frame's GPU work takes 0.47 ms instead of 0.54 ms.

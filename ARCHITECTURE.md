@@ -526,7 +526,7 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_texture_create`, `_destroy`, `emberwave_decoder_decode_texture` | A texture of the picture's size, RGBA or BGRA, on the decoder's device, and a decode that draws the RGB picture into it and waits |
 | `emberwave_texture_create_plane`, `emberwave_decoder_decode_plane_textures` | A one-channel texture for the Y, the Cb or the Cr plane, and a decode that puts the planes into three and waits: on Metal it stores them there, elsewhere it copies them in (D52) |
 | `emberwave_texture_metal`, `emberwave_context_metal_device` | The `id<MTLTexture>` and `id<MTLDevice>` behind a texture and a context, borrowed, or `NULL` off Metal |
-| `emberwave_context_create_metal`, `emberwave_decoder_submit_texture`, `_submit_plane_textures` | A context on the client's own Metal device and queue, and decodes into textures that return without waiting, which only such a context takes |
+| `emberwave_context_create_metal`, `emberwave_decoder_submit_texture_metal`, `_submit_plane_textures_metal` | A context on the client's own Metal device and queue, and decodes into textures that return without waiting, which only such a context takes |
 | `emberwave_texture_from_metal`, `_from_metal_plane` | The client's own `id<MTLTexture>`, such as a `CVPixelBuffer`'s, as a texture every decode above fills |
 | `emberwave_vulkan_instance_extensions`, `emberwave_vulkan_requirements_create`, `_extensions`, `_features`, `_destroy` | What the client enables on its Vulkan instance and device for a context on them (D61) |
 | `emberwave_context_create_vulkan` | A context on the client's own `VkDevice` and one of its queues, under the client's lock of the queue (D61) |
@@ -542,9 +542,9 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_decoder_submit_texture_d3d12`, `_submit_plane_textures_d3d12`, `emberwave_encoder_encode_textures_d3d12` | Decodes and encodes on such textures, with fences to wait for and to signal, leaving them in `D3D12_RESOURCE_STATE_COMMON` (D63) |
 | `emberwave_decoder_set_concealment` | Frames drawn in part keep the last frame's detail where the picture is still, for the blocks they lack (D66) |
 | `emberwave_frame_packets` | Where a frame splits into packets of a given size, at its blocks |
-| `emberwave_version`, `emberwave_last_error` | The version, and the message of the last failure on the calling thread |
+| `emberwave_version`, `emberwave_version_number`, `emberwave_last_error` | The library's version as text and as the number `EMBERWAVE_VERSION` gives the header's (D69), and the message of the last failure on the calling thread |
 
-Every function returns a status, or a value that cannot fail. A Rust panic is caught at the boundary, because unwinding into C is not allowed, and becomes `EMBERWAVE_STATUS_INTERNAL`, or `EMBERWAVE_STATUS_DEVICE_LOST` when the device is lost: wgpu panics when the device fails while it is waited for (D22), after recording the loss. Arguments are checked before the frame is used: a `NULL` pointer, a stride shorter than a row, a picture size the format cannot have or an unknown constant is `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and the frame can still be decoded with correct ones. What the caller passes in is a plain integer, never a Rust enum, so no value from C can be an invalid one.
+Every function returns a status, or a value that cannot fail. A Rust panic is caught at the boundary, because unwinding into C is not allowed, and becomes `EMBERWAVE_STATUS_INTERNAL`, or `EMBERWAVE_STATUS_DEVICE_LOST` when the device is lost: wgpu panics when the device fails while it is waited for (D22), after recording the loss. Arguments are checked before the frame is used: a `NULL` pointer, a stride shorter than a row, a picture size the format cannot have, a struct's `struct_size` below its first size or an unknown constant is `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and the frame can still be decoded with correct ones. A plane whose `size` is less than its rows span is `EMBERWAVE_STATUS_BUFFER_TOO_SMALL` for a decode's output and `EMBERWAVE_STATUS_INVALID_ARGUMENT` for an encode's input. A call this system lacks, such as Metal's off Apple's systems, is `EMBERWAVE_STATUS_UNSUPPORTED`. What the caller passes in is a plain integer, never a Rust enum, so no value from C can be an invalid one. Structs passed by pointer start with `struct_size`, read and written through `read_struct` and `write_struct`, so that they can grow (D69).
 
 `unsafe` code lives in this crate only. It has its own lint table instead of the workspace's `forbid`: every unsafe operation sits in an `unsafe` block of its own with a comment saying why it is sound, and every public function documents what the caller must guarantee.
 
@@ -1747,3 +1747,45 @@ The last frame's detail, always, gains everything on a still picture and loses u
 - Less workgroup memory alone, 5 KiB instead of 9, made the inverse transform no faster: the load phase held it back, not the memory a workgroup takes. Halving workgroup memory, which D48 counted among the sources of upstream's FP16 gain, would not help emberwave's kernel by itself.
 - `BENCHMARKS.md` keeps its tables until the next full run on a quiet machine.
 - The test of the workgroup variables checked for writes before reads (D25) lists the new ones.
+
+### 2026-10-31 — D69: The C API before 1.0: structs that grow, statuses, versions
+
+**Context.** From 1.0 on the C API is to stay compatible (#152). Our review agent audited v0.16.0 and found five problems:
+- No struct passed by pointer could grow.
+- Planes carried no capacity, so decodes wrote what their strides implied on trust.
+- `EMBERWAVE_STATUS_NO_GPU` also meant "not on this system", and `EMBERWAVE_STATUS_INVALID_ARGUMENT` also meant "too small".
+- Metal's two submits had no suffix, while Vulkan's and Direct3D's had one.
+- A program could not tell the library's version from its header's but by parsing a string.
+
+**Decision.**
+- **`struct_size` first** in every struct passed by pointer:
+  - The structs: `EmberwaveContextOptions`, `EmberwaveStreamInfo`, `EmberwaveFrameInfo`, `EmberwaveColor`, `EmberwaveSignalling`, `EmberwaveVulkanInstance`, `EmberwaveVulkanDevice`, `EmberwaveVulkanImage`, `EmberwaveVulkanSync` and `EmberwaveD3D12Sync`.
+  - The caller sets it to `sizeof` the struct before the call, for structs in and out. A size below the struct's first size, its size in 0.17, is `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+  - A struct passed in is read up to its size, and the members past it are zeros, their defaults. A struct filled in is written up to its size. Members are added at the end only.
+  - `EmberwaveVulkanDevice` points to its instance instead of holding it, so that each can grow.
+  - `EmberwaveSignalling`'s reserved words go, as its size does their work.
+  - `EmberwavePacket` stays as it is: it is the element of an array, whose stride is its size.
+- **Planes carry `size`,** the bytes at `data`, and the calls check it.
+  - A decode's plane that is too small gives `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`. An encode's gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+  - They stay passed by value, since another pixel format would be another call.
+- **Two new statuses.**
+  - `EMBERWAVE_STATUS_UNSUPPORTED`, which was `NO_GPU`, is for a call the system lacks: Metal's off Apple's systems, Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off Windows.
+  - `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, which was `INVALID_ARGUMENT`, is for an output array, a plane or an encode's budget that is too small.
+  - The header says to treat any status but `OK` as a failure, as later versions may add more.
+  - The status stays a C enum of `int`'s width, as Rust's `repr(C)` gives it. Fixing it to `int32_t` would change how Swift imports it, for the sake of compilers set to `-fshort-enums`, which break other libraries' enums as well.
+- **Arrays the caller sizes** take the array, its capacity, and a count out, which is the count needed. A capacity that is short gives `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`. `emberwave_frame_packets` did this already, and `emberwave_vulkan_instance_extensions` now does. The Vulkan calls count in `uint32_t`, as Vulkan does.
+- **Names.** The two submits that only Metal has are now `emberwave_decoder_submit_texture_metal` and `emberwave_decoder_submit_plane_textures_metal`, beside the `_vulkan` and `_d3d12` forms.
+- **Versions.** The header has `EMBERWAVE_VERSION_MAJOR`, `_MINOR` and `_PATCH`, and `EMBERWAVE_VERSION`: 10000 times the major, plus 100 times the minor, plus the patch. The library has `emberwave_version_number()`. A compile-time assertion ties them to the crate's version, so a release changes both.
+- **Threads.** Compile-time assertions check the threads the docs promise:
+  - in the C API, contexts `Send` and `Sync`, and decoders, encoders and textures `Send`;
+  - in the core, outside the browser, `GpuContext` `Send` and `Sync`, and `Decoder` and `Encoder` `Send`.
+- **Callbacks** given to emberwave must not call emberwave.
+- **Provisional calls.** Until a client has used them, the calls on the caller's Metal, Vulkan and Direct3D objects may change in a minor version. This is decided again at 1.0.
+
+**Not done.**
+- A versioned SONAME and install name, and an export list. The list would leave out the four Objective-C symbols that a dependency of wgpu exports. All of this waits for 1.0, when the major version starts to mean the ABI.
+- The Rust API's half of #152, which comes next.
+
+**Consequence.**
+- Every C caller changes. It sets `struct_size`, gives planes their `size`, calls the Metal submits by their new names, and checks the new statuses. The C examples, the Swift example, the benchmark app and the tests have been changed.
+- From now on, a minor version can add a member to a struct without breaking a program, as the C API must from 1.0 on.

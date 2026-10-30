@@ -114,6 +114,7 @@ fn source_planes(
         EmberwaveSourcePlane {
             data: storage[plane].as_ptr(),
             stride: width + padding,
+            size: storage[plane].len(),
         }
     })
 }
@@ -261,7 +262,7 @@ fn a_budget_too_small_gives_the_size_of_the_smallest_frame() {
     let mut storage = Vec::new();
     let planes = source_planes(&layout, &source, 0, &mut storage);
     let (status, _, minimum) = encode_c(encoder, planes, 7);
-    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert_eq!(status, EmberwaveStatus::BufferTooSmall);
     assert!(last_error().contains("smallest frame"), "{}", last_error());
     // The header and the blocks of the coarsest level, which every frame
     // carries, each as small as it gets: 12 bytes at least.
@@ -309,7 +310,7 @@ fn every_start_of_frame_header_says_what_the_signalling_does() {
         chroma_siting: EMBERWAVE_SITING_CENTER,
         primaries: EMBERWAVE_PRIMARIES_SRGB,
         transfer: EMBERWAVE_TRANSFER_SRGB,
-        reserved: [0; 3],
+        ..Default::default()
     };
     // NULL, the defaults spelt out, and each field away from its default on
     // its own, so that one field cannot stand in for another.
@@ -421,7 +422,7 @@ fn bad_encoder_arguments_are_errors_with_a_message() {
         chroma_siting: EMBERWAVE_SITING_CENTER,
         primaries: EMBERWAVE_PRIMARIES_SRGB,
         transfer: EMBERWAVE_TRANSFER_SRGB,
-        reserved: [0; 3],
+        ..Default::default()
     };
     let signalling_cases = [
         (
@@ -440,10 +441,10 @@ fn bad_encoder_arguments_are_errors_with_a_message() {
         ),
         (
             EmberwaveSignalling {
-                reserved: [0, 1, 0],
+                struct_size: 4,
                 ..good
             },
-            "reserved",
+            "signalling.struct_size is 4",
         ),
     ];
     let create = |width, height, chroma, signalling: *const EmberwaveSignalling| {
@@ -581,7 +582,7 @@ fn frames_split_into_the_packets_of_the_rust_function() {
                 &mut count,
             )
         };
-        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert_eq!(status, EmberwaveStatus::BufferTooSmall);
         assert_eq!(count, needed);
         assert!(packets.iter().all(|p| *p == EmberwavePacket::default()));
         // Room to spare: the packets, and the rest untouched.
@@ -666,6 +667,7 @@ fn the_c_decoder_shows_the_c_encoders_pictures() {
                 .map(|(plane, bytes)| EmberwavePlane {
                     data: bytes.as_mut_ptr(),
                     stride: layout.plane_size(Component::ALL[plane]).0 as usize,
+                    size: bytes.len(),
                 })
                 .collect();
             // SAFETY: a live decoder and planes of its sizes.
@@ -796,6 +798,7 @@ fn planes_a_decode_left_in_textures_encode_as_the_same_planes_in_memory() {
                     let [y, cb, cr] = [0, 1, 2].map(|plane| EmberwavePlane {
                         data: decoded[plane].as_mut_ptr(),
                         stride: layout.plane_size(Component::ALL[plane]).0 as usize,
+                        size: decoded[plane].len(),
                     });
                     emberwave_decoder_decode_yuv(decoder, y, cb, cr)
                 };
@@ -822,7 +825,7 @@ fn planes_a_decode_left_in_textures_encode_as_the_same_planes_in_memory() {
         // A budget too small, as from CPU memory.
         let (status, _, size) =
             encode_textures_c(from_textures, textures.map(|t| t.cast_const()), 13);
-        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert_eq!(status, EmberwaveStatus::BufferTooSmall);
         assert!(size > 13, "the smallest frame's size, not {size}");
 
         // SAFETY: live, destroyed once each.
@@ -912,6 +915,7 @@ fn textures_an_encode_cannot_read_are_refused() {
             layout: 5,
             release: None,
             user: ptr::null_mut(),
+            ..Default::default()
         };
         let mut texture = ptr::null_mut();
         let status =
@@ -1004,7 +1008,7 @@ fn pictures_in_rgb_encode_as_the_planes_they_convert_to() {
         chroma_siting: EMBERWAVE_SITING_LEFT,
         primaries: EMBERWAVE_PRIMARIES_BT2020,
         transfer: EMBERWAVE_TRANSFER_PQ,
-        reserved: [0; 3],
+        ..Default::default()
     };
     let other_params = ColorParams {
         matrix: ColorMatrix::Bt2020,
@@ -1036,6 +1040,7 @@ fn pictures_in_rgb_encode_as_the_planes_they_convert_to() {
                 let rgb = EmberwaveSourcePlane {
                     data: bytes.as_ptr(),
                     stride,
+                    size: bytes.len(),
                 };
                 let (status, frame, _) = encode_rgb_c(from_rgb, rgb, format, 9_000);
                 assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
@@ -1092,6 +1097,7 @@ fn a_picture_a_decode_left_in_a_texture_encodes_as_the_same_picture_in_memory() 
                         let plane = EmberwavePlane {
                             data: rgb.as_mut_ptr(),
                             stride: 3 * w,
+                            size: rgb.len(),
                         };
                         emberwave_decoder_decode_rgb(decoder, ptr::null(), plane)
                     };
@@ -1115,6 +1121,7 @@ fn a_picture_a_decode_left_in_a_texture_encodes_as_the_same_picture_in_memory() 
             let picture = EmberwaveSourcePlane {
                 data: rgba.as_ptr(),
                 stride: 4 * w,
+                size: rgba.len(),
             };
             let (status, expected, _) =
                 encode_rgb_c(from_memory, picture, EMBERWAVE_TEXTURE_RGBA8, 9_000);
@@ -1158,6 +1165,7 @@ fn rgb_pictures_an_encode_cannot_read_are_refused() {
     let good = EmberwaveSourcePlane {
         data: bytes.as_ptr(),
         stride: 256,
+        size: bytes.len(),
     };
     refused(
         good,
@@ -1168,6 +1176,7 @@ fn rgb_pictures_an_encode_cannot_read_are_refused() {
         EmberwaveSourcePlane {
             data: ptr::null(),
             stride: 256,
+            size: 0,
         },
         EMBERWAVE_TEXTURE_BGRA8,
         "rgb.data is NULL",
@@ -1176,6 +1185,7 @@ fn rgb_pictures_an_encode_cannot_read_are_refused() {
         EmberwaveSourcePlane {
             data: bytes.as_ptr(),
             stride: 255,
+            size: bytes.len(),
         },
         EMBERWAVE_TEXTURE_BGRA8,
         "rgb.stride is 255, less than the 256 bytes of a row",
@@ -1198,4 +1208,28 @@ fn rgb_pictures_an_encode_cannot_read_are_refused() {
 /// A second context, where the first was made.
 fn context_or_panic() -> *mut EmberwaveContext {
     context().expect("a second context where there is a first")
+}
+
+#[test]
+fn source_planes_shorter_than_their_rows_are_refused() {
+    let Some(context) = context() else {
+        return;
+    };
+    let layout = FrameLayout::new(200, 120, ChromaSubsampling::Yuv420).unwrap();
+    let encoder = encoder_for(context, &layout, None);
+    let source = picture(&layout, 7);
+    let mut storage = Vec::new();
+    let mut planes = source_planes(&layout, &source, 0, &mut storage);
+    planes[1].size -= 1;
+    let (status, _, _) = encode_c(encoder, planes, 20_000);
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(last_error().contains("cb.size"), "{}", last_error());
+    planes[1].size += 1;
+    let (status, _, _) = encode_c(encoder, planes, 20_000);
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    // SAFETY: live, destroyed once each.
+    unsafe {
+        emberwave_encoder_destroy(encoder);
+        emberwave_context_destroy(context);
+    }
 }

@@ -273,11 +273,11 @@ final class Emberwave {
                             try check(
                                 emberwave_encoder_encode(
                                     encoder,
-                                    EmberwaveSourcePlane(data: y.baseAddress, stride: size.width),
+                                    EmberwaveSourcePlane(data: y.baseAddress, stride: size.width, size: y.count),
                                     EmberwaveSourcePlane(
-                                        data: cb.baseAddress, stride: size.width / 2),
+                                        data: cb.baseAddress, stride: size.width / 2, size: cb.count),
                                     EmberwaveSourcePlane(
-                                        data: cr.baseAddress, stride: size.width / 2),
+                                        data: cr.baseAddress, stride: size.width / 2, size: cr.count),
                                     frame.baseAddress, size.budget, &written),
                                 "emberwave_encoder_encode")
                         }
@@ -379,9 +379,9 @@ final class Emberwave {
                         try check(
                             emberwave_decoder_decode_yuv(
                                 decoder,
-                                EmberwavePlane(data: y.baseAddress, stride: size.width),
-                                EmberwavePlane(data: cb.baseAddress, stride: cw),
-                                EmberwavePlane(data: cr.baseAddress, stride: cw)),
+                                EmberwavePlane(data: y.baseAddress, stride: size.width, size: y.count),
+                                EmberwavePlane(data: cb.baseAddress, stride: cw, size: cb.count),
+                                EmberwavePlane(data: cr.baseAddress, stride: cw, size: cr.count)),
                             "emberwave_decoder_decode_yuv")
                     }
                 }
@@ -454,8 +454,8 @@ final class Emberwave {
                     "emberwave_decoder_push_packet")
             }
             try check(
-                emberwave_decoder_submit_texture(decoder, nil, texture),
-                "emberwave_decoder_submit_texture")
+                emberwave_decoder_submit_texture_metal(decoder, nil, texture),
+                "emberwave_decoder_submit_texture_metal")
             guard let commands = appQueue.makeCommandBuffer(),
                 let blit = commands.makeBlitCommandEncoder()
             else {
@@ -510,7 +510,7 @@ final class Emberwave {
         try rgb.withUnsafeMutableBufferPointer {
             try check(
                 emberwave_decoder_decode_rgb(
-                    decoder, nil, EmberwavePlane(data: $0.baseAddress, stride: size.width * 3)),
+                    decoder, nil, EmberwavePlane(data: $0.baseAddress, stride: size.width * 3, size: $0.count)),
                 "emberwave_decoder_decode_rgb")
         }
         try push()
@@ -547,9 +547,9 @@ final class Emberwave {
                     try check(
                         emberwave_decoder_decode_yuv(
                             decoder,
-                            EmberwavePlane(data: y.baseAddress, stride: size.width),
-                            EmberwavePlane(data: cb.baseAddress, stride: cw),
-                            EmberwavePlane(data: cr.baseAddress, stride: cw)),
+                            EmberwavePlane(data: y.baseAddress, stride: size.width, size: y.count),
+                            EmberwavePlane(data: cb.baseAddress, stride: cw, size: cb.count),
+                            EmberwavePlane(data: cr.baseAddress, stride: cw, size: cr.count)),
                         "emberwave_decoder_decode_yuv")
                 }
             }
@@ -613,8 +613,8 @@ final class Emberwave {
                 "emberwave_decoder_push_packet")
         }
         try check(
-            emberwave_decoder_submit_texture(decoder, nil, texture),
-            "emberwave_decoder_submit_texture")
+            emberwave_decoder_submit_texture_metal(decoder, nil, texture),
+            "emberwave_decoder_submit_texture_metal")
         let metal = try metalTexture(texture, on: device, "queue check")
         // Metal orders the queue's work by the texture only while it tracks it.
         guard metal.hazardTrackingMode == .tracked else {
@@ -647,9 +647,9 @@ final class Emberwave {
                         try check(
                             emberwave_encoder_encode(
                                 encoder,
-                                EmberwaveSourcePlane(data: y.baseAddress, stride: size.width),
-                                EmberwaveSourcePlane(data: cb.baseAddress, stride: size.width / 2),
-                                EmberwaveSourcePlane(data: cr.baseAddress, stride: size.width / 2),
+                                EmberwaveSourcePlane(data: y.baseAddress, stride: size.width, size: y.count),
+                                EmberwaveSourcePlane(data: cb.baseAddress, stride: size.width / 2, size: cb.count),
+                                EmberwaveSourcePlane(data: cr.baseAddress, stride: size.width / 2, size: cr.count),
                                 out.baseAddress, size.budget, &written),
                             "emberwave_encoder_encode")
                     }

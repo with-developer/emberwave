@@ -102,6 +102,7 @@ impl Target {
         EmberwavePlane {
             data: self.bytes.as_mut_ptr(),
             stride: self.stride,
+            size: self.bytes.len(),
         }
     }
 
@@ -218,10 +219,12 @@ fn bad_arguments_are_errors_with_a_message_not_crashes() {
             EmberwaveContextOptions {
                 backends: 1 << 7,
                 flags: 0,
+                ..Default::default()
             },
             EmberwaveContextOptions {
                 backends: EMBERWAVE_BACKEND_ANY,
                 flags: 1 << 5,
+                ..Default::default()
             },
         ] {
             assert_eq!(
@@ -377,6 +380,7 @@ fn rgb_through_the_c_api_follows_the_stream_or_the_caller() {
         matrix: info.matrix,
         range: info.range,
         chroma_siting: info.chroma_siting,
+        ..Default::default()
     };
     let expected = rust
         .decode_rgb(frame, &ColorParams::from_stream(&header.stream))
@@ -388,6 +392,7 @@ fn rgb_through_the_c_api_follows_the_stream_or_the_caller() {
         matrix: EMBERWAVE_MATRIX_BT601,
         range: EMBERWAVE_RANGE_FULL,
         chroma_siting: EMBERWAVE_SITING_LEFT,
+        ..Default::default()
     };
     let expected = rust
         .decode_rgb(
@@ -449,6 +454,7 @@ fn a_bad_target_is_refused_before_the_frame_is_used() {
         let missing = EmberwavePlane {
             data: ptr::null_mut(),
             stride: 96,
+            size: 0,
         };
         assert_eq!(
             emberwave_decoder_decode_yuv(decoder, y.plane(), cb.plane(), missing),
@@ -960,7 +966,7 @@ fn a_decode_without_a_wait_needs_the_callers_own_queue() {
             EmberwaveStatus::Ok
         );
         assert_eq!(
-            emberwave_decoder_submit_texture(decoder, ptr::null(), picture),
+            emberwave_decoder_submit_texture_metal(decoder, ptr::null(), picture),
             EmberwaveStatus::InvalidArgument
         );
         assert!(
@@ -969,7 +975,7 @@ fn a_decode_without_a_wait_needs_the_callers_own_queue() {
             last_error()
         );
         assert_eq!(
-            emberwave_decoder_submit_plane_textures(decoder, y, cb, cr),
+            emberwave_decoder_submit_plane_textures_metal(decoder, y, cb, cr),
             EmberwaveStatus::InvalidArgument
         );
         assert!(emberwave_decoder_is_ready(decoder, 0));
@@ -1005,7 +1011,7 @@ fn a_metal_context_needs_a_device_and_a_queue() {
         let anything = std::ptr::from_mut(&mut marker).cast();
         // SAFETY: never dereferenced off Apple systems.
         let status = unsafe { emberwave_context_create_metal(anything, anything, &mut context) };
-        assert_eq!(status, EmberwaveStatus::NoGpu);
+        assert_eq!(status, EmberwaveStatus::Unsupported);
         assert!(context.is_null());
     }
 }
@@ -1028,7 +1034,7 @@ fn vulkan_contexts_need_their_handles_and_vulkan() {
         );
         assert!(requirements.is_null());
         assert_eq!(
-            emberwave_vulkan_instance_extensions(None, ptr::null_mut(), ptr::null_mut()),
+            emberwave_vulkan_instance_extensions(None, ptr::null_mut(), 0, ptr::null_mut()),
             EmberwaveStatus::InvalidArgument
         );
         assert!(emberwave_vulkan_requirements_extensions(ptr::null(), &mut count).is_null());
@@ -1057,9 +1063,10 @@ fn vulkan_contexts_need_their_handles_and_vulkan() {
             api_version: 0,
             extensions: ptr::null(),
             extension_count: 0,
+            ..Default::default()
         };
         let device = EmberwaveVulkanDevice {
-            instance,
+            instance: &instance,
             physical_device: anything,
             device: anything,
             extensions: ptr::null(),
@@ -1069,22 +1076,23 @@ fn vulkan_contexts_need_their_handles_and_vulkan() {
             lock_queue: None,
             unlock_queue: None,
             user: ptr::null_mut(),
+            ..Default::default()
         };
         // SAFETY: never dereferenced where there is no Vulkan.
         unsafe {
             assert_eq!(
                 emberwave_vulkan_requirements_create(&instance, anything, &mut requirements),
-                EmberwaveStatus::NoGpu
+                EmberwaveStatus::Unsupported
             );
             assert!(requirements.is_null());
             assert_eq!(
                 emberwave_context_create_vulkan(&device, &mut context),
-                EmberwaveStatus::NoGpu
+                EmberwaveStatus::Unsupported
             );
             assert!(context.is_null());
             assert_eq!(
-                emberwave_vulkan_instance_extensions(Some(nothing), ptr::null_mut(), &mut count),
-                EmberwaveStatus::NoGpu
+                emberwave_vulkan_instance_extensions(Some(nothing), ptr::null_mut(), 0, &mut count),
+                EmberwaveStatus::Unsupported
             );
         }
     }
@@ -1096,7 +1104,12 @@ fn direct3d_calls_need_a_context_of_their_own() {
     let mut made = ptr::null_mut();
     // SAFETY: a pointer to store the context in.
     let status = unsafe { emberwave_context_create_d3d12(0, 0, &mut made) };
-    assert_eq!(status, EmberwaveStatus::NoGpu, "{}", last_error());
+    let expected = if cfg!(windows) {
+        EmberwaveStatus::NoGpu
+    } else {
+        EmberwaveStatus::Unsupported
+    };
+    assert_eq!(status, expected, "{}", last_error());
     assert!(made.is_null());
 
     // A context of emberwave_context_create takes no shared handle nor
@@ -1152,7 +1165,7 @@ fn metal_textures_of_the_callers_own_need_metal() {
         let expected = if cfg!(any(target_os = "macos", target_os = "ios")) {
             EmberwaveStatus::InvalidArgument
         } else {
-            EmberwaveStatus::NoGpu
+            EmberwaveStatus::Unsupported
         };
         assert_eq!(
             emberwave_texture_from_metal(decoder, ptr::null_mut(), &mut texture),
@@ -1165,6 +1178,136 @@ fn metal_textures_of_the_callers_own_need_metal() {
         );
         assert!(last_error().contains("plane is 3"), "{}", last_error());
         assert!(texture.is_null());
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}
+
+#[test]
+fn the_header_and_the_library_have_one_version() {
+    assert_eq!(emberwave_version_number(), EMBERWAVE_VERSION);
+    // SAFETY: a static string.
+    let text = unsafe { CStr::from_ptr(emberwave_version()) }
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        text,
+        format!("{EMBERWAVE_VERSION_MAJOR}.{EMBERWAVE_VERSION_MINOR}.{EMBERWAVE_VERSION_PATCH}")
+    );
+}
+
+#[test]
+fn structs_carry_their_size_and_planes_theirs() {
+    let bytes = testdata("gradient_200x120_420.pwv1");
+    let size = std::mem::size_of::<EmberwaveStreamInfo>();
+    // SAFETY: valid buffers, and structs as large as their sizes say.
+    unsafe {
+        // A size below the struct's is refused, and nothing is written.
+        let mut info = EmberwaveStreamInfo {
+            struct_size: 4,
+            width: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            emberwave_probe_pwv1(bytes.as_ptr(), bytes.len(), &mut info),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("info.struct_size is 4"),
+            "{}",
+            last_error()
+        );
+        assert_eq!(info.width, 7);
+
+        // A caller built with a larger struct gets what this version knows,
+        // and the bytes past it stay as they were.
+        #[repr(C)]
+        struct Later {
+            info: EmberwaveStreamInfo,
+            added: [u32; 4],
+        }
+        let mut later = Later {
+            info: EmberwaveStreamInfo {
+                struct_size: std::mem::size_of::<Later>() as u32,
+                ..Default::default()
+            },
+            added: [0x5a5a_5a5a; 4],
+        };
+        assert_eq!(
+            emberwave_probe_pwv1(bytes.as_ptr(), bytes.len(), &mut later.info),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        assert_eq!((later.info.width, later.info.height), (200, 120));
+        assert_eq!(
+            later.info.struct_size as usize,
+            std::mem::size_of::<Later>()
+        );
+        assert_eq!(later.added, [0x5a5a_5a5a; 4]);
+        assert!(size < std::mem::size_of::<Later>());
+
+        // An options struct of size 0, as a zeroed one is, is refused.
+        let mut context = ptr::null_mut();
+        let zeroed = EmberwaveContextOptions {
+            struct_size: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            emberwave_context_create(&zeroed, &mut context),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("options.struct_size is 0"),
+            "{}",
+            last_error()
+        );
+        assert!(context.is_null());
+    }
+
+    // Planes too small for their rows: a decode's are refused as too small,
+    // and nothing is decoded.
+    let Some(context) = context() else {
+        return;
+    };
+    let decoder = decoder_for(context, &bytes);
+    let frame = frames(&bytes)[0];
+    let mut y = vec![0u8; 200 * 120];
+    let mut cb = vec![0u8; 100 * 60];
+    let mut cr = vec![0u8; 100 * 60];
+    let plane = |bytes: &mut Vec<u8>, stride, size| EmberwavePlane {
+        data: bytes.as_mut_ptr(),
+        stride,
+        size,
+    };
+    // SAFETY: a live decoder, and planes no larger than their buffers.
+    unsafe {
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        let short = plane(&mut cb, 100, 100 * 60 - 1);
+        assert_eq!(
+            emberwave_decoder_decode_yuv(
+                decoder,
+                plane(&mut y, 200, 200 * 120),
+                short,
+                plane(&mut cr, 100, 100 * 60)
+            ),
+            EmberwaveStatus::BufferTooSmall
+        );
+        assert!(last_error().contains("cb.size is 5999"), "{}", last_error());
+        assert_eq!(
+            emberwave_decoder_decode_yuv(
+                decoder,
+                plane(&mut y, 200, 200 * 120),
+                plane(&mut cb, 100, 100 * 60),
+                plane(&mut cr, 100, 100 * 60)
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
         emberwave_decoder_destroy(decoder);
         emberwave_context_destroy(context);
     }

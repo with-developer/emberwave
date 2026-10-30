@@ -133,7 +133,8 @@ EmberwaveEncoder *encoder;   /* one per stream, on a context as above */
 emberwave_encoder_create(context, 1920, 1080, EMBERWAVE_CHROMA_420, NULL, &encoder);
 
 /* For every picture: planes with their strides, a buffer of `budget` bytes. */
-EmberwaveSourcePlane y = { y_data, y_stride }, cb = { cb_data, cb_stride }, cr = { cr_data, cr_stride };
+EmberwaveSourcePlane y = { y_data, y_stride, y_size }, cb = { cb_data, cb_stride, cb_size },
+                     cr = { cr_data, cr_stride, cr_size };
 size_t size, count;
 emberwave_encoder_encode(encoder, y, cb, cr, frame, budget, &size);
 /* or a picture in BGRA: emberwave_encoder_encode_rgb(encoder, bgra, EMBERWAVE_TEXTURE_BGRA8, …) */
@@ -155,6 +156,33 @@ target/c-example/emberwave_encode testdata/encoder/scene_200x120_420.source.y4m 
 ```
 
 `scripts/check_c_example.sh` decodes every test vector that way and compares the output with upstream's decoder, and encodes two of the encoder's sources; CI runs it on Linux, macOS and Windows.
+
+## Versions, sizes and statuses
+
+The C API is to stay compatible from 1.0 on, and these rules let it grow without breaking programs (decision D69):
+
+- **Structs carry their size.** A struct passed by pointer starts with `struct_size`, which the caller sets to `sizeof` the struct before the call, for the structs it passes in and those it gets filled in:
+
+  ```c
+  EmberwaveStreamInfo info = { .struct_size = sizeof info };
+  emberwave_probe_pwv1(data, size, &info);
+  ```
+
+  emberwave reads and writes no more than that many bytes and takes the members a shorter struct lacks as zeros, their defaults, so a program built with an older header keeps working with a newer library. Members are only ever added at the end. A `struct_size` below the struct's first size is `EMBERWAVE_STATUS_INVALID_ARGUMENT`. The planes, passed by value, carry the bytes they span in `size` instead, which the calls check.
+- **Versions.** `EMBERWAVE_VERSION`, with `EMBERWAVE_VERSION_MAJOR`, `_MINOR` and `_PATCH`, is the header's version as one number, 10000 times the major plus 100 times the minor plus the patch. `emberwave_version_number()` is the library's: a program that finds them different runs with another library than the one it was built for.
+- **Statuses.** Later versions may add statuses: treat any but `EMBERWAVE_STATUS_OK` as a failure. `EMBERWAVE_STATUS_UNSUPPORTED` means the system lacks the call, such as Metal's off Apple's systems, and `EMBERWAVE_STATUS_BUFFER_TOO_SMALL` that an output array or buffer, or an encode's budget, is too small; the call stores what it needs where its documentation says.
+- **Callbacks** given to emberwave must not call emberwave.
+- **Provisional calls.** The calls on Metal, Vulkan and Direct3D objects of the caller's, below, are provisional: until a client has used them, a minor version may change them.
+
+| Platform | Built in CI | Tested in CI | Prebuilt in releases |
+|---|---|---|---|
+| macOS on Apple silicon, Metal | yes | yes, the C examples, the Metal interop and the benchmark app's checks | yes, and in the XCFramework |
+| Linux on x86-64, Vulkan | yes | yes, on lavapipe, the Vulkan interop under the validation layer | yes |
+| Windows on x86-64, Direct3D 12 | yes | yes, on WARP, the Direct3D 11 interop | yes |
+| iOS and iPadOS, Metal | yes, the device and the Simulator | the app builds; it runs on a phone by hand | in the XCFramework |
+| Android, Linux on Arm, 32-bit Windows | no | no | no |
+
+The header is C99 and C++11.
 
 ## Pictures on the GPU: Metal
 
@@ -211,13 +239,13 @@ emberwave_context_create_metal((__bridge void *)device, (__bridge void *)queue, 
 /* ... a decoder on it, and one texture for every frame ... */
 
 /* For every frame that is ready: */
-emberwave_decoder_submit_texture(decoder, NULL, texture);   /* returns once the work is on the queue */
+emberwave_decoder_submit_texture_metal(decoder, NULL, texture);   /* returns once the work is on the queue */
 id<MTLCommandBuffer> commands = [queue commandBuffer];       /* the same queue, committed after */
 /* ... encode the draw that samples the texture ... */
 [commands commit];
 ```
 
-`emberwave_decoder_submit_plane_textures` does the same for the planes. On an Apple M3 Max a 4K frame takes the decoding thread 0.26 ms instead of 1.3 ms, and the client's draw completes as soon as after the waiting decode, at 1080p 0.1 ms sooner. The rules of a shared queue:
+`emberwave_decoder_submit_plane_textures_metal` does the same for the planes. On an Apple M3 Max a 4K frame takes the decoding thread 0.26 ms instead of 1.3 ms, and the client's draw completes as soon as after the waiting decode, at 1080p 0.1 ms sooner. The rules of a shared queue:
 - Use the textures directly in the command buffers that read them, not through a heap or through an argument buffer without `useResource`, as Metal does not track those.
 - Commit those command buffers after the call has returned.
 - A call makes all its command buffers before it commits them: on an Apple M3 Max, 9 for a decode to a texture or to RGB, 6 to planes or to plane textures and 18 for an encode, one for each pass and transition of wgpu's. The decoders and encoders of every context made on the queue take turns at this, and hold none between calls (decision D60). A full queue makes a call wait until one of its command buffers has completed and that buffer's completed handlers have returned; a queue without room for 20 besides those the client holds uncommitted can wait for good. The default of 64 is plenty.
@@ -247,10 +275,10 @@ CFRelease(image);
 /* ... the pixel buffer holds the picture: enqueue it on the display layer */
 ```
 
-For a pixel buffer that goes to a display layer, the decode that waits is the simple way. The display layer is not on the queue, so the submit gains nothing there unless the client queues GPU work of its own behind the decode. With `emberwave_decoder_submit_texture` the call returns before the GPU has written the pixel buffer. The queue orders only command buffers that use the texture: one that does not use it may run beside the decode and finish first. Commit one that uses it, such as the client's own pass over the texture or a copy of one pixel from it. In its completed handler, release the `CVMetalTextureRef` and enqueue the pixel buffer:
+For a pixel buffer that goes to a display layer, the decode that waits is the simple way. The display layer is not on the queue, so the submit gains nothing there unless the client queues GPU work of its own behind the decode. With `emberwave_decoder_submit_texture_metal` the call returns before the GPU has written the pixel buffer. The queue orders only command buffers that use the texture: one that does not use it may run beside the decode and finish first. Commit one that uses it, such as the client's own pass over the texture or a copy of one pixel from it. In its completed handler, release the `CVMetalTextureRef` and enqueue the pixel buffer:
 
 ```objc
-emberwave_decoder_submit_texture(decoder, NULL, texture);
+emberwave_decoder_submit_texture_metal(decoder, NULL, texture);
 id<MTLTexture> metal = CVMetalTextureGetTexture(image);
 id<MTLCommandBuffer> commands = [queue commandBuffer];   /* the same queue, after the call */
 id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
@@ -282,11 +310,12 @@ On Linux, Android and 64-bit Windows, where wgpu runs on Vulkan, a context can r
 
 ```c
 uint32_t wanted = 0;
-emberwave_vulkan_instance_extensions((EmberwaveVkGetInstanceProcAddr)vkGetInstanceProcAddr, NULL, &wanted);
+emberwave_vulkan_instance_extensions((EmberwaveVkGetInstanceProcAddr)vkGetInstanceProcAddr, NULL, 0, &wanted);
 /* ... room for `wanted` names, then the same call fills them in; vkCreateInstance with them,
    and an apiVersion at least the physical device's, up to VK_API_VERSION_1_3 ... */
 
 EmberwaveVulkanInstance instance = {
+    .struct_size = sizeof instance,
     .get_instance_proc_addr = (EmberwaveVkGetInstanceProcAddr)vkGetInstanceProcAddr,
     .instance = vk_instance,
     .api_version = VK_API_VERSION_1_3,            /* the instance's apiVersion */
@@ -302,7 +331,8 @@ const VkPhysicalDeviceFeatures2 *features = emberwave_vulkan_requirements_featur
 emberwave_vulkan_requirements_destroy(needs);
 
 EmberwaveVulkanDevice device = {
-    .instance = instance,
+    .struct_size = sizeof device,
+    .instance = &instance,
     .physical_device = physical_device,
     .device = vk_device,
     .extensions = device_extensions,              /* all the device's extensions */
@@ -338,6 +368,7 @@ The decodes that wait, `emberwave_decoder_decode_texture` and `emberwave_decoder
 
 ```c
 EmberwaveVulkanSync sync = {
+    .struct_size = sizeof sync,
     .wait_semaphore = (uint64_t)reads_done,       /* signalled when the client's reads of the image end */
     .wait_value = frame,
     .signal_semaphore = (uint64_t)picture_ready,  /* the client's reads wait for it */
@@ -382,6 +413,7 @@ emberwave_texture_from_d3d12(decoder, texture_handle, &texture);
 /* For every frame that is ready: the decode waits for the client's reads of the last picture,
    and signals when the texture holds the new one. */
 EmberwaveD3D12Sync sync = {
+    .struct_size = sizeof sync,
     .wait_fence = shared, .wait_value = reads_done,
     .signal_fence = shared, .signal_value = reads_done + 1,
 };
@@ -456,6 +488,7 @@ On Vulkan, `emberwave_texture_from_vulkan_source` wraps an image of the host's, 
 
 ```c
 EmberwaveVulkanImage image = {
+    .struct_size = sizeof image,
     .image = (uint64_t)luma_image,
     .format = VK_FORMAT_R8_UNORM,
     .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -466,7 +499,7 @@ emberwave_texture_from_vulkan_source(encoder, EMBERWAVE_PLANE_Y, &image, &y);
 /* ... and the VK_FORMAT_R8G8_UNORM image of Cb and Cr for EMBERWAVE_PLANE_CBCR */
 
 /* For every picture: the host's copy of the capture into the images signals `copied`. */
-EmberwaveVulkanSync sync = { .wait_semaphore = (uint64_t)copied };
+EmberwaveVulkanSync sync = { .struct_size = sizeof sync, .wait_semaphore = (uint64_t)copied };
 emberwave_encoder_encode_textures_vulkan(encoder, y, cbcr, NULL, &sync, frame, budget, &size);
 ```
 
@@ -510,7 +543,7 @@ CFRelease(bgra);
 - **Packets.** `emberwave_decoder_push_packet` takes one packet or several back to back, in any order, and ignores a block that arrived already. Frames are told apart by the bitstream's sequence number, which has three bits: a packet of a frame one to three frames newer discards what was received of the older one and starts its own; one four to seven frames newer, or one to four frames older, is ignored; one five to seven frames older passes for a newer frame, and one eight frames off for the same frame. So a transport keeps frame numbers of its own: it drops packets of frames older than the one being received, and before it gives the first packet of a newer frame it decodes the current one if it is ready, then calls `emberwave_decoder_clear`, not after.
 - **Partial frames.** `emberwave_decoder_is_ready` with `allow_partial_frame` accepts a frame that lost packets once every block of the coarsest level and more than 90 percent of the blocks its start of frame header announced have arrived, for a picture despite the loss; `emberwave_decoder_set_partial_share` sets another share, lower to draw frames that lost more, with more of their detail blank, or 1 for whole frames only (decision D59). `emberwave_decoder_set_concealment(decoder, 1)` fills the blocks of detail such a frame lacks with the last frame's where the picture is still, so that a still picture keeps its detail, and `0` turns it off again, as it is by default (decision D66). Until that header arrives the count is of all the picture's blocks. emberwave's encoder sends every block of the coarsest level for this; upstream's leaves out the empty ones, so a frame of it that lost any packet may never be ready in part (decision D58).
 - **Encoding.** `emberwave_encoder_encode` reads planes with a stride of at least their width (`emberwave_encoder_info` gives the sizes), `emberwave_encoder_encode_rgb` a picture in RGB with a stride of at least four bytes a pixel, and `emberwave_encoder_encode_textures` reads either from textures on the GPU (see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu)), as `_vulkan` and `_d3d12` do with fences or semaphores. Both write the frame, at most `budget` bytes, into a buffer of that many bytes the caller provides, and wait for the GPU. A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in `size`, and encodes nothing. The frame's sequence number, a three-bit counter from 1 that wraps around, advances only with frames that were encoded. `emberwave_frame_packets` splits a frame at its blocks; a block larger than the packet size gets a packet of its own.
-- **Signalling.** `EmberwaveSignalling` sets what every frame says about its colours: matrix (BT.709 or BT.2020; the format cannot signal BT.601), range, chroma siting, primaries and transfer function (sRGB or PQ). `NULL` means BT.709, video range, centred chroma and sRGB. Its `reserved` words are zero.
+- **Signalling.** `EmberwaveSignalling` sets what every frame says about its colours: matrix (BT.709 or BT.2020; the format cannot signal BT.601), range, chroma siting, primaries and transfer function (sRGB or PQ). `NULL` means BT.709, video range, centred chroma and sRGB.
 - **Colours.** With a `NULL` colour, `emberwave_decoder_decode_rgb` converts the way the frame's start of frame header says. Upstream's Metal encoder writes BT.709, full range and centred chroma there whatever the pictures are, so pass what you know, such as the colours of a PWV1 file's header from `emberwave_probe_pwv1`.
 
 The header documents every function; `ARCHITECTURE.md` in the repository explains the design (decisions D27 and D33).

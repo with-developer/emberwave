@@ -74,10 +74,11 @@ int main(int argc, char **argv)
     unsigned char *file, *planes;
     FILE *out;
     EmberwaveStatus status;
-    EmberwaveStreamInfo stream;
+    /* A struct passed by pointer starts with its size, which the caller sets. */
+    EmberwaveStreamInfo stream = {.struct_size = sizeof stream};
     EmberwaveContext *context = NULL;
     EmberwaveDecoder *decoder = NULL;
-    EmberwaveFrameInfo frame;
+    EmberwaveFrameInfo frame = {.struct_size = sizeof frame};
     EmberwavePlane y, cb, cr;
     size_t luma_bytes, chroma_bytes;
     unsigned frames = 0;
@@ -124,10 +125,13 @@ int main(int argc, char **argv)
     }
     y.data = planes;
     y.stride = frame.width;
+    y.size = luma_bytes;
     cb.data = planes + luma_bytes;
     cb.stride = frame.chroma_width;
+    cb.size = chroma_bytes;
     cr.data = planes + luma_bytes + chroma_bytes;
     cr.stride = frame.chroma_width;
+    cr.size = chroma_bytes;
 
     out = fopen(argv[2], "wb");
     if (!out) {

@@ -134,7 +134,8 @@ int main(int argc, char **argv)
     EmberwaveContext *context = NULL;
     EmberwaveEncoder *encoder = NULL;
     EmberwaveDecoder *decoder = NULL;
-    EmberwaveFrameInfo info;
+    /* A struct passed by pointer starts with its size, which the caller sets. */
+    EmberwaveFrameInfo info = {.struct_size = sizeof info};
     EmberwaveStatus status;
     unsigned char *source[3] = { NULL, NULL, NULL };
     unsigned char *decoded[3] = { NULL, NULL, NULL };
@@ -219,13 +220,16 @@ int main(int argc, char **argv)
          * stride instead of the width. */
         y.data = source[0];
         y.stride = info.width;
+        y.size = sizes[0];
         cb.data = source[1];
         cb.stride = info.chroma_width;
+        cb.size = sizes[1];
         cr.data = source[2];
         cr.stride = info.chroma_width;
+        cr.size = sizes[2];
         status = emberwave_encoder_encode(encoder, y, cb, cr, frame, budget, &size);
         if (status != EMBERWAVE_STATUS_OK) {
-            if (status == EMBERWAVE_STATUS_INVALID_ARGUMENT && size > budget) {
+            if (status == EMBERWAVE_STATUS_BUFFER_TOO_SMALL) {
                 fprintf(stderr, "the smallest frame takes %lu bytes\n", (unsigned long)size);
             }
             result = fail("emberwave_encoder_encode", status);
@@ -269,6 +273,7 @@ int main(int argc, char **argv)
         for (plane = 0; plane < 3; plane++) {
             targets[plane].data = decoded[plane];
             targets[plane].stride = plane == 0 ? info.width : info.chroma_width;
+            targets[plane].size = sizes[plane];
         }
         status = emberwave_decoder_decode_yuv(decoder, targets[0], targets[1], targets[2]);
         if (status != EMBERWAVE_STATUS_OK) {
