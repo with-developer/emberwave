@@ -373,6 +373,10 @@ pub struct EmberwaveTexture {
         allow(dead_code)
     )]
     vulkan: bool,
+    /// Whether the texture is the caller's, shared with its Direct3D 12 or
+    /// Direct3D 11 device: only the `_d3d12` calls take it, which leave it in
+    /// `D3D12_RESOURCE_STATE_COMMON` (decision D63).
+    d3d12: bool,
 }
 
 impl EmberwaveTexture {
@@ -396,6 +400,7 @@ impl EmberwaveTexture {
             holds: wrapping.holds,
             tracked,
             vulkan: wrapping.vulkan,
+            d3d12: false,
         }
     }
 }
@@ -1364,6 +1369,52 @@ pub const EMBERWAVE_SYNC_WAIT_TIMELINE: u32 = 1 << 0;
 /// to signal to `signal_value`.
 pub const EMBERWAVE_SYNC_SIGNAL_TIMELINE: u32 = 1 << 1;
 
+/// A fence of the caller's Direct3D 12 or Direct3D 11 device, opened on the
+/// device of a context of `emberwave_context_create_d3d12` from its shared
+/// NT handle (`emberwave_d3d12_fence_open`, decision D63), for the waits and
+/// signals of an `EmberwaveD3D12Sync`.
+pub struct EmberwaveD3D12Fence {
+    #[cfg(windows)]
+    fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence,
+    /// The context whose device opened it, which the calls that take it
+    /// must use.
+    context_id: u64,
+}
+
+/// Fences for a call on textures shared with the caller's Direct3D 12 or
+/// Direct3D 11 device (decision D63). Either may be `NULL`, and `sync` too.
+///
+/// A fence orders work across devices as a semaphore does: the call's GPU
+/// work waits until `wait_fence` has reached `wait_value` before it uses the
+/// textures, and sets `signal_fence` to `signal_value` once it is done with
+/// them. A wait that is never met holds up every later submission of the
+/// context.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EmberwaveD3D12Sync {
+    /// A fence the call's GPU work waits for, such as one the caller signals
+    /// once its own work on the textures is done, or `NULL`.
+    pub wait_fence: *const EmberwaveD3D12Fence,
+    /// The value `wait_fence` is to reach.
+    pub wait_value: u64,
+    /// A fence the call's GPU work signals once it is done with the
+    /// textures, or `NULL`.
+    pub signal_fence: *const EmberwaveD3D12Fence,
+    /// The value `signal_fence` is set to.
+    pub signal_value: u64,
+}
+
+impl Default for EmberwaveD3D12Sync {
+    fn default() -> Self {
+        Self {
+            wait_fence: std::ptr::null(),
+            wait_value: 0,
+            signal_fence: std::ptr::null(),
+            signal_value: 0,
+        }
+    }
+}
+
 /// What emberwave needs a Vulkan device of the caller's to have enabled:
 /// device extensions and features, from
 /// `emberwave_vulkan_requirements_create`.
@@ -1946,6 +1997,544 @@ pub unsafe extern "C" fn emberwave_encoder_encode_textures_vulkan(
         },
         // SAFETY: as the caller promises; the body's borrow has ended.
         || unsafe { encoder_lost(encoder) },
+    )
+}
+
+/// Creates a context on the Direct3D 12 adapter whose locally unique
+/// identifier is `luid_low` and `luid_high`, the `LowPart` and `HighPart` of
+/// a `LUID` (decision D63): the adapter of the caller's Direct3D 12 or
+/// Direct3D 11 device whose textures and fences the context is to open, as
+/// `ID3D12Device::GetAdapterLuid` or `IDXGIAdapter::GetDesc` gives it. A
+/// shared handle opens only on the adapter that made it. Only on Windows;
+/// elsewhere, and where no Direct3D 12 adapter has the identifier,
+/// `EMBERWAVE_STATUS_NO_GPU`.
+///
+/// The device is emberwave's own, made by wgpu on that adapter: textures and
+/// fences of the caller's come to it through shared NT handles
+/// (`emberwave_texture_from_d3d12`, `emberwave_d3d12_fence_open`), as wgpu
+/// cannot run on the caller's `ID3D12Device`.
+///
+/// # Safety
+///
+/// `context` points to where the new context is stored; it is set to `NULL`
+/// when the call fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_context_create_d3d12(
+    luid_low: u32,
+    luid_high: i32,
+    context: *mut *mut EmberwaveContext,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        unsafe { output(context, "context", std::ptr::null_mut()) }?;
+        let created = d3d12_context(luid_low, luid_high)?;
+        // SAFETY: checked by the output() above.
+        unsafe { context.write(EmberwaveContext::boxed(created, false, false)) };
+        Ok(())
+    })
+}
+
+/// Opens a fence of the caller's Direct3D 12 or Direct3D 11 device on the
+/// device of `context`, a context of `emberwave_context_create_d3d12`, from
+/// the NT handle `handle` (decision D63): an `ID3D12Fence` made with
+/// `D3D12_FENCE_FLAG_SHARED`, or an `ID3D11Fence` made with
+/// `D3D11_FENCE_FLAG_SHARED`, and the handle its `CreateSharedHandle` gave.
+/// The fence then orders the `_d3d12` calls on the context against the
+/// caller's work, through an `EmberwaveD3D12Sync`. emberwave does not close
+/// the handle: the caller may close it once this returns. A context that
+/// does not run on Direct3D 12, or a handle that is not a fence's of the
+/// context's adapter, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`; off Windows
+/// `EMBERWAVE_STATUS_NO_GPU`.
+///
+/// # Safety
+///
+/// `context` is a live context, `handle` is `NULL` or a handle of the
+/// calling process, and `fence` points to where the new fence is stored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_d3d12_fence_open(
+    context: *const EmberwaveContext,
+    handle: *mut c_void,
+    fence: *mut *mut EmberwaveD3D12Fence,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        unsafe { output(fence, "fence", std::ptr::null_mut()) }?;
+        // SAFETY: as the caller promises.
+        let Some(context) = (unsafe { context.as_ref() }) else {
+            return Err(Failure::argument("context is NULL"));
+        };
+        if handle.is_null() {
+            return Err(Failure::argument("handle is NULL"));
+        }
+        // SAFETY: as the caller promises.
+        let opened = unsafe { d3d12_fence(&context.context, handle) }?;
+        // SAFETY: checked by the output() above.
+        unsafe { fence.write(Box::into_raw(Box::new(opened))) };
+        Ok(())
+    })
+}
+
+/// Destroys a fence that `emberwave_d3d12_fence_open` opened; the caller's
+/// fence stays. Calls that waited for it or signalled it may still be on
+/// the GPU: they keep it until they are done.
+///
+/// # Safety
+///
+/// `fence` is `NULL`, or a fence of `emberwave_d3d12_fence_open` that has not
+/// been destroyed and that no other thread is using.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_d3d12_fence_destroy(fence: *mut EmberwaveD3D12Fence) {
+    if !fence.is_null() {
+        // SAFETY: it came from Box::into_raw, as the caller promises.
+        let boxed = unsafe { Box::from_raw(fence) };
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+    }
+}
+
+/// Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device for the
+/// decodes of `decoder` to put the picture into, from the NT handle
+/// `handle`, on a context of `emberwave_context_create_d3d12` (decision D63):
+/// a Direct3D 12 resource made with `D3D12_HEAP_FLAG_SHARED`, or a Direct3D
+/// 11 texture made with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`, and the handle
+/// `CreateSharedHandle` gave. Only `emberwave_decoder_submit_texture_d3d12`
+/// takes it.
+///
+/// The texture is 2D, of one level, layer and sample, of the picture's size,
+/// in `DXGI_FORMAT_B8G8R8A8_UNORM` or `DXGI_FORMAT_R8G8B8A8_UNORM`, and can be
+/// sampled: without `D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE`. A decode
+/// copies the picture into it when its width is a multiple of 64 pixels, and
+/// draws it otherwise, which needs `D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET`
+/// (`D3D11_BIND_RENDER_TARGET`). emberwave reads all of this from the
+/// resource itself; a texture that is not so gives
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is then `NULL`. Off
+/// Windows, `EMBERWAVE_STATUS_NO_GPU`.
+///
+/// emberwave keeps a reference to the resource until the texture is
+/// destroyed and the GPU is done with it, and does not close the handle: the
+/// caller may close it once this returns.
+///
+/// # Safety
+///
+/// `decoder` is a live decoder that no other thread is using, `handle` is
+/// `NULL` or a handle of the calling process, and `texture` points to where
+/// the new texture is stored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_d3d12(
+    decoder: *const EmberwaveDecoder,
+    handle: *mut c_void,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live(decoder) }?;
+            // SAFETY: as the caller promises.
+            let wrapped = unsafe { d3d12_import(&Wrapping::decoder(decoder, None), handle) }?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device for the
+/// Y, Cb or Cr plane of the pictures of `decoder`, as
+/// `emberwave_texture_from_d3d12` does for the picture: `plane` is
+/// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`, and the
+/// texture is `DXGI_FORMAT_R8_UNORM` of the plane's size, which a decode
+/// copies the plane into. Only `emberwave_decoder_submit_plane_textures_d3d12`
+/// takes it.
+///
+/// # Safety
+///
+/// As for `emberwave_texture_from_d3d12`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_d3d12_plane(
+    decoder: *const EmberwaveDecoder,
+    plane: u32,
+    handle: *mut c_void,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            let component = plane_component(plane)?;
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live(decoder) }?;
+            // SAFETY: as the caller promises.
+            let wrapped =
+                unsafe { d3d12_import(&Wrapping::decoder(decoder, Some(component)), handle) }?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device that
+/// holds a plane of a picture for the encodes of `encoder` to read, from the
+/// NT handle `handle`, as `emberwave_texture_from_d3d12` does for a decoder
+/// (decision D63): `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+/// `EMBERWAVE_PLANE_CR` for a texture in `DXGI_FORMAT_R8_UNORM`, or
+/// `EMBERWAVE_PLANE_CBCR` for one in `DXGI_FORMAT_R8G8_UNORM` with Cb and Cr
+/// interleaved, of the plane's size as `emberwave_encoder_info` gives it (that
+/// of Cb for `EMBERWAVE_PLANE_CBCR`). The texture can be sampled. Only
+/// `emberwave_encoder_encode_textures_d3d12` takes it.
+///
+/// # Safety
+///
+/// `encoder` is a live encoder that no other thread is using, `handle` is
+/// `NULL` or a handle of the calling process, and `texture` points to where
+/// the new texture is stored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_d3d12_source(
+    encoder: *const EmberwaveEncoder,
+    plane: u32,
+    handle: *mut c_void,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            let holds = source_holds(plane)?;
+            // SAFETY: as the caller promises.
+            let encoder =
+                unsafe { encoder.as_ref() }.ok_or_else(|| Failure::argument("encoder is NULL"))?;
+            // SAFETY: as the caller promises.
+            let wrapped = unsafe { d3d12_import(&Wrapping::encoder(encoder, holds), handle) }?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { encoder_lost(encoder) },
+    )
+}
+
+/// Decodes the frame received so far into `texture` as
+/// `emberwave_decoder_decode_texture` does, but returns once the work is
+/// submitted, with the fences of `sync`, on a context of
+/// `emberwave_context_create_d3d12` (decision D63); elsewhere
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`. `texture` may be a texture of the
+/// caller's (`emberwave_texture_from_d3d12`) or emberwave's own.
+///
+/// The decode's GPU work waits until `sync.wait_fence` has reached
+/// `wait_value` before it writes the texture: the caller signals it once its
+/// own work that reads the texture is done. The decode leaves the texture in
+/// `D3D12_RESOURCE_STATE_COMMON`, as another device takes it, and then sets
+/// `signal_fence` to `signal_value`: the caller's work that reads the picture
+/// waits for that value. Keep the fences until the work that signals them is
+/// done. When the call fails, the fences may or may not have been waited for
+/// and signalled.
+///
+/// # Safety
+///
+/// As for `emberwave_decoder_decode_texture`, and `sync` is `NULL` or points
+/// to an `EmberwaveD3D12Sync` whose fences are `NULL` or live fences.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_submit_texture_d3d12(
+    decoder: *mut EmberwaveDecoder,
+    color: *const EmberwaveColor,
+    texture: *const EmberwaveTexture,
+    sync: *const EmberwaveD3D12Sync,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            let context_id = decoder.decoder.context_id();
+            require_d3d12(decoder.decoder.device(), "decoder")?;
+            // SAFETY: as the caller promises.
+            let texture = unsafe { picture_texture(texture, context_id) }?;
+            // SAFETY: as the caller promises.
+            let params = unsafe { conversion(decoder, color) }?;
+            // SAFETY: as the caller promises.
+            let mut fences = unsafe { d3d12_fences(sync, context_id, &[texture]) }?;
+            decoder.decoder.submit_assembled_to_texture_with(
+                &params,
+                &texture.view,
+                &mut *fences,
+            )?;
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Decodes the frame received so far into the plane textures `y`, `cb` and
+/// `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
+/// the work is submitted, with the fences of `sync`, as
+/// `emberwave_decoder_submit_texture_d3d12` does.
+///
+/// # Safety
+///
+/// As for `emberwave_decoder_decode_plane_textures`, and `sync` is `NULL` or
+/// points to an `EmberwaveD3D12Sync` whose fences are `NULL` or live fences.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_d3d12(
+    decoder: *mut EmberwaveDecoder,
+    y: *const EmberwaveTexture,
+    cb: *const EmberwaveTexture,
+    cr: *const EmberwaveTexture,
+    sync: *const EmberwaveD3D12Sync,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            let context_id = decoder.decoder.context_id();
+            require_d3d12(decoder.decoder.device(), "decoder")?;
+            // SAFETY: as the caller promises.
+            let textures = unsafe {
+                [
+                    plane_texture(y, Component::Y, "y", context_id)?,
+                    plane_texture(cb, Component::Cb, "cb", context_id)?,
+                    plane_texture(cr, Component::Cr, "cr", context_id)?,
+                ]
+            };
+            if same_texture(textures[0], textures[1])
+                || same_texture(textures[0], textures[2])
+                || same_texture(textures[1], textures[2])
+            {
+                return Err(Failure::argument("two of the planes are the same texture"));
+            }
+            // SAFETY: as the caller promises.
+            let mut fences = unsafe { d3d12_fences(sync, context_id, &textures) }?;
+            let targets = textures.map(|texture| &texture.view);
+            decoder
+                .decoder
+                .submit_assembled_to_plane_textures_with(targets, &mut *fences)?;
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Encodes the picture whose planes are in the textures `y`, `cb` and `cr`,
+/// as `emberwave_encoder_encode_textures` does, with the fences of `sync`, on
+/// a context of `emberwave_context_create_d3d12` (decision D63); elsewhere
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+///
+/// The encode's GPU work waits until `sync.wait_fence` has reached
+/// `wait_value` before it reads the textures: the caller signals it once its
+/// own work that writes them, such as the copy of a captured picture, is
+/// done. The encode leaves the caller's textures in
+/// `D3D12_RESOURCE_STATE_COMMON` and then sets `signal_fence` to
+/// `signal_value`, for the caller's work that writes them again. The call
+/// waits for the GPU as the other encodes do, so it returns only once its
+/// wait is met: by work submitted before the call, or from another thread.
+///
+/// # Safety
+///
+/// As for `emberwave_encoder_encode_textures`, and `sync` is `NULL` or points
+/// to an `EmberwaveD3D12Sync` whose fences are `NULL` or live fences.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_encoder_encode_textures_d3d12(
+    encoder: *mut EmberwaveEncoder,
+    y: *const EmberwaveTexture,
+    cb: *const EmberwaveTexture,
+    cr: *const EmberwaveTexture,
+    sync: *const EmberwaveD3D12Sync,
+    frame: *mut u8,
+    budget: usize,
+    size: *mut usize,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { frame_arguments(frame, budget, size) }?;
+            // SAFETY: as the caller promises.
+            let encoder = unsafe { live_encoder(encoder) }?;
+            let context_id = encoder.encoder.context_id();
+            require_d3d12(encoder.encoder.device(), "encoder")?;
+            // SAFETY: as the caller promises.
+            let used: Vec<&EmberwaveTexture> = unsafe { [y, cb, cr].map(|t| t.as_ref()) }
+                .into_iter()
+                .flatten()
+                .collect();
+            // SAFETY: as the caller promises.
+            let picture = unsafe { source_picture(y, cb, cr, context_id) }?;
+            // SAFETY: as the caller promises.
+            let mut fences = unsafe { d3d12_fences(sync, context_id, &used) }?;
+            let encoded = encoder
+                .encoder
+                .encode_textures_with(picture, budget, &mut *fences);
+            // SAFETY: as the caller promises.
+            unsafe { deliver(encoded, frame, size) }
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { encoder_lost(encoder) },
+    )
+}
+
+/// Whether two textures are the same, or wrap the same texture of the
+/// caller's.
+fn same_texture(a: &EmberwaveTexture, b: &EmberwaveTexture) -> bool {
+    a.texture == b.texture
+}
+
+/// An error if one of `textures` is shared with the caller's Direct3D
+/// device, which only the `_d3d12` calls take.
+fn refuse_d3d12(textures: &[&EmberwaveTexture]) -> Result<(), Failure> {
+    if textures.iter().any(|texture| texture.d3d12) {
+        return Err(Failure::argument(
+            "a texture of the caller's Direct3D device takes the _d3d12 calls, which leave it \
+             in D3D12_RESOURCE_STATE_COMMON",
+        ));
+    }
+    Ok(())
+}
+
+/// An error unless `device`, that of a decoder or an encoder (`owner`),
+/// runs on Direct3D 12.
+fn require_d3d12(device: &wgpu::Device, owner: &str) -> Result<(), Failure> {
+    if on_d3d12(device) {
+        Ok(())
+    } else {
+        Err(Failure::argument(format!(
+            "the {owner}'s context does not run on Direct3D 12 \
+             (emberwave_context_create_d3d12)"
+        )))
+    }
+}
+
+#[cfg(windows)]
+fn on_d3d12(device: &wgpu::Device) -> bool {
+    // SAFETY: only asks which backend the device has.
+    unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }.is_some()
+}
+
+#[cfg(not(windows))]
+fn on_d3d12(_device: &wgpu::Device) -> bool {
+    false
+}
+
+/// The hooks of a `_d3d12` call: the fences of `sync`, checked to be of the
+/// context `context_id`, and the transitions of the caller's `textures` to
+/// `D3D12_RESOURCE_STATE_COMMON`.
+///
+/// # Safety
+///
+/// `sync` is `NULL` or points to an `EmberwaveD3D12Sync` whose fences are
+/// `NULL` or live fences.
+unsafe fn d3d12_fences(
+    sync: *const EmberwaveD3D12Sync,
+    context_id: u64,
+    textures: &[&EmberwaveTexture],
+) -> Result<Box<dyn emberwave_core::gpu::SubmissionHooks>, Failure> {
+    // SAFETY: as the caller promises.
+    let sync = unsafe { sync.as_ref() }.copied().unwrap_or_default();
+    // SAFETY: as the caller promises.
+    let (wait, signal) = unsafe { (sync.wait_fence.as_ref(), sync.signal_fence.as_ref()) };
+    for (fence, name) in [(wait, "wait_fence"), (signal, "signal_fence")] {
+        if fence.is_some_and(|fence| fence.context_id != context_id) {
+            return Err(Failure::argument(format!(
+                "sync's {name} was opened on another context"
+            )));
+        }
+    }
+    let shared: Vec<wgpu::Texture> = textures
+        .iter()
+        .filter(|texture| texture.d3d12)
+        .map(|texture| texture.texture.clone())
+        .collect();
+    Ok(d3d12_hooks(
+        wait.map(|fence| (fence, sync.wait_value)),
+        signal.map(|fence| (fence, sync.signal_value)),
+        shared,
+    ))
+}
+
+#[cfg(windows)]
+fn d3d12_hooks(
+    wait: Option<(&EmberwaveD3D12Fence, u64)>,
+    signal: Option<(&EmberwaveD3D12Fence, u64)>,
+    shared: Vec<wgpu::Texture>,
+) -> Box<dyn emberwave_core::gpu::SubmissionHooks> {
+    Box::new(d3d12::Fences::new(wait, signal, shared))
+}
+
+/// Off Windows no context runs on Direct3D 12, and `require_d3d12` refuses
+/// every call before this.
+#[cfg(not(windows))]
+fn d3d12_hooks(
+    _wait: Option<(&EmberwaveD3D12Fence, u64)>,
+    _signal: Option<(&EmberwaveD3D12Fence, u64)>,
+    _shared: Vec<wgpu::Texture>,
+) -> Box<dyn emberwave_core::gpu::SubmissionHooks> {
+    struct Nothing;
+    impl emberwave_core::gpu::SubmissionHooks for Nothing {
+        fn before_submit(&mut self, _queue: &wgpu::Queue) {}
+        fn after_submit(&mut self, _queue: &wgpu::Queue, _submitted: bool) {}
+    }
+    Box::new(Nothing)
+}
+
+#[cfg(windows)]
+fn d3d12_context(luid_low: u32, luid_high: i32) -> Result<GpuContext, Failure> {
+    d3d12::context(luid_low, luid_high)
+}
+
+#[cfg(not(windows))]
+fn d3d12_context(_luid_low: u32, _luid_high: i32) -> Result<GpuContext, Failure> {
+    Err(d3d12_elsewhere())
+}
+
+/// # Safety
+///
+/// `handle` is a handle of the calling process.
+#[cfg(windows)]
+unsafe fn d3d12_fence(
+    context: &GpuContext,
+    handle: *mut c_void,
+) -> Result<EmberwaveD3D12Fence, Failure> {
+    // SAFETY: as the caller promises.
+    unsafe { d3d12::open_fence(context, handle) }
+}
+
+#[cfg(not(windows))]
+unsafe fn d3d12_fence(
+    _context: &GpuContext,
+    _handle: *mut c_void,
+) -> Result<EmberwaveD3D12Fence, Failure> {
+    Err(d3d12_elsewhere())
+}
+
+/// # Safety
+///
+/// `handle` is `NULL` or a handle of the calling process.
+#[cfg(windows)]
+unsafe fn d3d12_import(
+    wrapping: &Wrapping<'_>,
+    handle: *mut c_void,
+) -> Result<EmberwaveTexture, Failure> {
+    // SAFETY: as the caller promises.
+    unsafe { d3d12::import(wrapping, handle) }
+}
+
+#[cfg(not(windows))]
+unsafe fn d3d12_import(
+    _wrapping: &Wrapping<'_>,
+    _handle: *mut c_void,
+) -> Result<EmberwaveTexture, Failure> {
+    Err(d3d12_elsewhere())
+}
+
+#[cfg(not(windows))]
+fn d3d12_elsewhere() -> Failure {
+    Failure(
+        EmberwaveStatus::NoGpu,
+        "Direct3D 12 exists on Windows only".into(),
     )
 }
 
@@ -2719,6 +3308,333 @@ mod vulkan {
                 }
                 if let Some((semaphore, _)) = self.signal {
                     hal.remove_signal_semaphore(semaphore);
+                }
+            }
+        }
+    }
+}
+
+/// The Direct3D 12 side of the `_d3d12` calls: a context on the adapter of
+/// the caller's device, and wgpu's objects made from the caller's shared
+/// handles (decision D63).
+#[cfg(windows)]
+mod d3d12 {
+    use std::ffi::c_void;
+    use std::sync::Arc;
+
+    use emberwave_core::gpu::{GpuContext, GpuOptions, PLANE_FORMAT, QueueTurns, SubmissionHooks};
+    use wgpu::hal::api::Dx12;
+    use windows::Win32::Foundation::{HANDLE, LUID};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE, ID3D12Fence, ID3D12Resource,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+    };
+
+    use super::{
+        EmberwaveD3D12Fence, EmberwaveStatus, EmberwaveTexture, Failure, Holds, Wrapping,
+        creation_failure,
+    };
+
+    fn no_gpu(message: impl Into<String>) -> Failure {
+        Failure(EmberwaveStatus::NoGpu, message.into())
+    }
+
+    /// A context on the Direct3D 12 adapter whose LUID is `low` and `high`.
+    /// Its decoders and encoders take turns at the queue (decision D60): the
+    /// fences of a call wait in wgpu's queue until a submission takes them,
+    /// and another call's submission must not take them first.
+    pub(super) fn context(low: u32, high: i32) -> Result<GpuContext, Failure> {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::DX12;
+        let instance = wgpu::Instance::new(descriptor);
+        let wanted = LUID {
+            LowPart: low,
+            HighPart: high,
+        };
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12))
+            .into_iter()
+            .find(|adapter| {
+                // SAFETY: only reads the adapter's description.
+                unsafe { adapter.as_hal::<Dx12>() }.is_some_and(|hal| {
+                    // SAFETY: a live DXGI adapter.
+                    unsafe { hal.as_raw().GetDesc1() }.is_ok_and(|desc| {
+                        (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart)
+                            == (wanted.LowPart, wanted.HighPart)
+                    })
+                })
+            })
+            .ok_or_else(|| {
+                no_gpu(format!(
+                    "no Direct3D 12 adapter has the LUID {high:#x}:{low:#010x}"
+                ))
+            })?;
+        let created = pollster::block_on(GpuContext::from_adapter(adapter, &GpuOptions::default()))
+            .map_err(creation_failure)?;
+        Ok(created.with_queue_turns(Arc::new(QueueTurns::new())))
+    }
+
+    /// The device of wgpu's `device` that the caller's handles open on.
+    fn raw_device(
+        device: &wgpu::Device,
+        owner: &str,
+    ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Device, Failure> {
+        // SAFETY: only takes a reference to the device, which outlives it.
+        unsafe { device.as_hal::<Dx12>() }
+            .map(|hal| hal.raw_device().clone())
+            .ok_or_else(|| {
+                Failure::argument(format!(
+                    "the {owner} does not run on Direct3D 12 (emberwave_context_create_d3d12)"
+                ))
+            })
+    }
+
+    /// Opens the caller's shared fence on the device of `context`.
+    ///
+    /// # Safety
+    ///
+    /// `handle` is a handle of the calling process.
+    pub(super) unsafe fn open_fence(
+        context: &GpuContext,
+        handle: *mut c_void,
+    ) -> Result<EmberwaveD3D12Fence, Failure> {
+        let device = raw_device(context.device(), "context")?;
+        let mut fence: Option<ID3D12Fence> = None;
+        // SAFETY: a handle of the process, as the caller promises. The fence
+        // takes a reference of its own and leaves the handle open.
+        unsafe { device.OpenSharedHandle(HANDLE(handle), &mut fence) }.map_err(|error| {
+            Failure::argument(format!(
+                "the handle opens no fence on the context's device: {error}"
+            ))
+        })?;
+        let fence = fence.ok_or_else(|| Failure::argument("the handle opens no fence"))?;
+        Ok(EmberwaveD3D12Fence {
+            fence,
+            context_id: context.id(),
+        })
+    }
+
+    /// See `emberwave_texture_from_d3d12`.
+    ///
+    /// # Safety
+    ///
+    /// `handle` is `NULL` or a handle of the calling process.
+    pub(super) unsafe fn import(
+        wrapping: &Wrapping<'_>,
+        handle: *mut c_void,
+    ) -> Result<EmberwaveTexture, Failure> {
+        let owner = if wrapping.read {
+            "encoder's context"
+        } else {
+            "decoder's context"
+        };
+        let device = raw_device(wrapping.device, owner)?;
+        if handle.is_null() {
+            return Err(Failure::argument("handle is NULL"));
+        }
+        let mut resource: Option<ID3D12Resource> = None;
+        // SAFETY: a handle of the process, as the caller promises. The
+        // resource takes a reference of its own and leaves the handle open.
+        unsafe { device.OpenSharedHandle(HANDLE(handle), &mut resource) }.map_err(|error| {
+            Failure::argument(format!(
+                "the handle opens no texture on the {owner}'s device: {error}"
+            ))
+        })?;
+        let resource = resource.ok_or_else(|| Failure::argument("the handle opens no texture"))?;
+        // SAFETY: a live resource.
+        let description = unsafe { resource.GetDesc() };
+
+        let (width, height) = wrapping.size();
+        let found = description.Format;
+        let format = match wrapping.holds {
+            Holds::Plane(_) if found == DXGI_FORMAT_R8_UNORM => PLANE_FORMAT,
+            Holds::Chroma if found == DXGI_FORMAT_R8G8_UNORM => wgpu::TextureFormat::Rg8Unorm,
+            Holds::Picture if found == DXGI_FORMAT_B8G8R8A8_UNORM => {
+                wgpu::TextureFormat::Bgra8Unorm
+            }
+            Holds::Picture if found == DXGI_FORMAT_R8G8B8A8_UNORM => {
+                wgpu::TextureFormat::Rgba8Unorm
+            }
+            Holds::Plane(_) => {
+                return Err(Failure::argument(format!(
+                    "the texture's format is {}, not DXGI_FORMAT_R8_UNORM",
+                    found.0
+                )));
+            }
+            Holds::Chroma => {
+                return Err(Failure::argument(format!(
+                    "the texture's format is {}, not DXGI_FORMAT_R8G8_UNORM",
+                    found.0
+                )));
+            }
+            Holds::Picture => {
+                return Err(Failure::argument(format!(
+                    "the texture's format is {}, not DXGI_FORMAT_B8G8R8A8_UNORM or \
+                     DXGI_FORMAT_R8G8B8A8_UNORM",
+                    found.0
+                )));
+            }
+        };
+        let flags = description.Flags;
+        let has = |flag: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS| {
+            flags.0 & flag.0 != 0
+        };
+        let whose = wrapping.holds.whose();
+        let problem = if description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            Some("is not 2D".to_owned())
+        } else if (
+            description.MipLevels,
+            description.DepthOrArraySize,
+            description.SampleDesc.Count,
+        ) != (1, 1, 1)
+        {
+            Some("has more than one level, layer or sample".to_owned())
+        } else if (description.Width, description.Height) != (u64::from(width), height) {
+            Some(format!(
+                "is {}x{} rather than the {whose} {width}x{height}",
+                description.Width, description.Height
+            ))
+        } else if has(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
+            Some("cannot be sampled: it has D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE".to_owned())
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(Failure::argument(format!("the texture {problem}")));
+        }
+
+        // Direct3D 12 copies into and out of any texture, and samples one
+        // that does not deny it.
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST;
+        if has(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+            usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        }
+        let fillable = match wrapping.holds {
+            Holds::Picture => {
+                (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                    || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            }
+            Holds::Plane(_) | Holds::Chroma => true,
+        };
+        // An encode only samples the texture (decision D62).
+        if !wrapping.read && !fillable {
+            return Err(Failure::argument(
+                "a draw fills the picture's texture where its width is not a multiple of 64 \
+                 pixels, and needs D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET \
+                 (D3D11_BIND_RENDER_TARGET)",
+            ));
+        }
+
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        // SAFETY: a 2D texture of one level, layer and sample, in the format
+        // and of the size given, as checked above.
+        let hal_texture = unsafe {
+            wgpu::hal::dx12::Device::texture_from_raw(
+                resource,
+                format,
+                wgpu::TextureDimension::D2,
+                size,
+                1,
+                1,
+            )
+        };
+        // SAFETY: as above, and the usage is what the resource allows. A
+        // texture shared between devices is in D3D12_RESOURCE_STATE_COMMON
+        // when it changes hands, the state wgpu's UNINITIALIZED stands for on
+        // Direct3D 12; wgpu takes a texture of the caller's as initialised
+        // and never clears it.
+        let texture = unsafe {
+            wrapping.device.create_texture_from_hal::<Dx12>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("caller's shared texture"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                },
+                wgpu::TextureUses::UNINITIALIZED,
+            )
+        };
+        let mut wrapped = EmberwaveTexture::wrap(wrapping, texture, true);
+        wrapped.d3d12 = true;
+        Ok(wrapped)
+    }
+
+    /// The fences of an `EmberwaveD3D12Sync`, added to a call's submission
+    /// and taken back if it was not made, and the transitions of the
+    /// caller's textures to D3D12_RESOURCE_STATE_COMMON at the end of the
+    /// call's commands.
+    pub(super) struct Fences {
+        wait: Option<(ID3D12Fence, u64)>,
+        signal: Option<(ID3D12Fence, u64)>,
+        shared: Vec<wgpu::Texture>,
+    }
+
+    impl Fences {
+        pub(super) fn new(
+            wait: Option<(&EmberwaveD3D12Fence, u64)>,
+            signal: Option<(&EmberwaveD3D12Fence, u64)>,
+            shared: Vec<wgpu::Texture>,
+        ) -> Self {
+            let take = |(fence, value): (&EmberwaveD3D12Fence, u64)| (fence.fence.clone(), value);
+            Self {
+                wait: wait.map(take),
+                signal: signal.map(take),
+                shared,
+            }
+        }
+    }
+
+    impl SubmissionHooks for Fences {
+        fn record(&mut self, encoder: &mut wgpu::CommandEncoder) {
+            // COMMON is the state of PRESENT on Direct3D 12.
+            encoder.transition_resources(
+                std::iter::empty(),
+                self.shared.iter().map(|texture| wgpu::TextureTransition {
+                    texture,
+                    selector: None,
+                    state: wgpu::TextureUses::PRESENT,
+                }),
+            );
+        }
+
+        fn before_submit(&mut self, queue: &wgpu::Queue) {
+            // SAFETY: only adds to the next submission, the call's, during
+            // its turn.
+            if let Some(hal) = unsafe { queue.as_hal::<Dx12>() } {
+                if let Some((fence, value)) = &self.wait {
+                    hal.add_wait_fence(fence.clone(), *value);
+                }
+                if let Some((fence, value)) = &self.signal {
+                    hal.add_signal_fence(fence.clone(), *value);
+                }
+            }
+        }
+
+        fn after_submit(&mut self, queue: &wgpu::Queue, _submitted: bool) {
+            // As for the Vulkan semaphores: a submission that took them
+            // leaves nothing to take back, and one that did not must not
+            // hand them to another.
+            // SAFETY: only takes back what before_submit added.
+            if let Some(hal) = unsafe { queue.as_hal::<Dx12>() } {
+                if let Some((fence, _)) = &self.wait {
+                    hal.remove_wait_fence(fence);
+                }
+                if let Some((fence, _)) = &self.signal {
+                    hal.remove_signal_fence(fence);
                 }
             }
         }
@@ -3584,6 +4500,7 @@ pub unsafe extern "C" fn emberwave_decoder_decode_texture(
             let decoder = unsafe { live_mut(decoder) }?;
             // SAFETY: as the caller promises.
             let texture = unsafe { picture_texture(texture, decoder.decoder.context_id()) }?;
+            refuse_d3d12(&[texture])?;
             // SAFETY: as the caller promises.
             let params = unsafe { conversion(decoder, color) }?;
             decoder
@@ -3808,6 +4725,7 @@ pub unsafe extern "C" fn emberwave_decoder_decode_plane_textures(
                 ]
             };
             distinct_metal(&textures)?;
+            refuse_d3d12(&textures)?;
             let targets = textures.map(|texture| &texture.view);
             decoder
                 .decoder
@@ -4157,6 +5075,12 @@ pub unsafe extern "C" fn emberwave_encoder_encode_textures(
             unsafe { frame_arguments(frame, budget, size) }?;
             // SAFETY: as the caller promises.
             let encoder = unsafe { live_encoder(encoder) }?;
+            // SAFETY: as the caller promises.
+            let used: Vec<&EmberwaveTexture> = unsafe { [y, cb, cr].map(|t| t.as_ref()) }
+                .into_iter()
+                .flatten()
+                .collect();
+            refuse_d3d12(&used)?;
             // SAFETY: as the caller promises.
             let picture = unsafe { source_picture(y, cb, cr, encoder.encoder.context_id()) }?;
             let encoded = encoder.encoder.encode_textures(picture, budget);

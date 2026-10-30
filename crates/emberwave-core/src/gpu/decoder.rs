@@ -1191,6 +1191,7 @@ impl Decoder {
             .and_then(|()| {
                 with_error_scope(&self.device, || {
                     if let Some(hooks) = after.hooks.as_deref_mut() {
+                        hooks.record(&mut encoder);
                         hooks.before_submit(&self.queue);
                     }
                     submit(&self.queue, turns.as_deref(), [encoder.finish()]);

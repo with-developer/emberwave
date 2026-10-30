@@ -612,9 +612,16 @@ pub(crate) fn submit(
 
 /// What a caller's graphics API adds to the submission of a decode that
 /// does not wait, or of an encode from textures, such as Vulkan semaphores
-/// to wait on and to signal (decisions D61, D62). Both run during the
+/// to wait on and to signal (decisions D61, D62), or Direct3D 12 fences and
+/// the transitions of shared textures (decision D63). They run during the
 /// call's turn at the queue, if the context has turns (decision D60).
 pub trait SubmissionHooks {
+    /// Records what the call's commands end with, in the same command
+    /// buffer, such as transitions of textures the caller shares with
+    /// another device. Nothing by default.
+    fn record(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let _ = encoder;
+    }
     /// Runs just before the call's submission.
     fn before_submit(&mut self, queue: &wgpu::Queue);
     /// Runs after the submission, or after a failure before or in it
