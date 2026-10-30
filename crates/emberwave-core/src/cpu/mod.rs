@@ -94,9 +94,9 @@ pub fn decode_frame_with_ll(frame: &FrameView<'_>) -> Result<(DecodedFrame, LlBa
 /// The largest change of the coarsest level around a block of detail, in the
 /// coefficients' units, at which a frame drawn in part keeps the last
 /// decode's coefficients for the block when it lacks it (decision D66).
-/// Measured to keep a still picture's detail whole, and never to put a
-/// moving picture's in the wrong place, even when it moves by one pixel a
-/// frame.
+/// Measured to keep a still picture's detail whole, and to stay within
+/// 0.03 dB of the zeros of before on pictures that moved by one to eight
+/// pixels a frame.
 pub const CONCEALMENT_THRESHOLD: f32 = 0.03;
 
 /// Decodes the frames of a stream one after another, as a client draws
@@ -114,6 +114,14 @@ impl Concealer {
     /// A concealer that has decoded nothing yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The coefficients the last decode left, concealment included, as the
+    /// GPU decoder's pyramid holds them after the same decode
+    /// ([`gpu::Decoder::read_band`](crate::gpu::Decoder::read_band) reads
+    /// the bands that are not LL, and the coarsest LL).
+    pub fn bands(&self) -> Option<&Bands> {
+        self.last.as_ref().map(|(_, bands)| bands)
     }
 
     /// Decodes `frame`. A whole frame decodes as [`decode_frame`] does. A
@@ -200,7 +208,9 @@ fn coarse_change(
         ((block_x * BLOCK_SIZE) >> shift).saturating_sub(1),
         ((block_y * BLOCK_SIZE) >> shift).saturating_sub(1),
     );
-    let reach = |block: u32| (((block + 1) * BLOCK_SIZE + (1 << shift) - 1) >> shift) + 1;
+    // The block's end falls on a coefficient of the coarsest level: 32 is a
+    // multiple of every 2^shift.
+    let reach = |block: u32| (((block + 1) * BLOCK_SIZE) >> shift) + 1;
     let mut largest = 0.0f32;
     for band in Band::ALL {
         let (Some(info), Some(now), Some(then)) = (

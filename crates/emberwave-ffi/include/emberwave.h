@@ -1494,7 +1494,7 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures(struct EmberwaveDec
 // The planes never go through CPU memory: on Metal the decode stores them
 // into the textures from its shaders when all three allow it, and copies
 // them in otherwise (decision D52). Blocks that did not arrive decode as
-// zeros.
+// zeros, or are concealed (`emberwave_decoder_set_concealment`).
 //
 // Each texture is one for that plane, from `emberwave_texture_create_plane`
 // or `emberwave_texture_from_metal_plane`, on a decoder of the same context,

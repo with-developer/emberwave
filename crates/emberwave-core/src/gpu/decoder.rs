@@ -834,12 +834,14 @@ impl Decoder {
     /// block keeps the last frame's coefficients: the frame shows the detail
     /// it lost. Elsewhere the block is zero, as without concealment. Whole
     /// frames decode as before. [`cpu::Concealer`](crate::cpu::Concealer)
-    /// does the same on the CPU.
+    /// does the same on the CPU, to the last bit of the coefficients.
     ///
-    /// On an Apple M3 Max, frames drawn in part from 40 to 60 % of their
-    /// blocks came within 0.1 dB of the whole frame's luma PSNR on a still
-    /// picture rather than 3 to 4 dB below it, and stayed where they were on
-    /// a picture that moved by one to eight pixels a frame.
+    /// Measured with the CPU's, frames drawn from 40 to 60 % of their blocks
+    /// of a still game frame came out as the whole frame, 3 to 4 dB of luma
+    /// PSNR above the zeros, and those of the same picture moving by one to
+    /// eight pixels a frame within 0.03 dB of the zeros (D66 has the table).
+    /// The first frame that conceals compiles the pass, if no decoder of the
+    /// context did.
     pub fn set_concealment(&mut self, on: bool) {
         self.concealment = on;
     }
@@ -848,6 +850,20 @@ impl Decoder {
     /// ([`set_concealment`](Self::set_concealment)).
     pub fn concealment(&self) -> bool {
         self.concealment
+    }
+
+    /// Compiles the concealment's pass for a frame that will conceal, if the
+    /// context has not: before the decode takes its turn at the queue
+    /// (decision D60), which other threads may be waiting for, as compiling
+    /// needs no queue.
+    fn compile_concealment(&self) -> Result<(), GpuError> {
+        if self.concealment
+            && self.conceal.is_none()
+            && self.assembler.received_blocks() < self.assembler.total_blocks()
+        {
+            self.conceal_pipeline.get(&self.device)?;
+        }
+        Ok(())
     }
 
     /// Whether the decode of the assembled frame conceals, and the
@@ -1071,6 +1087,7 @@ impl Decoder {
     ) -> Result<Timings, GpuError> {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
+        self.compile_concealment()?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
         // The decode makes command buffers from here to its submission, and
         // takes its turn at them (decision D60); the upload above waits for
@@ -1302,6 +1319,7 @@ impl Decoder {
         hooks: Option<&mut dyn SubmissionHooks>,
     ) -> Result<(), GpuError> {
         self.check_device()?;
+        self.compile_concealment()?;
         let turns = self.turns.clone();
         let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let mut encoder = self

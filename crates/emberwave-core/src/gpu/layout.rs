@@ -739,6 +739,12 @@ mod tests {
         // Uniform buffers need struct sizes that are multiples of 16 bytes.
         assert_eq!(size_of::<BandInfo>(), 32);
         assert_eq!(size_of::<DequantParams>(), 16 + 32 * MAX_BANDS);
+        // The decoder writes the one word through the queue by its offset.
+        assert_eq!(
+            std::mem::offset_of!(DequantParams, conceal) as u64,
+            DequantParams::CONCEAL_OFFSET
+        );
+        assert_eq!(size_of::<ConcealParams>(), 48);
         assert_eq!(size_of::<CompParams>(), 48);
         assert_eq!(size_of::<LevelParams>(), 16 + 3 * 48);
         assert_eq!(size_of::<YuvParams>(), 64 + 3 * 16);
@@ -866,6 +872,8 @@ mod tests {
                 Some(entry.dst_offset),
                 buffers.band_offset(*component, *level, *band)
             );
+            assert_eq!(entry.level as usize, *level);
+            assert_eq!(entry.component as usize, component.index());
         }
         // Sorted by first block, which the shader's search relies on.
         assert!(

@@ -118,10 +118,12 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     let shift = COARSEST_LEVEL - band.level;
     let x0 = max((block_x * BLOCK_SIZE) >> shift, 1u) - 1u;
     let y0 = max((block_y * BLOCK_SIZE) >> shift, 1u) - 1u;
-    let x1 = min((((block_x + 1u) * BLOCK_SIZE + (1u << shift) - 1u) >> shift) + 1u, conceal.coarse_width);
-    let y1 = min((((block_y + 1u) * BLOCK_SIZE + (1u << shift) - 1u) >> shift) + 1u, conceal.coarse_height);
-    let width = x1 - x0;
-    let per_band = width * (y1 - y0);
+    let x1 = min((((block_x + 1u) * BLOCK_SIZE) >> shift) + 1u, conceal.coarse_width);
+    let y1 = min((((block_y + 1u) * BLOCK_SIZE) >> shift) + 1u, conceal.coarse_height);
+    // Never empty for a band of the frame's layout; were it, no region
+    // rather than a subtraction that wraps.
+    let width = select(0u, x1 - x0, x1 > x0);
+    let per_band = width * select(0u, y1 - y0, y1 > y0);
     let band_floats = conceal.coarse_width * conceal.coarse_height;
     let current_base = conceal.pyramid_offset[band.component];
     let last_base = conceal.last_offset[band.component];

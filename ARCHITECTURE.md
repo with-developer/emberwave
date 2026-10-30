@@ -304,11 +304,12 @@ The gap to the default precision is the reference decoder's own FP16 storage. In
 
 ### Stages
 
-A frame takes six dispatches in two compute passes, whatever its size, and a seventh dispatch in a third pass when it is converted to RGB:
+A frame takes six dispatches in two compute passes, whatever its size, a seventh in the first pass when a frame drawn in part conceals what it lacks (D66), and another in a third pass when it is converted to RGB:
 
 | Stage | Shader | Dispatch | Reads | Writes |
 |---|---|---|---|---|
 | Dequantisation | `dequant.wgsl` | 1: one workgroup of 128 invocations per block index | payload, block offsets | the pyramid |
+| Concealment (optional) | `conceal.wgsl` | 1, in the same pass: one workgroup of 128 invocations per block index, which return at once but for a block of detail the frame lacks | block offsets, the pyramid's coarsest level, its copy from the last decode | the pyramid: zeros for the blocks where the picture moved (D66) |
 | Inverse DWT | `idwt.wgsl` with `idwt_packed.wgsl`, or with `idwt_planes.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or, at the last level of a component, the packed 8-bit planes, or on Metal the caller's plane textures (D52) |
 | Colour conversion (optional) | `yuv2rgb.wgsl` | 1: one invocation per pixel | packed planes | RGBA words |
 
@@ -325,8 +326,9 @@ The packed planes are copied to a mappable buffer and returned as a `Frame`. Whe
 | readback (`MAP_READ`) | copy of the packed planes for the CPU | 11.9 MiB |
 | RGBA words (`array<u32>`) | one word per pixel, created on the first RGB decode | 31.6 MiB |
 | RGB readback (`MAP_READ`) | copy of the RGBA words, likewise | 31.6 MiB |
+| last coarsest level (`array<f32>`) | the coarsest level's bands of every component as the last decode left them, copied before a decode that conceals; created on the first (D66) | 383 KiB |
 
-The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 to 0 have room where the inverse transform of the level above writes them. Every band is rewritten for every frame, with zeros for blocks that were not received, so nothing needs clearing. The sizes of the pyramid and the planes are checked against the device limits when the decoder is created, and that of the RGBA buffer when it is created. The payload buffer is checked the same way every time it grows: a frame whose payload does not fit gives `GpuError::LimitExceeded` instead of an allocation that fails. With the WebGPU default of 128 MiB that can only happen for a stream of maximal blocks (a 4K frame of them is about 200 MiB); real frames are a few MiB.
+The pyramid holds LL, HL, LH and HH for each level, so the LL bands of levels 3 to 0 have room where the inverse transform of the level above writes them. Every band is rewritten for every frame, with zeros for blocks that were not received, so nothing needs clearing. A frame drawn in part that conceals leaves the blocks of detail it lacks as they were, and zeroes those where the picture moved (D66). The sizes of the pyramid and the planes are checked against the device limits when the decoder is created, and that of the RGBA buffer when it is created. The payload buffer is checked the same way every time it grows: a frame whose payload does not fit gives `GpuError::LimitExceeded` instead of an allocation that fails. With the WebGPU default of 128 MiB that can only happen for a stream of maximal blocks (a 4K frame of them is about 200 MiB); real frames are a few MiB.
 
 Per-dispatch parameters (band table, tile sizes, buffer offsets) depend only on the picture size, so they are computed once and live in small uniform buffers.
 
@@ -1680,6 +1682,7 @@ The last frame's detail, always, gains everything on a still picture and loses u
   - On the CPU, a still picture's frame drawn in part decodes as the whole frame, a changed picture's as without concealment, and nothing is taken from the frame of another size or with no frame before.
   - On every GPU CI runs, the GPU decoder conceals as `cpu::Concealer` does, within 1 of a sample, through a sequence of whole, still and changed frames. The still frame in part is the whole frame to the byte.
   - Through the C API, a still frame drawn in part with concealment decodes as the whole frame did.
-- **Cost.** On an Apple M3 Max a 4K frame drawn from 838 of its 1037 packets decodes with read-back in 0.930 to 0.946 ms with concealment, against 0.935 to 0.953 ms without, within the runs' noise.
-- **What the gate misses.** A picture whose motion shows only in fine texture, which the coarsest level averages out, takes the last frame's detail out of place. A unit test met that with texture alone moved by two pixels; natural pictures, the game frame included, move their coarsest level too.
-- **emberwave-stream** turns it on, where a frame drawn in part is what a lossy link leaves when parity falls short.
+- **A differential test**, after the review's, decodes evolving scenes on the GPU and with `cpu::Concealer` and compares every band after every decode, to the bit. The scenes are still, moved, patched in luma or chroma, or noisy. The losses come at random, in bursts, or take every block of detail, in packets of three sizes. It runs four decode paths and turns concealment off and on, in both chroma formats and in odd sizes, and it asserts that blocks were both kept and zeroed, in luma and in chroma. The review ran the same comparison much further: 21 shapes up to 4K, six decode paths and upstream's vectors, without a mismatch. It also found that the first tests let mutants pass, a wrong component or margin among them, which this one catches.
+- **Cost.** On an Apple M3 Max a 4K frame drawn from 838 of its 1037 packets decodes with read-back as fast with concealment as without, 0.93 to 0.94 ms, where its blocks keep the last frame's. Where they are zeroed, with two pictures in turn, it takes 0.05 to 0.06 ms more (a loaded machine, load 5 to 6). The first frame that conceals compiles the pass, before the decode takes its turn at the queue.
+- **What the gate misses.** A picture whose motion shows only in fine texture, which the coarsest level averages out, takes the last frame's detail out of place. A first unit test met that, with texture alone moved by two pixels; natural pictures, the game frame included, move their coarsest level too.
+- **emberwave-stream** is to turn it on, where a frame drawn in part is what a lossy link leaves when parity falls short.
