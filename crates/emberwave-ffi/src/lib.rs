@@ -265,12 +265,17 @@ pub struct EmberwaveContext {
     /// Whether the context runs on the caller's own Vulkan device
     /// (`emberwave_context_create_vulkan`).
     vulkan: bool,
+    /// Whether the context is one of `emberwave_context_create_d3d12`, whose
+    /// decoders and encoders take turns at its queue, as the fences of the
+    /// `_d3d12` calls need (decision D63).
+    d3d12: bool,
 }
 
 impl EmberwaveContext {
     /// A new context of `created`'s, on the caller's Metal queue with
-    /// `shared_queue`, on the caller's Vulkan device with `vulkan`.
-    fn boxed(created: GpuContext, shared_queue: bool, vulkan: bool) -> *mut Self {
+    /// `shared_queue`, on the caller's Vulkan device with `vulkan`, and for
+    /// textures shared with Direct3D with `d3d12`.
+    fn boxed(created: GpuContext, shared_queue: bool, vulkan: bool, d3d12: bool) -> *mut Self {
         let info = created.adapter_info();
         let adapter = format!("{} ({:?})", info.name, info.backend).replace('\0', "");
         Box::into_raw(Box::new(Self {
@@ -278,6 +283,7 @@ impl EmberwaveContext {
             adapter: CString::new(adapter).unwrap_or_default(),
             shared_queue,
             vulkan,
+            d3d12,
         }))
     }
 }
@@ -300,6 +306,9 @@ pub struct EmberwaveDecoder {
     shared_queue: bool,
     /// Whether the decoder's context runs on the caller's own Vulkan device.
     vulkan: bool,
+    /// Whether the decoder's context is one of
+    /// `emberwave_context_create_d3d12`.
+    d3d12: bool,
     /// The turns at the queue of the decoder's context, if it has any.
     turns: Option<Arc<QueueTurns>>,
 }
@@ -527,6 +536,9 @@ pub struct EmberwaveEncoder {
     encoder: Encoder,
     /// Whether the encoder's context runs on the caller's own Vulkan device.
     vulkan: bool,
+    /// Whether the encoder's context is one of
+    /// `emberwave_context_create_d3d12`.
+    d3d12: bool,
     /// The turns at the queue of the encoder's context, if it has any.
     turns: Option<Arc<QueueTurns>>,
 }
@@ -1073,7 +1085,7 @@ pub unsafe extern "C" fn emberwave_context_create(
         };
         let created = GpuContext::new(&gpu_options)?;
         // SAFETY: checked by the first output() above.
-        unsafe { context.write(EmberwaveContext::boxed(created, false, false)) };
+        unsafe { context.write(EmberwaveContext::boxed(created, false, false, false)) };
         Ok(())
     })
 }
@@ -1133,7 +1145,7 @@ pub unsafe extern "C" fn emberwave_context_create_metal(
         // SAFETY: as the caller promises.
         let created = unsafe { metal_context(device, queue) }?;
         // SAFETY: checked by the first output() above.
-        unsafe { context.write(EmberwaveContext::boxed(created, true, false)) };
+        unsafe { context.write(EmberwaveContext::boxed(created, true, false, false)) };
         Ok(())
     })
 }
@@ -1689,7 +1701,7 @@ pub unsafe extern "C" fn emberwave_context_create_vulkan(
         // SAFETY: as the caller promises.
         let created = unsafe { vulkan_context(device) }?;
         // SAFETY: checked by the first output() above.
-        unsafe { context.write(EmberwaveContext::boxed(created, false, true)) };
+        unsafe { context.write(EmberwaveContext::boxed(created, false, true, false)) };
         Ok(())
     })
 }
@@ -2068,7 +2080,7 @@ pub unsafe extern "C" fn emberwave_context_create_d3d12(
         unsafe { output(context, "context", std::ptr::null_mut()) }?;
         let created = d3d12_context(luid_low, luid_high)?;
         // SAFETY: checked by the output() above.
-        unsafe { context.write(EmberwaveContext::boxed(created, false, false)) };
+        unsafe { context.write(EmberwaveContext::boxed(created, false, false, true)) };
         Ok(())
     })
 }
@@ -2080,10 +2092,10 @@ pub unsafe extern "C" fn emberwave_context_create_d3d12(
 /// `D3D11_FENCE_FLAG_SHARED`, and the handle its `CreateSharedHandle` gave.
 /// The fence then orders the `_d3d12` calls on the context against the
 /// caller's work, through an `EmberwaveD3D12Sync`. emberwave does not close
-/// the handle: the caller may close it once this returns. A context that
-/// does not run on Direct3D 12, or a handle that is not a fence's of the
-/// context's adapter, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`; off Windows
-/// `EMBERWAVE_STATUS_NO_GPU`.
+/// the handle: the caller may close it once this returns. A context that is
+/// not one of `emberwave_context_create_d3d12`, or a handle that is not a
+/// fence's of the context's adapter, gives
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
 ///
 /// # Safety
 ///
@@ -2102,6 +2114,7 @@ pub unsafe extern "C" fn emberwave_d3d12_fence_open(
         let Some(context) = (unsafe { context.as_ref() }) else {
             return Err(Failure::argument("context is NULL"));
         };
+        require_d3d12(context.d3d12, "the context")?;
         if handle.is_null() {
             return Err(Failure::argument("handle is NULL"));
         }
@@ -2169,6 +2182,7 @@ pub unsafe extern "C" fn emberwave_texture_from_d3d12(
             unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
             // SAFETY: as the caller promises.
             let decoder = unsafe { live(decoder) }?;
+            require_d3d12(decoder.d3d12, "the decoder's context")?;
             // SAFETY: as the caller promises.
             let wrapped = unsafe { d3d12_import(&Wrapping::decoder(decoder, None), handle) }?;
             // SAFETY: checked by the first output() above.
@@ -2205,6 +2219,7 @@ pub unsafe extern "C" fn emberwave_texture_from_d3d12_plane(
             let component = plane_component(plane)?;
             // SAFETY: as the caller promises.
             let decoder = unsafe { live(decoder) }?;
+            require_d3d12(decoder.d3d12, "the decoder's context")?;
             // SAFETY: as the caller promises.
             let wrapped =
                 unsafe { d3d12_import(&Wrapping::decoder(decoder, Some(component)), handle) }?;
@@ -2247,6 +2262,7 @@ pub unsafe extern "C" fn emberwave_texture_from_d3d12_source(
             // SAFETY: as the caller promises.
             let encoder =
                 unsafe { encoder.as_ref() }.ok_or_else(|| Failure::argument("encoder is NULL"))?;
+            require_d3d12(encoder.d3d12, "the encoder's context")?;
             // SAFETY: as the caller promises.
             let wrapped = unsafe { d3d12_import(&Wrapping::encoder(encoder, holds), handle) }?;
             // SAFETY: checked by the first output() above.
@@ -2290,7 +2306,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_texture_d3d12(
             // SAFETY: as the caller promises.
             let decoder = unsafe { live_mut(decoder) }?;
             let context_id = decoder.decoder.context_id();
-            require_d3d12(decoder.decoder.device(), "decoder")?;
+            require_d3d12(decoder.d3d12, "the decoder's context")?;
             // SAFETY: as the caller promises.
             let texture = unsafe { picture_texture(texture, context_id) }?;
             // SAFETY: as the caller promises.
@@ -2331,7 +2347,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_d3d12(
             // SAFETY: as the caller promises.
             let decoder = unsafe { live_mut(decoder) }?;
             let context_id = decoder.decoder.context_id();
-            require_d3d12(decoder.decoder.device(), "decoder")?;
+            require_d3d12(decoder.d3d12, "the decoder's context")?;
             // SAFETY: as the caller promises.
             let textures = unsafe {
                 [
@@ -2395,7 +2411,7 @@ pub unsafe extern "C" fn emberwave_encoder_encode_textures_d3d12(
             // SAFETY: as the caller promises.
             let encoder = unsafe { live_encoder(encoder) }?;
             let context_id = encoder.encoder.context_id();
-            require_d3d12(encoder.encoder.device(), "encoder")?;
+            require_d3d12(encoder.d3d12, "the encoder's context")?;
             // SAFETY: as the caller promises.
             let used: Vec<&EmberwaveTexture> = unsafe { [y, cb, cr].map(|t| t.as_ref()) }
                 .into_iter()
@@ -2434,28 +2450,18 @@ fn refuse_d3d12(textures: &[&EmberwaveTexture]) -> Result<(), Failure> {
     Ok(())
 }
 
-/// An error unless `device`, that of a decoder or an encoder (`owner`),
-/// runs on Direct3D 12.
-fn require_d3d12(device: &wgpu::Device, owner: &str) -> Result<(), Failure> {
-    if on_d3d12(device) {
+/// An error unless `owner`, a context or that of a decoder or an encoder,
+/// is one of `emberwave_context_create_d3d12` (`d3d12`): only those take
+/// turns at their queue, which the fences of a call need (decision D63).
+fn require_d3d12(d3d12: bool, owner: &str) -> Result<(), Failure> {
+    if d3d12 {
         Ok(())
     } else {
         Err(Failure::argument(format!(
-            "the {owner}'s context does not run on Direct3D 12 \
-             (emberwave_context_create_d3d12)"
+            "{owner} is not one of emberwave_context_create_d3d12, whose calls take turns at \
+             its queue as their fences need"
         )))
     }
-}
-
-#[cfg(windows)]
-fn on_d3d12(device: &wgpu::Device) -> bool {
-    // SAFETY: only asks which backend the device has.
-    unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }.is_some()
-}
-
-#[cfg(not(windows))]
-fn on_d3d12(_device: &wgpu::Device) -> bool {
-    false
 }
 
 /// The hooks of a `_d3d12` call: the fences of `sync`, checked to be of the
@@ -3753,6 +3759,7 @@ pub unsafe extern "C" fn emberwave_decoder_create(
             decoder: created,
             shared_queue: context.shared_queue,
             vulkan: context.vulkan,
+            d3d12: context.d3d12,
             turns: context.context.queue_turns().cloned(),
         });
         // SAFETY: checked by the first output() above.
@@ -4945,6 +4952,7 @@ pub unsafe extern "C" fn emberwave_encoder_create(
         let boxed = Box::new(EmberwaveEncoder {
             encoder: created,
             vulkan: context.vulkan,
+            d3d12: context.d3d12,
             turns: context.context.queue_turns().cloned(),
         });
         // SAFETY: checked by the first output() above.

@@ -368,7 +368,7 @@ emberwave_decoder_submit_texture_d3d12(decoder, NULL, texture, &sync);
 context4->Wait(fence, reads_done + 1);   /* the client's work that reads the picture */
 ```
 
-- **Context.** `emberwave_context_create_d3d12` takes the adapter's LUID, its `LowPart` and `HighPart`. Shared handles open only on the adapter that made them. The context runs on Direct3D 12, and its decoders and encoders take turns at its queue, so that the fences of one call go with that call's submission alone.
+- **Context.** `emberwave_context_create_d3d12` takes the adapter's LUID, its `LowPart` and `HighPart`. Shared handles open only on the adapter that made them. The context runs on Direct3D 12, and its decoders and encoders take turns at its queue, so that the fences of one call go with that call's submission alone. A context of `emberwave_context_create`, which takes no turns, opens no shared handle or fence, even where it runs on Direct3D 12.
 - **Fences.** `emberwave_d3d12_fence_open` opens an `ID3D12Fence` made with `D3D12_FENCE_FLAG_SHARED`, or an `ID3D11Fence` made with `D3D11_FENCE_FLAG_SHARED`. An `EmberwaveD3D12Sync` names a fence and a value to wait for before the call's GPU work, and a fence and a value to signal after it. Either may be `NULL`, as may `sync`. The client destroys its fences after emberwave's.
 - **Textures.** `emberwave_texture_from_d3d12` opens a texture for the picture, `_plane` for a plane, and `_source` for a plane of a picture to encode. emberwave reads everything it checks from the resource itself:
   - 2D, of one level, layer and sample, and of the size of the picture or the plane;

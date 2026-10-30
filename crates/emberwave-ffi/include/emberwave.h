@@ -884,10 +884,10 @@ enum EmberwaveStatus emberwave_context_create_d3d12(uint32_t luid_low,
 // `D3D11_FENCE_FLAG_SHARED`, and the handle its `CreateSharedHandle` gave.
 // The fence then orders the `_d3d12` calls on the context against the
 // caller's work, through an `EmberwaveD3D12Sync`. emberwave does not close
-// the handle: the caller may close it once this returns. A context that
-// does not run on Direct3D 12, or a handle that is not a fence's of the
-// context's adapter, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`; off Windows
-// `EMBERWAVE_STATUS_NO_GPU`.
+// the handle: the caller may close it once this returns. A context that is
+// not one of `emberwave_context_create_d3d12`, or a handle that is not a
+// fence's of the context's adapter, gives
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
 //
 // # Safety
 //

@@ -1017,6 +1017,52 @@ fn vulkan_contexts_need_their_handles_and_vulkan() {
 }
 
 #[test]
+fn direct3d_calls_need_a_context_of_their_own() {
+    // No adapter has the LUID 0, and off Windows there is no Direct3D.
+    let mut made = ptr::null_mut();
+    // SAFETY: a pointer to store the context in.
+    let status = unsafe { emberwave_context_create_d3d12(0, 0, &mut made) };
+    assert_eq!(status, EmberwaveStatus::NoGpu, "{}", last_error());
+    assert!(made.is_null());
+
+    // A context of emberwave_context_create takes no shared handle nor
+    // fence, whatever its backend: its calls do not take turns.
+    let Some(context) = context() else {
+        return;
+    };
+    let bytes = testdata("gradient_200x120_420.pwv1");
+    let decoder = decoder_for(context, &bytes);
+    let mut marker = 0u8;
+    let handle = std::ptr::from_mut(&mut marker).cast::<std::ffi::c_void>();
+    let mut fence = ptr::null_mut();
+    let mut texture = ptr::null_mut();
+    // SAFETY: a live context and decoder, a handle that is never used, and
+    // pointers to store results in.
+    unsafe {
+        assert_eq!(
+            emberwave_d3d12_fence_open(context, handle, &mut fence),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(last_error().contains("emberwave_context_create_d3d12"));
+        assert!(fence.is_null());
+        assert_eq!(
+            emberwave_texture_from_d3d12(decoder, handle, &mut texture),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(last_error().contains("emberwave_context_create_d3d12"));
+        assert!(texture.is_null());
+        assert_eq!(
+            emberwave_decoder_submit_texture_d3d12(decoder, ptr::null(), ptr::null(), ptr::null()),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(last_error().contains("emberwave_context_create_d3d12"));
+        emberwave_d3d12_fence_destroy(ptr::null_mut());
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}
+
+#[test]
 fn metal_textures_of_the_callers_own_need_metal() {
     let Some(context) = context() else {
         return;
