@@ -26,7 +26,7 @@ use crate::encode::{
     stream_header,
 };
 
-use super::context::{GpuContext, notice_loss};
+use super::context::{GpuContext, QueueTurns, notice_loss, take_turn};
 use super::error::GpuError;
 use super::layout::{
     BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
@@ -205,6 +205,9 @@ pub struct Encoder {
 
     /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
     lost: Arc<Mutex<Option<String>>>,
+    /// The turns at the queue of a context on a queue of the caller's
+    /// (decision D60).
+    turns: Option<Arc<QueueTurns>>,
 }
 
 impl Encoder {
@@ -242,7 +245,10 @@ impl Encoder {
         check_size(&device, "the cost tables", cost_bytes)?;
         check_size(&device, "the rate control's steps", step_bytes)?;
 
-        with_error_scope(&device, || {
+        // As in the decoder: on a queue of the caller's, the writes below
+        // are made during a turn and submitted at once (decision D60).
+        let turn = take_turn(context.turns.as_deref(), &device, &queue);
+        let made = with_error_scope(&device, || {
             let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
             // Tests write and read the buffers between the stages.
             let usage = wgpu::BufferUsages::STORAGE
@@ -410,9 +416,13 @@ impl Encoder {
                     .supports_timestamps()
                     .then(|| StageQueries::new(&device, &queue, TIMED_STAGES)),
                 lost: context.lost_record(),
+                turns: context.turns.clone(),
             }
         })
-        .map_err(|error| context.explain(error))
+        .map_err(|error| context.explain(error));
+        // Ending, the turn submits the writes.
+        drop(turn);
+        made
     }
 
     /// The block layout of the frames.
@@ -550,6 +560,11 @@ impl Encoder {
             pad: [0; 3],
         };
 
+        // The encode makes command buffers from here to its submission, and
+        // takes its turn at them (decision D60); the upload above waits for
+        // the GPU to map its buffer, so it comes first.
+        let turns = self.turns.clone();
+        let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         with_error_scope(&self.device, || {
             self.queue
                 .write_buffer(&self.frame_params, 0, bytemuck::bytes_of(&params));
@@ -575,6 +590,8 @@ impl Encoder {
             self.encode_read_back(&mut encoder, capacity_words);
             self.queue.submit([encoder.finish()]);
         })?;
+        recording.submitted();
+        drop(recording);
         let data = read_back(
             &self.device,
             &self.readback,
@@ -582,14 +599,16 @@ impl Encoder {
         )?;
         let gpu_wall = gpu_start.elapsed();
         let stages = match queries {
-            Some(q) => q.read(&self.device, &self.queue)?.and_then(|stages| {
-                Some(EncodeStageTimings {
-                    transform: stages[TRANSFORM as usize]?,
-                    quantisation: stages[QUANTISATION as usize]?,
-                    rate_control: stages[RATE_CONTROL as usize]?,
-                    packing: stages[PACKING as usize]?,
-                })
-            }),
+            Some(q) => q
+                .read(&self.device, &self.queue, self.turns.as_deref())?
+                .and_then(|stages| {
+                    Some(EncodeStageTimings {
+                        transform: stages[TRANSFORM as usize]?,
+                        quantisation: stages[QUANTISATION as usize]?,
+                        rate_control: stages[RATE_CONTROL as usize]?,
+                        packing: stages[PACKING as usize]?,
+                    })
+                }),
             None => None,
         };
 

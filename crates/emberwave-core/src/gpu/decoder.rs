@@ -16,7 +16,7 @@ use crate::bitstream::{
 };
 use crate::color::ColorParams;
 
-use super::context::{GpuContext, notice_loss};
+use super::context::{GpuContext, QueueTurns, notice_loss, take_turn};
 use super::error::GpuError;
 use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{DrawPipeline, Pipelines, Stage, with_error_scope};
@@ -227,6 +227,9 @@ pub struct Decoder {
 
     /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
     lost: Arc<Mutex<Option<String>>>,
+    /// The turns at the queue of a context on a queue of the caller's
+    /// (decision D60).
+    turns: Option<Arc<QueueTurns>>,
 }
 
 /// The pipeline of `draw.wgsl` for one target format, and its bind group:
@@ -304,7 +307,12 @@ impl Decoder {
         check_size(&device, "the wavelet pyramid", buffers.pyramid_floats * 4)?;
         check_size(&device, "the packed planes", buffers.packed_words * 4)?;
 
-        with_error_scope(&device, || {
+        // The parameters written below wait in a command buffer of the queue
+        // until a submission. On a queue of the caller's they are written
+        // during a turn and submitted at once, so that a decoder not yet
+        // used holds none of its command buffers (decision D60).
+        let turn = take_turn(context.turns.as_deref(), &device, &queue);
+        let made = with_error_scope(&device, || {
             let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
 
             let payload_capacity_words = MIN_PAYLOAD_WORDS;
@@ -389,10 +397,14 @@ impl Decoder {
                 draw: None,
                 timestamps,
                 lost: context.lost_record(),
+                turns: context.turns.clone(),
                 context_id: context.id(),
             }
         })
-        .map_err(|error| context.explain(error))
+        .map_err(|error| context.explain(error));
+        // Ending, the turn submits the writes.
+        drop(turn);
+        made
     }
 
     /// Why the device of this decoder was lost, if it was. See
@@ -902,6 +914,11 @@ impl Decoder {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
+        // The decode makes command buffers from here to its submission, and
+        // takes its turn at them (decision D60); the upload above waits for
+        // the GPU to map its buffer, so it comes first.
+        let turns = self.turns.clone();
+        let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let output = self.prepare_output(color, read)?;
         let prepare = assembled_in + prepare_start.elapsed();
 
@@ -953,6 +970,8 @@ impl Decoder {
             }
             self.queue.submit([encoder.finish()]);
         })?;
+        recording.submitted();
+        drop(recording);
 
         // The wait for the frame polls the device, which records a loss. A
         // device lost by then ran the frame in part or not at all, and its
@@ -1098,6 +1117,8 @@ impl Decoder {
         read: Read<'_>,
     ) -> Result<(), GpuError> {
         self.check_device()?;
+        let turns = self.turns.clone();
+        let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1110,6 +1131,10 @@ impl Decoder {
                     self.queue.submit([encoder.finish()]);
                 })
             });
+        if outcome.is_ok() {
+            recording.submitted();
+        }
+        drop(recording);
         if outcome.is_ok() {
             self.assembler.mark_frame_decoded();
         }
@@ -1441,7 +1466,7 @@ impl Decoder {
         queries: &StageQueries,
         with_rgb: bool,
     ) -> Result<Option<StageTimings>, GpuError> {
-        let Some(stages) = queries.read(&self.device, &self.queue)? else {
+        let Some(stages) = queries.read(&self.device, &self.queue, self.turns.as_deref())? else {
             return Ok(None);
         };
         Ok(match (stages[0], stages[1]) {
@@ -1475,7 +1500,8 @@ impl Decoder {
         let bytes = u64::from(width) * u64::from(height) * 4;
 
         self.check_device()?;
-        let copied = with_error_scope(&self.device, || {
+        let mut recording = take_turn(self.turns.as_deref(), &self.device, &self.queue);
+        let submitted = with_error_scope(&self.device, || {
             let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("band readback"),
                 size: bytes,
@@ -1490,8 +1516,12 @@ impl Decoder {
             encoder.copy_buffer_to_buffer(&self.pyramid, u64::from(offset) * 4, &staging, 0, bytes);
             self.queue.submit([encoder.finish()]);
             staging
-        })
-        .and_then(|staging| read_back(&self.device, &staging, bytes));
+        });
+        if submitted.is_ok() {
+            recording.submitted();
+        }
+        drop(recording);
+        let copied = submitted.and_then(|staging| read_back(&self.device, &staging, bytes));
         // As in run_gpu: a failure on a device that was lost meanwhile is the loss.
         self.check_device()?;
         let data = copied?;

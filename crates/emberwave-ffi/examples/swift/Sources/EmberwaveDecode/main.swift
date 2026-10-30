@@ -109,7 +109,7 @@ func decode(input: String, output: String) throws {
                 "emberwave_decoder_push_packet")
         }
         offset += size
-        guard emberwave_decoder_is_ready(decoder, false) else {
+        guard emberwave_decoder_is_ready(decoder, 0) else {
             throw Failure(description: "frame \(frames) is incomplete")
         }
 

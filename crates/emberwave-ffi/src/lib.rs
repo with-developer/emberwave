@@ -14,7 +14,10 @@
 //!   destroying `NULL` does nothing.
 //! - A context may be used by several threads at once. A decoder or an
 //!   encoder may move between threads, but only one thread may use it at a
-//!   time.
+//!   time. A context keeps a few hundred bytes for every thread that has
+//!   called it or its decoders and encoders, until they are all destroyed,
+//!   as wgpu keeps its error scopes by thread: call from a pool of threads,
+//!   not from new ones without end.
 //! - A panic inside emberwave is caught and reported as
 //!   `EMBERWAVE_STATUS_INTERNAL`. Destroy the object it happened in.
 
@@ -427,7 +430,10 @@ fn run_or_lost(
         .take_while(|&b| b != 0)
         .collect();
     let message = CString::new(bytes).unwrap_or_default();
-    LAST_ERROR.with(|last| *last.borrow_mut() = message);
+    // Not `with`: from a thread-local destructor that runs after this one's,
+    // it would panic outside any `catch_unwind`, and abort the process. Then
+    // the message is lost, and the status still returned.
+    let _ = LAST_ERROR.try_with(|last| *last.borrow_mut() = message);
     status
 }
 
@@ -791,10 +797,14 @@ pub extern "C" fn emberwave_version() -> *const c_char {
 
 /// Describes the last failure on the calling thread, or is empty if no call on
 /// it has failed. The string stays valid until the next failing call on the
-/// same thread.
+/// same thread, and no longer than the thread: copy it to keep it, or to
+/// hand it to another thread. Empty, too, while the thread is ending.
 #[unsafe(no_mangle)]
 pub extern "C" fn emberwave_last_error() -> *const c_char {
-    LAST_ERROR.with(|last| last.borrow().as_ptr())
+    // Not `with`, for the reason in `run_or_lost`.
+    LAST_ERROR
+        .try_with(|last| last.borrow().as_ptr())
+        .unwrap_or(c"".as_ptr())
 }
 
 /// Describes the stream of a PWV1 file from its header, the first 24 bytes:
@@ -909,10 +919,20 @@ pub unsafe extern "C" fn emberwave_context_create(
 ///   decoded into them has returned, from whichever thread.
 /// - Use the textures in them directly, not through a heap or through an
 ///   argument buffer without `useResource`: Metal does not track those.
-/// - emberwave commits two command buffers a decode. A queue's default of 64
-///   command buffers in flight is plenty, and a full queue makes a call wait
-///   until the GPU frees one. A queue made with room for fewer than four can
-///   wait for good: emberwave makes its two before it commits them.
+/// - A call makes all its command buffers before it commits them: on an
+///   Apple M3 Max, 9 for a decode to a texture or to RGB, 6 to planes or to
+///   plane textures and 18 for an encode, as wgpu makes one for each pass
+///   and transition. The decoders and encoders of every context made on
+///   the queue take turns at this, and hold none between calls. A full
+///   queue makes a call wait until one of its command buffers has completed
+///   and that buffer's completed handlers have returned; a queue without
+///   room for 20 besides those the caller holds uncommitted can wait for
+///   good. The default of 64 is plenty.
+/// - Do not call emberwave inside a completion handler of a command buffer
+///   of this queue. A call that waits for the GPU never returns there: the
+///   wait ends in a handler of emberwave's that Metal runs after that one.
+///   The others can wait there too, for another thread's call or for room
+///   on the queue, and hold up the handlers behind them.
 ///
 /// # Safety
 ///
@@ -964,6 +984,15 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
     if !std::ptr::eq(&*queue.device(), &*device) {
         return Err(Failure::argument("queue is a queue of another device"));
     }
+    let queue_address = Retained::as_ptr(&queue) as *const c_void as usize;
+    // One at a time: from the making of its device until its first turn, a
+    // context holds a command buffer of the queue outside any turn, and
+    // several made at once beside a call that waits for room could each hold
+    // one while waiting for that call's turn (decision D60).
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _making = MAKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::METAL;
@@ -998,7 +1027,34 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
     // features and the limits of the descriptor, as above.
     let (device, queue) = unsafe { adapter.create_device_from_hal(open, &descriptor) }
         .map_err(|error| Failure(EmberwaveStatus::NoGpu, error.to_string()))?;
-    Ok(GpuContext::from_device(adapter, device, queue))
+    // Contexts made on one queue share its room for command buffers: their
+    // decoders and encoders take turns at it (#126, decision D60).
+    Ok(
+        GpuContext::from_device(adapter, device, queue)
+            .with_queue_turns(queue_turns(queue_address)),
+    )
+}
+
+/// The turns of the contexts made on the Metal queue at `address`: the same
+/// for each, while a context, decoder or encoder made on it lives. Those
+/// keep the queue, so that no other queue takes its address meanwhile.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn queue_turns(address: usize) -> std::sync::Arc<emberwave_core::gpu::QueueTurns> {
+    use emberwave_core::gpu::QueueTurns;
+    use std::sync::{Arc, Mutex, PoisonError, Weak};
+    static TURNS: Mutex<Vec<(usize, Weak<QueueTurns>)>> = Mutex::new(Vec::new());
+    let mut all = TURNS.lock().unwrap_or_else(PoisonError::into_inner);
+    all.retain(|(_, turns)| turns.strong_count() > 0);
+    if let Some(turns) = all
+        .iter()
+        .find(|&&(at, _)| at == address)
+        .and_then(|(_, turns)| turns.upgrade())
+    {
+        return turns;
+    }
+    let turns = Arc::new(QueueTurns::new());
+    all.push((address, Arc::downgrade(&turns)));
+    turns
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -1011,6 +1067,11 @@ unsafe fn metal_context(_device: *mut c_void, _queue: *mut c_void) -> Result<Gpu
 
 /// Destroys a context. Decoders and encoders created on it keep working, and
 /// keep the GPU device until they are destroyed as well.
+///
+/// It may wait for the GPU, when it lets go of the last hold on the
+/// context's queue. On a context of `emberwave_context_create_metal`, do not
+/// call it inside a completion handler of a command buffer of that queue:
+/// the wait never ends there.
 ///
 /// # Safety
 ///
@@ -1083,6 +1144,11 @@ pub unsafe extern "C" fn emberwave_decoder_create(
 }
 
 /// Destroys a decoder and frees its GPU memory.
+///
+/// It may wait for the GPU, when it lets go of the last hold on the
+/// context's queue. On a context of `emberwave_context_create_metal`, do not
+/// call it inside a completion handler of a command buffer of that queue:
+/// the wait never ends there.
 ///
 /// # Safety
 ///
@@ -1170,7 +1236,9 @@ pub unsafe extern "C" fn emberwave_decoder_push_packet(
 /// encoder left out few blocks. emberwave's encoder sends every block of the
 /// coarsest level for partial decodes; upstream's leaves out the empty ones,
 /// so that a frame of it that lost any packet may never be ready in part.
-/// False once the frame has been decoded, and for `NULL`.
+/// False once the frame has been decoded, and for `NULL`. Any
+/// `allow_partial_frame` but 0 allows a partial frame: an integer, not a
+/// `bool`, so that no value a caller passes is an invalid one.
 ///
 /// # Safety
 ///
@@ -1178,12 +1246,12 @@ pub unsafe extern "C" fn emberwave_decoder_push_packet(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_decoder_is_ready(
     decoder: *const EmberwaveDecoder,
-    allow_partial_frame: bool,
+    allow_partial_frame: u32,
 ) -> bool {
     // SAFETY: as the caller promises.
     match unsafe { decoder.as_ref() } {
         Some(decoder) => catch_unwind(AssertUnwindSafe(|| {
-            decoder.decoder.is_ready(allow_partial_frame)
+            decoder.decoder.is_ready(allow_partial_frame != 0)
         }))
         .unwrap_or(false),
         None => false,
@@ -1240,6 +1308,10 @@ pub unsafe extern "C" fn emberwave_decoder_clear(decoder: *mut EmberwaveDecoder)
 /// Waits for the GPU. The rows go from the GPU's memory straight to the
 /// planes, so a call that fails may have written some of them.
 ///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
+///
 /// # Safety
 ///
 /// `decoder` is a live decoder that no other thread is using. Each plane's
@@ -1294,6 +1366,10 @@ pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
 /// better, such as from the header of a PWV1 file, passes that. Waits for the
 /// GPU. The rows go from the GPU's memory straight to `rgb`, so a call that
 /// fails may have written some of them.
+///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
 ///
 /// # Safety
 ///
@@ -1744,6 +1820,10 @@ pub unsafe extern "C" fn emberwave_texture_destroy(texture: *mut EmberwaveTextur
 /// of another picture size gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` and
 /// leaves the frame to decode.
 ///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
+///
 /// # Safety
 ///
 /// `decoder` is a live decoder that no other thread is using, `texture` is a
@@ -1951,6 +2031,10 @@ fn require_shared_queue(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
 /// caller's GPU work that still reads the textures, and how many sets of
 /// three to keep in turn depends on the context and the textures: see
 /// `EmberwaveTexture`.
+///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
 ///
 /// # Safety
 ///
@@ -2163,6 +2247,11 @@ pub unsafe extern "C" fn emberwave_encoder_create(
 
 /// Destroys an encoder and frees its GPU memory.
 ///
+/// It may wait for the GPU, when it lets go of the last hold on the
+/// context's queue. On a context of `emberwave_context_create_metal`, do not
+/// call it inside a completion handler of a command buffer of that queue:
+/// the wait never ends there.
+///
 /// # Safety
 ///
 /// `encoder` is `NULL`, or an encoder from `emberwave_encoder_create` that
@@ -2212,6 +2301,10 @@ pub unsafe extern "C" fn emberwave_encoder_info(
 /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
 /// `*size`; nothing is encoded then, and the next frame takes the sequence
 /// number this one would have had. Waits for the GPU.
+///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
 ///
 /// # Safety
 ///
