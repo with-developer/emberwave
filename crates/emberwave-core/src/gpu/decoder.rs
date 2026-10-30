@@ -240,9 +240,26 @@ pub trait SubmissionHooks {
     /// Runs just before the decode's submission.
     fn before_submit(&mut self, queue: &wgpu::Queue);
     /// Runs after the submission, or after a failure before or in it
-    /// (`submitted` false): to take back what `before_submit` added, if the
-    /// submission did not take it.
+    /// (`submitted` false), also on a panic, while the turn lasts: to take
+    /// back what `before_submit` added, if the submission did not take it.
+    /// `submitted` says only that no error was caught: a lost device can
+    /// have taken nothing.
     fn after_submit(&mut self, queue: &wgpu::Queue, submitted: bool);
+}
+
+/// Runs [`SubmissionHooks::after_submit`] as it is dropped.
+struct AfterSubmit<'h> {
+    hooks: Option<&'h mut dyn SubmissionHooks>,
+    queue: wgpu::Queue,
+    submitted: bool,
+}
+
+impl Drop for AfterSubmit<'_> {
+    fn drop(&mut self) {
+        if let Some(hooks) = self.hooks.take() {
+            hooks.after_submit(&self.queue, self.submitted);
+        }
+    }
 }
 
 /// The pipeline of `draw.wgsl` for one target format, and its bind group:
@@ -1179,7 +1196,7 @@ impl Decoder {
         &mut self,
         color: Option<&ColorParams>,
         read: Read<'_>,
-        mut hooks: Option<&mut dyn SubmissionHooks>,
+        hooks: Option<&mut dyn SubmissionHooks>,
     ) -> Result<(), GpuError> {
         self.check_device()?;
         let turns = self.turns.clone();
@@ -1189,21 +1206,26 @@ impl Decoder {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("decode"),
             });
+        // Declared after the turn, so that it ends first, also on a panic:
+        // no other submission, the turn's of wgpu's writes included, takes
+        // what the hooks added and the call did not submit.
+        let mut after = AfterSubmit {
+            hooks,
+            queue: self.queue.clone(),
+            submitted: false,
+        };
         let outcome = self
             .record_assembled(color, read, &mut encoder)
             .and_then(|()| {
                 with_error_scope(&self.device, || {
-                    if let Some(hooks) = &mut hooks {
+                    if let Some(hooks) = after.hooks.as_deref_mut() {
                         hooks.before_submit(&self.queue);
                     }
                     submit(&self.queue, turns.as_deref(), [encoder.finish()]);
                 })
             });
-        // Still during the turn: no other call's submission takes what the
-        // hooks added and the failed call did not.
-        if let Some(hooks) = hooks {
-            hooks.after_submit(&self.queue, outcome.is_ok());
-        }
+        after.submitted = outcome.is_ok();
+        drop(after);
         if outcome.is_ok() {
             recording.submitted();
         }

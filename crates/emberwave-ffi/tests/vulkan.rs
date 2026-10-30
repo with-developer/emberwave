@@ -832,6 +832,10 @@ unsafe impl Send for Shared {}
 // SAFETY: as above.
 unsafe impl Sync for Shared {}
 
+/// How long a wait for the GPU may take before the test fails, rather than
+/// hangs, in nanoseconds.
+const TEN_SECONDS: u64 = 10_000_000_000;
+
 /// An image of the client's, with its memory.
 struct Image {
     image: vk::Image,
@@ -1041,7 +1045,7 @@ impl Client {
                 .queue_submit(queue, &[submit], fence)
                 .expect("submitted");
             device
-                .wait_for_fences(&[fence], true, u64::MAX)
+                .wait_for_fences(&[fence], true, TEN_SECONDS)
                 .expect("done");
             let mapped = device
                 .map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty())
@@ -1079,21 +1083,36 @@ fn wrapped(
     usage: vk::ImageUsageFlags,
     plane: Option<u32>,
 ) -> Result<*mut EmberwaveTexture, (EmberwaveStatus, String)> {
-    let described = EmberwaveVulkanImage {
-        image: image.image.as_raw(),
-        format: format.as_raw() as u32,
-        usage: usage.as_raw(),
-        layout: vk::ImageLayout::UNDEFINED.as_raw() as u32,
-    };
+    wrap(
+        decoder,
+        &EmberwaveVulkanImage {
+            image: image.image.as_raw(),
+            format: format.as_raw() as u32,
+            usage: usage.as_raw(),
+            layout: vk::ImageLayout::UNDEFINED.as_raw() as u32,
+            release: None,
+            user: ptr::null_mut(),
+        },
+        plane,
+    )
+}
+
+/// Wraps the image `described`, for `plane` or for the picture, of
+/// `decoder`.
+fn wrap(
+    decoder: *mut EmberwaveDecoder,
+    described: &EmberwaveVulkanImage,
+    plane: Option<u32>,
+) -> Result<*mut EmberwaveTexture, (EmberwaveStatus, String)> {
     let mut texture = ptr::null_mut();
     // SAFETY: a live decoder, an image made as described, and a pointer to
     // store the texture in.
     let status = unsafe {
         match plane {
             Some(plane) => {
-                emberwave_texture_from_vulkan_plane(decoder, plane, &described, &mut texture)
+                emberwave_texture_from_vulkan_plane(decoder, plane, described, &mut texture)
             }
-            None => emberwave_texture_from_vulkan(decoder, &described, &mut texture),
+            None => emberwave_texture_from_vulkan(decoder, described, &mut texture),
         }
     };
     if status == EmberwaveStatus::Ok {
@@ -1189,6 +1208,7 @@ fn the_callers_images_take_the_picture_and_the_planes_without_a_wait() {
         let signal = EmberwaveVulkanSync {
             signal_semaphore: semaphore.as_raw(),
             signal_value: value,
+            flags: EMBERWAVE_SYNC_SIGNAL_TIMELINE,
             ..Default::default()
         };
         // SAFETY: a live decoder, a frame of the length passed, live
@@ -1393,6 +1413,8 @@ fn images_emberwave_cannot_fill_or_leave_readable_are_refused() {
         format: vk::Format::B8G8R8A8_UNORM.as_raw() as u32,
         usage: usage.as_raw(),
         layout: vk::ImageLayout::GENERAL.as_raw() as u32,
+        release: None,
+        user: ptr::null_mut(),
     };
     let mut texture = ptr::null_mut();
     // SAFETY: a live decoder, and descriptions that are refused.
@@ -1409,6 +1431,317 @@ fn images_emberwave_cannot_fill_or_leave_readable_are_refused() {
         );
         emberwave_decoder_destroy(decoder);
         emberwave_context_destroy(context);
+        device.destroy_image(picture.image, None);
+        device.free_memory(picture.memory, None);
+        device.destroy_device(None);
+    }
+}
+
+impl Client {
+    /// Moves `image`, in `VK_IMAGE_LAYOUT_UNDEFINED`, to
+    /// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL` on the GPU, and waits.
+    fn make_readable(&self, device: &ash::Device, image: vk::Image) {
+        // SAFETY: a command pool and buffer of the queue's family, a valid
+        // barrier for a live image, and everything made destroyed once done.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(self.family),
+                    None,
+                )
+                .expect("a command pool");
+            let commands = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .command_buffer_count(1),
+                )
+                .expect("a command buffer")[0];
+            device
+                .begin_command_buffer(commands, &vk::CommandBufferBeginInfo::default())
+                .expect("begun");
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+            device.end_command_buffer(commands).expect("ended");
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .expect("a fence");
+            let buffers = [commands];
+            let queue = device.get_device_queue(self.family, 0);
+            device
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().command_buffers(&buffers)],
+                    fence,
+                )
+                .expect("submitted");
+            device
+                .wait_for_fences(&[fence], true, TEN_SECONDS)
+                .expect("done within ten seconds");
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// A binary semaphore.
+    fn binary(&self, device: &ash::Device) -> vk::Semaphore {
+        // SAFETY: a valid description of a semaphore.
+        unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+            .expect("a binary semaphore")
+    }
+}
+
+/// The picture of `frame`, pushed again into `decoder` of `width` by
+/// `height`, decoded the way that waits, as RGBA or BGRA.
+fn expected_picture(
+    decoder: *mut EmberwaveDecoder,
+    frame: &[u8],
+    (width, height): (usize, usize),
+    bgra: bool,
+) -> Vec<u8> {
+    let mut rgb = vec![0u8; width * height * 3];
+    // SAFETY: a live decoder, a frame of the length passed, and a buffer of
+    // the size and stride passed.
+    unsafe {
+        emberwave_decoder_clear(decoder);
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        let target = EmberwavePlane {
+            data: rgb.as_mut_ptr(),
+            stride: width * 3,
+        };
+        assert_eq!(
+            emberwave_decoder_decode_rgb(decoder, ptr::null(), target),
+            EmberwaveStatus::Ok
+        );
+        emberwave_decoder_clear(decoder);
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+    }
+    rgb.chunks_exact(3)
+        .flat_map(|p| {
+            if bgra {
+                [p[2], p[1], p[0], 255]
+            } else {
+                [p[0], p[1], p[2], 255]
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn semaphores_hold_the_decode_back_and_order_the_reads() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let mut decoder = ptr::null_mut();
+    // SAFETY: a live context, and a pointer to store the decoder in.
+    let status =
+        unsafe { emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    let usage = vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::TRANSFER_SRC;
+    let picture = client.image(&device, vk::Format::B8G8R8A8_UNORM, (192, 136), usage);
+    let texture = wrapped(decoder, &picture, vk::Format::B8G8R8A8_UNORM, usage, None).unwrap();
+    let frames = frames();
+    let submit = |sync: Option<&EmberwaveVulkanSync>| {
+        // SAFETY: a live decoder and texture, and a sync that is NULL or
+        // holds semaphores of the device.
+        unsafe {
+            emberwave_decoder_submit_texture_vulkan(
+                decoder,
+                ptr::null(),
+                texture,
+                sync.map_or(ptr::null(), ptr::from_ref),
+            )
+        }
+    };
+
+    // A timeline wait holds the decode back until the client signals it.
+    let gate = client.timeline(&device);
+    let done = client.timeline(&device);
+    let bgra = expected_picture(decoder, &frames[0], (192, 136), true);
+    let sync = EmberwaveVulkanSync {
+        wait_semaphore: gate.as_raw(),
+        wait_value: 1,
+        signal_semaphore: done.as_raw(),
+        signal_value: 1,
+        flags: EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE,
+    };
+    assert_eq!(submit(Some(&sync)), EmberwaveStatus::Ok, "{}", last_error());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // SAFETY: timeline semaphores of the device.
+    unsafe {
+        assert_eq!(
+            device.get_semaphore_counter_value(done).unwrap(),
+            0,
+            "the decode ran before its wait was signalled"
+        );
+        device
+            .signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(gate).value(1))
+            .unwrap();
+    }
+    let read = client.read(&device, picture.image, (192, 136, 4), Some((done, 1)));
+    assert!(read == bgra, "the picture after the timeline wait");
+
+    // Binary semaphores: the client's own work signals the one the decode
+    // waits for, and its read waits for the one the decode signals.
+    let ready = client.binary(&device);
+    let decoded = client.binary(&device);
+    let bgra = expected_picture(decoder, &frames[1], (192, 136), true);
+    // SAFETY: a queue of the device, and a binary semaphore to signal.
+    unsafe {
+        let queue = device.get_device_queue(client.family, 0);
+        let signals = [ready];
+        device
+            .queue_submit(
+                queue,
+                &[vk::SubmitInfo::default().signal_semaphores(&signals)],
+                vk::Fence::null(),
+            )
+            .unwrap();
+    }
+    let sync = EmberwaveVulkanSync {
+        wait_semaphore: ready.as_raw(),
+        signal_semaphore: decoded.as_raw(),
+        ..Default::default()
+    };
+    assert_eq!(submit(Some(&sync)), EmberwaveStatus::Ok, "{}", last_error());
+    let read = client.read(&device, picture.image, (192, 136, 4), Some((decoded, 0)));
+    assert!(read == bgra, "the picture after the binary semaphores");
+
+    // No semaphores: the client's later work on the queue reads the
+    // picture after a barrier from all commands, as its read has.
+    let bgra = expected_picture(decoder, &frames[2], (192, 136), true);
+    assert_eq!(submit(None), EmberwaveStatus::Ok, "{}", last_error());
+    let read = client.read(&device, picture.image, (192, 136, 4), None);
+    assert!(read == bgra, "the picture without semaphores");
+
+    // Flags it does not know.
+    let sync = EmberwaveVulkanSync {
+        flags: 1 << 7,
+        ..Default::default()
+    };
+    assert_eq!(submit(Some(&sync)), EmberwaveStatus::InvalidArgument);
+
+    // SAFETY: live objects, which nothing uses any more; the GPU is done
+    // with them once the context is destroyed.
+    unsafe {
+        emberwave_texture_destroy(texture);
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+        for semaphore in [gate, done, ready, decoded] {
+            device.destroy_semaphore(semaphore, None);
+        }
+        device.destroy_image(picture.image, None);
+        device.free_memory(picture.memory, None);
+        device.destroy_device(None);
+    }
+}
+
+/// The calls of the release callback of `a_wrapped_image_is_drawn_into_and_released`.
+static RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn count_release(_user: *mut c_void) {
+    RELEASED.fetch_add(1, Ordering::SeqCst);
+}
+
+#[test]
+fn a_wrapped_image_is_drawn_into_and_released() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let mut decoder = ptr::null_mut();
+    // 200 pixels wide, the picture is drawn rather than copied.
+    // SAFETY: a live context, and a pointer to store the decoder in.
+    let status =
+        unsafe { emberwave_decoder_create(context, 200, 120, EMBERWAVE_CHROMA_420, &mut decoder) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    let bytes = testdata("gradient_200x120_420.pwv1");
+    let frames: Vec<Vec<u8>> = Pwv1File::parse(&bytes)
+        .unwrap()
+        .frames()
+        .map(|frame| frame.unwrap().to_vec())
+        .collect();
+    let usage = vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::TRANSFER_SRC;
+    let picture = client.image(&device, vk::Format::R8G8B8A8_UNORM, (200, 120), usage);
+    // Wrapped in the layout a decode leaves, which the client gave it.
+    client.make_readable(&device, picture.image);
+    RELEASED.store(0, Ordering::SeqCst);
+    let texture = wrap(
+        decoder,
+        &EmberwaveVulkanImage {
+            image: picture.image.as_raw(),
+            format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
+            usage: usage.as_raw(),
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL.as_raw() as u32,
+            release: Some(count_release),
+            user: ptr::null_mut(),
+        },
+        None,
+    )
+    .unwrap();
+    let done = client.timeline(&device);
+    for (index, frame) in frames.iter().enumerate() {
+        let rgba = expected_picture(decoder, frame, (200, 120), false);
+        let value = index as u64 + 1;
+        let sync = EmberwaveVulkanSync {
+            signal_semaphore: done.as_raw(),
+            signal_value: value,
+            flags: EMBERWAVE_SYNC_SIGNAL_TIMELINE,
+            ..Default::default()
+        };
+        // SAFETY: a live decoder and texture, and a semaphore of the device.
+        let status = unsafe {
+            emberwave_decoder_submit_texture_vulkan(decoder, ptr::null(), texture, &sync)
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        let read = client.read(&device, picture.image, (200, 120, 4), Some((done, value)));
+        assert!(read == rgba, "frame {index}");
+    }
+    // The image is released once emberwave and the GPU are done with it:
+    // by the time the context is gone at the latest.
+    // SAFETY: live objects, which nothing uses any more.
+    unsafe {
+        emberwave_texture_destroy(texture);
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+    assert_eq!(RELEASED.load(Ordering::SeqCst), 1, "released once");
+    // SAFETY: released by emberwave, and the semaphore's work is done.
+    unsafe {
+        device.destroy_semaphore(done, None);
         device.destroy_image(picture.image, None);
         device.free_memory(picture.memory, None);
         device.destroy_device(None);

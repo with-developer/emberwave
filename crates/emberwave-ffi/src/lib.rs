@@ -1210,12 +1210,26 @@ pub struct EmberwaveVulkanImage {
     /// contents a decode may discard, or
     /// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
     pub layout: u32,
+    /// Called with `user` once emberwave and the GPU are done with the
+    /// image, after the texture is destroyed and the work of every decode
+    /// into it has completed: from then on the caller may destroy the image
+    /// and free its memory. From any thread, perhaps during another call of
+    /// emberwave's on the context, or in the destroy of its last decoder,
+    /// encoder or context. `NULL` if the caller knows that moment otherwise.
+    pub release: Option<unsafe extern "C" fn(user: *mut c_void)>,
+    /// Passed to `release`.
+    pub user: *mut c_void,
 }
 
 /// Semaphores for a decode that does not wait, on a context of
-/// `emberwave_context_create_vulkan` (decision D61). A value of 0 is for a
-/// binary semaphore; any other, for a timeline semaphore, is the value to
-/// wait for or to signal.
+/// `emberwave_context_create_vulkan` (decision D61): binary ones, or
+/// timeline ones where `flags` says so.
+///
+/// A binary semaphore to wait for has a signal submitted already, or the
+/// decode never runs, nor does any later work on the queue; one to signal
+/// is waited for before it is signalled again. A wait that is never met
+/// holds up every later submission to the queue, the caller's too, as the
+/// decode's waits at every stage.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EmberwaveVulkanSync {
@@ -1223,14 +1237,24 @@ pub struct EmberwaveVulkanSync {
     /// caller signals once its reads of the textures are done, or 0 for
     /// none.
     pub wait_semaphore: u64,
-    /// The value of `wait_semaphore` to wait for, or 0.
+    /// For a timeline `wait_semaphore`, the value to wait for.
     pub wait_value: u64,
     /// A `VkSemaphore` the decode signals once the textures hold the
     /// picture, for the caller's reads to wait for, or 0 for none.
     pub signal_semaphore: u64,
-    /// The value to signal `signal_semaphore` to, or 0.
+    /// For a timeline `signal_semaphore`, the value to signal it to.
     pub signal_value: u64,
+    /// `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
+    /// combined with `|` for timeline semaphores, or 0 for binary ones.
+    pub flags: u32,
 }
+
+/// `wait_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore, to
+/// wait for at `wait_value`.
+pub const EMBERWAVE_SYNC_WAIT_TIMELINE: u32 = 1 << 0;
+/// `signal_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore,
+/// to signal to `signal_value`.
+pub const EMBERWAVE_SYNC_SIGNAL_TIMELINE: u32 = 1 << 1;
 
 /// What emberwave needs a Vulkan device of the caller's to have enabled:
 /// device extensions and features, from
@@ -1505,9 +1529,8 @@ pub unsafe extern "C" fn emberwave_texture_vulkan(texture: *const EmberwaveTextu
 
 /// Wraps the caller's own Vulkan image for the decodes of `decoder` to put
 /// the picture into, as into one of `emberwave_texture_create`'s, on a
-/// context of `emberwave_context_create_vulkan` (decision D61). Elsewhere
-/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `EMBERWAVE_STATUS_NO_GPU` where
-/// there are no such contexts.
+/// context of `emberwave_context_create_vulkan` (decision D61); for a
+/// decoder on another context, `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
 ///
 /// The image is on the context's device, 2D, of one level, layer and
 /// sample, with optimal tiling and exclusive sharing on the context's queue
@@ -1521,8 +1544,11 @@ pub unsafe extern "C" fn emberwave_texture_vulkan(texture: *const EmberwaveTextu
 /// not as above where `image` says so; `texture` is then `NULL`.
 ///
 /// emberwave never destroys the image, nor frees its memory: keep both
-/// until the texture is destroyed. Between emberwave's calls the image is
-/// in `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, as for
+/// until `release` is called, or, without it, until the texture is
+/// destroyed and the work of every decode into it has completed; a decode
+/// that does not wait may still run after `emberwave_texture_destroy` has
+/// returned. Between emberwave's calls the image is in
+/// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, as for
 /// `emberwave_texture_vulkan`.
 ///
 /// # Safety
@@ -1635,7 +1661,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_texture_vulkan(
             // SAFETY: as the caller promises.
             let params = unsafe { conversion(decoder, color) }?;
             // SAFETY: as the caller promises.
-            let sync = unsafe { sync.as_ref() }.copied().unwrap_or_default();
+            let sync = unsafe { vulkan_sync(sync) }?;
             let mut semaphores = vulkan_semaphores(sync);
             decoder.decoder.submit_assembled_to_texture_with(
                 &params,
@@ -1683,7 +1709,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_vulkan(
             };
             distinct_images(&textures)?;
             // SAFETY: as the caller promises.
-            let sync = unsafe { sync.as_ref() }.copied().unwrap_or_default();
+            let sync = unsafe { vulkan_sync(sync) }?;
             let mut semaphores = vulkan_semaphores(sync);
             let targets = textures.map(|texture| &texture.view);
             decoder
@@ -1694,6 +1720,24 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_vulkan(
         // SAFETY: as the caller promises; the body's borrow has ended.
         || unsafe { lost(decoder) },
     )
+}
+
+/// The semaphores of `sync`, none for `NULL`, or an error for unknown flags.
+///
+/// # Safety
+///
+/// `sync` is `NULL` or points to an `EmberwaveVulkanSync`.
+unsafe fn vulkan_sync(sync: *const EmberwaveVulkanSync) -> Result<EmberwaveVulkanSync, Failure> {
+    // SAFETY: as the caller promises.
+    let sync = unsafe { sync.as_ref() }.copied().unwrap_or_default();
+    let known = EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE;
+    if sync.flags & !known != 0 {
+        return Err(Failure::argument(format!(
+            "sync's flags {:#x} include unknown ones",
+            sync.flags
+        )));
+    }
+    Ok(sync)
 }
 
 /// An error unless `decoder`'s context runs on the caller's own Vulkan
@@ -2322,6 +2366,18 @@ mod vulkan {
                     uses |= internal;
                 }
             }
+            // wgpu calls a drop callback, rather than destroying the image,
+            // once it and the GPU are done with it: the caller's `release`.
+            let release = SendPointer(image.user);
+            let release: wgpu::hal::DropCallback = match image.release {
+                Some(callback) => Box::new(move || {
+                    let release = release;
+                    // SAFETY: the caller's callback with its `user`, which
+                    // it promises may be called from any thread.
+                    unsafe { callback(release.0) }
+                }),
+                None => Box::new(|| {}),
+            };
             // SAFETY: an image of the device, made as described, as the
             // caller promises. Given a drop callback and external memory,
             // wgpu leaves both to the caller.
@@ -2339,7 +2395,7 @@ mod vulkan {
                         memory_flags: wgpu::hal::MemoryFlags::empty(),
                         view_formats: Vec::new(),
                     },
-                    Some(Box::new(|| {})),
+                    Some(release),
                     wgpu::hal::vulkan::TextureMemory::External,
                 )
             }
@@ -2365,6 +2421,16 @@ mod vulkan {
         Ok(EmberwaveTexture::wrap(decoder, texture, plane, true))
     }
 
+    /// The caller's `user` of an `EmberwaveVulkanImage`, for its `release`
+    /// on whichever thread wgpu calls it.
+    struct SendPointer(*mut c_void);
+
+    // SAFETY: the caller promises that `release` may be called with `user`
+    // from any thread.
+    unsafe impl Send for SendPointer {}
+    // SAFETY: as above.
+    unsafe impl Sync for SendPointer {}
+
     /// The semaphores of an `EmberwaveVulkanSync`, added to a decode's
     /// submission, and taken back if it was not made.
     pub(super) struct Semaphores {
@@ -2374,17 +2440,21 @@ mod vulkan {
 
     impl Semaphores {
         pub(super) fn new(sync: EmberwaveVulkanSync) -> Self {
-            let semaphore = |handle: u64, value: u64| {
-                (handle != 0).then(|| {
-                    (
-                        vk::Semaphore::from_raw(handle),
-                        (value != 0).then_some(value),
-                    )
-                })
+            let semaphore = |handle: u64, timeline: bool, value: u64| {
+                (handle != 0).then(|| (vk::Semaphore::from_raw(handle), timeline.then_some(value)))
             };
+            let timeline = |flag| sync.flags & flag != 0;
             Self {
-                wait: semaphore(sync.wait_semaphore, sync.wait_value),
-                signal: semaphore(sync.signal_semaphore, sync.signal_value),
+                wait: semaphore(
+                    sync.wait_semaphore,
+                    timeline(super::EMBERWAVE_SYNC_WAIT_TIMELINE),
+                    sync.wait_value,
+                ),
+                signal: semaphore(
+                    sync.signal_semaphore,
+                    timeline(super::EMBERWAVE_SYNC_SIGNAL_TIMELINE),
+                    sync.signal_value,
+                ),
             }
         }
     }
@@ -2402,10 +2472,10 @@ mod vulkan {
             }
         }
 
-        fn after_submit(&mut self, queue: &wgpu::Queue, submitted: bool) {
-            if submitted {
-                return;
-            }
+        fn after_submit(&mut self, queue: &wgpu::Queue, _submitted: bool) {
+            // Whatever the call says: a submission that took them leaves
+            // nothing to take back, and one that did not, as on a device lost
+            // meanwhile, must not hand them to another.
             // SAFETY: only takes back what before_submit added.
             if let Some(hal) = unsafe { queue.as_hal::<Vulkan>() } {
                 if let Some((semaphore, _)) = self.wait {

@@ -318,15 +318,21 @@ The decodes that wait, `emberwave_decoder_decode_texture` and `emberwave_decoder
 ```c
 EmberwaveVulkanSync sync = {
     .wait_semaphore = (uint64_t)reads_done,       /* signalled when the client's reads of the image end */
-    .wait_value = frame,                          /* a timeline value; 0 for a binary semaphore */
+    .wait_value = frame,
     .signal_semaphore = (uint64_t)picture_ready,  /* the client's reads wait for it */
-    .signal_value = frame,
+    .signal_value = frame + 1,
+    .flags = EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE,  /* 0 for binary semaphores */
 };
 emberwave_decoder_submit_texture_vulkan(decoder, NULL, texture, &sync);
-/* ... the client's command buffer that samples the image waits for picture_ready at `frame` ... */
+/* ... the client's command buffer that samples the image waits for picture_ready at frame + 1 ... */
 ```
 
-`emberwave_decoder_submit_plane_textures_vulkan` does the same for the planes. Either semaphore may be 0. The queue orders the work it carries, but not memory: work of the client's on the same queue after the call needs a barrier from all commands, or the signal semaphore. Keep the semaphores until the work that signals them has completed. When the call fails, the semaphores may or may not have been waited for and signalled.
+`emberwave_decoder_submit_plane_textures_vulkan` does the same for the planes. Either semaphore may be 0, and `sync` `NULL`. The queue orders the work it carries, but not memory: work of the client's on the same queue after the call needs a barrier from all commands, or the signal semaphore.
+- A binary semaphore to wait for has its signal submitted already, and one to signal is waited for before it is signalled again.
+- A wait that is never met holds up every later submission to the queue, the client's too: the decode waits at every stage.
+- Keep the semaphores until the work that signals them has completed. When the call fails, the semaphores may or may not have been waited for and signalled.
+
+A decode that does not wait may still run after `emberwave_texture_destroy` returns. So the client destroys a wrapped image only once `release` of its `EmberwaveVulkanImage` has been called, which emberwave does when it and the GPU are done with the image, from any thread. Without `release`, the client waits for the work of every decode into the image itself.
 
 `tests/vulkan.rs` makes an instance, a device and images as a client does, and runs on Linux CI's lavapipe.
 

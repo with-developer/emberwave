@@ -117,7 +117,9 @@ fn required_limits(supported: &wgpu::Limits, strict_webgpu: bool) -> wgpu::Limit
     }
     let mut limits = wgpu::Limits::default().or_worse_values_from(supported);
     limits.max_storage_buffer_binding_size = supported.max_storage_buffer_binding_size;
-    limits.max_buffer_size = supported.max_buffer_size;
+    // No more than 4 GiB: wgpu-core's validation of indirect calls, on by
+    // default, asserts that much, and some adapters offer more.
+    limits.max_buffer_size = supported.max_buffer_size.min(u64::from(u32::MAX));
     limits.max_texture_dimension_2d = supported.max_texture_dimension_2d;
     limits
 }
@@ -698,7 +700,14 @@ mod tests {
         };
         let limits = required_limits(&supported, false);
         assert_eq!(limits.max_storage_buffer_binding_size, 1 << 31);
-        assert_eq!(limits.max_buffer_size, 1 << 34);
+        // At most 4 GiB, which wgpu-core's validation of indirect calls
+        // asserts; less where the adapter has less.
+        assert_eq!(limits.max_buffer_size, u64::from(u32::MAX));
+        let smaller = wgpu::Limits {
+            max_buffer_size: 1 << 30,
+            ..supported.clone()
+        };
+        assert_eq!(required_limits(&smaller, false).max_buffer_size, 1 << 30);
         assert_eq!(limits.max_texture_dimension_2d, 16384);
         // Better than the default elsewhere, the adapter's values are not
         // asked for: a device with the defaults behaves alike everywhere.

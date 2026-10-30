@@ -1505,7 +1505,12 @@ The second step is the images:
 - **emberwave's textures.** `emberwave_texture_vulkan` gives the `VkImage` of a texture on such a context, and only there: the image of a context of emberwave's own is on another device.
 - **The caller's images.** `emberwave_texture_from_vulkan` and `_plane` wrap a caller's image with wgpu-hal's `texture_from_raw`, external memory and a drop callback, so that wgpu frees neither. The caller describes the image's format, usage and current layout: the layout gives wgpu's initial state, `UNINITIALIZED` or `RESOURCE`.
 - **One layout between calls.** Every decode into a texture ends with a transition to `RESOURCE` (`CommandEncoder::transition_resources`), where the texture can be sampled: on Vulkan that is `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, which the caller then knows, and to which it returns the image before the next call. On Metal and WebGPU the transition changes nothing that matters.
-- **Semaphores.** `emberwave_decoder_submit_texture_vulkan` and `_plane_textures_vulkan` take an `EmberwaveVulkanSync`: a semaphore to wait for and one to signal, binary or timeline. The core's `SubmissionHooks` add them to the decode's submission during its turn (wgpu-hal's `add_wait_semaphore`, `add_signal_semaphore`). A failed call takes them back during the same turn, so no other call's submission carries them.
+- **Semaphores.**
+  - `emberwave_decoder_submit_texture_vulkan` and `_plane_textures_vulkan` take an `EmberwaveVulkanSync`: a semaphore to wait for and one to signal, binary, or timeline where its flags say so.
+  - A first version took a value of 0 for binary. A review showed that this made a timeline value of 0 impossible to wait for, and that a timeline semaphore passed with 0 crashed a driver.
+  - The core's `SubmissionHooks` add the semaphores to the decode's submission during its turn (wgpu-hal's `add_wait_semaphore`, `add_signal_semaphore`). After every call, failed or not, and also on a panic, they are taken back during the same turn, so no other submission carries them. Taking back what a submission took does nothing, and a device lost meanwhile can take nothing.
+- **Release.** A decode that does not wait can still run after its texture is destroyed. The caller's image therefore comes with an optional `release` callback, which wgpu-hal calls in place of destroying it once wgpu and the GPU are done with it.
+- **Buffer size.** A context asks for buffers of at most 4 GiB. wgpu-core's validation of indirect calls, on by default, asserts that limit, and some adapters offer more.
 
 Direct3D 12 through shared handles follows, and the encoder's input from the caller's images.
 
@@ -1517,4 +1522,9 @@ Direct3D 12 through shared handles follows, and the encoder's input from the cal
   - The tests run one at a time, against the loaders of D31.
   - A real driver's behaviour and a second process are not tested.
 - **The type check.** On macOS the Vulkan code type-checks only with wgpu's `vulkan-portability`, which the workspace does not enable: CI's Linux and Windows jobs compile it.
-- **The second step's tests.** On lavapipe the test decodes every frame of a test vector into images of its own without waiting, and checks the bytes against the decodes that wait. For the picture it signals a timeline semaphore; the planes are read back on the GPU after a wait for it. An emberwave texture's image is read after a decode that waits, and images that a decode cannot fill or leave readable are refused.
+- **The second step's tests.** On lavapipe, under the validation layer, which tracks every image's layout from submission to submission:
+  - The test decodes every frame of a test vector into images of its own without waiting, signalling a timeline semaphore. It reads them back on the GPU after a wait for that value, and checks the bytes against the decodes that wait.
+  - A timeline wait holds a decode back until the client signals it. Binary semaphores order a decode after the client's work and its read after the decode. A decode with no semaphores is ordered by a barrier.
+  - A 200-pixel-wide picture is drawn into an RGBA image that was wrapped in `SHADER_READ_ONLY_OPTIMAL`. Its `release` is called once by the time the context is gone.
+  - An emberwave texture's image is read after a decode that waits.
+  - Images that a decode cannot fill or leave readable are refused, and so are unknown flags.

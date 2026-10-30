@@ -103,6 +103,14 @@
 // `emberwave_texture_from_metal_plane`.
 #define EMBERWAVE_PLANE_CR 2
 
+// `wait_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore, to
+// wait for at `wait_value`.
+#define EMBERWAVE_SYNC_WAIT_TIMELINE (1 << 0)
+
+// `signal_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore,
+// to signal to `signal_value`.
+#define EMBERWAVE_SYNC_SIGNAL_TIMELINE (1 << 1)
+
 // The result of a call.
 typedef enum EmberwaveStatus {
   // The call succeeded.
@@ -288,6 +296,15 @@ typedef struct EmberwaveVulkanImage {
   // contents a decode may discard, or
   // `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
   uint32_t layout;
+  // Called with `user` once emberwave and the GPU are done with the
+  // image, after the texture is destroyed and the work of every decode
+  // into it has completed: from then on the caller may destroy the image
+  // and free its memory. From any thread, perhaps during another call of
+  // emberwave's on the context, or in the destroy of its last decoder,
+  // encoder or context. `NULL` if the caller knows that moment otherwise.
+  void (*release)(void *user);
+  // Passed to `release`.
+  void *user;
 } EmberwaveVulkanImage;
 
 // The colour conversion of `emberwave_decoder_decode_rgb`.
@@ -301,21 +318,29 @@ typedef struct EmberwaveColor {
 } EmberwaveColor;
 
 // Semaphores for a decode that does not wait, on a context of
-// `emberwave_context_create_vulkan` (decision D61). A value of 0 is for a
-// binary semaphore; any other, for a timeline semaphore, is the value to
-// wait for or to signal.
+// `emberwave_context_create_vulkan` (decision D61): binary ones, or
+// timeline ones where `flags` says so.
+//
+// A binary semaphore to wait for has a signal submitted already, or the
+// decode never runs, nor does any later work on the queue; one to signal
+// is waited for before it is signalled again. A wait that is never met
+// holds up every later submission to the queue, the caller's too, as the
+// decode's waits at every stage.
 typedef struct EmberwaveVulkanSync {
   // A `VkSemaphore` the decode's GPU work waits for, such as one the
   // caller signals once its reads of the textures are done, or 0 for
   // none.
   uint64_t wait_semaphore;
-  // The value of `wait_semaphore` to wait for, or 0.
+  // For a timeline `wait_semaphore`, the value to wait for.
   uint64_t wait_value;
   // A `VkSemaphore` the decode signals once the textures hold the
   // picture, for the caller's reads to wait for, or 0 for none.
   uint64_t signal_semaphore;
-  // The value to signal `signal_semaphore` to, or 0.
+  // For a timeline `signal_semaphore`, the value to signal it to.
   uint64_t signal_value;
+  // `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
+  // combined with `|` for timeline semaphores, or 0 for binary ones.
+  uint32_t flags;
 } EmberwaveVulkanSync;
 
 // The sizes of the planes a decoder writes or an encoder reads.
@@ -615,9 +640,8 @@ uint64_t emberwave_texture_vulkan(const struct EmberwaveTexture *texture);
 
 // Wraps the caller's own Vulkan image for the decodes of `decoder` to put
 // the picture into, as into one of `emberwave_texture_create`'s, on a
-// context of `emberwave_context_create_vulkan` (decision D61). Elsewhere
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `EMBERWAVE_STATUS_NO_GPU` where
-// there are no such contexts.
+// context of `emberwave_context_create_vulkan` (decision D61); for a
+// decoder on another context, `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
 //
 // The image is on the context's device, 2D, of one level, layer and
 // sample, with optimal tiling and exclusive sharing on the context's queue
@@ -631,8 +655,11 @@ uint64_t emberwave_texture_vulkan(const struct EmberwaveTexture *texture);
 // not as above where `image` says so; `texture` is then `NULL`.
 //
 // emberwave never destroys the image, nor frees its memory: keep both
-// until the texture is destroyed. Between emberwave's calls the image is
-// in `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, as for
+// until `release` is called, or, without it, until the texture is
+// destroyed and the work of every decode into it has completed; a decode
+// that does not wait may still run after `emberwave_texture_destroy` has
+// returned. Between emberwave's calls the image is in
+// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, as for
 // `emberwave_texture_vulkan`.
 //
 // # Safety
