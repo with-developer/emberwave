@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.13.0] - 2026-10-30
+
+Streams decoded as they arrive, and a client's own Metal queue shared safely. The browser player takes a stream packet by packet, every frame carries the blocks that a decode in part needs, and a client chooses how much of a frame it draws in part. Calls on a context of a client's own Metal queue take turns at its command buffers, where threads that shared the queue could wait for good. Also the encoder's planes written in place on Apple silicon, upstream's encoder fixes tracked, and a command that measures any encoder's stream against its pictures.
 
 ### Added
 
