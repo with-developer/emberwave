@@ -147,7 +147,7 @@ Done: the milestones to the first release, M0 to M5 ([#1](https://github.com/wit
 Next, each in a release when it is ready:
 
 - **Measured in real use.** Decoding inside a client's display loop, timed to the screen, on a Mac and an iPhone ([#81](https://github.com/with-developer/emberwave/issues/81)); NVENC's HEVC and AV1 streams decoded beside emberwave's, and the quality of moving game footage against HEVC with predicted frames at the same bit rate ([#82](https://github.com/with-developer/emberwave/issues/82)); and the CPU's preparation of a frame, the last item of [#86](https://github.com/with-developer/emberwave/issues/86).
-- **Quality.** Within the error it minimises, the encoder has under 1 % left ([#136](https://github.com/with-developer/emberwave/issues/136)): a visibly better encoder needs its band weights tuned against a metric of perceived quality, so the metric comes first. Frames drawn in part could keep the last frame's detail where the picture is still ([#129](https://github.com/with-developer/emberwave/issues/129)).
+- **Quality.** Within the error it minimises, the encoder has under 1 % left ([#136](https://github.com/with-developer/emberwave/issues/136)): a visibly better encoder needs its band weights tuned against a metric of perceived quality, so the metric comes first.
 - **Toward 1.0, clients.** Streaming to a browser, in a repository of its own so that emberwave stays a codec: a host's screen encoded on its GPU, sent over the local network and decoded with WebGPU in a tab, its latency measured first. After that, emberwave's encoder offered to the hosts that stream PyroWave. 1.0 needs stable C and Rust APIs, one client in real use, and decoding at a stream's pace level with upstream's.
 
 ## Repository layout

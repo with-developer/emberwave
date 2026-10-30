@@ -2,6 +2,12 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Frames drawn in part conceal the blocks of detail they lack: where the coarsest level around such a block changed by little since the last decode, the picture is taken to be still and the block keeps the last frame's coefficients, so a still picture keeps its detail through lost packets, and a moving one decodes as before (decision D66, [#129](https://github.com/with-developer/emberwave/issues/129)). Off by default: `gpu::Decoder::set_concealment`, the C API's `emberwave_decoder_set_concealment` and the browser player's `set_concealment` turn it on, and `cpu::Concealer` is the CPU's. Measured with the CPU's: frames drawn from 40 to 60 % of their blocks of a still game frame came out as the whole frame, 3 to 4 dB of luma PSNR above the zeros of before, those of a mostly still scene 12 to 16 dB above them, and those of a picture moving by one to eight pixels a frame within 0.03 dB of them. A 4K frame takes 0.06 ms more on an Apple M3 Max at most, where its blocks are zeroed.
+
 ## [0.15.0] - 2026-10-31
 
 Pictures in RGB encoded as hosts' captures hold them. The encoder converts BGRA or RGBA to Y'CbCr as it reads them, from textures of Metal, Vulkan and Direct3D or from CPU memory, in integers that make the same bytes on every GPU and on the CPU. Also a frame assembler that no stream of packets can slow down, and late packets ignored as the docs say.

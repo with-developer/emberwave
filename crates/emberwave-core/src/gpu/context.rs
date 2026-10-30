@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::GpuError;
 use super::decoder::PLANE_FORMAT;
-use super::pipelines::{EncoderPipelines, Pipelines, RgbStages, with_error_scope};
+use super::pipelines::{
+    EncoderPipelines, Pipelines, RgbStages, Stage, conceal_stage, with_error_scope,
+};
 
 /// Environment variable that restricts the backends considered, for example
 /// `vulkan`, `metal`, `dx12` or a comma separated list. Unset or `auto` means
@@ -153,6 +155,9 @@ pub struct GpuContext {
     /// The encoders' pipelines for RGB pictures, built when one first takes
     /// one (decision D65).
     rgb_pipelines: RgbPipelines,
+    /// The decoders' pipeline for the concealment of frames drawn in part,
+    /// built when one first conceals one (decision D66).
+    conceal_pipeline: ConcealPipeline,
     /// Why the device was lost, once it has been; shared with the decoders
     /// and the encoders.
     lost: Arc<Mutex<Option<String>>>,
@@ -312,6 +317,7 @@ impl GpuContext {
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             rgb_pipelines: RgbPipelines::default(),
+            conceal_pipeline: ConcealPipeline::default(),
             lost,
             turns: None,
         }
@@ -418,6 +424,25 @@ impl GpuContext {
     /// first that needs them builds.
     pub(crate) fn rgb_pipelines(&self) -> RgbPipelines {
         self.rgb_pipelines.clone()
+    }
+
+    /// Where the decoders find the pipeline that conceals what frames drawn
+    /// in part lack, which the first that needs it builds.
+    pub(crate) fn conceal_pipeline(&self) -> ConcealPipeline {
+        self.conceal_pipeline.clone()
+    }
+}
+
+/// A context's pipeline for the concealment of frames drawn in part,
+/// shared by its decoders and built when the first of them conceals one
+/// (decision D66).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConcealPipeline(Arc<Mutex<Option<Arc<Stage>>>>);
+
+impl ConcealPipeline {
+    /// The pipeline, compiled on `device`, the context's, if it is not yet.
+    pub(crate) fn get(&self, device: &wgpu::Device) -> Result<Arc<Stage>, GpuError> {
+        cached(&self.0, || conceal_stage(device))
     }
 }
 

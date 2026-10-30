@@ -90,6 +90,26 @@ impl Pipelines {
     }
 }
 
+/// The stage of `conceal.wgsl`, the concealment of the blocks a frame drawn
+/// in part lacks. A context compiles it when one of its decoders first
+/// conceals such a frame, as most never do (decision D66).
+pub(crate) fn conceal_stage(device: &wgpu::Device) -> Result<Stage, GpuError> {
+    with_error_scope(device, || {
+        create_stage(
+            device,
+            "conceal",
+            shader_sources::CONCEAL,
+            &[
+                storage_entry(0, true),
+                storage_entry(1, false),
+                uniform_entry(2),
+                uniform_entry(3),
+                storage_entry(4, true),
+            ],
+        )
+    })
+}
+
 /// The entry points of `rate.wgsl`, which share one bind group layout.
 #[derive(Debug)]
 pub(crate) struct RateStages {

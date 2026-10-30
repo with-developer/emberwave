@@ -11,7 +11,10 @@
 // is a single dispatch with one workgroup per block index. Invocation
 // `tid` = 8 * (8x8 block, row-major) + (4x2 subblock) decodes the 8 values of
 // its subblock. Every block of every band is written, with zeros for blocks
-// that were not received, so the pyramid never needs clearing.
+// that were not received, so the pyramid never needs clearing. Only a frame
+// drawn in part that the decoder conceals (decision D66) leaves the blocks of
+// detail it lacks as the last decode left them: conceal.wgsl decides what
+// becomes of them.
 
 struct BandInfo {
     first_block: u32,
@@ -19,16 +22,18 @@ struct BandInfo {
     width: u32,
     height: u32,
     dst_offset: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    // The band's decomposition level and component (0 Y, 1 Cb, 2 Cr).
+    level: u32,
+    component: u32,
+    pad: u32,
 }
 
 struct DequantParams {
     band_count: u32,
     block_count: u32,
     grid_width: u32,
-    pad: u32,
+    // 1 for a frame drawn in part that the decoder conceals.
+    conceal: u32,
     // Transmitted bands in block index order.
     bands: array<BandInfo, 48>,
 }
@@ -43,6 +48,10 @@ const MISSING_BLOCK: u32 = 0xffffffffu;
 
 // Side of a coded block and of the 8x8 blocks inside it.
 const BLOCK_SIZE: u32 = 32u;
+
+// The coarsest decomposition level, whose blocks a frame drawn in part has
+// whole (DECOMPOSITION_LEVELS - 1).
+const COARSEST_LEVEL: u32 = 4u;
 
 // Workgroup memory is not zeroed for this pipeline (decision D25): each
 // variable is written in full before the barrier that precedes its reads.
@@ -124,6 +133,9 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     }
     workgroupBarrier();
     let offset_words = workgroupUniformLoad(&shared_offset);
+    if (offset_words == MISSING_BLOCK && params.conceal == 1u && band.level < COARSEST_LEVEL) {
+        return;
+    }
 
     // This invocation's 4x2 subblock: raster index of its 8x8 block and
     // subblock number inside it.

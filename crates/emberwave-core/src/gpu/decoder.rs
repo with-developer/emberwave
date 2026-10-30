@@ -17,10 +17,11 @@ use crate::bitstream::{
 use crate::color::ColorParams;
 
 use super::context::{
-    AfterSubmit, GpuContext, QueueTurns, SubmissionHooks, notice_loss, submit, take_turn,
+    AfterSubmit, ConcealPipeline, GpuContext, QueueTurns, SubmissionHooks, notice_loss, submit,
+    take_turn,
 };
 use super::error::GpuError;
-use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
+use super::layout::{BufferLayout, ConcealParams, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{DrawPipeline, Pipelines, Stage, with_error_scope};
 use super::resources::{
     StageQueries, buffer, buffer_limit, check_size, entry, map_for_writing, read_back,
@@ -219,6 +220,16 @@ pub struct Decoder {
     dequant_bind_group: wgpu::BindGroup,
     dequant_grid: (u32, u32),
 
+    /// Whether frames drawn in part conceal the blocks of detail they lack
+    /// ([`set_concealment`](Self::set_concealment)).
+    concealment: bool,
+    /// What the concealment needs, made by the first frame that conceals;
+    /// its pipeline is the context's.
+    conceal: Option<ConcealResources>,
+    conceal_pipeline: ConcealPipeline,
+    /// The `conceal` word of the dequantisation's parameters on the GPU.
+    conceal_written: bool,
+
     idwt_stages: Vec<IdwtStage>,
 
     color: Option<ColorResources>,
@@ -232,6 +243,16 @@ pub struct Decoder {
     /// The turns at the queue of a context on a queue of the caller's
     /// (decision D60).
     turns: Option<Arc<QueueTurns>>,
+}
+
+/// The concealment of frames drawn in part (decision D66): the copy of the
+/// last decode's coarsest level, the parameters, and the pass that keeps the
+/// last frame's detail where the picture is still.
+struct ConcealResources {
+    last: wgpu::Buffer,
+    params: ConcealParams,
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
 }
 
 /// The pipeline of `draw.wgsl` for one target format, and its bind group:
@@ -394,6 +415,10 @@ impl Decoder {
                 dequant_params,
                 dequant_bind_group,
                 dequant_grid,
+                concealment: false,
+                conceal: None,
+                conceal_pipeline: context.conceal_pipeline(),
+                conceal_written: false,
                 idwt_stages,
                 color: None,
                 draw: None,
@@ -538,7 +563,8 @@ impl Decoder {
     /// [`encode_rgb_to_texture`](Self::encode_rgb_to_texture) does, and waits
     /// for the GPU. When this returns the texture holds the picture, for any
     /// queue of the device to read; a texture another queue may still be
-    /// reading must not be passed. Blocks that did not arrive decode as zeros.
+    /// reading must not be passed. Blocks that did not arrive decode as zeros,
+    /// or are concealed ([`set_concealment`](Self::set_concealment)).
     pub fn decode_assembled_to_texture(
         &mut self,
         color: &ColorParams,
@@ -648,7 +674,8 @@ impl Decoder {
     /// [`encode_to_plane_textures`](Self::encode_to_plane_textures) does, and
     /// waits for the GPU. When this returns the textures hold the planes, for
     /// any queue of the device to read; textures another queue may still be
-    /// reading must not be passed. Blocks that did not arrive decode as zeros.
+    /// reading must not be passed. Blocks that did not arrive decode as zeros,
+    /// or are concealed ([`set_concealment`](Self::set_concealment)).
     pub fn decode_assembled_to_plane_textures(
         &mut self,
         targets: [&wgpu::TextureView; 3],
@@ -798,6 +825,123 @@ impl Decoder {
         self.partial_share
     }
 
+    /// Sets whether a frame drawn in part conceals the blocks of detail it
+    /// lacks, off by default (decision D66). Where the coarsest level
+    /// around such a block, which every frame drawn in part has whole,
+    /// changed by at most
+    /// [`CONCEALMENT_THRESHOLD`](crate::cpu::CONCEALMENT_THRESHOLD) since
+    /// the last decode, the picture is taken to be still there, and the
+    /// block keeps the last frame's coefficients: the frame shows the detail
+    /// it lost. Elsewhere the block is zero, as without concealment. Whole
+    /// frames decode as before. [`cpu::Concealer`](crate::cpu::Concealer)
+    /// does the same on the CPU, to the last bit of the coefficients.
+    ///
+    /// Measured with the CPU's, frames drawn from 40 to 60 % of their blocks
+    /// of a still game frame came out as the whole frame, 3 to 4 dB of luma
+    /// PSNR above the zeros, and those of the same picture moving by one to
+    /// eight pixels a frame within 0.03 dB of the zeros (D66 has the table).
+    /// The first frame that conceals compiles the pass, if no decoder of the
+    /// context did.
+    pub fn set_concealment(&mut self, on: bool) {
+        self.concealment = on;
+    }
+
+    /// Whether frames drawn in part conceal what they lack
+    /// ([`set_concealment`](Self::set_concealment)).
+    pub fn concealment(&self) -> bool {
+        self.concealment
+    }
+
+    /// Compiles the concealment's pass for a frame that will conceal, if the
+    /// context has not: before the decode takes its turn at the queue
+    /// (decision D60), which other threads may be waiting for, as compiling
+    /// needs no queue.
+    fn compile_concealment(&self) -> Result<(), GpuError> {
+        if self.concealment
+            && self.conceal.is_none()
+            && self.assembler.received_blocks() < self.assembler.total_blocks()
+        {
+            self.conceal_pipeline.get(&self.device)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the decode of the assembled frame conceals, and the
+    /// dequantisation's `conceal` word set to say so: a frame drawn in part
+    /// with concealment on. Makes what the concealment needs on its first
+    /// use. Called in the decode's turn at the queue (decision D60), as it
+    /// writes through the queue.
+    fn prepare_concealment(&mut self) -> Result<bool, GpuError> {
+        let conceal =
+            self.concealment && self.assembler.received_blocks() < self.assembler.total_blocks();
+        if conceal && self.conceal.is_none() {
+            self.conceal = Some(self.make_conceal()?);
+        }
+        if conceal != self.conceal_written {
+            with_error_scope(&self.device, || {
+                self.queue.write_buffer(
+                    &self.dequant_params,
+                    DequantParams::CONCEAL_OFFSET,
+                    bytemuck::bytes_of(&u32::from(conceal)),
+                );
+            })?;
+            self.conceal_written = conceal;
+        }
+        Ok(conceal)
+    }
+
+    /// The copy of the coarsest level, the parameters and the bind group of
+    /// the concealment, with the context's pipeline.
+    fn make_conceal(&self) -> Result<ConcealResources, GpuError> {
+        let stage = self.conceal_pipeline.get(&self.device)?;
+        let params = ConcealParams::new(self.layout(), &self.buffers);
+        let bytes = u64::from(params.coarse_floats()) * 4 * Component::ALL.len() as u64;
+        with_error_scope(&self.device, || {
+            let last = buffer(
+                &self.device,
+                "last coarsest level",
+                bytes,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            let uniform = uniform_buffer(&self.device, &self.queue, "conceal params", &params);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("conceal"),
+                layout: &stage.layout,
+                entries: &[
+                    entry(0, &self.block_offsets),
+                    entry(1, &self.pyramid),
+                    entry(2, &self.dequant_params),
+                    entry(3, &uniform),
+                    entry(4, &last),
+                ],
+            });
+            ConcealResources {
+                last,
+                params,
+                pipeline: stage.pipeline.clone(),
+                bind_group,
+            }
+        })
+    }
+
+    /// Records the copy of the last decode's coarsest level, which the
+    /// pyramid still holds, for the concealment to compare the frame's with.
+    fn encode_conceal_copy(&self, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(conceal) = &self.conceal {
+            let bytes = u64::from(conceal.params.coarse_floats()) * 4;
+            for component in Component::ALL {
+                let i = component.index();
+                encoder.copy_buffer_to_buffer(
+                    &self.pyramid,
+                    u64::from(conceal.params.pyramid_offset[i]) * 4,
+                    &conceal.last,
+                    u64::from(conceal.params.last_offset[i]) * 4,
+                    bytes,
+                );
+            }
+        }
+    }
+
     /// Discards what was received, and forgets the order of the frames: the
     /// next packet starts a frame, whatever its sequence number. See
     /// [`FrameAssembler::clear`].
@@ -812,7 +956,8 @@ impl Decoder {
     }
 
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
-    /// calls. Blocks that did not arrive decode as zeros.
+    /// calls. Blocks that did not arrive decode as zeros, or are concealed
+    /// ([`set_concealment`](Self::set_concealment)).
     pub fn decode_assembled(&mut self) -> Result<Frame, GpuError> {
         let layout = self.layout();
         let chroma = layout.chroma();
@@ -942,6 +1087,7 @@ impl Decoder {
     ) -> Result<Timings, GpuError> {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
+        self.compile_concealment()?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
         // The decode makes command buffers from here to its submission, and
         // takes its turn at them (decision D60); the upload above waits for
@@ -949,6 +1095,7 @@ impl Decoder {
         let turns = self.turns.clone();
         let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let output = self.prepare_output(color, read)?;
+        let conceal = self.prepare_concealment()?;
         let prepare = assembled_in + prepare_start.elapsed();
 
         self.make_readback(read)?;
@@ -992,7 +1139,7 @@ impl Decoder {
                     payload_bytes,
                 );
             }
-            self.encode_passes(&mut encoder, color.is_some(), queries, &output);
+            self.encode_passes(&mut encoder, color.is_some(), conceal, queries, &output);
             self.encode_output(&mut encoder, read, &output);
             if let Some((source, target, bytes)) = copy_back {
                 encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
@@ -1154,7 +1301,8 @@ impl Decoder {
         self.ensure_payload_capacity()?;
         with_error_scope(&self.device, || self.upload())?;
         let output = self.prepare_output(color, read)?;
-        self.encode_passes(encoder, color.is_some(), None, &output);
+        let conceal = self.prepare_concealment()?;
+        self.encode_passes(encoder, color.is_some(), conceal, None, &output);
         self.encode_output(encoder, read, &output);
         Ok(())
     }
@@ -1171,6 +1319,7 @@ impl Decoder {
         hooks: Option<&mut dyn SubmissionHooks>,
     ) -> Result<(), GpuError> {
         self.check_device()?;
+        self.compile_concealment()?;
         let turns = self.turns.clone();
         let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let mut encoder = self
@@ -1423,12 +1572,16 @@ impl Decoder {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         rgb: bool,
+        conceal: bool,
         queries: Option<&StageQueries>,
         output: &Output,
     ) {
         // Each pass is a stage of its own.
         let writes = |pass: u32| queries.map(|q| q.writes(Some(pass), Some(pass)));
 
+        if conceal {
+            self.encode_conceal_copy(encoder);
+        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("dequant"),
@@ -1437,6 +1590,13 @@ impl Decoder {
             pass.set_pipeline(&self.pipelines.dequant.pipeline);
             pass.set_bind_group(0, &self.dequant_bind_group, &[]);
             pass.dispatch_workgroups(self.dequant_grid.0, self.dequant_grid.1, 1);
+            // A dispatch of a compute pass sees the writes of the ones
+            // before it: the concealment, the frame's coarsest level.
+            if let (true, Some(resources)) = (conceal, &self.conceal) {
+                pass.set_pipeline(&resources.pipeline);
+                pass.set_bind_group(0, &resources.bind_group, &[]);
+                pass.dispatch_workgroups(self.dequant_grid.0, self.dequant_grid.1, 1);
+            }
         }
 
         {
@@ -1889,6 +2049,9 @@ impl Drop for Decoder {
         if let Some(color) = &self.color {
             buffers.push(&color.rgba);
             buffers.extend(&color.readback);
+        }
+        if let Some(conceal) = &self.conceal {
+            buffers.push(&conceal.last);
         }
         for buffer in buffers {
             buffer.destroy();

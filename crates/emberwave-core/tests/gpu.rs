@@ -1120,6 +1120,433 @@ fn an_incomplete_frame_is_an_error_until_it_is_allowed_to_be_partial() {
     assert_ne!(frame, complete, "the missing blocks must make a difference");
 }
 
+/// A 192x128 4:2:0 picture with texture everywhere, its luma raised by
+/// `lift`, and its frame from the CPU encoder.
+fn textured_frame(lift: u8) -> (FrameLayout, Vec<u8>) {
+    let (width, height) = (192usize, 128usize);
+    let luma: Vec<u8> = (0..width * height)
+        .map(|i| {
+            let (x, y) = (i % width, i / width);
+            ((x * 37 + y * 101 + (x * y) % 23) % 171) as u8 + 20 + lift
+        })
+        .collect();
+    let chroma = (vec![110; width * height / 4], vec![140; width * height / 4]);
+    let mut encoder = emberwave_core::encode::Encoder::new(
+        width as u32,
+        height as u32,
+        ChromaSubsampling::Yuv420,
+        emberwave_core::encode::Signalling::default(),
+    )
+    .unwrap();
+    let frame = encoder
+        .encode([&luma, &chroma.0, &chroma.1], 20_000)
+        .unwrap();
+    (encoder.layout().clone(), frame)
+}
+
+/// The packets of `frame` but every third that holds blocks below the
+/// coarsest level only, from the `phase`th on, as a stream that lost them.
+fn lossy_packets<'a>(layout: &FrameLayout, frame: &'a [u8], phase: usize) -> Vec<&'a [u8]> {
+    let coarsest = layout
+        .bands()
+        .find(|&(_, level, _, _)| level < DECOMPOSITION_LEVELS - 1)
+        .map_or(layout.block_count(), |(.., band)| band.first_block);
+    emberwave_core::encode::packets(frame, 64)
+        .into_iter()
+        .enumerate()
+        .filter(|(n, packet)| {
+            let detail = matches!(Header::parse(packet), Ok(Header::Block(block)) if block.block_index >= coarsest);
+            !(detail && n % 3 == phase)
+        })
+        .map(|(_, packet)| packet)
+        .collect()
+}
+
+#[test]
+fn frames_drawn_in_part_conceal_what_they_lack_as_the_cpu_does() {
+    // Concealment (decision D66): a frame drawn in part keeps the last
+    // frame's coefficients for the blocks of detail it lacks where the
+    // picture is still, and has zeros where it changed, on the GPU as
+    // cpu::Concealer has them. Whole frames are as without it.
+    let context = gpu_or_return!();
+    let (layout, still) = textured_frame(0);
+    let (_, changed) = textured_frame(40);
+    let mut decoder = decoder_for(context, &layout);
+    assert!(!decoder.concealment());
+    decoder.set_concealment(true);
+    let mut concealer = cpu::Concealer::new();
+    // Whole, the same picture in part, the same whole, a brighter picture in
+    // part, and the brighter in part again, now still against the last,
+    // which has the blocks it lacks.
+    let sequence = [
+        (&still, None),
+        (&still, Some(0)),
+        (&still, None),
+        (&changed, Some(0)),
+        (&changed, Some(1)),
+    ];
+    let mut decoded = Vec::new();
+    for (index, &(frame, phase)) in sequence.iter().enumerate() {
+        let lossy = phase.is_some();
+        let packets = match phase {
+            Some(phase) => lossy_packets(&layout, frame, phase),
+            None => vec![&frame[..]],
+        };
+        decoder.clear();
+        let mut assembler = FrameAssembler::new(layout.clone());
+        for packet in &packets {
+            decoder.push_packet(packet).unwrap();
+            assembler.push_packet(packet).unwrap();
+        }
+        assert_eq!(decoder.is_ready(false), !lossy);
+        let gpu = decoder.decode_assembled().unwrap();
+        let cpu = concealer.decode(&assembler.frame(), lossy).unwrap();
+        for (plane, expected) in gpu.planes.iter().zip(&cpu.planes) {
+            assert!(
+                max_abs_diff(&expected.to_unorm8(), &plane.data) <= 1,
+                "frame {index}: {}",
+                max_abs_diff(&expected.to_unorm8(), &plane.data)
+            );
+        }
+        let zeros = cpu::decode_frame(&assembler.frame()).unwrap();
+        decoded.push((gpu, zeros));
+    }
+    let whole = &decoded[0].0;
+    // The still picture in part is the whole picture.
+    assert_eq!(&decoded[1].0, whole);
+    assert_ne!(
+        decoded[1].0.planes[0].data,
+        decoded[1].1.planes[0].to_unorm8()
+    );
+    // The changed picture in part has zeros where it lacks blocks: as
+    // without concealment, to the GPU's rounding.
+    for (plane, zeros) in decoded[3].0.planes.iter().zip(&decoded[3].1.planes) {
+        assert!(max_abs_diff(&zeros.to_unorm8(), &plane.data) <= 1);
+    }
+    // Then still against the frame before, it keeps that frame's detail
+    // rather than the zeros.
+    assert_ne!(
+        decoded[4].0.planes[0].data,
+        decoded[4].1.planes[0].to_unorm8()
+    );
+
+    // Off again, a frame in part has zeros.
+    decoder.set_concealment(false);
+    decoder.clear();
+    let mut assembler = FrameAssembler::new(layout.clone());
+    for packet in lossy_packets(&layout, &still, 0) {
+        decoder.push_packet(packet).unwrap();
+        assembler.push_packet(packet).unwrap();
+    }
+    let gpu = decoder.decode_assembled().unwrap();
+    let zeros = cpu::decode_frame(&assembler.frame()).unwrap();
+    for (plane, expected) in gpu.planes.iter().zip(&zeros.planes) {
+        assert!(max_abs_diff(&expected.to_unorm8(), &plane.data) <= 1);
+    }
+}
+
+/// A step of a scene for the concealment's differential test: a texture of
+/// sines and noise in every plane, moved, with a patch of luma or of chroma
+/// changed, or noise of its own in every frame.
+#[derive(Debug, Clone, Copy)]
+struct Scene {
+    seed: u64,
+    shift: i64,
+    patch: bool,
+    chroma_patch: bool,
+    noise: i32,
+}
+
+/// A deterministic hash of a sample's place, from -15 to 15.
+fn grain(x: i64, y: i64, salt: u64) -> i32 {
+    let mut v = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ salt.wrapping_mul(0x1656_67B1_9E37_79F9);
+    v ^= v >> 29;
+    v = v.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    v ^= v >> 32;
+    (v % 31) as i32 - 15
+}
+
+fn scene_picture(layout: &FrameLayout, scene: Scene, rng: &mut SceneRng) -> [Vec<u8>; 3] {
+    let freq = 1.0 + (scene.seed % 5) as f64 * 0.37;
+    std::array::from_fn(|plane| {
+        let (w, h) = layout.plane_size(Component::ALL[plane]);
+        let (w, h) = (w as i64, h as i64);
+        let shift = scene.shift / if plane == 0 { 1 } else { 2 };
+        let (amplitude, period) = if plane == 0 {
+            (60.0, 17.0)
+        } else {
+            (30.0, 23.0 + 9.0 * plane as f64)
+        };
+        let patched = if plane == 0 {
+            scene.patch
+        } else {
+            scene.chroma_patch
+        };
+        let mut samples = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let xs = x + shift;
+                let mut v = 128.0
+                    + amplitude * (xs as f64 / (period * freq)).sin()
+                    + 0.7 * amplitude * (y as f64 / (13.0 * freq)).cos()
+                    + f64::from(grain(xs, y, scene.seed + plane as u64 * 11));
+                if patched && x >= w / 3 && x < w / 2 + 1 && y >= h / 4 && y < h / 2 + 1 {
+                    v += 60.0;
+                }
+                let mut v = v as i32;
+                if scene.noise > 0 {
+                    v += (rng.next() % (2 * scene.noise as u64 + 1)) as i32 - scene.noise;
+                }
+                samples.push(v.clamp(0, 255) as u8);
+            }
+        }
+        samples
+    })
+}
+
+/// A small xorshift generator of 64 bits, for the scenes.
+struct SceneRng(u64);
+
+impl SceneRng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Blocks kept from the last frame and blocks zeroed, in luma and in
+/// chroma, over a run of [`conceal_like_the_cpu`].
+#[derive(Debug, Default)]
+struct ConcealCounts {
+    kept: [usize; 2],
+    zeroed: [usize; 2],
+}
+
+/// Decodes `steps` frames of an evolving scene of `layout`, each with packets
+/// lost in one of several ways, on the GPU through one of its decode paths
+/// with concealment now and then turned off and on, and on the CPU with
+/// `cpu::Concealer`. After every decode the GPU's bands must be the CPU's to
+/// the bit. Returns how many blocks were kept and zeroed.
+fn conceal_like_the_cpu(
+    context: &GpuContext,
+    layout: &FrameLayout,
+    steps: usize,
+    seed: u64,
+) -> ConcealCounts {
+    let mut rng = SceneRng(seed | 1);
+    let mut encoder = emberwave_core::encode::Encoder::new(
+        layout.width(),
+        layout.height(),
+        layout.chroma(),
+        emberwave_core::encode::Signalling::default(),
+    )
+    .unwrap();
+    let coarsest = layout
+        .bands()
+        .find(|&(_, level, _, _)| level < DECOMPOSITION_LEVELS - 1)
+        .map_or(layout.block_count(), |(.., band)| band.first_block);
+    let mut decoder = decoder_for(context, layout);
+    decoder.set_concealment(true);
+    let mut on = true;
+    let mut concealer = cpu::Concealer::new();
+    let color = ColorParams::default();
+    let samples: usize = Component::ALL
+        .iter()
+        .map(|&c| {
+            let (w, h) = layout.plane_size(c);
+            (w * h) as usize
+        })
+        .sum();
+    let mut scene = Scene {
+        seed: rng.next() % 1000,
+        shift: 0,
+        patch: false,
+        chroma_patch: false,
+        noise: 0,
+    };
+    let mut counts = ConcealCounts::default();
+    for step in 0..steps {
+        match rng.next() % 10 {
+            0..=3 => {}
+            4 => scene.noise = if scene.noise == 0 { 2 } else { 0 },
+            5 => scene.shift += 1,
+            6 => scene.shift += 2,
+            7 => scene.patch = !scene.patch,
+            8 => scene.chroma_patch = !scene.chroma_patch,
+            _ => scene.seed = rng.next() % 1000,
+        }
+        let planes = scene_picture(layout, scene, &mut rng);
+        let budget = (samples as f64 * [0.15, 0.6][step % 2]) as usize;
+        let frame = encoder
+            .encode([&planes[0], &planes[1], &planes[2]], budget.max(3000))
+            .unwrap();
+        let packets =
+            emberwave_core::encode::packets(&frame, [64, 200, 1403][(rng.next() % 3) as usize]);
+        let (loss, burst) = (rng.next() % 6, (rng.next() % packets.len() as u64) as usize);
+        let kept: Vec<&[u8]> = packets
+            .iter()
+            .enumerate()
+            .filter(|&(n, packet)| {
+                let detail = matches!(Header::parse(packet), Ok(Header::Block(block)) if block.block_index >= coarsest);
+                !detail
+                    || match loss {
+                        0 => true,
+                        1 | 2 => rng.unit() >= 0.5,
+                        3 | 4 => !(burst..burst + packets.len() / 3).contains(&n),
+                        _ => false,
+                    }
+            })
+            .map(|(_, packet)| *packet)
+            .collect();
+        let mut assembler = FrameAssembler::new(layout.clone());
+        decoder.clear();
+        for packet in &kept {
+            decoder.push_packet(packet).unwrap();
+            assembler.push_packet(packet).unwrap();
+        }
+        let partial = assembler.received_blocks() < assembler.total_blocks();
+        if rng.next().is_multiple_of(8) {
+            on = !on;
+            decoder.set_concealment(on);
+        }
+        let path = rng.next() % 4;
+        let what = format!(
+            "{}x{} {:?}, step {step}, loss {loss}, path {path}, concealing {}",
+            layout.width(),
+            layout.height(),
+            layout.chroma(),
+            partial && on
+        );
+        match path {
+            0 => {
+                decoder.decode_assembled().unwrap();
+            }
+            1 => {
+                decoder.decode_assembled_rgb(&color).unwrap();
+            }
+            2 => {
+                let textures = Component::ALL.map(|c| decoder.create_plane_texture(c).unwrap());
+                let views = textures
+                    .each_ref()
+                    .map(|t| t.create_view(&Default::default()));
+                decoder
+                    .submit_assembled_to_plane_textures([&views[0], &views[1], &views[2]])
+                    .unwrap();
+            }
+            _ => {
+                let texture = decoder
+                    .create_texture(wgpu::TextureFormat::Bgra8Unorm)
+                    .unwrap();
+                decoder
+                    .submit_assembled_to_texture(&color, &texture.create_view(&Default::default()))
+                    .unwrap();
+            }
+        }
+        let last = concealer.bands().cloned();
+        concealer.decode(&assembler.frame(), partial && on).unwrap();
+        let bands = concealer.bands().unwrap();
+        for (component, level, band, _) in layout.bands() {
+            if band == Band::Ll && level < DECOMPOSITION_LEVELS - 1 {
+                continue; // the inverse transform's, not the decode's
+            }
+            let gpu = decoder.read_band(component, level, band).unwrap().unwrap();
+            let cpu = bands.plane(component, level, band).unwrap();
+            let differ = gpu
+                .iter()
+                .zip(cpu)
+                .filter(|(a, b)| a.to_bits() != b.to_bits() && !(**a == 0.0 && **b == 0.0))
+                .count();
+            assert_eq!(differ, 0, "{what}: {component:?} level {level} {band:?}");
+        }
+        // What the concealment did with the blocks the frame lacked.
+        if let (Some(last), true) = (last, partial && on) {
+            let view = assembler.frame();
+            for block in 0..layout.block_count() {
+                let location = layout.locate(block).unwrap();
+                if view.block(block).is_some() || location.level == DECOMPOSITION_LEVELS - 1 {
+                    continue;
+                }
+                let info = layout
+                    .band(location.component, location.level, location.band)
+                    .unwrap();
+                let (old, new) = (
+                    last.plane(location.component, location.level, location.band)
+                        .unwrap(),
+                    bands
+                        .plane(location.component, location.level, location.band)
+                        .unwrap(),
+                );
+                let (mut had, mut has, mut same) = (false, false, true);
+                for y in location.block_y * 32..((location.block_y + 1) * 32).min(info.height) {
+                    for x in location.block_x * 32..((location.block_x + 1) * 32).min(info.width) {
+                        let at = (y * info.width + x) as usize;
+                        had |= old[at] != 0.0;
+                        has |= new[at] != 0.0;
+                        same &= old[at] == new[at];
+                    }
+                }
+                let chroma = usize::from(location.component != Component::Y);
+                if had && same {
+                    counts.kept[chroma] += 1;
+                }
+                if had && !has {
+                    counts.zeroed[chroma] += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+#[test]
+fn concealment_matches_the_cpu_through_scenes_losses_and_decode_paths() {
+    // After a review's differential test: still, moved, patched and noisy
+    // pictures, losses at random, in bursts and of every block of detail,
+    // packets of three sizes, four decode paths, concealment turned off and
+    // on, in both chroma formats and sizes odd and even. The GPU must leave
+    // the CPU's coefficients in every band, and both outcomes must happen,
+    // in luma and in chroma.
+    let context = gpu_or_return!();
+    let mut total = ConcealCounts::default();
+    let shapes = [
+        (192, 128, ChromaSubsampling::Yuv420),
+        (130, 66, ChromaSubsampling::Yuv420),
+        (66, 258, ChromaSubsampling::Yuv420),
+        (2, 2, ChromaSubsampling::Yuv420),
+        (131, 67, ChromaSubsampling::Yuv444),
+        (65, 129, ChromaSubsampling::Yuv444),
+        (7, 3, ChromaSubsampling::Yuv444),
+    ];
+    for (index, &(width, height, chroma)) in shapes.iter().enumerate() {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let counts = conceal_like_the_cpu(context, &layout, 16, 0x1234_5678 + index as u64 * 7);
+        for i in 0..2 {
+            total.kept[i] += counts.kept[i];
+            total.zeroed[i] += counts.zeroed[i];
+        }
+    }
+    println!(
+        "blocks kept {:?} and zeroed {:?} (luma, chroma)",
+        total.kept, total.zeroed
+    );
+    assert!(
+        total
+            .kept
+            .iter()
+            .chain(&total.zeroed)
+            .all(|&count| count > 0),
+        "{total:?}"
+    );
+}
+
 #[test]
 fn a_partial_frame_needs_the_share_of_blocks_its_decoder_asks() {
     let context = gpu_or_return!();

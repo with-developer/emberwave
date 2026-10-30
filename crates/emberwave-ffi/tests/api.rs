@@ -246,6 +246,10 @@ fn bad_arguments_are_errors_with_a_message_not_crashes() {
             emberwave_decoder_set_partial_share(ptr::null_mut(), 0.5),
             EmberwaveStatus::InvalidArgument
         );
+        assert_eq!(
+            emberwave_decoder_set_concealment(ptr::null_mut(), 1),
+            EmberwaveStatus::InvalidArgument
+        );
         assert_eq!(*emberwave_context_adapter(ptr::null()), 0);
         emberwave_decoder_clear(ptr::null_mut());
         emberwave_decoder_destroy(ptr::null_mut());
@@ -581,6 +585,76 @@ fn a_partial_frame_needs_the_share_the_caller_sets() {
             EmberwaveStatus::Ok
         );
         assert!(!emberwave_decoder_is_ready(decoder, 1));
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}
+
+#[test]
+fn a_still_frame_drawn_in_part_conceals_what_it_lacks_with_the_last_one() {
+    // The same picture again, without every other packet past the coarsest
+    // level: with concealment it decodes as the whole frame did, without
+    // it the detail it lacks is blank (decision D66).
+    let Some(context) = context() else {
+        return;
+    };
+    let bytes = testdata("encoder/gradient_200x120_420.pwv1");
+    let decoder = decoder_for(context, &bytes);
+    let frame = frames(&bytes)[0];
+    let stream = Pwv1File::parse(&bytes).unwrap().header().stream;
+    let layout = FrameLayout::new(stream.width, stream.height, stream.chroma).unwrap();
+    let coarsest = layout
+        .bands()
+        .find(|&(_, level, _, _)| level < DECOMPOSITION_LEVELS - 1)
+        .map_or(layout.block_count(), |(_, _, _, band)| band.first_block);
+    let (width, height) = (stream.width as usize, stream.height as usize);
+    // SAFETY: a live decoder, packets of the lengths passed, and planes of
+    // the picture's sizes.
+    let decode = |lossy: bool| unsafe {
+        emberwave_decoder_clear(decoder);
+        for (number, packet) in emberwave_core::encode::packets(frame, 64)
+            .into_iter()
+            .enumerate()
+        {
+            let detail = matches!(
+                Header::parse(packet),
+                Ok(Header::Block(block)) if block.block_index >= coarsest
+            );
+            if lossy && detail && number % 2 == 1 {
+                continue;
+            }
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, packet.as_ptr(), packet.len()),
+                EmberwaveStatus::Ok
+            );
+        }
+        let (mut y, mut cb, mut cr) = (
+            Target::new(width, height, 0),
+            Target::new(width / 2, height / 2, 0),
+            Target::new(width / 2, height / 2, 0),
+        );
+        assert_eq!(
+            emberwave_decoder_decode_yuv(decoder, y.plane(), cb.plane(), cr.plane()),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        [y.rows(), cb.rows(), cr.rows()]
+    };
+    let whole = decode(false);
+    let blank = decode(true);
+    assert_ne!(blank, whole);
+    // SAFETY: a live decoder.
+    let status = unsafe { emberwave_decoder_set_concealment(decoder, 1) };
+    assert_eq!(status, EmberwaveStatus::Ok);
+    decode(false);
+    assert_eq!(decode(true), whole);
+    // SAFETY: a live decoder.
+    let status = unsafe { emberwave_decoder_set_concealment(decoder, 0) };
+    assert_eq!(status, EmberwaveStatus::Ok);
+    assert_eq!(decode(true), blank);
+    // SAFETY: live, destroyed once each.
+    unsafe {
         emberwave_decoder_destroy(decoder);
         emberwave_context_destroy(context);
     }

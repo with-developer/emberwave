@@ -20,6 +20,7 @@ for (const [name, value] of [
   ["Player.create", Player?.create],
   ["Player.max_file_bytes", Player?.max_file_bytes],
   ["Player.prototype.set_partial_share", Player?.prototype.set_partial_share],
+  ["Player.prototype.set_concealment", Player?.prototype.set_concealment],
   ["Bench.create", Bench?.create],
   ["Demo", Demo],
   ["Demo.frames", Demo?.frames],

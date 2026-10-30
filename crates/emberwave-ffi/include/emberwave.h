@@ -1188,6 +1188,20 @@ bool emberwave_decoder_is_ready(const struct EmberwaveDecoder *decoder,
 enum EmberwaveStatus emberwave_decoder_set_partial_share(struct EmberwaveDecoder *decoder,
                                                          float share);
 
+// Sets whether a frame drawn in part conceals the blocks of detail it
+// lacks, off by default (decision D66): `on` other than 0 sets it, 0 clears
+// it. Where the coarsest level around such a block changed by little since
+// the last decode, the picture is taken to be still there, and the block
+// keeps the last decode's coefficients, so that the frame shows the detail
+// it lost; elsewhere the block's detail is blank, as without concealment.
+// Whole frames decode as before. It stays until it is set again.
+//
+// # Safety
+//
+// `decoder` is `NULL` or a live decoder that no other thread is using.
+enum EmberwaveStatus emberwave_decoder_set_concealment(struct EmberwaveDecoder *decoder,
+                                                       uint32_t on);
+
 // Discards what was received, and forgets the order of the frames: the next
 // packet starts a frame, whatever its sequence number.
 //
@@ -1198,7 +1212,8 @@ void emberwave_decoder_clear(struct EmberwaveDecoder *decoder);
 
 // Decodes the frame received so far and writes its Y, Cb and Cr planes, 8
 // bits per sample in the range the stream uses. Blocks that did not arrive
-// decode as zeros, so call it when `emberwave_decoder_is_ready` says so.
+// decode as zeros, or are concealed (`emberwave_decoder_set_concealment`),
+// so call it when `emberwave_decoder_is_ready` says so.
 // Waits for the GPU. The rows go from the GPU's memory straight to the
 // planes, so a call that fails may have written some of them.
 //
@@ -1389,7 +1404,8 @@ void emberwave_texture_destroy(struct EmberwaveTexture *texture);
 // `texture` on the GPU, then waits for the GPU: when this returns, the
 // texture holds the picture, for the caller's graphics API to read on any
 // queue of the device. The picture never goes through CPU memory. Blocks
-// that did not arrive decode as zeros.
+// that did not arrive decode as zeros, or are concealed
+// (`emberwave_decoder_set_concealment`).
 //
 // `color` chooses the conversion as for `emberwave_decoder_decode_rgb`, and
 // with `NULL` follows the frame. Upstream's Metal encoder signals BT.709,
@@ -1478,7 +1494,7 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures(struct EmberwaveDec
 // The planes never go through CPU memory: on Metal the decode stores them
 // into the textures from its shaders when all three allow it, and copies
 // them in otherwise (decision D52). Blocks that did not arrive decode as
-// zeros.
+// zeros, or are concealed (`emberwave_decoder_set_concealment`).
 //
 // Each texture is one for that plane, from `emberwave_texture_create_plane`
 // or `emberwave_texture_from_metal_plane`, on a decoder of the same context,

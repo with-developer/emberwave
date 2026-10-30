@@ -176,7 +176,12 @@ impl Bands {
             .take()
     }
 
-    fn plane_mut(&mut self, component: Component, level: usize, band: Band) -> Option<&mut [f32]> {
+    pub(crate) fn plane_mut(
+        &mut self,
+        component: Component,
+        level: usize,
+        band: Band,
+    ) -> Option<&mut [f32]> {
         self.planes
             .get_mut(component.index())?
             .get_mut(level)?
