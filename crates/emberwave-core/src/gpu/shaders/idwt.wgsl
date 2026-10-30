@@ -168,8 +168,11 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     // the low bit of a mirrored coordinate says which band the sample comes
     // from, LL, HL (odd column), LH (odd row) or HH, and mirroring keeps that
     // bit, so a row's even columns come from one band and its odd ones from
-    // another. Loading the neighbourhood into workgroup memory first made the
-    // transform take a quarter longer at 4K (decision D68).
+    // another. It keeps it up to the level's width less two past an edge, and
+    // the samples that are stored read no further than four: the levels must
+    // be at least six wide, and the minimum image size makes them eight
+    // (gpu/layout.rs tests it). Loading the neighbourhood into workgroup memory
+    // first made the transform take a quarter longer at 4K (decision D68).
     if (tid < 160u) {
         let row = tid / 4u;
         let segment = tid % 4u;
