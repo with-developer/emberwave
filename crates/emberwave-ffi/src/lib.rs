@@ -1044,8 +1044,8 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
         .map_err(|error| Failure(EmberwaveStatus::NoGpu, error.to_string()))?;
     // Contexts made on one queue share its room for command buffers: their
     // decoders and encoders take turns at it (#126, decision D60).
-    Ok(GpuContext::from_device(adapter, device, queue)
-        .with_queue_turns(queue_turns(queue_address, QueueTurns::new)))
+    let turns = queue_turns(queue_address, None, QueueTurns::new)?;
+    Ok(GpuContext::from_device(adapter, device, queue).with_queue_turns(turns))
 }
 
 /// The turns of the contexts made on the queue at `address`, a Metal queue
@@ -1057,24 +1057,45 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
     target_os = "ios",
     target_os = "linux",
     target_os = "android",
-    windows
+    all(windows, target_pointer_width = "64")
 ))]
-fn queue_turns(address: usize, make: impl FnOnce() -> QueueTurns) -> Arc<QueueTurns> {
+fn queue_turns(
+    address: usize,
+    lock: LockKey,
+    make: impl FnOnce() -> QueueTurns,
+) -> Result<Arc<QueueTurns>, Failure> {
     use std::sync::{Mutex, PoisonError, Weak};
-    static TURNS: Mutex<Vec<(usize, Weak<QueueTurns>)>> = Mutex::new(Vec::new());
+    static TURNS: Mutex<Vec<(usize, LockKey, Weak<QueueTurns>)>> = Mutex::new(Vec::new());
     let mut all = TURNS.lock().unwrap_or_else(PoisonError::into_inner);
-    all.retain(|(_, turns)| turns.strong_count() > 0);
-    if let Some(turns) = all
+    all.retain(|(_, _, turns)| turns.strong_count() > 0);
+    if let Some((key, turns)) = all
         .iter()
-        .find(|&&(at, _)| at == address)
-        .and_then(|(_, turns)| turns.upgrade())
+        .filter(|&&(at, _, _)| at == address)
+        .find_map(|(_, key, turns)| Some((*key, turns.upgrade()?)))
     {
-        return turns;
+        if key != lock {
+            return Err(Failure::argument(
+                "another context on this queue was made with other lock_queue, unlock_queue \
+                 or user: every context on one queue takes the same",
+            ));
+        }
+        return Ok(turns);
     }
     let turns = Arc::new(make());
-    all.push((address, Arc::downgrade(&turns)));
-    turns
+    all.push((address, lock, Arc::downgrade(&turns)));
+    Ok(turns)
 }
+
+/// The caller's lock of a queue, as the contexts on it were given it: the
+/// addresses of `lock_queue`, `unlock_queue` and `user`, or none.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
+type LockKey = Option<(usize, usize, usize)>;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 unsafe fn metal_context(_device: *mut c_void, _queue: *mut c_void) -> Result<GpuContext, Failure> {
@@ -1094,7 +1115,8 @@ pub type EmberwaveVkGetInstanceProcAddr = Option<
     ) -> Option<unsafe extern "C" fn()>,
 >;
 
-/// A Vulkan instance of the caller's (decision D61).
+/// A Vulkan instance of the caller's (decision D61), made with the
+/// extensions of `emberwave_vulkan_instance_extensions` among its own.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveVulkanInstance {
@@ -1103,7 +1125,8 @@ pub struct EmberwaveVulkanInstance {
     /// The `VkInstance`.
     pub instance: *mut c_void,
     /// The `apiVersion` the instance was made with, such as
-    /// `VK_API_VERSION_1_3`.
+    /// `VK_API_VERSION_1_3`: at least the physical device's, up to 1.3,
+    /// which wgpu uses.
     pub api_version: u32,
     /// The instance extensions it was made with: `extension_count` names, or
     /// `NULL` for none.
@@ -1130,7 +1153,8 @@ pub struct EmberwaveVulkanDevice {
     pub extensions: *const *const c_char,
     /// How many names `extensions` holds.
     pub extension_count: u32,
-    /// The family of the queue emberwave submits to.
+    /// The family of the queue emberwave submits to, one with graphics and
+    /// compute, which wgpu records work for.
     pub queue_family_index: u32,
     /// Which queue of that family, as for `vkGetDeviceQueue`.
     pub queue_index: u32,
@@ -1139,7 +1163,9 @@ pub struct EmberwaveVulkanDevice {
     /// emberwave calls it with `user` around each submission, and while it
     /// lets go of the queue, never twice without `unlock_queue` between,
     /// from any thread. `NULL`, with `unlock_queue` `NULL` too, if nothing
-    /// else uses the queue during emberwave's calls.
+    /// else uses the queue during emberwave's calls. Every context on one
+    /// queue takes the same `lock_queue`, `unlock_queue` and `user`, which
+    /// stay valid until everything made on those contexts is destroyed.
     pub lock_queue: Option<unsafe extern "C" fn(user: *mut c_void)>,
     /// Frees the caller's lock of the queue that `lock_queue` took.
     pub unlock_queue: Option<unsafe extern "C" fn(user: *mut c_void)>,
@@ -1155,8 +1181,83 @@ pub struct EmberwaveVulkanRequirements {
     extensions: Vec<*const c_char>,
     /// A `VkPhysicalDeviceFeatures2`, whose chain `_held` keeps.
     features: *const c_void,
-    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        all(windows, target_pointer_width = "64")
+    ))]
     _held: vulkan::Held,
+}
+
+/// The instance extensions that wgpu uses, of those the loader of
+/// `get_instance_proc_addr` offers: make the instance with them among its
+/// own (decision D61). wgpu uses only those enabled, and without
+/// `VK_KHR_get_physical_device_properties2` it learns less of a device and
+/// uses fewer of its features. `VK_KHR_surface` goes with the
+/// `VK_KHR_swapchain` that `emberwave_vulkan_requirements_create` lists on
+/// devices that have it. With `names` `NULL`, stores their number in
+/// `*count`; otherwise writes them to `names`, which has room for `*count`,
+/// or gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the number needed in
+/// `*count` if that is too few. The names stay valid as long as the process.
+/// Only where wgpu runs on Vulkan; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+///
+/// # Safety
+///
+/// `get_instance_proc_addr` is `NULL` or a loader's `vkGetInstanceProcAddr`,
+/// `count` points to a `uint32_t`, and `names` is `NULL` or points to
+/// `*count` pointers that may be written.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_vulkan_instance_extensions(
+    get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
+    names: *mut *const c_char,
+    count: *mut u32,
+) -> EmberwaveStatus {
+    run(|| {
+        if count.is_null() {
+            return Err(Failure::argument("count is NULL"));
+        }
+        let wanted = vulkan_instance_extensions(get_instance_proc_addr)?;
+        // SAFETY: as the caller promises.
+        let room = unsafe { count.read() };
+        // SAFETY: as the caller promises.
+        unsafe { count.write(wanted.len() as u32) };
+        if names.is_null() {
+            return Ok(());
+        }
+        if (room as usize) < wanted.len() {
+            return Err(Failure::argument(format!(
+                "names has room for {room} names, not the {} needed",
+                wanted.len()
+            )));
+        }
+        for (at, name) in wanted.iter().enumerate() {
+            // SAFETY: room for `room` pointers, as the caller promises.
+            unsafe { names.add(at).write(name.as_ptr()) };
+        }
+        Ok(())
+    })
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
+fn vulkan_instance_extensions(
+    get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
+) -> Result<Vec<&'static std::ffi::CStr>, Failure> {
+    vulkan::instance_extensions(get_instance_proc_addr)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+)))]
+fn vulkan_instance_extensions(
+    _get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
+) -> Result<Vec<&'static std::ffi::CStr>, Failure> {
+    Err(vulkan_elsewhere())
 }
 
 /// Lists what a Vulkan device of the caller's must have enabled for
@@ -1195,9 +1296,9 @@ pub unsafe extern "C" fn emberwave_vulkan_requirements_create(
     })
 }
 
-/// The names of the device extensions in `requirements`, which stay valid as
-/// long as the process: `*count` of them. `NULL`, and a count of 0, for
-/// `NULL`.
+/// The names of the device extensions in `requirements`: `*count` of them,
+/// in an array that lives as long as `requirements`, of names that live as
+/// long as the process. `NULL`, and a count of 0, for `NULL`.
 ///
 /// # Safety
 ///
@@ -1223,7 +1324,10 @@ pub unsafe extern "C" fn emberwave_vulkan_requirements_extensions(
 
 /// The features in `requirements`: a `VkPhysicalDeviceFeatures2` whose
 /// `features`, and the structures of its `pNext` chain, have `VK_TRUE` for
-/// each feature emberwave needs. Set the same members to `VK_TRUE` in the
+/// each feature emberwave needs. They are what wgpu enables on a device of
+/// its own on that physical device, and then counts on: some, such as
+/// `robustBufferAccess`, for its own sake, others, such as the robustness of
+/// images, for the bounds checks of the shaders it compiles. Set the same members to `VK_TRUE` in the
 /// structures that make the device, or chain copies of the structures the
 /// caller's chain lacks; where the caller's chain has
 /// `VkPhysicalDeviceVulkan11Features`, `VkPhysicalDeviceVulkan12Features` or
@@ -1268,16 +1372,21 @@ pub unsafe extern "C" fn emberwave_vulkan_requirements_destroy(
 /// The device must have been made with the extensions and the features of
 /// `emberwave_vulkan_requirements_create`: a lacking extension is
 /// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and a lacking feature undefined
-/// behaviour, as Vulkan cannot tell which were enabled.
+/// behaviour, as Vulkan cannot tell which were enabled. So is a queue family
+/// without graphics and compute, a queue it does not have, and an instance
+/// whose `apiVersion` is below the physical device's, up to 1.3.
 ///
 /// The queue is shared:
 /// - emberwave submits to it during its calls. Either nothing else uses the
 ///   queue during those, or the caller gives `lock_queue` and
 ///   `unlock_queue`, which emberwave holds around each submission, and
-///   while it lets go of the queue in a destroy. Do not call emberwave while
-///   holding that lock, and give every context made on one queue the same
-///   callbacks. A second queue of the family, where the device has one,
-///   needs neither.
+///   around each destroy of a context, decoder or encoder. The destroy that
+///   lets go of the last hold on the queue waits for the queue to be idle
+///   meanwhile, which holds up the caller's own submissions until it is. Do
+///   not call emberwave while holding that lock; a context on a queue that
+///   has contexts with other callbacks is
+///   `EMBERWAVE_STATUS_INVALID_ARGUMENT`. A second queue of the family,
+///   where the device has one, needs neither.
 /// - The decoders and encoders of every context made on the queue take
 ///   turns at it, as on Metal (decision D60).
 /// - The decodes that wait return once the GPU is done. The decodes that do
@@ -1310,7 +1419,11 @@ pub unsafe extern "C" fn emberwave_context_create_vulkan(
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
 unsafe fn vulkan_requirements(
     instance: &EmberwaveVulkanInstance,
     physical_device: *mut c_void,
@@ -1319,7 +1432,11 @@ unsafe fn vulkan_requirements(
     unsafe { vulkan::requirements(instance, physical_device) }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+)))]
 unsafe fn vulkan_requirements(
     _instance: &EmberwaveVulkanInstance,
     _physical_device: *mut c_void,
@@ -1327,29 +1444,45 @@ unsafe fn vulkan_requirements(
     Err(vulkan_elsewhere())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
 unsafe fn vulkan_context(device: &EmberwaveVulkanDevice) -> Result<GpuContext, Failure> {
     // SAFETY: as the caller promises.
     unsafe { vulkan::context(device) }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+)))]
 unsafe fn vulkan_context(_device: &EmberwaveVulkanDevice) -> Result<GpuContext, Failure> {
     Err(vulkan_elsewhere())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+)))]
 fn vulkan_elsewhere() -> Failure {
     Failure(
         EmberwaveStatus::NoGpu,
-        "Vulkan contexts are made on Linux, Android and Windows only".into(),
+        "Vulkan contexts are made on Linux, Android and 64-bit Windows only".into(),
     )
 }
 
 /// The Vulkan side of `emberwave_vulkan_requirements_create` and
 /// `emberwave_context_create_vulkan`, through wgpu's Vulkan objects made
 /// from the caller's (decision D61).
-#[cfg(any(target_os = "linux", target_os = "android", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
 mod vulkan {
     use std::ffi::{CStr, c_char, c_void};
 
@@ -1358,8 +1491,8 @@ mod vulkan {
     use wgpu::hal::api::Vulkan;
 
     use super::{
-        EmberwaveStatus, EmberwaveVulkanDevice, EmberwaveVulkanInstance,
-        EmberwaveVulkanRequirements, Failure, queue_turns,
+        EmberwaveStatus, EmberwaveVkGetInstanceProcAddr, EmberwaveVulkanDevice,
+        EmberwaveVulkanInstance, EmberwaveVulkanRequirements, Failure, queue_turns,
     };
 
     /// What keeps the chain of an `EmberwaveVulkanRequirements` alive.
@@ -1402,6 +1535,27 @@ mod vulkan {
             .collect()
     }
 
+    /// The instance extensions wgpu uses where the loader of
+    /// `get_instance_proc_addr` offers them.
+    pub(super) fn instance_extensions(
+        get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
+    ) -> Result<Vec<&'static CStr>, Failure> {
+        let Some(get_instance_proc_addr) = get_instance_proc_addr else {
+            return Err(Failure::argument("get_instance_proc_addr is NULL"));
+        };
+        // SAFETY: as in `adapter`.
+        let get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr =
+            unsafe { std::mem::transmute(get_instance_proc_addr) };
+        // SAFETY: a loader's vkGetInstanceProcAddr.
+        let entry = unsafe {
+            ash::Entry::from_static_fn(ash::StaticFn {
+                get_instance_proc_addr,
+            })
+        };
+        wgpu::hal::vulkan::Instance::desired_extensions(&entry, 0, wgpu::InstanceFlags::empty())
+            .map_err(no_gpu)
+    }
+
     fn no_gpu(error: impl std::fmt::Display) -> Failure {
         Failure(EmberwaveStatus::NoGpu, error.to_string())
     }
@@ -1438,6 +1592,23 @@ mod vulkan {
         let raw_instance = vk::Instance::from_raw(instance.instance as usize as u64);
         // SAFETY: a live instance of that loader, as the caller promises.
         let ash_instance = unsafe { ash::Instance::load(entry.static_fn(), raw_instance) };
+        let physical = vk::PhysicalDevice::from_raw(physical_device as usize as u64);
+        // wgpu takes the version of the physical device, up to 1.3, as the
+        // one it may use; the instance's limits what may be used.
+        // SAFETY: a physical device of the instance, as the caller promises.
+        let device_version =
+            unsafe { ash_instance.get_physical_device_properties(physical) }.api_version;
+        let needed = device_version.min(vk::API_VERSION_1_3);
+        if instance.api_version < needed {
+            return Err(Failure::argument(format!(
+                "the instance's apiVersion is {}.{}, below the {}.{} of the physical device that \
+                 wgpu uses: make the instance with at least that",
+                vk::api_version_major(instance.api_version),
+                vk::api_version_minor(instance.api_version),
+                vk::api_version_major(needed),
+                vk::api_version_minor(needed),
+            )));
+        }
         // SAFETY: as the caller promises.
         let enabled = unsafe {
             names(
@@ -1473,9 +1644,7 @@ mod vulkan {
         }
         .map_err(no_gpu)?;
         let exposed = hal
-            .expose_adapter(vk::PhysicalDevice::from_raw(
-                physical_device as usize as u64,
-            ))
+            .expose_adapter(physical)
             .ok_or_else(|| no_gpu("wgpu cannot run on that physical device"))?;
         // SAFETY: an instance of wgpu's Vulkan.
         let wgpu_instance = unsafe { wgpu::Instance::from_hal::<Vulkan>(hal) };
@@ -1587,6 +1756,29 @@ mod vulkan {
                 )));
             }
             let instance = hal.shared_instance().raw_instance();
+            // wgpu records graphics, compute and copies for any queue: a
+            // family without graphics would take stages it cannot run.
+            // SAFETY: the adapter's physical device, of that instance.
+            let families = unsafe {
+                instance.get_physical_device_queue_family_properties(hal.raw_physical_device())
+            };
+            let family = families
+                .get(device.queue_family_index as usize)
+                .ok_or_else(|| Failure::argument("the device has no such queue family"))?;
+            if !family
+                .queue_flags
+                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+            {
+                return Err(Failure::argument(
+                    "the queue family lacks graphics or compute, which wgpu records for",
+                ));
+            }
+            if device.queue_index >= family.queue_count {
+                return Err(Failure::argument(format!(
+                    "the queue family has {} queues, not one of index {}",
+                    family.queue_count, device.queue_index
+                )));
+            }
             // SAFETY: a live device of that instance, as the caller promises.
             let raw = unsafe {
                 ash::Device::load(
@@ -1621,10 +1813,13 @@ mod vulkan {
         // features and limits.
         let (wgpu_device, wgpu_queue) =
             unsafe { adapter.create_device_from_hal(open, &descriptor) }.map_err(no_gpu)?;
-        let turns = queue_turns(queue.as_raw() as usize, || match lock {
+        let key = lock
+            .as_ref()
+            .map(|lock| (lock.lock as usize, lock.unlock as usize, lock.user as usize));
+        let turns = queue_turns(queue.as_raw() as usize, key, || match lock {
             Some(lock) => QueueTurns::with_caller_lock(Box::new(lock)),
             None => QueueTurns::new(),
-        });
+        })?;
         Ok(GpuContext::from_device(adapter, wgpu_device, wgpu_queue).with_queue_turns(turns))
     }
 }
@@ -1639,9 +1834,9 @@ mod vulkan {
 ///
 /// # Safety
 ///
-/// `context` is `NULL`, or a context from `emberwave_context_create` or
-/// `emberwave_context_create_metal` that has not been destroyed and that no
-/// other thread is using.
+/// `context` is `NULL`, or a context from `emberwave_context_create`,
+/// `emberwave_context_create_metal` or `emberwave_context_create_vulkan`
+/// that has not been destroyed and that no other thread is using.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_context_destroy(context: *mut EmberwaveContext) {
     if !context.is_null() {

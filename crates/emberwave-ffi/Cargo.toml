@@ -35,8 +35,9 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 pollster.workspace = true
 
 # A context on the caller's own Vulkan device (emberwave_context_create_vulkan),
-# where wgpu runs on Vulkan. wgpu uses ash already, the same version.
-[target.'cfg(any(target_os = "linux", target_os = "android", windows))'.dependencies]
+# where wgpu runs on Vulkan; not on 32-bit Windows, where Vulkan's calling
+# convention is not C's. wgpu uses ash already, the same version.
+[target.'cfg(any(target_os = "linux", target_os = "android", all(windows, target_pointer_width = "64")))'.dependencies]
 ash = "0.38"
 
 [dev-dependencies]

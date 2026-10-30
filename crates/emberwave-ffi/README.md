@@ -251,15 +251,20 @@ emberwave_texture_destroy(texture);   /* the work on the GPU keeps what it uses 
 - **Planes.** `emberwave_texture_from_metal_plane(decoder, plane, metal, &texture)` wraps an R8 texture for one plane. A Metal texture wrapped for two planes is refused by the decode. When all three textures of a decode have `MTLTextureUsageShaderWrite`, as those of `emberwave_texture_create_plane` do, the decode stores the planes into them from its shaders; otherwise it copies them in, which takes a little longer.
 - **Hazards.** A submit takes only textures whose hazards Metal tracks, as it does for those of a `CVMetalTextureCache`. A heap's textures are usually untracked; the waiting decodes take those too.
 
-Vulkan and Direct3D 12 handles are not part of the interface yet.
+On Vulkan, see [A context on the client's Vulkan device](#a-context-on-the-clients-vulkan-device); Direct3D 12 handles are not part of the interface yet.
 
 [`examples/ios`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/ios) is an iPhone and iPad app that does all of this in Swift: it times decoding into textures, decoding to planes and encoding on the device's GPU, and draws the last picture from its texture. Its README says how to run it on a phone.
 
 ## A context on the client's Vulkan device
 
-On Linux, Android and Windows, where wgpu runs on Vulkan, a context can run on the client's own `VkDevice` and submit to one of its queues (decision D61). The client makes the device with what emberwave needs, besides what it needs itself:
+On Linux, Android and 64-bit Windows, where wgpu runs on Vulkan, a context can run on the client's own `VkDevice` and submit to one of its queues (decision D61). The client makes the instance with the extensions of `emberwave_vulkan_instance_extensions` among its own, as wgpu uses only those enabled, and the device with what emberwave needs, besides what it needs itself:
 
 ```c
+uint32_t wanted = 0;
+emberwave_vulkan_instance_extensions((EmberwaveVkGetInstanceProcAddr)vkGetInstanceProcAddr, NULL, &wanted);
+/* ... room for `wanted` names, then the same call fills them in; vkCreateInstance with them,
+   and an apiVersion at least the physical device's, up to VK_API_VERSION_1_3 ... */
+
 EmberwaveVulkanInstance instance = {
     .get_instance_proc_addr = (EmberwaveVkGetInstanceProcAddr)vkGetInstanceProcAddr,
     .instance = vk_instance,
@@ -291,10 +296,10 @@ EmberwaveContext *context = NULL;
 emberwave_context_create_vulkan(&device, &context);
 ```
 
-- **Features.** `emberwave_vulkan_requirements_features` gives a `VkPhysicalDeviceFeatures2` whose `features`, and the structures chained to it, have `VK_TRUE` for each feature emberwave needs. Set those members in the client's own structures, or chain copies of the structures it lacks. Where the client chains `VkPhysicalDeviceVulkan11Features`, `VkPhysicalDeviceVulkan12Features` or `VkPhysicalDeviceVulkan13Features`, set the same features there: Vulkan allows only one of the two kinds. A missing extension makes `emberwave_context_create_vulkan` fail with `EMBERWAVE_STATUS_INVALID_ARGUMENT`. A missing feature is undefined behaviour, as Vulkan cannot tell which were enabled.
-- **The queue.** Vulkan requires the uses of a queue to be externally synchronised. emberwave calls `lock_queue` and `unlock_queue` with `user` around each of its submissions, and while it lets go of the queue in a destroy, from any thread.
+- **Features.** `emberwave_vulkan_requirements_features` gives a `VkPhysicalDeviceFeatures2` whose `features`, and the structures chained to it, have `VK_TRUE` for each feature emberwave needs: those wgpu enables on a device of its own, and then counts on. Set those members in the client's own structures, or chain copies of the structures it lacks. Where the client chains `VkPhysicalDeviceVulkan11Features`, `VkPhysicalDeviceVulkan12Features` or `VkPhysicalDeviceVulkan13Features`, set the same features there: Vulkan allows only one of the two kinds. A missing extension makes `emberwave_context_create_vulkan` fail with `EMBERWAVE_STATUS_INVALID_ARGUMENT`. A missing feature is undefined behaviour, as Vulkan cannot tell which were enabled.
+- **The queue.** It belongs to a family with graphics and compute, which wgpu records work for. Vulkan requires the uses of a queue to be externally synchronised. emberwave calls `lock_queue` and `unlock_queue` with `user` around each of its submissions, and around each destroy of a context, decoder or encoder, from any thread. The destroy that lets go of the last hold on the queue waits for the queue to be idle while it holds the lock, which holds up the client's own submissions until then.
   - Do not call emberwave while holding that lock.
-  - Give every context on one queue the same callbacks. The decoders and encoders of those contexts take turns at the queue, as on Metal (decision D60).
+  - Give every context on one queue the same callbacks and `user`, and keep them valid until everything made on those contexts is destroyed. A context with other callbacks is refused. The decoders and encoders of those contexts take turns at the queue, as on Metal (decision D60).
   - Without callbacks, nothing else may use the queue during emberwave's calls. A second queue of the family, where the device has one, needs neither.
 - **The device.** It stays the client's: destroy it after the context and everything made on it.
 - **For now, through CPU memory.** Decodes and encodes go through CPU memory, as on a context of `emberwave_context_create`, but on the client's device, without a second one. The decodes into the client's images, and semaphores to order them without waiting, are the next step ([#115](https://github.com/with-developer/emberwave/issues/115)).
