@@ -1792,10 +1792,20 @@ impl Client {
         wait: Option<vk::Semaphore>,
         signal: Option<vk::Semaphore>,
     ) -> Upload {
-        let bytes: Vec<u8> = pictures
+        // Each picture at an offset of a multiple of 4 bytes, as copies into
+        // images of 2-byte texels need a multiple of 2.
+        let offsets: Vec<usize> = pictures
             .iter()
-            .flat_map(|(_, samples)| samples.iter().copied())
+            .scan(0, |next, (_, samples)| {
+                let offset = *next;
+                *next = (offset + samples.len()).next_multiple_of(4);
+                Some(offset)
+            })
             .collect();
+        let mut bytes = vec![0u8; offsets.last().unwrap() + pictures.last().unwrap().1.len()];
+        for ((_, samples), &offset) in pictures.iter().zip(&offsets) {
+            bytes[offset..offset + samples.len()].copy_from_slice(samples);
+        }
         // SAFETY: valid descriptions of a buffer, its memory, a command pool
         // and buffer of the queue's family; each image is in the layout the
         // first barrier names and as large as its samples; the caller frees
@@ -1882,15 +1892,14 @@ impl Client {
                 &[],
                 &before,
             );
-            let mut offset = 0;
-            for (image, samples) in pictures {
+            for ((image, samples), &offset) in pictures.iter().zip(&offsets) {
                 device.cmd_copy_buffer_to_image(
                     commands,
                     buffer,
                     image.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[vk::BufferImageCopy::default()
-                        .buffer_offset(offset)
+                        .buffer_offset(offset as u64)
                         .image_subresource(
                             vk::ImageSubresourceLayers::default()
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1906,7 +1915,6 @@ impl Client {
                     samples.len(),
                     (image.width * image.height * image.texel) as usize
                 );
-                offset += samples.len() as u64;
             }
             let after: Vec<_> = pictures
                 .iter()
