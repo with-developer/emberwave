@@ -23,8 +23,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM,
+    DXGI_FORMAT_R8G8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIAdapter,
@@ -730,6 +730,146 @@ fn a_hosts_shared_planes_are_encoded_after_the_fence() {
         for texture in sources.into_iter().chain([cbcr]) {
             emberwave_texture_destroy(texture);
         }
+        for encoder in encoders {
+            emberwave_encoder_destroy(encoder);
+        }
+    }
+}
+
+#[test]
+fn a_hosts_shared_bgra_picture_is_encoded_as_rgb() {
+    // A picture in DXGI_FORMAT_B8G8R8A8_UNORM, as a desktop duplication
+    // gives it, encodes after the host's fence as the same bytes in CPU
+    // memory do (decision D65).
+    let mut host = Host::new();
+    let size = (192usize, 136usize);
+    let mut encoders = [ptr::null_mut(); 2];
+    for encoder in &mut encoders {
+        // SAFETY: a live context, and a pointer to store the encoder in.
+        let status = unsafe {
+            emberwave_encoder_create(
+                host.context,
+                size.0 as u32,
+                size.1 as u32,
+                EMBERWAVE_CHROMA_420,
+                ptr::null(),
+                encoder,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    }
+    let [memory, from_texture] = encoders;
+    let (texture, handle) =
+        host.texture(DXGI_FORMAT_B8G8R8A8_UNORM, size, D3D11_BIND_SHADER_RESOURCE);
+    // SAFETY: a live encoder, a handle of this process, and a pointer to
+    // store the texture in.
+    let rgb = wrapped(handle, |handle, texture| unsafe {
+        emberwave_texture_from_d3d12_source(from_texture, EMBERWAVE_PLANE_RGB, handle, texture)
+    })
+    .unwrap();
+    for seed in 0..2usize {
+        let bgra: Vec<u8> = (0..size.0 * size.1)
+            .flat_map(|i| {
+                let (x, y) = (i % size.0, i / size.0);
+                [
+                    (40 + y * 150 / size.1 + 7 * seed) as u8,
+                    (20 + x * 200 / size.0) as u8,
+                    (230 - x * 100 / size.0) as u8,
+                    (x * 13 + y) as u8,
+                ]
+            })
+            .collect();
+        let written = host.write(&texture, &bgra, 4 * size.0);
+
+        let mut expected = vec![0u8; 9_000];
+        let mut length = 0;
+        let picture = EmberwaveSourcePlane {
+            data: bgra.as_ptr(),
+            stride: 4 * size.0,
+        };
+        // SAFETY: a live encoder, a picture of its size, and a frame of the
+        // length passed.
+        let status = unsafe {
+            emberwave_encoder_encode_rgb(
+                memory,
+                picture,
+                EMBERWAVE_TEXTURE_BGRA8,
+                expected.as_mut_ptr(),
+                expected.len(),
+                &mut length,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        expected.truncate(length);
+
+        let sync = EmberwaveD3D12Sync {
+            wait_fence: host.shared_fence,
+            wait_value: written,
+            signal_fence: host.shared_fence,
+            signal_value: written + 1,
+        };
+        host.value = written + 1;
+        let mut frame = vec![0u8; 9_000];
+        // SAFETY: a live encoder, a live texture, live fences, and a frame
+        // of the length passed.
+        let status = unsafe {
+            emberwave_encoder_encode_textures_d3d12(
+                from_texture,
+                rgb,
+                ptr::null(),
+                ptr::null(),
+                &sync,
+                frame.as_mut_ptr(),
+                frame.len(),
+                &mut length,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        frame.truncate(length);
+        assert!(frame == expected, "picture {seed}");
+    }
+
+    // The encodes that take no fences refuse the shared texture, as they
+    // refuse shared planes.
+    let mut frame = vec![0u8; 9_000];
+    let mut length = 0;
+    // SAFETY: a live encoder, a live texture, and a frame of the length
+    // passed.
+    let status = unsafe {
+        emberwave_encoder_encode_textures(
+            from_texture,
+            rgb,
+            ptr::null(),
+            ptr::null(),
+            frame.as_mut_ptr(),
+            frame.len(),
+            &mut length,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(last_error().contains("_d3d12"), "{}", last_error());
+
+    // An sRGB texture, whose reads would undo the transfer function, is
+    // refused.
+    let (srgb, handle) = host.texture(
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        size,
+        D3D11_BIND_SHADER_RESOURCE,
+    );
+    // SAFETY: as above.
+    let (status, error) = wrapped(handle, |handle, texture| unsafe {
+        emberwave_texture_from_d3d12_source(memory, EMBERWAVE_PLANE_RGB, handle, texture)
+    })
+    .unwrap_err();
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(
+        error.contains("not DXGI_FORMAT_B8G8R8A8_UNORM or DXGI_FORMAT_R8G8B8A8_UNORM"),
+        "{error}"
+    );
+    drop(srgb);
+    // SAFETY: live objects, destroyed once each.
+    unsafe {
+        emberwave_texture_destroy(rgb);
         for encoder in encoders {
             emberwave_encoder_destroy(encoder);
         }

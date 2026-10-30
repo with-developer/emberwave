@@ -779,6 +779,74 @@ fn bench_encode_times_pictures_in_textures() {
 }
 
 #[test]
+fn bench_encode_times_pictures_in_bgra() {
+    let source = testdata("encoder/scene_200x120_420.source.y4m");
+    let args = [
+        "--bytes-per-frame",
+        "6000",
+        "--frames",
+        "3",
+        "--warmup",
+        "1",
+        "--warmup-seconds",
+        "0",
+        "--rgb",
+        "--json",
+    ];
+    // The CPU encoder converts them itself.
+    let output = cli()
+        .arg("bench-encode")
+        .arg(&source)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(json["picture"], "bgra");
+    assert!(
+        json["description"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("encoded on the CPU from BGRA in memory")),
+        "{json}"
+    );
+
+    for (extra, picture, said) in [
+        (&[][..], "bgra", "encoded on the GPU from BGRA in memory"),
+        (
+            &["--textures"][..],
+            "bgra textures",
+            "encoded on the GPU from BGRA textures",
+        ),
+    ] {
+        let Some(output) = run_on_gpu(
+            cli()
+                .arg("bench-encode")
+                .arg(&source)
+                .args(args)
+                .arg("--gpu")
+                .args(extra),
+        ) else {
+            return;
+        };
+        assert!(output.status.success(), "{}", stderr(&output));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        assert_eq!(json["picture"], picture);
+        assert!(
+            json["description"]
+                .as_str()
+                .is_some_and(|text| text.ends_with(said)),
+            "{json}"
+        );
+        assert!(
+            json["series"]["total"]["mean"]
+                .as_f64()
+                .is_some_and(|mean| mean > 0.0),
+            "{json}"
+        );
+    }
+}
+
+#[test]
 fn output_into_a_closed_pipe_ends_quietly() {
     // As when the output goes to `head`: the reader is gone before the first
     // line, which is no reason for an error, let alone a panic.

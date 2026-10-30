@@ -136,6 +136,7 @@ emberwave_encoder_create(context, 1920, 1080, EMBERWAVE_CHROMA_420, NULL, &encod
 EmberwaveSourcePlane y = { y_data, y_stride }, cb = { cb_data, cb_stride }, cr = { cr_data, cr_stride };
 size_t size, count;
 emberwave_encoder_encode(encoder, y, cb, cr, frame, budget, &size);
+/* or a picture in BGRA: emberwave_encoder_encode_rgb(encoder, bgra, EMBERWAVE_TEXTURE_BGRA8, …) */
 emberwave_frame_packets(frame, size, 1200, NULL, 0, &count);           /* how many */
 emberwave_frame_packets(frame, size, 1200, packets, capacity, &count); /* where */
 /* send frame + packets[i].offset, packets[i].size bytes, for each i */
@@ -476,6 +477,28 @@ emberwave_encoder_encode_textures_vulkan(encoder, y, cbcr, NULL, &sync, frame, b
 
 `tests/metal.rs` and `tests/vulkan.rs` encode the host's own textures and images both ways, against the same pictures encoded from CPU memory.
 
+### Pictures in RGB
+
+Most captures hold their pictures in RGB, four bytes a pixel, blue first: ScreenCaptureKit's BGRA pixel buffers, Windows' desktop duplication, a renderer's target. A texture of the whole picture, wrapped with `EMBERWAVE_PLANE_RGB`, goes in as `y`, with `cb` and `cr` `NULL`, and the encoder converts it to Y'CbCr as it reads it, by the matrix, range and chroma siting of its signalling (decision D65):
+
+```objc
+CVMetalTextureRef bgra;   /* a '32BGRA' pixel buffer of the encoder's size */
+CVMetalTextureCacheCreateTextureFromImage(NULL, cache, pixelBuffer, NULL, MTLPixelFormatBGRA8Unorm,
+                                          width, height, 0, &bgra);
+EmberwaveTexture *picture;
+emberwave_texture_from_metal_source(encoder, EMBERWAVE_PLANE_RGB,
+                                    (__bridge void *)CVMetalTextureGetTexture(bgra), &picture);
+emberwave_encoder_encode_textures(encoder, picture, NULL, NULL, frame, budget, &size);
+emberwave_texture_destroy(picture);
+CFRelease(bgra);
+```
+
+- **Formats.** `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm` on Metal, `VK_FORMAT_B8G8R8A8_UNORM` or `VK_FORMAT_R8G8B8A8_UNORM` on Vulkan, and `DXGI_FORMAT_B8G8R8A8_UNORM` or `DXGI_FORMAT_R8G8B8A8_UNORM` on Direct3D, through `emberwave_texture_from_d3d12_source` and `emberwave_encoder_encode_textures_d3d12`. The fourth channel is not read. The sRGB formats are refused, as their reads would undo the transfer function that the picture's bytes carry.
+- **The conversion** is in integers and makes the same bytes on every GPU, so a picture encodes into the frame of the planes it converts to; in Rust, `color::rgb_to_ycbcr8` makes them. A 4:2:0 chroma sample is the average of the pixels it covers: across two columns where chroma is centred, across three weighted 1, 2 and 1 where it is on the left.
+- **Time.** On an Apple M3 Max a 4K frame encodes from a BGRA texture in 1.82 to 1.84 ms, against 1.74 to 1.75 ms from textures of its planes.
+- **A decode's picture.** A texture that a decode put a picture into encodes the same way, for a transcode on the GPU.
+- **In CPU memory**, `emberwave_encoder_encode_rgb(encoder, rgb, EMBERWAVE_TEXTURE_BGRA8, frame, budget, &size)` takes the picture's rows, `rgb.stride` bytes apart, and converts them on the GPU. It copies the picture into memory the encoder keeps, and on the GPU into a texture: a 4K frame takes 2.5 to 2.8 ms.
+
 ## Rules
 
 - **Errors.** Functions that can fail return an `EmberwaveStatus`. After a failure, `emberwave_last_error()` describes it, for the thread that made the call, until that thread's next failure.
@@ -486,7 +509,7 @@ emberwave_encoder_encode_textures_vulkan(encoder, y, cbcr, NULL, &sync, frame, b
 - **Panics.** A panic inside emberwave is caught and reported as `EMBERWAVE_STATUS_INTERNAL`; destroy the object it happened in.
 - **Packets.** `emberwave_decoder_push_packet` takes one packet or several back to back, in any order, and ignores a block that arrived already. Frames are told apart by the bitstream's sequence number, which has three bits: a packet of a frame one to three frames newer discards what was received of the older one and starts its own; one four to seven frames newer, or one to four frames older, is ignored; one five to seven frames older passes for a newer frame, and one eight frames off for the same frame. So a transport keeps frame numbers of its own: it drops packets of frames older than the one being received, and before it gives the first packet of a newer frame it decodes the current one if it is ready, then calls `emberwave_decoder_clear`, not after.
 - **Partial frames.** `emberwave_decoder_is_ready` with `allow_partial_frame` accepts a frame that lost packets once every block of the coarsest level and more than 90 percent of the blocks its start of frame header announced have arrived, for a picture despite the loss; `emberwave_decoder_set_partial_share` sets another share, lower to draw frames that lost more, with more of their detail blank, or 1 for whole frames only (decision D59). Until that header arrives the count is of all the picture's blocks. emberwave's encoder sends every block of the coarsest level for this; upstream's leaves out the empty ones, so a frame of it that lost any packet may never be ready in part (decision D58).
-- **Encoding.** `emberwave_encoder_encode` reads planes with a stride of at least their width (`emberwave_encoder_info` gives the sizes), and `emberwave_encoder_encode_textures` reads them from textures on the GPU (see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu)), as `_vulkan` and `_d3d12` do with fences or semaphores. Both write the frame, at most `budget` bytes, into a buffer of that many bytes the caller provides, and wait for the GPU. A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in `size`, and encodes nothing. The frame's sequence number, a three-bit counter from 1 that wraps around, advances only with frames that were encoded. `emberwave_frame_packets` splits a frame at its blocks; a block larger than the packet size gets a packet of its own.
+- **Encoding.** `emberwave_encoder_encode` reads planes with a stride of at least their width (`emberwave_encoder_info` gives the sizes), `emberwave_encoder_encode_rgb` a picture in RGB with a stride of at least four bytes a pixel, and `emberwave_encoder_encode_textures` reads either from textures on the GPU (see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu)), as `_vulkan` and `_d3d12` do with fences or semaphores. Both write the frame, at most `budget` bytes, into a buffer of that many bytes the caller provides, and wait for the GPU. A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in `size`, and encodes nothing. The frame's sequence number, a three-bit counter from 1 that wraps around, advances only with frames that were encoded. `emberwave_frame_packets` splits a frame at its blocks; a block larger than the packet size gets a packet of its own.
 - **Signalling.** `EmberwaveSignalling` sets what every frame says about its colours: matrix (BT.709 or BT.2020; the format cannot signal BT.601), range, chroma siting, primaries and transfer function (sRGB or PQ). `NULL` means BT.709, video range, centred chroma and sRGB. Its `reserved` words are zero.
 - **Colours.** With a `NULL` colour, `emberwave_decoder_decode_rgb` converts the way the frame's start of frame header says. Upstream's Metal encoder writes BT.709, full range and centred chroma there whatever the pictures are, so pass what you know, such as the colours of a PWV1 file's header from `emberwave_probe_pwv1`.
 

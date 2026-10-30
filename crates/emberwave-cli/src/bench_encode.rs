@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use emberwave_core::bitstream::consts::HEADER_BYTES;
 use emberwave_core::bitstream::{ChromaSubsampling, Component, FrameLayout};
+use emberwave_core::color::{RgbOrder, yuv_to_rgb8};
 use emberwave_core::encode::{self, Signalling};
 use emberwave_core::gpu;
 
@@ -44,6 +45,12 @@ pub struct Args {
     #[arg(long, requires = "gpu")]
     textures: bool,
 
+    /// Encode pictures in RGB, BGRA as screen captures hold them, made from
+    /// the frames before the measurement: in CPU memory, or with --textures
+    /// a BGRA texture per frame. The encoder converts them to Y'CbCr
+    #[arg(long)]
+    rgb: bool,
+
     /// Print the result as JSON
     #[arg(long)]
     json: bool,
@@ -59,24 +66,30 @@ enum Encoder {
     Gpu(Box<gpu::Encoder>),
 }
 
-/// A picture to encode: planes in CPU memory, or textures on the GPU.
+/// A picture to encode: planes or BGRA in CPU memory, or textures on the
+/// GPU.
 enum Picture<'a> {
     Planes([&'a [u8]; 3]),
+    Bgra(&'a [u8]),
     Textures(gpu::TexturePicture<'a>),
 }
 
-/// The pictures of the video, taken in turn: in CPU memory, or in textures,
-/// an R8 texture per plane.
+/// The pictures of the video, taken in turn: in CPU memory, as planes or in
+/// BGRA, or in textures, an R8 texture per plane or a BGRA texture.
 enum Pictures {
     Planes(Vec<[Vec<u8>; 3]>),
+    Bgra(Vec<Vec<u8>>),
     Textures(Vec<[wgpu::TextureView; 3]>),
+    BgraTextures(Vec<wgpu::TextureView>),
 }
 
 impl Pictures {
     fn len(&self) -> usize {
         match self {
             Self::Planes(frames) => frames.len(),
+            Self::Bgra(frames) => frames.len(),
             Self::Textures(textures) => textures.len(),
+            Self::BgraTextures(textures) => textures.len(),
         }
     }
 
@@ -87,20 +100,46 @@ impl Pictures {
                 let frame = &frames[i % frames.len()];
                 Picture::Planes([&frame[0], &frame[1], &frame[2]])
             }
+            Self::Bgra(frames) => Picture::Bgra(&frames[i % frames.len()]),
             Self::Textures(textures) => {
                 let [y, cb, cr] = &textures[i % textures.len()];
                 Picture::Textures(gpu::TexturePicture::Planes([y, cb, cr]))
             }
+            Self::BgraTextures(textures) => {
+                Picture::Textures(gpu::TexturePicture::Rgb(&textures[i % textures.len()]))
+            }
         }
+    }
+
+    /// The same pictures in BGRA, as the decode's conversion of the
+    /// stream's colours gives them, one frame at a time.
+    fn into_bgra(self, layout: &FrameLayout) -> Result<Self> {
+        let Self::Planes(frames) = self else {
+            return Ok(self);
+        };
+        let color = Signalling::default().color_params();
+        let mut pictures = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let rgb = yuv_to_rgb8(
+                [&frame[0], &frame[1], &frame[2]],
+                layout.width(),
+                layout.height(),
+                layout.chroma(),
+                &color,
+            )?;
+            pictures.push(
+                rgb.chunks_exact(3)
+                    .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], 255])
+                    .collect(),
+            );
+        }
+        Ok(Self::Bgra(pictures))
     }
 
     /// The same pictures in textures on the context's device, made one
     /// frame at a time: each frame's upload is submitted and done, and its
     /// planes freed, before the next is made.
     fn into_textures(self, context: &gpu::GpuContext, layout: &FrameLayout) -> Result<Self> {
-        let Self::Planes(frames) = self else {
-            return Ok(self);
-        };
         let max = context.device().limits().max_texture_dimension_2d;
         let (width, height) = layout.plane_size(Component::Y);
         if width.max(height) > max {
@@ -109,16 +148,50 @@ impl Pictures {
             )
             .into());
         }
-        let mut textures = Vec::with_capacity(frames.len());
-        for frame in frames {
-            textures.push(std::array::from_fn(|i| {
-                plane_texture(context, layout.plane_size(Component::ALL[i]), &frame[i])
-            }));
-            // wgpu uploads what write_texture stages with the next submission.
+        // wgpu uploads what write_texture stages with the next submission.
+        let uploaded = || -> Result<()> {
             context.queue().submit([]);
             context.device().poll(wgpu::PollType::wait_indefinitely())?;
+            Ok(())
+        };
+        match self {
+            Self::Planes(frames) => {
+                let mut textures = Vec::with_capacity(frames.len());
+                for frame in frames {
+                    textures.push(std::array::from_fn(|i| {
+                        let size = layout.plane_size(Component::ALL[i]);
+                        texture_of(context, size, wgpu::TextureFormat::R8Unorm, &frame[i])
+                    }));
+                    uploaded()?;
+                }
+                Ok(Self::Textures(textures))
+            }
+            Self::Bgra(frames) => {
+                let mut textures = Vec::with_capacity(frames.len());
+                for frame in frames {
+                    let size = (width, height);
+                    textures.push(texture_of(
+                        context,
+                        size,
+                        wgpu::TextureFormat::Bgra8Unorm,
+                        &frame,
+                    ));
+                    uploaded()?;
+                }
+                Ok(Self::BgraTextures(textures))
+            }
+            textures => Ok(textures),
         }
-        Ok(Self::Textures(textures))
+    }
+
+    /// What the pictures are, for the description and the JSON.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Planes(_) => "planes",
+            Self::Bgra(_) => "bgra",
+            Self::Textures(_) => "textures",
+            Self::BgraTextures(_) => "bgra textures",
+        }
     }
 }
 
@@ -156,12 +229,22 @@ impl Measurement {
                 encoder.encode(planes, budget)?;
                 self.total.samples.push(ms(start.elapsed()));
             }
+            (Encoder::Cpu(encoder), Picture::Bgra(bgra)) => {
+                let start = Instant::now();
+                let stride = 4 * encoder.layout().width() as usize;
+                encoder.encode_rgb(bgra, stride, RgbOrder::Bgra, budget)?;
+                self.total.samples.push(ms(start.elapsed()));
+            }
             (Encoder::Cpu(_), Picture::Textures(_)) => {
                 return Err("the CPU encoder takes pictures in CPU memory".into());
             }
             (Encoder::Gpu(encoder), picture) => {
                 let (_, timings) = match picture {
                     Picture::Planes(planes) => encoder.encode_timed(planes, budget)?,
+                    Picture::Bgra(bgra) => {
+                        let stride = 4 * encoder.layout().width() as usize;
+                        encoder.encode_rgb_timed(bgra, stride, RgbOrder::Bgra, budget)?
+                    }
                     Picture::Textures(textures) => {
                         encoder.encode_textures_timed(textures, budget)?
                     }
@@ -238,6 +321,10 @@ pub fn run(args: &Args) -> Result<()> {
     }
 
     let mut pictures = Pictures::Planes(frames);
+    if args.rgb {
+        let layout = FrameLayout::new(width, height, header.chroma)?;
+        pictures = pictures.into_bgra(&layout)?;
+    }
     let (mut encoder, adapter, backend) = if args.gpu {
         let context = args.gpu_args.create_context(true)?;
         let info = context.adapter_info();
@@ -276,14 +363,19 @@ pub fn run(args: &Args) -> Result<()> {
         measurement.encode(&mut encoder, pictures.get(i), args.bytes_per_frame)?;
     }
     // What was encoded, rather than what was asked for.
-    let from_textures = matches!(pictures, Pictures::Textures(_));
+    let kind = pictures.kind();
 
     let description = format!(
         "{width}x{height} {}, {} bytes per frame, encoded on the {}{}",
         chroma_name(header.chroma),
         args.bytes_per_frame,
         if args.gpu { "GPU" } else { "CPU" },
-        if from_textures { " from textures" } else { "" }
+        match pictures {
+            Pictures::Planes(_) => "",
+            Pictures::Bgra(_) => " from BGRA in memory",
+            Pictures::Textures(_) => " from textures",
+            Pictures::BgraTextures(_) => " from BGRA textures",
+        }
     );
     let series = measurement.series();
     if args.json {
@@ -298,10 +390,7 @@ pub fn run(args: &Args) -> Result<()> {
                     ("frames", count.to_string()),
                     ("warmup", warmup.to_string()),
                     ("bytes_per_frame", args.bytes_per_frame.to_string()),
-                    (
-                        "picture",
-                        quote(if from_textures { "textures" } else { "planes" }),
-                    ),
+                    ("picture", quote(kind)),
                 ],
                 &series,
             )
@@ -316,12 +405,13 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// A view of an `R8Unorm` texture holding `plane`, of `width` x `height`
-/// samples, on the context's device.
-fn plane_texture(
+/// A view of a texture of `format` holding `texels`, of `width` x `height`,
+/// on the context's device.
+fn texture_of(
     context: &gpu::GpuContext,
     (width, height): (u32, u32),
-    plane: &[u8],
+    format: wgpu::TextureFormat,
+    texels: &[u8],
 ) -> wgpu::TextureView {
     let size = wgpu::Extent3d {
         width,
@@ -329,21 +419,24 @@ fn plane_texture(
         depth_or_array_layers: 1,
     };
     let texture = context.device().create_texture(&wgpu::TextureDescriptor {
-        label: Some("picture plane"),
+        label: Some("picture"),
         size,
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R8Unorm,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    let texel_bytes = format
+        .block_copy_size(None)
+        .expect("an uncompressed format");
     context.queue().write_texture(
         texture.as_image_copy(),
-        plane,
+        texels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width),
+            bytes_per_row: Some(width * texel_bytes),
             rows_per_image: Some(height),
         },
         size,

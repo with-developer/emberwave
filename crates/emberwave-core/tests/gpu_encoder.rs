@@ -1,8 +1,8 @@
 //! The GPU encoder through its public API: on the sources of the encoder's
 //! vectors in `testdata/encoder/`, against the CPU encoder's committed
 //! streams; on a device limited to what WebGPU guarantees; frame after frame;
-//! from textures as from CPU memory; and on a lost device (decisions D29 and
-//! D32).
+//! from textures as from CPU memory, and from RGB as from the planes it
+//! converts to; and on a lost device (decisions D29, D32 and D65).
 //!
 //! Like `tests/gpu.rs`, they skip without a GPU unless
 //! `EMBERWAVE_REQUIRE_GPU` is set.
@@ -18,6 +18,7 @@ use common::{
 use emberwave_core::bitstream::{
     ChromaSubsampling, Component, FrameAssembler, FrameLayout, Header, Pwv1File,
 };
+use emberwave_core::color::{ColorError, RgbOrder, rgb_to_ycbcr8, yuv_to_rgb8};
 use emberwave_core::cpu::decode_frame;
 use emberwave_core::encode::{self, EncodeError, Signalling};
 use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions, TexturePicture};
@@ -774,6 +775,288 @@ fn encoding_from_textures_frame_after_frame_allocates_nothing() {
         before,
         "live GPU objects and memory"
     );
+}
+
+/// A vector's picture as RGB: four bytes a pixel in `order`, rows `stride`
+/// bytes apart with 0x5A between them, and the fourth byte varied.
+fn rgb_of(layout: &FrameLayout, source: &[Vec<u8>; 3], order: RgbOrder, stride: usize) -> Vec<u8> {
+    let (width, height) = (layout.width() as usize, layout.height() as usize);
+    let rgb = yuv_to_rgb8(
+        planes(source),
+        layout.width(),
+        layout.height(),
+        layout.chroma(),
+        &Signalling::default().color_params(),
+    )
+    .expect("the planes fit");
+    let mut bytes = vec![0x5A; stride * (height - 1) + 4 * width];
+    for (i, pixel) in rgb.chunks_exact(3).enumerate() {
+        let (x, y) = (i % width, i / width);
+        let [r, g, b] = [pixel[0], pixel[1], pixel[2]];
+        let fourth = (x * 7 + y * 13) as u8;
+        let ordered = match order {
+            RgbOrder::Rgba => [r, g, b, fourth],
+            RgbOrder::Bgra => [b, g, r, fourth],
+        };
+        bytes[y * stride + 4 * x..][..4].copy_from_slice(&ordered);
+    }
+    bytes
+}
+
+#[test]
+fn pictures_in_rgb_encode_as_the_planes_they_convert_to_do() {
+    // gather_rgb.wgsl converts as rgb_to_ycbcr8 does, to the last bit, so a
+    // picture in an RGB texture of either order, or as RGB in CPU memory,
+    // encodes to the frame of the planes rgb_to_ycbcr8 makes of it, also on
+    // a device limited to what WebGPU guarantees (decision D65).
+    let context = gpu_or_return!();
+    let mut contexts = vec![(context.clone(), usize::MAX)];
+    let strict = GpuOptions {
+        strict_webgpu: true,
+        ..GpuOptions::default()
+    };
+    if let Some(strict) = create_context(&strict) {
+        contexts.push((strict, 2));
+    }
+    let bound = wgpu::TextureUsages::TEXTURE_BINDING;
+    for (context, count) in &contexts {
+        for vector in vectors().into_iter().take(*count) {
+            let layout = &vector.layout;
+            let (width, height) = (layout.width(), layout.height());
+            // An encoder for each way, so that their frames are numbered
+            // alike, and one that takes the two orders in turn.
+            let mut from_planes = encoder_for(context, layout);
+            let mut from_rgb: Vec<Encoder> = (0..4).map(|_| encoder_for(context, layout)).collect();
+            let mut alternating = encoder_for(context, layout);
+            let cpu = || {
+                encode::Encoder::new(width, height, layout.chroma(), Signalling::default()).unwrap()
+            };
+            let (mut cpu_planes, mut cpu_rgb) = (cpu(), cpu());
+            for (index, source) in vector.source.frames.iter().enumerate() {
+                let row = 4 * width as usize;
+                let rgba = rgb_of(layout, source, RgbOrder::Rgba, row);
+                let bgra = rgb_of(layout, source, RgbOrder::Bgra, row);
+                let converted = rgb_to_ycbcr8(
+                    &rgba,
+                    row,
+                    RgbOrder::Rgba,
+                    width,
+                    height,
+                    layout.chroma(),
+                    &Signalling::default().color_params(),
+                )
+                .unwrap();
+                let expected = from_planes
+                    .encode(planes(&converted), vector.budget)
+                    .unwrap();
+                let what = |how: &str| format!("{} frame {index}: {how}", vector.name);
+                let [rgba_texture, bgra_texture, bgra_memory, rgba_memory] = &mut from_rgb[..]
+                else {
+                    unreachable!()
+                };
+                for (how, encoder, format, bytes) in [
+                    (
+                        "RGBA texture",
+                        rgba_texture,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                        &rgba,
+                    ),
+                    (
+                        "BGRA texture",
+                        bgra_texture,
+                        wgpu::TextureFormat::Bgra8Unorm,
+                        &bgra,
+                    ),
+                ] {
+                    let view = texture(context, format, bound, (width, height), bytes)
+                        .create_view(&Default::default());
+                    let frame = encoder
+                        .encode_textures(TexturePicture::Rgb(&view), vector.budget)
+                        .unwrap();
+                    assert!(frame == expected, "{}", what(how));
+                }
+                let stride = row + 20;
+                for (encoder, order) in
+                    [(bgra_memory, RgbOrder::Bgra), (rgba_memory, RgbOrder::Rgba)]
+                {
+                    let padded = rgb_of(layout, source, order, stride);
+                    let frame = encoder
+                        .encode_rgb(&padded, stride, order, vector.budget)
+                        .unwrap();
+                    assert!(
+                        frame == expected,
+                        "{}",
+                        what(&format!("{order:?} in CPU memory"))
+                    );
+                }
+                let order = if index % 2 == 0 {
+                    RgbOrder::Rgba
+                } else {
+                    RgbOrder::Bgra
+                };
+                let picture = rgb_of(layout, source, order, row);
+                let frame = alternating
+                    .encode_rgb(&picture, row, order, vector.budget)
+                    .unwrap();
+                assert!(frame == expected, "{}", what(&format!("{order:?} in turn")));
+                // The CPU encoder converts alike.
+                let expected = cpu_planes
+                    .encode(planes(&converted), vector.budget)
+                    .unwrap();
+                let frame = cpu_rgb
+                    .encode_rgb(&bgra, row, RgbOrder::Bgra, vector.budget)
+                    .unwrap();
+                assert!(frame == expected, "{}", what("the CPU encoder"));
+            }
+        }
+    }
+}
+
+#[test]
+fn rgb_pictures_that_do_not_fit_are_errors() {
+    let context = gpu_or_return!();
+    let layout = FrameLayout::new(64, 32, ChromaSubsampling::Yuv420).unwrap();
+    let mut encoder = encoder_for(context, &layout);
+    let bound = wgpu::TextureUsages::TEXTURE_BINDING;
+    let view =
+        |format, size| texture(context, format, bound, size, &[]).create_view(&Default::default());
+    let cases = [
+        (
+            view(wgpu::TextureFormat::R8Unorm, (64, 32)),
+            "the RGB texture is R8Unorm rather than Rgba8Unorm or Bgra8Unorm",
+        ),
+        // Its reads would undo the transfer function.
+        (
+            view(wgpu::TextureFormat::Bgra8UnormSrgb, (64, 32)),
+            "the RGB texture is Bgra8UnormSrgb rather than Rgba8Unorm or Bgra8Unorm",
+        ),
+        (
+            view(wgpu::TextureFormat::Rgba8Unorm, (32, 32)),
+            "the RGB texture is 32x32 rather than 64x32",
+        ),
+    ];
+    for (view, message) in &cases {
+        match encoder.encode_textures(TexturePicture::Rgb(view), 100_000) {
+            Err(GpuError::Texture(actual)) => assert_eq!(&actual, message),
+            other => panic!("{message}: {:?}", other.map(drop)),
+        }
+    }
+    let bytes = vec![128u8; 64 * 4 * 32];
+    let short = &bytes[..bytes.len() - 1];
+    match encoder.encode_rgb(short, 256, RgbOrder::Bgra, 100_000) {
+        Err(GpuError::Encode(EncodeError::Picture(ColorError::PictureTooSmall {
+            needed: 8192,
+            actual: 8191,
+        }))) => {}
+        other => panic!("a short picture: {:?}", other.map(drop)),
+    }
+    match encoder.encode_rgb(&bytes, 255, RgbOrder::Bgra, 100_000) {
+        Err(GpuError::Encode(EncodeError::Picture(ColorError::StrideTooSmall {
+            stride: 255,
+            row: 256,
+        }))) => {}
+        other => panic!("a short stride: {:?}", other.map(drop)),
+    }
+    // A failure leaves the numbering alone: the next frame is still frame 1.
+    let frame = encoder
+        .encode_rgb(&bytes, 256, RgbOrder::Bgra, 100_000)
+        .unwrap();
+    assert_eq!(sequence_of(&frame), 1, "the first frame after the errors");
+}
+
+#[test]
+fn encoding_rgb_frame_after_frame_allocates_nothing() {
+    // A context of its own, as for textures: the texture that RGB in CPU
+    // memory goes into is kept, and made again only for the other order.
+    let Some(context) = create_context(&GpuOptions::default()) else {
+        return;
+    };
+    let vector = vectors()
+        .into_iter()
+        .find(|v| v.name == "scene_200x120_420")
+        .unwrap();
+    let layout = &vector.layout;
+    let row = 4 * layout.width() as usize;
+    let pictures: Vec<Vec<u8>> = vector
+        .source
+        .frames
+        .iter()
+        .map(|source| rgb_of(layout, source, RgbOrder::Bgra, row))
+        .collect();
+    let view = texture(
+        &context,
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureUsages::TEXTURE_BINDING,
+        (layout.width(), layout.height()),
+        &pictures[0],
+    )
+    .create_view(&Default::default());
+    let mut encoder = encoder_for(&context, layout);
+    let mut encode = |round: usize| {
+        if round % 3 == 2 {
+            encoder.encode_textures(TexturePicture::Rgb(&view), vector.budget)
+        } else {
+            let picture = &pictures[round % pictures.len()];
+            encoder.encode_rgb(picture, row, RgbOrder::Bgra, vector.budget)
+        }
+        .unwrap();
+    };
+    for round in 0..4 {
+        encode(round);
+    }
+    let before = live_resources(&context);
+    for round in 0..24 {
+        encode(round);
+    }
+    assert_eq!(
+        live_resources(&context),
+        before,
+        "live GPU objects and memory"
+    );
+    // The other order replaces the buffer and the texture rather than
+    // adding others. Their memory tells: wgpu-hal 30's Vulkan backend counts
+    // the textures it destroys but not those it makes.
+    let memory = |context: &GpuContext| {
+        let hal = context.device().get_internal_counters().hal;
+        (
+            hal.buffers.read(),
+            hal.buffer_memory.read(),
+            hal.texture_memory.read(),
+        )
+    };
+    let before = memory(&context);
+    encoder
+        .encode_rgb(&pictures[0], row, RgbOrder::Rgba, vector.budget)
+        .unwrap();
+    assert_eq!(memory(&context), before, "after the other order");
+}
+
+#[test]
+fn one_row_rgb_pictures_take_any_stride() {
+    // A picture of one row has no stride to keep: zero, less than the row,
+    // or past what a copy takes, it encodes as the row's planes do.
+    let context = gpu_or_return!();
+    let layout = FrameLayout::new(64, 1, ChromaSubsampling::Yuv444).unwrap();
+    let row: Vec<u8> = (0..64 * 4).map(|i| (i * 37 % 251) as u8).collect();
+    let converted = rgb_to_ycbcr8(
+        &row,
+        256,
+        RgbOrder::Bgra,
+        64,
+        1,
+        ChromaSubsampling::Yuv444,
+        &Signalling::default().color_params(),
+    )
+    .unwrap();
+    for stride in [0, 255, 256, 1 << 33] {
+        let expected = encoder_for(context, &layout)
+            .encode(planes(&converted), 4_000)
+            .unwrap();
+        let frame = encoder_for(context, &layout)
+            .encode_rgb(&row, stride, RgbOrder::Bgra, 4_000)
+            .unwrap();
+        assert!(frame == expected, "stride {stride}");
+    }
 }
 
 #[test]

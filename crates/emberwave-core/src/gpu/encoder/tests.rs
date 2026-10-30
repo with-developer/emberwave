@@ -739,8 +739,8 @@ fn gathering_textures_writes_the_words_of_the_upload() {
             // A pattern where the gather must write, padding included.
             gpu.queue
                 .write_buffer(&gpu.planes, 0, &vec![0xab; bytes as usize]);
-            let bind_group = gpu.gather_bind_group(picture).unwrap();
-            gpu.run(|this, encoder| this.encode_transform(encoder, Some(&bind_group), None));
+            let gather = gpu.gather(picture).unwrap();
+            gpu.run(|this, encoder| this.encode_transform(encoder, Some(&gather), None));
             let gathered = gpu.read_buffer(&gpu.planes, 0, bytes);
             assert!(
                 gathered == uploaded,
@@ -751,6 +751,125 @@ fn gathering_textures_writes_the_words_of_the_upload() {
                     .filter(|(a, b)| a != b)
                     .count()
             );
+        }
+    }
+}
+
+/// An RGB picture of `width` x `height` pixels, four bytes each in `order`,
+/// rows `stride` bytes apart: every byte value in each channel, then a
+/// gradient, edges and noise.
+fn rgb_picture(width: u32, height: u32, stride: usize, order: RgbOrder, seed: u32) -> Vec<u8> {
+    let (width, height) = (width as usize, height as usize);
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut bytes = vec![0x5A; stride * (height - 1) + 4 * width];
+    for y in 0..height {
+        for x in 0..width {
+            let i = y * width + x;
+            let noise = random();
+            let [r, g, b] = if i < 256 {
+                [i, (i + 85) % 256, (i + 170) % 256].map(|v| v as u8)
+            } else if (x / 7 + y / 5) % 3 == 0 {
+                [(x * 255 / width) as u8, (y * 255 / height) as u8, 40]
+            } else {
+                [noise as u8, (noise >> 8) as u8, (noise >> 16) as u8]
+            };
+            let pixel = match order {
+                RgbOrder::Rgba => [r, g, b, (noise >> 24) as u8],
+                RgbOrder::Bgra => [b, g, r, (noise >> 24) as u8],
+            };
+            bytes[y * stride + 4 * x..][..4].copy_from_slice(&pixel);
+        }
+    }
+    bytes
+}
+
+#[test]
+fn gathering_rgb_writes_the_words_of_its_converted_planes() {
+    // The packed planes, padding included, from an RGB texture of either
+    // order and from RGB in CPU memory, as the upload of the planes that
+    // rgb_to_ycbcr8 makes of the picture (decision D65): for every matrix,
+    // range and siting the stream may signal.
+    let Some(context) = test_context() else {
+        return;
+    };
+    use crate::bitstream::{ChromaSiting, YcbcrRange, YcbcrTransform};
+    let mut signallings = Vec::new();
+    for ycbcr_transform in [YcbcrTransform::Bt709, YcbcrTransform::Bt2020] {
+        for ycbcr_range in [YcbcrRange::Limited, YcbcrRange::Full] {
+            for chroma_siting in [ChromaSiting::Center, ChromaSiting::Left] {
+                signallings.push(Signalling {
+                    ycbcr_transform,
+                    ycbcr_range,
+                    chroma_siting,
+                    ..Signalling::default()
+                });
+            }
+        }
+    }
+    for (shape, (width, height, chroma)) in SHAPES.into_iter().enumerate() {
+        for (index, &signalling) in signallings.iter().enumerate() {
+            let mut gpu = Encoder::new(context, width, height, chroma, signalling).unwrap();
+            let seed = (shape * 8 + index) as u32;
+            let rgba = rgb_picture(width, height, 4 * width as usize, RgbOrder::Rgba, seed);
+            let planes = crate::color::rgb_to_ycbcr8(
+                &rgba,
+                4 * width as usize,
+                RgbOrder::Rgba,
+                width,
+                height,
+                chroma,
+                &signalling.color_params(),
+            )
+            .unwrap();
+            let bytes = gpu.buffers.packed_words * 4;
+            gpu.upload_planes(as_slices(&planes), None).unwrap();
+            gpu.run(|this, encoder| this.encode_upload(encoder));
+            let uploaded = gpu.read_buffer(&gpu.planes, 0, bytes);
+
+            let bgra = rgb_picture(width, height, 4 * width as usize, RgbOrder::Bgra, seed);
+            let size = (width, height);
+            let textures = [
+                (
+                    "RGBA",
+                    texture_of(&gpu, wgpu::TextureFormat::Rgba8Unorm, size, &rgba),
+                ),
+                (
+                    "BGRA",
+                    texture_of(&gpu, wgpu::TextureFormat::Bgra8Unorm, size, &bgra),
+                ),
+            ];
+            // In CPU memory too, with bytes between the rows.
+            let stride = 4 * width as usize + 12;
+            let padded = rgb_picture(width, height, stride, RgbOrder::Bgra, seed);
+            let uploaded_rgb = gpu.upload_rgb(&padded, stride, RgbOrder::Bgra).unwrap();
+            gpu.run(|this, encoder| this.encode_rgb_upload(encoder));
+            let views: Vec<(&str, wgpu::TextureView)> = textures
+                .iter()
+                .map(|(name, texture)| (*name, texture.create_view(&Default::default())))
+                .chain([("BGRA from CPU memory", uploaded_rgb)])
+                .collect();
+            for (name, view) in &views {
+                gpu.queue
+                    .write_buffer(&gpu.planes, 0, &vec![0xab; bytes as usize]);
+                let gather = gpu.gather(TexturePicture::Rgb(view)).unwrap();
+                gpu.run(|this, encoder| this.encode_transform(encoder, Some(&gather), None));
+                let gathered = gpu.read_buffer(&gpu.planes, 0, bytes);
+                assert!(
+                    gathered == uploaded,
+                    "{width}x{height} {chroma:?} {signalling:?} {name}: {} of {bytes} bytes differ",
+                    gathered
+                        .iter()
+                        .zip(&uploaded)
+                        .filter(|(a, b)| a != b)
+                        .count()
+                );
+            }
         }
     }
 }

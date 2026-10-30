@@ -5,6 +5,8 @@
 //! most of all), so a [`GpuContext`](super::GpuContext) builds them on first
 //! use and hands out the same ones afterwards.
 
+use crate::bitstream::ChromaSubsampling;
+
 use super::decoder::PLANE_FORMAT;
 use super::error::GpuError;
 use super::shader_sources;
@@ -103,6 +105,39 @@ pub(crate) struct ScanStages {
     pub chunks: Stage,
     pub totals: Stage,
     pub add: Stage,
+}
+
+/// The entry points of `gather_rgb.wgsl`, for 4:4:4 and 4:2:0, which share
+/// one bind group layout: an encoder's input from an RGB texture (decision
+/// D65). A context compiles them when one of its encoders first takes such a
+/// picture, as most never do.
+#[derive(Debug)]
+pub(crate) struct RgbStages {
+    pub yuv444: Stage,
+    pub yuv420: Stage,
+}
+
+impl RgbStages {
+    pub(crate) fn new(device: &wgpu::Device) -> Result<Self, GpuError> {
+        with_error_scope(device, || {
+            let [yuv444, yuv420] = create_stages(
+                device,
+                "gather rgb",
+                shader_sources::GATHER_RGB,
+                ["yuv444", "yuv420"],
+                &[storage_entry(0, false), uniform_entry(1), texture_entry(2)],
+            );
+            Self { yuv444, yuv420 }
+        })
+    }
+
+    /// The stage for pictures of `chroma`.
+    pub(crate) fn for_chroma(&self, chroma: ChromaSubsampling) -> &Stage {
+        match chroma {
+            ChromaSubsampling::Yuv444 => &self.yuv444,
+            ChromaSubsampling::Yuv420 => &self.yuv420,
+        }
+    }
 }
 
 /// The stages of the encoder.
