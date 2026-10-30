@@ -313,6 +313,7 @@ dependencies = [
 name = "emberwave-ffi"
 version = "0.13.0"
 dependencies = [
+ "ash",
  "cbindgen",
  "emberwave-core",
  "objc2",

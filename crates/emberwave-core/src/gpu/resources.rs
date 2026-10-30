@@ -3,7 +3,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::context::{QueueTurns, take_turn};
+use super::context::{QueueTurns, submit, take_turn};
 use super::error::GpuError;
 use super::pipelines::with_error_scope;
 
@@ -266,7 +266,7 @@ impl StageQueries {
             });
             encoder.resolve_query_set(&self.query_set, 0..2 * self.stages, &self.resolve, 0);
             encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, bytes);
-            queue.submit([encoder.finish()]);
+            submit(queue, turns, [encoder.finish()]);
         })?;
         recording.submitted();
         drop(recording);

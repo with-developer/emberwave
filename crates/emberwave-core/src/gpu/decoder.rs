@@ -16,7 +16,7 @@ use crate::bitstream::{
 };
 use crate::color::ColorParams;
 
-use super::context::{GpuContext, QueueTurns, notice_loss, take_turn};
+use super::context::{GpuContext, QueueTurns, notice_loss, submit, take_turn};
 use super::error::GpuError;
 use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{DrawPipeline, Pipelines, Stage, with_error_scope};
@@ -968,7 +968,7 @@ impl Decoder {
             if let Some((source, target, bytes)) = copy_back {
                 encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
             }
-            self.queue.submit([encoder.finish()]);
+            submit(&self.queue, turns.as_deref(), [encoder.finish()]);
         })?;
         recording.submitted();
         drop(recording);
@@ -1128,7 +1128,7 @@ impl Decoder {
             .record_assembled(color, read, &mut encoder)
             .and_then(|()| {
                 with_error_scope(&self.device, || {
-                    self.queue.submit([encoder.finish()]);
+                    submit(&self.queue, turns.as_deref(), [encoder.finish()]);
                 })
             });
         if outcome.is_ok() {
@@ -1514,7 +1514,7 @@ impl Decoder {
                     label: Some("band readback"),
                 });
             encoder.copy_buffer_to_buffer(&self.pyramid, u64::from(offset) * 4, &staging, 0, bytes);
-            self.queue.submit([encoder.finish()]);
+            submit(&self.queue, self.turns.as_deref(), [encoder.finish()]);
             staging
         });
         if submitted.is_ok() {

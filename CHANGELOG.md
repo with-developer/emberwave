@@ -2,6 +2,12 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- A context on the caller's own Vulkan device, on Linux, Android and 64-bit Windows: `emberwave_vulkan_instance_extensions` lists the instance extensions wgpu uses, `emberwave_vulkan_requirements_create` the device extensions and features emberwave needs, `emberwave_context_create_vulkan` makes the context on the device and one of its queues, and optional lock callbacks keep the caller's own uses of the queue apart from emberwave's. Decodes and encodes still go through CPU memory; the caller's images come next (decision D61, [#115](https://github.com/with-developer/emberwave/issues/115)). In the Rust API, `CallerQueueLock` and `QueueTurns::with_caller_lock` hold such a lock around a context's submissions.
+
 ## [0.13.0] - 2026-10-30
 
 Streams decoded as they arrive, and a client's own Metal queue shared safely. The browser player takes a stream packet by packet, every frame carries the blocks that a decode in part needs, and a client chooses how much of a frame it draws in part. Calls on a context of a client's own Metal queue take turns at its command buffers, where threads that shared the queue could wait for good. Also the encoder's planes written in place on Apple silicon, upstream's encoder fixes tracked, and a command that measures any encoder's stream against its pictures.
