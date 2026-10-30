@@ -271,7 +271,7 @@ emberwave_texture_destroy(texture);   /* the work on the GPU keeps what it uses 
 - **Planes.** `emberwave_texture_from_metal_plane(decoder, plane, metal, &texture)` wraps an R8 texture for one plane. A Metal texture wrapped for two planes is refused by the decode. When all three textures of a decode have `MTLTextureUsageShaderWrite`, as those of `emberwave_texture_create_plane` do, the decode stores the planes into them from its shaders; otherwise it copies them in, which takes a little longer.
 - **Hazards.** A submit takes only textures whose hazards Metal tracks, as it does for those of a `CVMetalTextureCache`. A heap's textures are usually untracked; the waiting decodes take those too.
 
-On Vulkan, see [A context on the client's Vulkan device](#a-context-on-the-clients-vulkan-device); Direct3D 12 handles are not part of the interface yet. A host encodes pictures from textures as well: see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu).
+On Vulkan, see [A context on the client's Vulkan device](#a-context-on-the-clients-vulkan-device), and on Direct3D, [Textures shared with Direct3D](#textures-shared-with-direct3d). A host encodes pictures from textures as well: see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu).
 
 [`examples/ios`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/ios) is an iPhone and iPad app that does all of this in Swift: it times decoding into textures, decoding to planes and encoding on the device's GPU, and draws the last picture from its texture. Its README says how to run it on a phone.
 
@@ -356,6 +356,58 @@ A decode that does not wait may still run after `emberwave_texture_destroy` retu
 
 `tests/vulkan.rs` makes an instance, a device and images as a client does, and runs on Linux CI's lavapipe.
 
+## Textures shared with Direct3D
+
+On Windows, a host or a client that draws with Direct3D 12 or Direct3D 11 shares textures and fences with emberwave through NT handles (decision D63). wgpu cannot run on the caller's `ID3D12Device`, so emberwave opens them on a device of its own, on the same adapter:
+
+```c
+/* Once: a context on the adapter of the client's device, and its fence. */
+LUID luid = adapter_desc.AdapterLuid;   /* from IDXGIAdapter::GetDesc, or ID3D12Device::GetAdapterLuid */
+emberwave_context_create_d3d12(luid.LowPart, luid.HighPart, &context);
+
+ID3D11Fence *fence;   /* or an ID3D12Fence made with D3D12_FENCE_FLAG_SHARED */
+device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence));
+HANDLE handle;
+fence->CreateSharedHandle(NULL, GENERIC_ALL, NULL, &handle);
+EmberwaveD3D12Fence *shared;
+emberwave_d3d12_fence_open(context, handle, &shared);
+CloseHandle(handle);
+
+/* A texture of the picture's size, made with D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED
+   (or a Direct3D 12 resource on a heap with D3D12_HEAP_FLAG_SHARED), and its handle: */
+EmberwaveTexture *texture;
+emberwave_texture_from_d3d12(decoder, texture_handle, &texture);
+
+/* For every frame that is ready: the decode waits for the client's reads of the last picture,
+   and signals when the texture holds the new one. */
+EmberwaveD3D12Sync sync = {
+    .wait_fence = shared, .wait_value = reads_done,
+    .signal_fence = shared, .signal_value = reads_done + 1,
+};
+emberwave_decoder_submit_texture_d3d12(decoder, NULL, texture, &sync);
+context4->Wait(fence, reads_done + 1);   /* the client's work that reads the picture */
+```
+
+- **Context.** `emberwave_context_create_d3d12` takes the adapter's LUID, its `LowPart` and `HighPart`. Shared handles open only on the adapter that made them. The context runs on Direct3D 12, and its decoders and encoders take turns at its queue, so that the fences of one call go with that call's submission alone. A context of `emberwave_context_create`, which takes no turns, opens no shared handle or fence, even where it runs on Direct3D 12.
+- **Fences.** `emberwave_d3d12_fence_open` opens an `ID3D12Fence` made with `D3D12_FENCE_FLAG_SHARED`, or an `ID3D11Fence` made with `D3D11_FENCE_FLAG_SHARED`. An `EmberwaveD3D12Sync` names a fence and a value to wait for before the call's GPU work, all of it, and a fence and a value to signal after it. Either may be `NULL`, as may `sync`. The client destroys its fences after emberwave's. Fences order the work, not keyed mutexes.
+  - A wait that is never met holds up every later call on the context. The destroy that lets go of the last hold on the context's queue waits for it to be idle, and then never returns.
+  - A budget too small for an encode shows only once the GPU has run: the wait has been met and the signal made by then, so a retry takes a new signal value.
+- **Textures.** `emberwave_texture_from_d3d12` opens a texture for the picture, `_plane` for a plane, and `_source` for a plane of a picture to encode. emberwave reads everything it checks from the resource itself:
+  - 2D, of one level, layer and sample, and of the size of the picture or the plane;
+  - `DXGI_FORMAT_B8G8R8A8_UNORM` or `DXGI_FORMAT_R8G8B8A8_UNORM` for the picture, `DXGI_FORMAT_R8_UNORM` for a plane, and `DXGI_FORMAT_R8G8_UNORM` for Cb and Cr interleaved (`EMBERWAVE_PLANE_CBCR`);
+  - no `D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE`;
+  - for a picture that is not a multiple of 64 pixels wide, which a decode draws rather than copies, `D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET` (`D3D11_BIND_RENDER_TARGET`).
+
+  emberwave does not close the handles: the client may close each one once the call that took it returns.
+- **Calls.** Only the `_d3d12` calls take such textures:
+  - `emberwave_decoder_submit_texture_d3d12` and `emberwave_decoder_submit_plane_textures_d3d12` decode without waiting;
+  - `emberwave_encoder_encode_textures_d3d12` encodes and waits, as every encode does.
+
+  Each leaves the client's textures in `D3D12_RESOURCE_STATE_COMMON`, the state a texture is in when it changes devices, before it signals. The other calls refuse such textures, since they would leave them in other states.
+- **Lifetime.** A texture keeps a reference to the client's resource until it is destroyed and the GPU is done with it, so the client may release its own as it likes.
+
+`tests/d3d12.rs` shares textures and a fence of a Direct3D 11 device on WARP, as a host or a client does, and runs in Windows CI.
+
 ## Pictures to encode on the GPU
 
 A host whose pictures are on the GPU already, as a screen capture's are, encodes them from textures. That spares the read-back to CPU memory and the upload. The encoder reads one texture for each plane: Y, Cb and Cr, each with one 8-bit channel. It can also take Y and a second texture with Cb and Cr interleaved in two channels, as the second plane of NV12 holds them (decision D62). The frame has the bytes that `emberwave_encoder_encode` makes of the same picture in CPU memory.
@@ -434,7 +486,7 @@ emberwave_encoder_encode_textures_vulkan(encoder, y, cbcr, NULL, &sync, frame, b
 - **Panics.** A panic inside emberwave is caught and reported as `EMBERWAVE_STATUS_INTERNAL`; destroy the object it happened in.
 - **Packets.** `emberwave_decoder_push_packet` takes one packet or several back to back, in any order, and ignores a block that arrived already. Frames are told apart by the bitstream's sequence number, which has three bits: a packet of a frame one to three frames newer discards what was received of the older one and starts its own; one four to seven frames newer, or one to four frames older, is ignored; one five to seven frames older passes for a newer frame, and one eight frames off for the same frame. So a transport keeps frame numbers of its own: it drops packets of frames older than the one being received, and before it gives the first packet of a newer frame it decodes the current one if it is ready, then calls `emberwave_decoder_clear`, not after.
 - **Partial frames.** `emberwave_decoder_is_ready` with `allow_partial_frame` accepts a frame that lost packets once every block of the coarsest level and more than 90 percent of the blocks its start of frame header announced have arrived, for a picture despite the loss; `emberwave_decoder_set_partial_share` sets another share, lower to draw frames that lost more, with more of their detail blank, or 1 for whole frames only (decision D59). Until that header arrives the count is of all the picture's blocks. emberwave's encoder sends every block of the coarsest level for this; upstream's leaves out the empty ones, so a frame of it that lost any packet may never be ready in part (decision D58).
-- **Encoding.** `emberwave_encoder_encode` reads planes with a stride of at least their width (`emberwave_encoder_info` gives the sizes), and `emberwave_encoder_encode_textures` reads them from textures on the GPU (see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu)). Both write the frame, at most `budget` bytes, into a buffer of that many bytes the caller provides, and wait for the GPU. A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in `size`, and encodes nothing. The frame's sequence number, a three-bit counter from 1 that wraps around, advances only with frames that were encoded. `emberwave_frame_packets` splits a frame at its blocks; a block larger than the packet size gets a packet of its own.
+- **Encoding.** `emberwave_encoder_encode` reads planes with a stride of at least their width (`emberwave_encoder_info` gives the sizes), and `emberwave_encoder_encode_textures` reads them from textures on the GPU (see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu)), as `_vulkan` and `_d3d12` do with fences or semaphores. Both write the frame, at most `budget` bytes, into a buffer of that many bytes the caller provides, and wait for the GPU. A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in `size`, and encodes nothing. The frame's sequence number, a three-bit counter from 1 that wraps around, advances only with frames that were encoded. `emberwave_frame_packets` splits a frame at its blocks; a block larger than the packet size gets a packet of its own.
 - **Signalling.** `EmberwaveSignalling` sets what every frame says about its colours: matrix (BT.709 or BT.2020; the format cannot signal BT.601), range, chroma siting, primaries and transfer function (sRGB or PQ). `NULL` means BT.709, video range, centred chroma and sRGB. Its `reserved` words are zero.
 - **Colours.** With a `NULL` colour, `emberwave_decoder_decode_rgb` converts the way the frame's start of frame header says. Upstream's Metal encoder writes BT.709, full range and centred chroma there whatever the pictures are, so pass what you know, such as the colours of a PWV1 file's header from `emberwave_probe_pwv1`.
 

@@ -320,6 +320,7 @@ dependencies = [
  "objc2-metal",
  "pollster",
  "wgpu",
+ "windows",
 ]
 
 [[package]]

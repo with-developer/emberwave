@@ -153,6 +153,12 @@ typedef enum EmberwaveStatus {
 // one compiles the shaders, so make one and keep it.
 typedef struct EmberwaveContext EmberwaveContext;
 
+// A fence of the caller's Direct3D 12 or Direct3D 11 device, opened on the
+// device of a context of `emberwave_context_create_d3d12` from its shared
+// NT handle (`emberwave_d3d12_fence_open`, decision D63), for the waits and
+// signals of an `EmberwaveD3D12Sync`.
+typedef struct EmberwaveD3D12Fence EmberwaveD3D12Fence;
+
 // Decodes the frames of one stream: one picture size and chroma format.
 typedef struct EmberwaveDecoder EmberwaveDecoder;
 
@@ -367,6 +373,29 @@ typedef struct EmberwaveVulkanSync {
   // combined with `|` for timeline semaphores, or 0 for binary ones.
   uint32_t flags;
 } EmberwaveVulkanSync;
+
+// Fences for a call on textures shared with the caller's Direct3D 12 or
+// Direct3D 11 device (decision D63). Either may be `NULL`, and `sync` too.
+//
+// A fence orders work across devices as a semaphore does: the call's GPU
+// work waits until `wait_fence` has reached `wait_value`, all of it, the
+// upload of a frame included, and sets `signal_fence` to `signal_value` once
+// it is done with the textures. A wait that is never met holds up every
+// later submission of the context, and the destroy that lets go of the last
+// hold on the context's queue, which waits for the queue to be idle, never
+// returns.
+typedef struct EmberwaveD3D12Sync {
+  // A fence the call's GPU work waits for, such as one the caller signals
+  // once its own work on the textures is done, or `NULL`.
+  const struct EmberwaveD3D12Fence *wait_fence;
+  // The value `wait_fence` is to reach.
+  uint64_t wait_value;
+  // A fence the call's GPU work signals once it is done with the
+  // textures, or `NULL`.
+  const struct EmberwaveD3D12Fence *signal_fence;
+  // The value `signal_fence` is set to.
+  uint64_t signal_value;
+} EmberwaveD3D12Sync;
 
 // The sizes of the planes a decoder writes or an encoder reads.
 typedef struct EmberwaveFrameInfo {
@@ -827,6 +856,198 @@ enum EmberwaveStatus emberwave_encoder_encode_textures_vulkan(struct EmberwaveEn
                                                               uint8_t *frame,
                                                               size_t budget,
                                                               size_t *size);
+
+// Creates a context on the Direct3D 12 adapter whose locally unique
+// identifier is `luid_low` and `luid_high`, the `LowPart` and `HighPart` of
+// a `LUID` (decision D63): the adapter of the caller's Direct3D 12 or
+// Direct3D 11 device whose textures and fences the context is to open, as
+// `ID3D12Device::GetAdapterLuid` or `IDXGIAdapter::GetDesc` gives it. A
+// shared handle opens only on the adapter that made it. Only on Windows;
+// elsewhere, and where no Direct3D 12 adapter has the identifier,
+// `EMBERWAVE_STATUS_NO_GPU`.
+//
+// The device is emberwave's own, made by wgpu on that adapter: textures and
+// fences of the caller's come to it through shared NT handles
+// (`emberwave_texture_from_d3d12`, `emberwave_d3d12_fence_open`), as wgpu
+// cannot run on the caller's `ID3D12Device`.
+//
+// # Safety
+//
+// `context` points to where the new context is stored; it is set to `NULL`
+// when the call fails.
+enum EmberwaveStatus emberwave_context_create_d3d12(uint32_t luid_low,
+                                                    int32_t luid_high,
+                                                    struct EmberwaveContext **context);
+
+// Opens a fence of the caller's Direct3D 12 or Direct3D 11 device on the
+// device of `context`, a context of `emberwave_context_create_d3d12`, from
+// the NT handle `handle` (decision D63): an `ID3D12Fence` made with
+// `D3D12_FENCE_FLAG_SHARED`, or an `ID3D11Fence` made with
+// `D3D11_FENCE_FLAG_SHARED`, and the handle its `CreateSharedHandle` gave.
+// The fence then orders the `_d3d12` calls on the context against the
+// caller's work, through an `EmberwaveD3D12Sync`. emberwave does not close
+// the handle: the caller may close it once this returns. A context that is
+// not one of `emberwave_context_create_d3d12`, or a handle that is not a
+// fence's of the context's adapter, gives
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+//
+// # Safety
+//
+// `context` is a live context, `handle` is `NULL` or a handle of the
+// calling process, and `fence` points to where the new fence is stored.
+enum EmberwaveStatus emberwave_d3d12_fence_open(const struct EmberwaveContext *context,
+                                                void *handle,
+                                                struct EmberwaveD3D12Fence **fence);
+
+// Destroys a fence that `emberwave_d3d12_fence_open` opened; the caller's
+// fence stays. Calls that waited for it or signalled it may still be on
+// the GPU: they keep it until they are done.
+//
+// # Safety
+//
+// `fence` is `NULL`, or a fence of `emberwave_d3d12_fence_open` that has not
+// been destroyed and that no other thread is using.
+void emberwave_d3d12_fence_destroy(struct EmberwaveD3D12Fence *fence);
+
+// Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device for the
+// decodes of `decoder` to put the picture into, from the NT handle
+// `handle`, on a context of `emberwave_context_create_d3d12` (decision D63):
+// a Direct3D 12 resource made with `D3D12_HEAP_FLAG_SHARED`, or a Direct3D
+// 11 texture made with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+// D3D11_RESOURCE_MISC_SHARED`, and the handle `CreateSharedHandle` gave.
+// Fences order the work on it, not keyed mutexes. Only
+// `emberwave_decoder_submit_texture_d3d12` takes it.
+//
+// The texture is 2D, of one level, layer and sample, of the picture's size,
+// in `DXGI_FORMAT_B8G8R8A8_UNORM` or `DXGI_FORMAT_R8G8B8A8_UNORM`, and can be
+// sampled: without `D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE`. A decode
+// copies the picture into it when its width is a multiple of 64 pixels, and
+// draws it otherwise, which needs `D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET`
+// (`D3D11_BIND_RENDER_TARGET`). emberwave reads all of this from the
+// resource itself. A texture that is not so, or a decoder on another
+// context, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is then
+// `NULL`.
+//
+// emberwave keeps a reference to the resource until the texture is
+// destroyed and the GPU is done with it, and does not close the handle: the
+// caller may close it once this returns.
+//
+// # Safety
+//
+// `decoder` is a live decoder that no other thread is using, `handle` is
+// `NULL` or a handle of the calling process, and `texture` points to where
+// the new texture is stored.
+enum EmberwaveStatus emberwave_texture_from_d3d12(const struct EmberwaveDecoder *decoder,
+                                                  void *handle,
+                                                  struct EmberwaveTexture **texture);
+
+// Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device for the
+// Y, Cb or Cr plane of the pictures of `decoder`, as
+// `emberwave_texture_from_d3d12` does for the picture: `plane` is
+// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`, and the
+// texture is `DXGI_FORMAT_R8_UNORM` of the plane's size, which a decode
+// copies the plane into. Only `emberwave_decoder_submit_plane_textures_d3d12`
+// takes it.
+//
+// # Safety
+//
+// As for `emberwave_texture_from_d3d12`.
+enum EmberwaveStatus emberwave_texture_from_d3d12_plane(const struct EmberwaveDecoder *decoder,
+                                                        uint32_t plane,
+                                                        void *handle,
+                                                        struct EmberwaveTexture **texture);
+
+// Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device that
+// holds a plane of a picture for the encodes of `encoder` to read, from the
+// NT handle `handle`, as `emberwave_texture_from_d3d12` does for a decoder
+// (decision D63): `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+// `EMBERWAVE_PLANE_CR` for a texture in `DXGI_FORMAT_R8_UNORM`, or
+// `EMBERWAVE_PLANE_CBCR` for one in `DXGI_FORMAT_R8G8_UNORM` with Cb and Cr
+// interleaved, of the plane's size as `emberwave_encoder_info` gives it (that
+// of Cb for `EMBERWAVE_PLANE_CBCR`). The texture can be sampled. Only
+// `emberwave_encoder_encode_textures_d3d12` takes it.
+//
+// # Safety
+//
+// `encoder` is a live encoder that no other thread is using, `handle` is
+// `NULL` or a handle of the calling process, and `texture` points to where
+// the new texture is stored.
+enum EmberwaveStatus emberwave_texture_from_d3d12_source(const struct EmberwaveEncoder *encoder,
+                                                         uint32_t plane,
+                                                         void *handle,
+                                                         struct EmberwaveTexture **texture);
+
+// Decodes the frame received so far into `texture` as
+// `emberwave_decoder_decode_texture` does, but returns once the work is
+// submitted, with the fences of `sync`, on a context of
+// `emberwave_context_create_d3d12` (decision D63); elsewhere
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`. `texture` may be a texture of the
+// caller's (`emberwave_texture_from_d3d12`) or emberwave's own.
+//
+// The decode's GPU work waits until `sync.wait_fence` has reached
+// `wait_value`, all of it, so it does not run beside the caller's reads of
+// the last picture: the caller signals the value once its own work that
+// reads the texture is done. The decode leaves the texture in
+// `D3D12_RESOURCE_STATE_COMMON`, as another device takes it, and then sets
+// `signal_fence` to `signal_value`: the caller's work that reads the picture
+// waits for that value. Keep the fences until the work that signals them is
+// done. When the call fails, the fences may or may not have been waited for
+// and signalled.
+//
+// # Safety
+//
+// As for `emberwave_decoder_decode_texture`, and `sync` is `NULL` or points
+// to an `EmberwaveD3D12Sync` whose fences are `NULL` or live fences.
+enum EmberwaveStatus emberwave_decoder_submit_texture_d3d12(struct EmberwaveDecoder *decoder,
+                                                            const struct EmberwaveColor *color,
+                                                            const struct EmberwaveTexture *texture,
+                                                            const struct EmberwaveD3D12Sync *sync);
+
+// Decodes the frame received so far into the plane textures `y`, `cb` and
+// `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
+// the work is submitted, with the fences of `sync`, as
+// `emberwave_decoder_submit_texture_d3d12` does.
+//
+// # Safety
+//
+// As for `emberwave_decoder_decode_plane_textures`, and `sync` is `NULL` or
+// points to an `EmberwaveD3D12Sync` whose fences are `NULL` or live fences.
+enum EmberwaveStatus emberwave_decoder_submit_plane_textures_d3d12(struct EmberwaveDecoder *decoder,
+                                                                   const struct EmberwaveTexture *y,
+                                                                   const struct EmberwaveTexture *cb,
+                                                                   const struct EmberwaveTexture *cr,
+                                                                   const struct EmberwaveD3D12Sync *sync);
+
+// Encodes the picture whose planes are in the textures `y`, `cb` and `cr`,
+// as `emberwave_encoder_encode_textures` does, with the fences of `sync`, on
+// a context of `emberwave_context_create_d3d12` (decision D63); elsewhere
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+//
+// The encode's GPU work waits until `sync.wait_fence` has reached
+// `wait_value` before it reads the textures: the caller signals it once its
+// own work that writes them, such as the copy of a captured picture, is
+// done. The encode leaves the caller's textures in
+// `D3D12_RESOURCE_STATE_COMMON` and then sets `signal_fence` to
+// `signal_value`, for the caller's work that writes them again. The call
+// waits for the GPU as the other encodes do, so it returns only once its
+// wait is met: by the caller's work submitted before the call, or from
+// another thread during it. When the call fails, the fences may or may not
+// have been waited for and signalled. A budget too small for the smallest
+// frame shows only once the GPU has encoded the picture: the wait has been
+// met and the signal made by then, so a retry takes a new `signal_value`.
+//
+// # Safety
+//
+// As for `emberwave_encoder_encode_textures`, and `sync` is `NULL` or points
+// to an `EmberwaveD3D12Sync` whose fences are `NULL` or live fences.
+enum EmberwaveStatus emberwave_encoder_encode_textures_d3d12(struct EmberwaveEncoder *encoder,
+                                                             const struct EmberwaveTexture *y,
+                                                             const struct EmberwaveTexture *cb,
+                                                             const struct EmberwaveTexture *cr,
+                                                             const struct EmberwaveD3D12Sync *sync,
+                                                             uint8_t *frame,
+                                                             size_t budget,
+                                                             size_t *size);
 
 // Destroys a context. Decoders and encoders created on it keep working, and
 // keep the GPU device until they are destroyed as well.

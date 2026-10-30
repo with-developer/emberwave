@@ -630,6 +630,7 @@ impl Encoder {
             self.encode_packing(&mut encoder, queries);
             self.encode_read_back(&mut encoder, capacity_words);
             if let Some(hooks) = after.hooks.as_deref_mut() {
+                hooks.record(&mut encoder);
                 hooks.before_submit(&self.queue);
             }
             submit(&self.queue, turns.as_deref(), [encoder.finish()]);
