@@ -75,7 +75,27 @@ defer { emberwave_context_destroy(context) }
 print("decoding on", String(cString: emberwave_context_adapter(context)))
 ```
 
-A Swift package names the XCFramework as a binary target. [`examples/swift`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/swift) is one: `decode.c` in Swift, with the system libraries in its linker settings. From the root of the repository:
+A Swift package names the XCFramework as a binary target. From a release, it takes `Emberwave.xcframework.zip`, the XCFramework alone at the top of an archive, by its URL and checksum. The checksum is the archive's SHA-256, the line of `Emberwave.xcframework.zip` in the release's `SHA256SUMS`, which `swift package compute-checksum` also prints. The target that uses the library links the system libraries:
+
+```swift
+// In the app's Package.swift, with the version of the release:
+.binaryTarget(
+    name: "Emberwave",
+    url: "https://github.com/with-developer/emberwave/releases/download/v0.14.0/Emberwave.xcframework.zip",
+    checksum: "..."   // the release's SHA256SUMS line for Emberwave.xcframework.zip
+),
+.target(
+    name: "Player",
+    dependencies: ["Emberwave"],
+    linkerSettings: [
+        .linkedFramework("Metal"), .linkedFramework("QuartzCore"),
+        .linkedFramework("CoreGraphics"), .linkedFramework("Foundation"),
+        .linkedLibrary("iconv"), .linkedLibrary("objc"),
+    ]
+),
+```
+
+[`examples/swift`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/swift) is such a package: `decode.c` in Swift, with the XCFramework of a local build. From the root of the repository:
 
 ```sh
 scripts/build_xcframework.sh macos-arm64     # the Mac's library alone
@@ -83,7 +103,7 @@ swift run --package-path crates/emberwave-ffi/examples/swift \
     emberwave-decode testdata/noise_192x136_420.pwv1 out.y4m
 ```
 
-`scripts/check_xcframework.sh` builds the C examples and the Swift example against every library of the XCFramework. CI runs them on a Mac and in an iOS Simulator, and links them for devices. They have not run on an iPhone or an iPad yet, where an app has to be signed by its developer.
+`scripts/check_xcframework.sh` builds the C examples and the Swift example against every library of the XCFramework. It also builds the Swift example from `Emberwave.xcframework.zip` as a binary target, as an app's package takes a release's archive. CI runs them on a Mac and in an iOS Simulator, and links them for devices. They have not run on an iPhone or an iPad yet, where an app has to be signed by its developer. The Swift example is for macOS 12, the oldest that the Swift Build of Xcode 27 takes; the library runs on macOS 11.
 
 ## Use
 

@@ -7,7 +7,9 @@
 # examples decode every test vector, which emberwave-cli compares with
 # upstream's FP32 decode at the 80 dB of decision D9, and the encoding example
 # encodes two sources and fails below 40 dB, as in scripts/check_c_example.sh.
-# The programs for devices are only linked, as no device is at hand.
+# The programs for devices are only linked, as no device is at hand. On the
+# Mac, the Swift example is also built from Emberwave.xcframework.zip as a
+# SwiftPM binary target, as an app's package takes a release's zip, and run.
 #
 # Usage: scripts/check_xcframework.sh CLI
 #
@@ -47,6 +49,17 @@ slice_sdk() {
     esac
 }
 
+# The target triple of the Swift builds of a slice. Xcode 27's Swift Build
+# takes macOS 12 or later, so the Swift example is for macOS 12 (its
+# Package.swift says so), while the library and the C examples stay for
+# macOS 11.
+swift_triple() {
+    case $1 in
+        macos-arm64) echo "arm64-apple-macos12.0" ;;
+        *) read -r _ triple <<< "$(slice_sdk "$1")" && echo "$triple" ;;
+    esac
+}
+
 # Builds the C and Swift examples for SLICE into $BUILD/SLICE.
 build() {
     local slice=$1 spec sdk triple example bin
@@ -64,10 +77,10 @@ build() {
             -o "$BUILD/$slice/emberwave_$example"
     done
     swift build -c release --package-path crates/emberwave-ffi/examples/swift \
-        --scratch-path "$BUILD/swift-$slice" --triple "$triple" \
+        --scratch-path "$BUILD/swift-$slice" --triple "$(swift_triple "$slice")" \
         --sdk "$(xcrun --sdk "$sdk" --show-sdk-path)"
     bin=$(swift build -c release --package-path crates/emberwave-ffi/examples/swift \
-        --scratch-path "$BUILD/swift-$slice" --triple "$triple" \
+        --scratch-path "$BUILD/swift-$slice" --triple "$(swift_triple "$slice")" \
         --sdk "$(xcrun --sdk "$sdk" --show-sdk-path)" --show-bin-path)
     cp "$bin/emberwave-decode" "$BUILD/$slice/emberwave_decode_swift"
 }
@@ -115,11 +128,37 @@ for slice in "${slices[@]}"; do
     build "$slice"
 done
 
+# The Swift example in a package of its own whose binary target is the zip,
+# as a release publishes it: SwiftPM takes the archive only in that shape.
+check_zip() {
+    local package=$BUILD/swiftpm-zip bin
+    mkdir -p "$package"
+    cp -R crates/emberwave-ffi/examples/swift/Sources "$package/"
+    cp "$ROOT/target/xcframework/Emberwave.xcframework.zip" "$package/"
+    sed 's|path: "../../../../target/xcframework/Emberwave.xcframework"|path: "Emberwave.xcframework.zip"|' \
+        crates/emberwave-ffi/examples/swift/Package.swift > "$package/Package.swift"
+    grep -q 'path: "Emberwave.xcframework.zip"' "$package/Package.swift"
+    echo "== the Swift example from Emberwave.xcframework.zip"
+    local sdk triple
+    sdk=$(xcrun --sdk macosx --show-sdk-path)
+    triple=$(swift_triple macos-arm64)
+    swift build -c release --package-path "$package" --scratch-path "$package/.build" \
+        --triple "$triple" --sdk "$sdk"
+    bin=$(swift build -c release --package-path "$package" --scratch-path "$package/.build" \
+        --triple "$triple" --sdk "$sdk" --show-bin-path)
+    "$bin/emberwave-decode" "$ROOT/testdata/noise_192x136_420.pwv1" "$package/noise.y4m"
+    "$CLI" compare "$package/noise.y4m" "$ROOT/testdata/noise_192x136_420.ref-fp32.y4m" \
+        --min-psnr 80 | tail -n 1
+    echo "SwiftPM checksum: $(swift package --package-path "$package" --scratch-path "$package/.build" \
+        compute-checksum "$package/Emberwave.xcframework.zip")"
+}
+
 for slice in "${slices[@]}"; do
     case $slice in
         macos-arm64)
             echo "== on this Mac"
             exercise on_mac "$BUILD/$slice"
+            check_zip
             ;;
         ios-arm64-simulator)
             use_simulator

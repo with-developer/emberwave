@@ -1565,3 +1565,18 @@ Direct3D 12 through shared handles follows, and the encoder's input from the cal
   - A timeline wait signalled from another thread during the call holds the encode back.
   - Binary semaphores order the encode between the client's copies.
 - **Left for later.** RGB pictures, the format of most captures, need a conversion in the gather pass. Direct3D 12 shared handles follow.
+
+### 2026-10-31 — D64: The XCFramework for Swift packages
+
+**Context.** Apps on iPhones, iPads and Macs take the C library as an XCFramework (D35). A Swift package names one as a remote binary target, by a URL and the archive's SHA-256. SwiftPM takes only an archive with the XCFramework at its top. The release's `emberwave-ffi-VERSION-xcframework.zip` holds a directory with the XCFramework and the notices, so SwiftPM refuses it. A `Package.swift` at the root of the repository would let apps add emberwave by the repository's URL alone. It would have to carry the checksum of an archive the release workflow makes only after the tag exists, though, and the tag cannot move.
+
+**Decision.**
+- `scripts/build_xcframework.sh` also makes `Emberwave.xcframework.zip`, the XCFramework alone at the top. ditto makes it without extended attributes, which macOS adds to built files and which would otherwise go in as `._` files.
+- Each release publishes that archive as it is. Its checksum is its line in `SHA256SUMS`.
+- An app's own `Package.swift` names it, with the system libraries in the linker settings of the target that uses it. The C API README shows how.
+- There is no `Package.swift` at the root for now. One would need the archive made and uploaded to a draft release before the tag, and the release workflow changed to publish that draft rather than build the archive again.
+
+**Consequence.**
+- `scripts/check_xcframework.sh`, which CI runs, builds the Swift example from the archive as a binary target and decodes a test vector with it.
+- The Swift example is for macOS 12, the oldest that the Swift Build of Xcode 27 takes. Xcode 27 refused the example's macOS 11, and GitHub's runners will move to it. The library and the C examples stay for macOS 11.
+
