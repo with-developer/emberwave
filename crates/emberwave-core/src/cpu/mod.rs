@@ -133,10 +133,11 @@ impl Concealer {
     pub fn decode(&mut self, frame: &FrameView<'_>, partial: bool) -> Result<DecodedFrame, Error> {
         let layout = frame.layout();
         let mut bands = dequant::dequantize(frame)?;
-        if let (true, Some((last_layout, last))) = (partial, &self.last)
-            && last_layout == layout
-        {
-            conceal(frame, &mut bands, last);
+        // Not a let chain: those need Rust 1.88, and emberwave builds on 1.87.
+        if let (true, Some((last_layout, last))) = (partial, &self.last) {
+            if last_layout == layout {
+                conceal(frame, &mut bands, last);
+            }
         }
         let kept = bands.clone();
         let planes =
