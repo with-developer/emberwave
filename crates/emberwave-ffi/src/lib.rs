@@ -3938,6 +3938,30 @@ pub unsafe extern "C" fn emberwave_decoder_set_partial_share(
     })
 }
 
+/// Sets whether a frame drawn in part conceals the blocks of detail it
+/// lacks, off by default (decision D66): `on` other than 0 sets it, 0 clears
+/// it. Where the coarsest level around such a block changed by little since
+/// the last decode, the picture is taken to be still there, and the block
+/// keeps the last decode's coefficients, so that the frame shows the detail
+/// it lost; elsewhere the block's detail is blank, as without concealment.
+/// Whole frames decode as before. It stays until it is set again.
+///
+/// # Safety
+///
+/// `decoder` is `NULL` or a live decoder that no other thread is using.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_set_concealment(
+    decoder: *mut EmberwaveDecoder,
+    on: u32,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        let decoder = unsafe { live_mut(decoder) }?;
+        decoder.decoder.set_concealment(on != 0);
+        Ok(())
+    })
+}
+
 /// Discards what was received, and forgets the order of the frames: the next
 /// packet starts a frame, whatever its sequence number.
 ///
@@ -3954,7 +3978,8 @@ pub unsafe extern "C" fn emberwave_decoder_clear(decoder: *mut EmberwaveDecoder)
 
 /// Decodes the frame received so far and writes its Y, Cb and Cr planes, 8
 /// bits per sample in the range the stream uses. Blocks that did not arrive
-/// decode as zeros, so call it when `emberwave_decoder_is_ready` says so.
+/// decode as zeros, or are concealed (`emberwave_decoder_set_concealment`),
+/// so call it when `emberwave_decoder_is_ready` says so.
 /// Waits for the GPU. The rows go from the GPU's memory straight to the
 /// planes, so a call that fails may have written some of them.
 ///
@@ -4535,7 +4560,8 @@ pub unsafe extern "C" fn emberwave_texture_destroy(texture: *mut EmberwaveTextur
 /// `texture` on the GPU, then waits for the GPU: when this returns, the
 /// texture holds the picture, for the caller's graphics API to read on any
 /// queue of the device. The picture never goes through CPU memory. Blocks
-/// that did not arrive decode as zeros.
+/// that did not arrive decode as zeros, or are concealed
+/// (`emberwave_decoder_set_concealment`).
 ///
 /// `color` chooses the conversion as for `emberwave_decoder_decode_rgb`, and
 /// with `NULL` follows the frame. Upstream's Metal encoder signals BT.709,

@@ -470,6 +470,19 @@ impl Player {
         Ok(())
     }
 
+    /// Sets whether a frame drawn in part conceals the blocks of detail it
+    /// lacks with the last frame's, where the picture is still, rather than
+    /// leaving them blank: off by default (decision D66). It holds for the
+    /// stream open. Throws without a stream.
+    pub fn set_concealment(&mut self, on: bool) -> Result<(), JsError> {
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| JsError::new("no stream is open"))?;
+        stream.decoder.set_concealment(on);
+        Ok(())
+    }
+
     /// Drops what arrived of the frame being assembled, and forgets its
     /// sequence number, so that the next packet starts a frame of its own.
     /// Call it before pushing the first packet of a newer frame, never after:
@@ -482,7 +495,8 @@ impl Player {
 
     /// Decodes the frame assembled from packets and draws it: all of it, or
     /// what arrived of it if `is_ready(true)` allows that; the blocks that
-    /// did not arrive decode as zeros. A page that draws whole frames only
+    /// did not arrive decode as zeros, or are concealed if `set_concealment`
+    /// says so. A page that draws whole frames only
     /// checks `is_ready(false)` first. Packets of the frame that arrive after
     /// it was drawn are kept, and the frame is not drawn again. Returns the
     /// milliseconds the CPU spent on it.
