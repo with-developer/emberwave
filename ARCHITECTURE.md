@@ -486,7 +486,7 @@ PNG output is 8-bit RGB with fast compression. The Y4M writer takes range, chrom
 Nothing in a browser may block, so the player uses only the parts of the decoder that do not wait:
 
 - `GpuContext::from_adapter` creates the device on an adapter that can draw on the canvas. `GpuContext::new`, which blocks, does not exist in the browser build.
-- `Decoder::encode_rgb` records the decode and the colour conversion into the player's command encoder and returns. A render pass in the same encoder copies the RGBA words to the canvas (`blit.wgsl`: one triangle over the canvas, which has the size of the picture, so a fragment reads one word). One submission per frame, and the picture never leaves the GPU.
+- `Decoder::encode_rgb_to_texture` records the decode and the colour conversion into the player's command encoder and puts the picture into the canvas's texture: by a copy where the canvas allows it and is a multiple of 64 pixels wide, and otherwise by a draw (`draw.wgsl`: one triangle over the canvas, which has the size of the picture, so a fragment reads one word; decisions D40 and D42). One submission per frame, and the picture never leaves the GPU.
 - Error scopes cannot be waited for, so in the browser build `with_error_scope` just runs its work. The player catches what the browser reports instead (`on_uncaptured_error`) and shows the first error on the page with the next frame. Pictures wider or taller than the browser can draw (`max_texture_dimension_2d`, 8192 by default) are refused when the file is loaded.
 - The methods that read a frame back or time it wait for the GPU, and are not for the browser. The decoder makes its read-back buffers only when a decode first reads back, so the player has none: 43.5 MiB fewer at 4K.
 - In a browser, dropping a wgpu buffer only lets go of the JavaScript object, and the GPU memory waits for the garbage collector. `Decoder` therefore destroys its large buffers when it is dropped, and the player drops the old stream before it loads the next file: about 110 MiB for a 4K stream.
@@ -520,7 +520,7 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_probe_pwv1`, `emberwave_probe_packet` | Picture size, chroma format and colour signalling from a PWV1 file header or from a packet that starts with a start of frame header |
 | `emberwave_context_create`, `_destroy`, `_adapter` | Choose a GPU (backends, software only) and name it |
 | `emberwave_decoder_create`, `_destroy`, `_info` | One decoder per picture size and chroma format; the sizes of its planes |
-| `emberwave_decoder_push_packet`, `_is_ready`, `_clear` | Feed packets as they arrive; ask whether the frame, or enough of it, is there |
+| `emberwave_decoder_push_packet`, `_is_ready`, `_clear`, `_set_partial_share` | Feed packets as they arrive; ask whether the frame, or enough of it, is there; set the share of its blocks a frame decoded in part needs (D59) |
 | `emberwave_decoder_decode_yuv`, `_decode_rgb` | Decode and copy the planes, or RGB, into the caller's memory, row by row with the caller's strides |
 | `emberwave_texture_create`, `_destroy`, `emberwave_decoder_decode_texture` | A texture of the picture's size, RGBA or BGRA, on the decoder's device, and a decode that draws the RGB picture into it and waits |
 | `emberwave_texture_create_plane`, `emberwave_decoder_decode_plane_textures` | A one-channel texture for the Y, the Cb or the Cr plane, and a decode that puts the planes into three and waits: on Metal it stores them there, elsewhere it copies them in (D52) |

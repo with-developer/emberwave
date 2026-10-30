@@ -146,7 +146,7 @@ pub fn run(args: &Args) -> Result<()> {
             signalling,
         )?))
     };
-    eprintln!(
+    err!(
         "{}x{} {}, {} chroma siting, {:?} range; {} bytes per frame at most, on the {}",
         width,
         height,
@@ -175,7 +175,9 @@ pub fn run(args: &Args) -> Result<()> {
     // leaves whatever was there before.
     let partial = partial_path(&args.out);
     let result = (|| -> Result<(usize, usize, Vec<f64>)> {
-        let mut out = BufWriter::new(File::create(&partial)?);
+        let file =
+            File::create(&partial).map_err(|error| format!("{}: {error}", partial.display()))?;
+        let mut out = BufWriter::new(file);
         out.write_all(&file_header.to_bytes())?;
         let limit = args.frames.unwrap_or(usize::MAX);
         let (mut count, mut bytes, mut times) = (0usize, 0usize, Vec::new());
@@ -188,7 +190,7 @@ pub fn run(args: &Args) -> Result<()> {
             let elapsed = start.elapsed().as_secs_f64();
             out.write_all(&u32::try_from(frame.len())?.to_le_bytes())?;
             out.write_all(&frame)?;
-            eprintln!(
+            err!(
                 "frame {count:6}: {} bytes, {:.1} ms",
                 frame.len(),
                 elapsed * 1e3
@@ -212,7 +214,8 @@ pub fn run(args: &Args) -> Result<()> {
             return Err(error);
         }
     };
-    std::fs::rename(&partial, &args.out)?;
+    std::fs::rename(&partial, &args.out)
+        .map_err(|error| format!("{}: {error}", args.out.display()))?;
 
     // The time of a frame is that of the encoder's call: the picture in
     // memory to the frame in memory, the transfers to and from a GPU included.
