@@ -1744,7 +1744,7 @@ mod vulkan {
         // SAFETY: as the caller promises.
         let adapter = unsafe { adapter(&device.instance, device.physical_device) }?;
         let descriptor = GpuContext::device_descriptor(&adapter, &GpuOptions::default());
-        let (open, queue) = {
+        let (open, turns) = {
             // SAFETY: only read.
             let hal = unsafe { adapter.as_hal::<Vulkan>() }
                 .ok_or_else(|| no_gpu("not a Vulkan adapter"))?;
@@ -1790,6 +1790,16 @@ mod vulkan {
             // promises.
             let queue =
                 unsafe { raw.get_device_queue(device.queue_family_index, device.queue_index) };
+            // The queue's turns, before anything of wgpu's is made on it: a
+            // context refused here makes nothing that would use the queue
+            // without the lock as it goes.
+            let key = lock
+                .as_ref()
+                .map(|lock| (lock.lock as usize, lock.unlock as usize, lock.user as usize));
+            let turns = queue_turns(queue.as_raw() as usize, key, || match lock {
+                Some(lock) => QueueTurns::with_caller_lock(Box::new(lock)),
+                None => QueueTurns::new(),
+            })?;
             // SAFETY: the device was made on the adapter's physical device,
             // with that queue, the required extensions among its own and
             // the features wgpu needs for these, as the caller promises.
@@ -1807,19 +1817,12 @@ mod vulkan {
                 )
             }
             .map_err(no_gpu)?;
-            (open, queue)
+            (open, turns)
         };
         // SAFETY: a device opened on this adapter with the descriptor's
         // features and limits.
         let (wgpu_device, wgpu_queue) =
             unsafe { adapter.create_device_from_hal(open, &descriptor) }.map_err(no_gpu)?;
-        let key = lock
-            .as_ref()
-            .map(|lock| (lock.lock as usize, lock.unlock as usize, lock.user as usize));
-        let turns = queue_turns(queue.as_raw() as usize, key, || match lock {
-            Some(lock) => QueueTurns::with_caller_lock(Box::new(lock)),
-            None => QueueTurns::new(),
-        })?;
         Ok(GpuContext::from_device(adapter, wgpu_device, wgpu_queue).with_queue_turns(turns))
     }
 }

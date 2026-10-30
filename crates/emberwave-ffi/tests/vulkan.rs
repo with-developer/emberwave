@@ -59,6 +59,17 @@ unsafe extern "system" fn on_validation(
     data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user: *mut c_void,
 ) -> vk::Bool32 {
+    // SAFETY: the layer's callback data and its message ID's name, while
+    // this runs.
+    let id = unsafe { data.as_ref() }
+        .filter(|data| !data.p_message_id_name.is_null())
+        .map(|data| unsafe { CStr::from_ptr(data.p_message_id_name) });
+    // naga 30 decorates arrays in workgroup memory with ArrayStride, which
+    // the validation layer's spirv-val of 2025 rejects; drivers ignore it.
+    // That is wgpu's, and the one complaint left out.
+    if id == Some(c"VUID-StandaloneSpirv-None-10684") {
+        return vk::FALSE;
+    }
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
         // SAFETY: the layer's callback data and its message, while this runs.
         let message = unsafe { data.as_ref() }
