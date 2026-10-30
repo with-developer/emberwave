@@ -397,6 +397,43 @@ def encode_parts(results):
                 rows,
             )
         )
+    rows = []
+    for stem, label in ENCODE_SOURCES:
+        bgra = load(results, f"{stem}.encode-gpu-bgra")
+        bgra_textures = load(results, f"{stem}.encode-gpu-bgra-textures")
+        if bgra and bgra_textures:
+            rows.append(
+                [label]
+                + [
+                    ms(value(result, *key))
+                    for result in (bgra, bgra_textures)
+                    for key in (("total",), ("total", "p99"), ("cpu prepare",), ("transform",))
+                ]
+            )
+    if rows:
+        parts.append(
+            "From the same pictures in BGRA, as most screen captures hold them "
+            "(`Encoder::encode_rgb` and `TexturePicture::Rgb`, `bench-encode --rgb`). "
+            "`gather_rgb.wgsl` converts them to Y'CbCr within the transform's time "
+            "(decision D65). From CPU memory the picture, four bytes a pixel, goes "
+            "through an upload buffer the encoder keeps and a copy into a texture:"
+        )
+        parts.append(
+            table(
+                [
+                    "Picture",
+                    "BGRA in CPU memory mean",
+                    "p99",
+                    "CPU prepare",
+                    "transform",
+                    "BGRA texture mean",
+                    "p99",
+                    "CPU prepare",
+                    "transform",
+                ],
+                rows,
+            )
+        )
     return parts
 
 
