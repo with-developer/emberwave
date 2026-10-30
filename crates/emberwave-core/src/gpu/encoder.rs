@@ -136,6 +136,93 @@ enum Input<'a> {
     },
 }
 
+/// Where a picture in RGB in CPU memory goes on its way to the gather: a
+/// buffer the CPU writes it into, kept from frame to frame and mapped again
+/// before each, and the texture the encode copies it into, in the format of
+/// its order (decision D65). `Queue::write_texture` staged every picture in
+/// new memory of wgpu's, which cost a 4K picture 3.2 ms (issue #141).
+struct RgbUpload {
+    order: RgbOrder,
+    /// The picture's rows, `row_bytes` apart, as a copy into a texture
+    /// needs them.
+    buffer: wgpu::Buffer,
+    row_bytes: u32,
+    /// Whether `buffer` is mapped for writing.
+    mapped: bool,
+    texture: wgpu::Texture,
+}
+
+impl RgbUpload {
+    /// The buffer, mapped, and the texture for pictures of `size` in
+    /// `order`.
+    fn new(
+        device: &wgpu::Device,
+        order: RgbOrder,
+        (width, height): (u32, u32),
+    ) -> Result<Self, GpuError> {
+        let row_bytes = (4 * width).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let bytes = u64::from(row_bytes) * u64::from(height);
+        check_size(device, "the RGB picture's upload buffer", bytes)?;
+        let format = match order {
+            RgbOrder::Rgba => wgpu::TextureFormat::Rgba8Unorm,
+            RgbOrder::Bgra => wgpu::TextureFormat::Bgra8Unorm,
+        };
+        with_error_scope(device, || Self {
+            order,
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rgb upload"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            }),
+            row_bytes,
+            mapped: true,
+            texture: device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("rgb upload"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }),
+        })
+    }
+
+    /// Writes the picture's rows, `stride` bytes apart in `rgb`, into the
+    /// mapped buffer.
+    fn write(&self, rgb: &[u8], stride: usize) -> Result<(), GpuError> {
+        let size = self.texture.size();
+        let (row, rows) = (4 * size.width as usize, size.height as usize);
+        let row_bytes = self.row_bytes as usize;
+        let mut view = self
+            .buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .map_err(|error| GpuError::Device(error.to_string()))?;
+        if stride == row_bytes || rows == 1 {
+            let bytes = (rows - 1) * row_bytes + row;
+            view.slice(..bytes).copy_from_slice(&rgb[..bytes]);
+        } else {
+            for y in 0..rows {
+                view.slice(y * row_bytes..y * row_bytes + row)
+                    .copy_from_slice(&rgb[y * stride..y * stride + row]);
+            }
+        }
+        Ok(())
+    }
+
+    fn destroy(&self) {
+        self.buffer.destroy();
+        self.texture.destroy();
+    }
+}
+
 /// The pass that packs a picture in textures into the planes buffer.
 struct Gather {
     pipeline: wgpu::ComputePipeline,
@@ -201,10 +288,9 @@ pub struct Encoder {
     gather_rgb: wgpu::Buffer,
     gather_rgb_grid: (u32, u32, u32),
     rgb_pipelines: RgbPipelines,
-    /// The texture that a picture in RGB in CPU memory goes into, in the
-    /// format of its order: made for the first, and again when the order
-    /// changes.
-    rgb_upload: Option<(RgbOrder, wgpu::Texture)>,
+    /// Where a picture in RGB in CPU memory goes: made for the first, and
+    /// again when the order changes.
+    rgb_upload: Option<RgbUpload>,
     pyramid: wgpu::Buffer,
     /// A [`CostRecord`] per block, in block index order.
     costs: wgpu::Buffer,
@@ -586,10 +672,10 @@ impl Encoder {
 
     /// Encodes a picture of R', G' and B' in CPU memory: rows `stride`
     /// bytes apart of four bytes a pixel in `order`, the fourth not read. It
-    /// goes to the GPU as it is, into a texture the encoder keeps, and is
-    /// converted there as [`TexturePicture::Rgb`] says, into the frame of
-    /// the same picture in a texture (decision D65). A picture smaller than
-    /// its size and stride say is [`EncodeError::Picture`].
+    /// goes to the GPU as it is, through a buffer and a texture the encoder
+    /// keeps, and is converted there as [`TexturePicture::Rgb`] says, into
+    /// the frame of the same picture in a texture (decision D65). A picture
+    /// smaller than its size and stride say is [`EncodeError::Picture`].
     pub fn encode_rgb(
         &mut self,
         rgb: &[u8],
@@ -655,6 +741,7 @@ impl Encoder {
                 Some(self.gather(TexturePicture::Rgb(&view))?)
             }
         };
+        let rgb_upload = matches!(input, Input::Rgb { .. });
         // No frame takes more than every block at its largest, which fits
         // 32 bits; neither need the budget.
         let most_words = u64::from(self.layout.block_count()) * MAX_BLOCK_WORDS;
@@ -699,6 +786,9 @@ impl Encoder {
             encoder.clear_buffer(&self.rate_state, 0, None);
             if gather.is_none() {
                 self.encode_upload(&mut encoder);
+            }
+            if rgb_upload {
+                self.encode_rgb_upload(&mut encoder);
             }
             self.encode_transform(&mut encoder, gather.as_ref(), queries);
             self.encode_quantisation(&mut encoder, queries);
@@ -998,67 +1088,65 @@ impl Encoder {
         })
     }
 
-    /// Writes a picture of R', G' and B' in CPU memory into the texture the
-    /// encoder keeps for it, and returns a view of the texture, or an error
-    /// if the bytes do not hold the picture.
+    /// Writes a picture of R', G' and B' in CPU memory into the buffer the
+    /// encoder keeps for it, which [`encode_rgb_upload`](Self::encode_rgb_upload)
+    /// copies into its texture, and returns a view of the texture, or an
+    /// error if the bytes do not hold the picture.
     fn upload_rgb(
         &mut self,
         rgb: &[u8],
         stride: usize,
         order: RgbOrder,
     ) -> Result<wgpu::TextureView, GpuError> {
-        let (width, height) = self.layout.plane_size(Component::Y);
-        check_rgb(rgb.len(), stride, width, height).map_err(EncodeError::Picture)?;
-        // A row's pixels, for a picture of one row, whose stride is not read.
-        let stride = stride.max(width as usize * 4);
-        let bytes_per_row = u32::try_from(stride).map_err(|_| {
-            GpuError::Device(format!("rows {stride} bytes apart exceed what wgpu copies"))
-        })?;
+        let size = self.layout.plane_size(Component::Y);
+        check_rgb(rgb.len(), stride, size.0, size.1).map_err(EncodeError::Picture)?;
         if self
             .rgb_upload
             .as_ref()
-            .is_none_or(|(kept, _)| *kept != order)
+            .is_none_or(|upload| upload.order != order)
         {
-            let format = match order {
-                RgbOrder::Rgba => wgpu::TextureFormat::Rgba8Unorm,
-                RgbOrder::Bgra => wgpu::TextureFormat::Bgra8Unorm,
-            };
-            let made = with_error_scope(&self.device, || {
-                self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("rgb upload"),
-                    size: wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                })
-            })?;
-            if let Some((_, old)) = self.rgb_upload.replace((order, made)) {
+            let made = RgbUpload::new(&self.device, order, size)?;
+            if let Some(old) = self.rgb_upload.replace(made) {
                 old.destroy();
             }
         }
-        let (_, texture) = self.rgb_upload.as_ref().expect("made above");
-        with_error_scope(&self.device, || {
-            // Staged by wgpu, and copied before the next submission on the
-            // queue, the encode's or one before it.
-            self.queue.write_texture(
-                texture.as_image_copy(),
-                rgb,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(height),
+        let upload = self.rgb_upload.as_mut().expect("made above");
+        // The GPU is done with the buffer: every encode waits for its frame.
+        if !upload.mapped {
+            map_for_writing(&self.device, &[&upload.buffer])?;
+            upload.mapped = true;
+        }
+        let written = upload.write(rgb, stride);
+        // Unmapped whatever happened, so that the copy can read it.
+        let unmapped = with_error_scope(&self.device, || upload.buffer.unmap());
+        if unmapped.is_ok() {
+            upload.mapped = false;
+        }
+        written?;
+        unmapped?;
+        Ok(upload
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default()))
+    }
+
+    /// Records the copy of an RGB picture from the buffer the CPU wrote it
+    /// into to the texture the gather reads.
+    fn encode_rgb_upload(&self, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(upload) = &self.rgb_upload {
+            let size = upload.texture.size();
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &upload.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(upload.row_bytes),
+                        rows_per_image: Some(size.height),
+                    },
                 },
-                texture.size(),
+                upload.texture.as_image_copy(),
+                size,
             );
-            texture.create_view(&wgpu::TextureViewDescriptor::default())
-        })
+        }
     }
 
     /// Records the copy of the uploaded planes into the planes buffer, if
@@ -1332,6 +1420,9 @@ impl Drop for Encoder {
     /// Work already submitted keeps its buffers until it is done.
     fn drop(&mut self) {
         if let Some(upload) = &self.upload {
+            upload.destroy();
+        }
+        if let Some(upload) = &self.rgb_upload {
             upload.destroy();
         }
         for buffer in [

@@ -497,7 +497,7 @@ CFRelease(bgra);
 - **The conversion** is in integers and makes the same bytes on every GPU, so a picture encodes into the frame of the planes it converts to; in Rust, `color::rgb_to_ycbcr8` makes them. A 4:2:0 chroma sample is the average of the pixels it covers: across two columns where chroma is centred, across three weighted 1, 2 and 1 where it is on the left.
 - **Time.** On an Apple M3 Max a 4K frame encodes from a BGRA texture in 1.82 to 1.84 ms, against 1.74 to 1.75 ms from textures of its planes.
 - **A decode's picture.** A texture that a decode put a picture into encodes the same way, for a transcode on the GPU.
-- **In CPU memory**, `emberwave_encoder_encode_rgb(encoder, rgb, EMBERWAVE_TEXTURE_BGRA8, frame, budget, &size)` takes the picture's rows, `rgb.stride` bytes apart, and converts them on the GPU. It copies the picture once more than a texture would need: a 4K frame takes 6.0 ms ([#141](https://github.com/with-developer/emberwave/issues/141)).
+- **In CPU memory**, `emberwave_encoder_encode_rgb(encoder, rgb, EMBERWAVE_TEXTURE_BGRA8, frame, budget, &size)` takes the picture's rows, `rgb.stride` bytes apart, and converts them on the GPU. It copies the picture into memory the encoder keeps, and on the GPU into a texture: a 4K frame takes 2.5 to 2.8 ms.
 
 ## Rules
 

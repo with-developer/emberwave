@@ -848,6 +848,7 @@ fn gathering_rgb_writes_the_words_of_its_converted_planes() {
             let stride = 4 * width as usize + 12;
             let padded = rgb_picture(width, height, stride, RgbOrder::Bgra, seed);
             let uploaded_rgb = gpu.upload_rgb(&padded, stride, RgbOrder::Bgra).unwrap();
+            gpu.run(|this, encoder| this.encode_rgb_upload(encoder));
             let views: Vec<(&str, wgpu::TextureView)> = textures
                 .iter()
                 .map(|(name, texture)| (*name, texture.create_view(&Default::default())))
