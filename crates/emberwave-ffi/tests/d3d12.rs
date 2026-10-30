@@ -186,20 +186,29 @@ impl Host {
 
     /// Signals the fence's next value after the work so far, and returns it.
     fn signal(&mut self) -> u64 {
-        self.value += 1;
-        // SAFETY: the device's own fence.
-        unsafe {
-            self.immediate
-                .Signal(&self.fence, self.value)
-                .expect("a signal");
-            self.immediate.Flush();
-        }
+        self.signal_to(self.value + 1);
         self.value
     }
 
+    /// Signals the fence to `value` after the work so far.
+    fn signal_to(&mut self, value: u64) {
+        self.value = value;
+        // SAFETY: the device's own fence.
+        unsafe {
+            self.immediate.Signal(&self.fence, value).expect("a signal");
+            self.immediate.Flush();
+        }
+    }
+
+    /// The value the fence has reached.
+    fn completed(&self) -> u64 {
+        // SAFETY: the device's own fence.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
     /// The texels of `texture`, `texel` bytes each, read once the fence has
-    /// reached `value`.
-    fn read(&self, texture: &ID3D11Texture2D, texel: usize, value: u64) -> Vec<u8> {
+    /// reached `after`, or with no wait.
+    fn read(&self, texture: &ID3D11Texture2D, texel: usize, after: Option<u64>) -> Vec<u8> {
         // SAFETY: a staging copy of the texture's description, mapped for
         // reading once the copy is done, which Map waits for.
         unsafe {
@@ -214,7 +223,9 @@ impl Host {
                 .CreateTexture2D(&description, None, Some(&mut staging))
                 .expect("a staging texture");
             let staging: ID3D11Texture2D = staging.expect("a texture");
-            self.immediate.Wait(&self.fence, value).expect("a wait");
+            if let Some(value) = after {
+                self.immediate.Wait(&self.fence, value).expect("a wait");
+            }
             self.immediate.CopyResource(&staging, texture);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.immediate
@@ -393,7 +404,7 @@ fn a_client_reads_pictures_and_planes_after_the_fence() {
             };
             assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
             assert!(
-                host.read(&picture, 4, host.value) == bgra,
+                host.read(&picture, 4, Some(host.value)) == bgra,
                 "{name}: the picture after the fence"
             );
 
@@ -418,10 +429,56 @@ fn a_client_reads_pictures_and_planes_after_the_fence() {
             assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
             for ((texture, _), expected) in planes.iter().zip(&yuv) {
                 assert!(
-                    host.read(texture, 1, host.value) == *expected,
+                    host.read(texture, 1, Some(host.value)) == *expected,
                     "{name}: a plane after the fence"
                 );
             }
+        }
+
+        // A decode waits for its fence: until the client signals it, the
+        // texture keeps the last picture and the decode signals nothing.
+        let (last, _) = expected(decoder, &frames[1], size);
+        let (next, _) = expected(decoder, &frames[2], size);
+        push(decoder, &frames[2]);
+        let held = host.value + 1;
+        let sync = EmberwaveD3D12Sync {
+            wait_fence: host.shared_fence,
+            wait_value: held,
+            signal_fence: host.shared_fence,
+            signal_value: held + 1,
+        };
+        // SAFETY: a live decoder and texture, and live fences.
+        let status = unsafe {
+            emberwave_decoder_submit_texture_d3d12(decoder, ptr::null(), picture_texture, &sync)
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            host.completed() < held + 1,
+            "{name}: the decode signalled before its wait was met"
+        );
+        assert!(
+            host.read(&picture, 4, None) == last,
+            "{name}: the decode wrote the texture before its wait was met"
+        );
+        host.signal_to(held);
+        host.value = held + 1;
+        assert!(
+            host.read(&picture, 4, Some(held + 1)) == next,
+            "{name}: the picture once the wait was met"
+        );
+        if size.0 % 64 != 0 {
+            // A picture a decode draws needs a texture it can draw into.
+            let (_texture, handle) =
+                host.texture(DXGI_FORMAT_B8G8R8A8_UNORM, size, D3D11_BIND_SHADER_RESOURCE);
+            // SAFETY: a live decoder, a handle of this process, and a pointer
+            // to store the texture in.
+            let (status, error) = wrapped(handle, |handle, texture| unsafe {
+                emberwave_texture_from_d3d12(decoder, handle, texture)
+            })
+            .unwrap_err();
+            assert_eq!(status, EmberwaveStatus::InvalidArgument);
+            assert!(error.contains("ALLOW_RENDER_TARGET"), "{error}");
         }
 
         // The decodes that wait leave textures in other states, and refuse
@@ -430,6 +487,18 @@ fn a_client_reads_pictures_and_planes_after_the_fence() {
         // SAFETY: a live decoder and texture.
         let status =
             unsafe { emberwave_decoder_decode_texture(decoder, ptr::null(), picture_texture) };
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(last_error().contains("_d3d12"), "{}", last_error());
+        push(decoder, &frames[0]);
+        // SAFETY: a live decoder and textures.
+        let status = unsafe {
+            emberwave_decoder_decode_plane_textures(
+                decoder,
+                plane_textures[0],
+                plane_textures[1],
+                plane_textures[2],
+            )
+        };
         assert_eq!(status, EmberwaveStatus::InvalidArgument);
         assert!(last_error().contains("_d3d12"), "{}", last_error());
 
@@ -443,6 +512,17 @@ fn a_client_reads_pictures_and_planes_after_the_fence() {
         }
     }
 }
+
+/// An encode's arguments, for a thread of its own.
+struct Held {
+    encoder: *mut EmberwaveEncoder,
+    textures: [*mut EmberwaveTexture; 3],
+    sync: EmberwaveD3D12Sync,
+}
+
+// SAFETY: the C API's objects may move between threads, and the test's
+// thread does not use them while the encode's does.
+unsafe impl Send for Held {}
 
 #[test]
 fn a_hosts_shared_planes_are_encoded_after_the_fence() {
@@ -508,7 +588,7 @@ fn a_hosts_shared_planes_are_encoded_after_the_fence() {
         frame.truncate(size);
         frame
     };
-    for seed in 0..2u32 {
+    for seed in 0..3u32 {
         let picture: [Vec<u8>; 3] = std::array::from_fn(|plane| {
             let (w, h) = if plane == 0 { size } else { chroma };
             (0..w * h)
@@ -556,6 +636,36 @@ fn a_hosts_shared_planes_are_encoded_after_the_fence() {
         };
         assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
         frame.truncate(length);
+
+        if seed == 2 {
+            // An encode waits for its fence: until the host signals it, the
+            // call does not return.
+            let held = host.value + 1;
+            let call = Held {
+                encoder: as_planes,
+                textures: [sources[0], sources[1], sources[2]],
+                sync: EmberwaveD3D12Sync {
+                    wait_fence: host.shared_fence,
+                    wait_value: held,
+                    signal_fence: host.shared_fence,
+                    signal_value: held + 1,
+                },
+            };
+            let thread = std::thread::spawn(move || {
+                let call = call;
+                encode(call.encoder, call.textures, &call.sync)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !thread.is_finished(),
+                "the encode returned before its wait was met"
+            );
+            host.signal_to(held);
+            host.value = held + 1;
+            let planar = thread.join().expect("the encode's thread");
+            assert!(planar == frame, "the planes, once the wait was met");
+            continue;
+        }
 
         let sync = EmberwaveD3D12Sync {
             wait_fence: host.shared_fence,

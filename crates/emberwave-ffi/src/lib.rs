@@ -1430,10 +1430,12 @@ pub struct EmberwaveD3D12Fence {
 /// Direct3D 11 device (decision D63). Either may be `NULL`, and `sync` too.
 ///
 /// A fence orders work across devices as a semaphore does: the call's GPU
-/// work waits until `wait_fence` has reached `wait_value` before it uses the
-/// textures, and sets `signal_fence` to `signal_value` once it is done with
-/// them. A wait that is never met holds up every later submission of the
-/// context.
+/// work waits until `wait_fence` has reached `wait_value`, all of it, the
+/// upload of a frame included, and sets `signal_fence` to `signal_value` once
+/// it is done with the textures. A wait that is never met holds up every
+/// later submission of the context, and the destroy that lets go of the last
+/// hold on the context's queue, which waits for the queue to be idle, never
+/// returns.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveD3D12Sync {
@@ -2147,9 +2149,10 @@ pub unsafe extern "C" fn emberwave_d3d12_fence_destroy(fence: *mut EmberwaveD3D1
 /// decodes of `decoder` to put the picture into, from the NT handle
 /// `handle`, on a context of `emberwave_context_create_d3d12` (decision D63):
 /// a Direct3D 12 resource made with `D3D12_HEAP_FLAG_SHARED`, or a Direct3D
-/// 11 texture made with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`, and the handle
-/// `CreateSharedHandle` gave. Only `emberwave_decoder_submit_texture_d3d12`
-/// takes it.
+/// 11 texture made with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+/// D3D11_RESOURCE_MISC_SHARED`, and the handle `CreateSharedHandle` gave.
+/// Fences order the work on it, not keyed mutexes. Only
+/// `emberwave_decoder_submit_texture_d3d12` takes it.
 ///
 /// The texture is 2D, of one level, layer and sample, of the picture's size,
 /// in `DXGI_FORMAT_B8G8R8A8_UNORM` or `DXGI_FORMAT_R8G8B8A8_UNORM`, and can be
@@ -2157,9 +2160,9 @@ pub unsafe extern "C" fn emberwave_d3d12_fence_destroy(fence: *mut EmberwaveD3D1
 /// copies the picture into it when its width is a multiple of 64 pixels, and
 /// draws it otherwise, which needs `D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET`
 /// (`D3D11_BIND_RENDER_TARGET`). emberwave reads all of this from the
-/// resource itself; a texture that is not so gives
-/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is then `NULL`. Off
-/// Windows, `EMBERWAVE_STATUS_NO_GPU`.
+/// resource itself. A texture that is not so, or a decoder on another
+/// context, gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is then
+/// `NULL`.
 ///
 /// emberwave keeps a reference to the resource until the texture is
 /// destroyed and the GPU is done with it, and does not close the handle: the
@@ -2282,8 +2285,9 @@ pub unsafe extern "C" fn emberwave_texture_from_d3d12_source(
 /// caller's (`emberwave_texture_from_d3d12`) or emberwave's own.
 ///
 /// The decode's GPU work waits until `sync.wait_fence` has reached
-/// `wait_value` before it writes the texture: the caller signals it once its
-/// own work that reads the texture is done. The decode leaves the texture in
+/// `wait_value`, all of it, so it does not run beside the caller's reads of
+/// the last picture: the caller signals the value once its own work that
+/// reads the texture is done. The decode leaves the texture in
 /// `D3D12_RESOURCE_STATE_COMMON`, as another device takes it, and then sets
 /// `signal_fence` to `signal_value`: the caller's work that reads the picture
 /// waits for that value. Keep the fences until the work that signals them is
@@ -2387,7 +2391,11 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_d3d12(
 /// `D3D12_RESOURCE_STATE_COMMON` and then sets `signal_fence` to
 /// `signal_value`, for the caller's work that writes them again. The call
 /// waits for the GPU as the other encodes do, so it returns only once its
-/// wait is met: by work submitted before the call, or from another thread.
+/// wait is met: by the caller's work submitted before the call, or from
+/// another thread during it. When the call fails, the fences may or may not
+/// have been waited for and signalled. A budget too small for the smallest
+/// frame shows only once the GPU has encoded the picture: the wait has been
+/// met and the signal made by then, so a retry takes a new `signal_value`.
 ///
 /// # Safety
 ///

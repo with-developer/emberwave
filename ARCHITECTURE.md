@@ -1591,7 +1591,9 @@ Direct3D 12 through shared handles follows, and the encoder's input from the cal
 **Consequence.**
 - **Tests.** `tests/d3d12.rs` runs in Windows CI on WARP, Direct3D's software adapter, which every Windows has, so the tests never skip. A Direct3D 11 device stands for a host or a client: it shares textures and a fence through NT handles, and orders its own work with `ID3D11DeviceContext4::Wait` and `Signal`.
   - Pictures, copied at 192 pixels wide and drawn at 200, and planes decode into its textures, and read back after the fence as the decodes that wait give them.
+  - A decode whose wait value nobody has signalled leaves the texture as it was and signals nothing for 200 ms, and goes on once the device signals. An encode with such a wait, called on a thread of its own, does not return until then. A review showed that the first version of the tests only waited for values already reached, which would have passed without the waits.
   - Planes, and NV12's layout of Y with Cb and Cr interleaved, encode from its textures into the bytes of the same pictures in CPU memory.
+  - On every system, `tests/gpu_hooks.rs` of the core checks that the hooks of a decode and of an encode run as record, then before the submission, then after it, also when a budget too small shows after the GPU has run, and that a call failing before it records runs none.
   - Formats and sizes that do not fit are refused, a handle that is not a fence's is refused, a LUID of no adapter is refused, and the calls without fences refuse shared textures.
   - On every system, `tests/api.rs` checks that a context of `emberwave_context_create` opens no fence or texture and takes no `_d3d12` call.
 - **Not tested.** A hardware adapter, another process, and a Direct3D 12 device of the caller's.
