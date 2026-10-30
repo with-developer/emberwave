@@ -264,6 +264,12 @@ impl GpuContext {
         self
     }
 
+    /// The turns at the queue that [`with_queue_turns`](Self::with_queue_turns)
+    /// gave the context, if any.
+    pub fn queue_turns(&self) -> Option<&Arc<QueueTurns>> {
+        self.turns.as_ref()
+    }
+
     /// Creates a context on a device of `adapter` made with
     /// [`device_descriptor`](Self::device_descriptor), and its queue. The
     /// context takes over the device's lost callback. Without the limits of
@@ -455,15 +461,72 @@ pub(crate) fn notice_loss(device: &wgpu::Device, lost: &Mutex<Option<String>>) {
 /// them: calls that each held some while they waited for more could wait
 /// for good (#126). Give the contexts of one queue the same turns, with
 /// [`GpuContext::with_queue_turns`].
-#[derive(Debug, Default)]
+///
+/// On a queue that the caller submits to as well, Vulkan requires the uses
+/// of the queue to be externally synchronised: the turns then also hold the
+/// caller's lock of the queue around each submission (decision D61).
+#[derive(Default)]
 pub struct QueueTurns {
     turn: Mutex<()>,
+    caller: Option<Box<dyn CallerQueueLock>>,
+}
+
+/// The caller's lock of a queue it shares with emberwave (decision D61).
+/// emberwave holds it around each of its submissions, and while it lets go
+/// of the queue, where wgpu waits for the queue to be idle. Not while
+/// emberwave holds the caller's lock already: it is not taken twice.
+pub trait CallerQueueLock: Send + Sync {
+    /// Waits until the queue is free, and takes it.
+    fn lock(&self);
+    /// Frees the queue.
+    fn unlock(&self);
+}
+
+impl std::fmt::Debug for QueueTurns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueTurns")
+            .field("caller_lock", &self.caller.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The caller's lock of a queue, held until dropped, also on a panic.
+struct CallerHold<'a>(&'a dyn CallerQueueLock);
+
+impl<'a> CallerHold<'a> {
+    fn take(lock: &'a dyn CallerQueueLock) -> Self {
+        lock.lock();
+        Self(lock)
+    }
+}
+
+impl Drop for CallerHold<'_> {
+    fn drop(&mut self) {
+        self.0.unlock();
+    }
 }
 
 impl QueueTurns {
     /// Turns for the contexts of one queue.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Turns for the contexts of one queue that the caller uses too, under
+    /// `lock` (decision D61).
+    pub fn with_caller_lock(lock: Box<dyn CallerQueueLock>) -> Self {
+        Self {
+            turn: Mutex::default(),
+            caller: Some(lock),
+        }
+    }
+
+    /// Runs `body` holding the caller's lock of the queue, if there is one:
+    /// for whatever uses the queue outside a submission, such as letting go
+    /// of the last of wgpu's handles to it, which waits for it to be idle.
+    pub fn caller_locked<T>(&self, body: impl FnOnce() -> T) -> T {
+        let _held = self.caller.as_deref().map(CallerHold::take);
+        body()
     }
 
     /// Takes a turn, waiting for it: for work of the caller's own that it
@@ -491,6 +554,7 @@ pub struct QueueTurn<'a> {
 /// failed, the turn submits those writes, so that the context holds no
 /// command buffer between calls.
 pub(crate) struct Turn<'a> {
+    turns: Option<&'a QueueTurns>,
     unsubmitted: Option<(wgpu::Device, wgpu::Queue)>,
     _held: Option<QueueTurn<'a>>,
 }
@@ -507,7 +571,7 @@ impl Drop for Turn<'_> {
         // Still during the turn: the fields drop after this.
         if let Some((device, queue)) = self.unsubmitted.take() {
             // On a device lost meanwhile, the next call fails instead.
-            let _ = with_error_scope(&device, || queue.submit([]));
+            let _ = with_error_scope(&device, || submit(&queue, self.turns, []));
         }
     }
 }
@@ -521,9 +585,23 @@ pub(crate) fn take_turn<'a>(
     queue: &wgpu::Queue,
 ) -> Turn<'a> {
     Turn {
+        turns,
         unsubmitted: turns.map(|_| (device.clone(), queue.clone())),
         _held: turns.map(QueueTurns::take),
     }
+}
+
+/// Submits `buffers` to `queue`, under the caller's lock of the queue if
+/// `turns` has one (decision D61). Called during a turn.
+pub(crate) fn submit(
+    queue: &wgpu::Queue,
+    turns: Option<&QueueTurns>,
+    buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
+) {
+    match turns {
+        Some(turns) => turns.caller_locked(|| queue.submit(buffers)),
+        None => queue.submit(buffers),
+    };
 }
 
 /// The value in `cache`, which `build` makes if there is none yet.

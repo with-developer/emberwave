@@ -177,6 +177,11 @@ typedef struct EmberwaveEncoder EmberwaveEncoder;
 //   has completed.
 typedef struct EmberwaveTexture EmberwaveTexture;
 
+// What emberwave needs a Vulkan device of the caller's to have enabled:
+// device extensions and features, from
+// `emberwave_vulkan_requirements_create`.
+typedef struct EmberwaveVulkanRequirements EmberwaveVulkanRequirements;
+
 // What a stream says about its pictures.
 typedef struct EmberwaveStreamInfo {
   // Width of the pictures in pixels.
@@ -207,6 +212,60 @@ typedef struct EmberwaveContextOptions {
   // `EMBERWAVE_CONTEXT_*` flags combined with `|`, or 0.
   uint32_t flags;
 } EmberwaveContextOptions;
+
+// `vkGetInstanceProcAddr` of a Vulkan loader, as the C API takes it: cast
+// the loader's function to this type. Vulkan's calling convention is C's on
+// the 64-bit systems emberwave runs on.
+typedef void (*(*EmberwaveVkGetInstanceProcAddr)(void *instance, const char *name))(void);
+
+// A Vulkan instance of the caller's (decision D61).
+typedef struct EmberwaveVulkanInstance {
+  // `vkGetInstanceProcAddr` of the loader the instance was made with.
+  EmberwaveVkGetInstanceProcAddr get_instance_proc_addr;
+  // The `VkInstance`.
+  void *instance;
+  // The `apiVersion` the instance was made with, such as
+  // `VK_API_VERSION_1_3`.
+  uint32_t api_version;
+  // The instance extensions it was made with: `extension_count` names, or
+  // `NULL` for none.
+  const char *const *extensions;
+  // How many names `extensions` holds.
+  uint32_t extension_count;
+} EmberwaveVulkanInstance;
+
+// A Vulkan device of the caller's, and the queue of it that emberwave is to
+// submit to (decision D61).
+typedef struct EmberwaveVulkanDevice {
+  // The instance the device was made with.
+  struct EmberwaveVulkanInstance instance;
+  // The `VkPhysicalDevice` the device was made on.
+  void *physical_device;
+  // The `VkDevice`, made with the extensions and features that
+  // `emberwave_vulkan_requirements_create` lists, and more if the caller
+  // needs them.
+  void *device;
+  // The device extensions the device was made with: `extension_count`
+  // names.
+  const char *const *extensions;
+  // How many names `extensions` holds.
+  uint32_t extension_count;
+  // The family of the queue emberwave submits to.
+  uint32_t queue_family_index;
+  // Which queue of that family, as for `vkGetDeviceQueue`.
+  uint32_t queue_index;
+  // Takes the caller's lock of the queue, waiting for it to be free:
+  // Vulkan requires the uses of a queue to be externally synchronised.
+  // emberwave calls it with `user` around each submission, and while it
+  // lets go of the queue, never twice without `unlock_queue` between,
+  // from any thread. `NULL`, with `unlock_queue` `NULL` too, if nothing
+  // else uses the queue during emberwave's calls.
+  void (*lock_queue)(void *user);
+  // Frees the caller's lock of the queue that `lock_queue` took.
+  void (*unlock_queue)(void *user);
+  // Passed to `lock_queue` and `unlock_queue`.
+  void *user;
+} EmberwaveVulkanDevice;
 
 // The sizes of the planes a decoder writes or an encoder reads.
 typedef struct EmberwaveFrameInfo {
@@ -378,6 +437,93 @@ enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptio
 enum EmberwaveStatus emberwave_context_create_metal(void *device,
                                                     void *queue,
                                                     struct EmberwaveContext **context);
+
+// Lists what a Vulkan device of the caller's must have enabled for
+// `emberwave_context_create_vulkan`, on the physical device
+// `physical_device` of `instance` (decision D61): the extensions, which
+// `emberwave_vulkan_requirements_extensions` gives, and the features, which
+// `emberwave_vulkan_requirements_features` gives. Make the device with
+// them, and with whatever else the caller needs. Only where wgpu runs on
+// Vulkan, on Linux, Android and Windows; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+// `EMBERWAVE_STATUS_NO_GPU` too for a physical device wgpu cannot use.
+//
+// # Safety
+//
+// `instance` is `NULL` or points to an `EmberwaveVulkanInstance` that
+// describes a live instance, and `physical_device` is `NULL` or a physical
+// device of it. `requirements` points to where the new requirements are
+// stored; it is set to `NULL` when the call fails.
+enum EmberwaveStatus emberwave_vulkan_requirements_create(const struct EmberwaveVulkanInstance *instance,
+                                                          void *physical_device,
+                                                          struct EmberwaveVulkanRequirements **requirements);
+
+// The names of the device extensions in `requirements`, which stay valid as
+// long as the process: `*count` of them. `NULL`, and a count of 0, for
+// `NULL`.
+//
+// # Safety
+//
+// `requirements` is `NULL` or live requirements, and `count` points to a
+// `uint32_t`.
+const char *const *emberwave_vulkan_requirements_extensions(const struct EmberwaveVulkanRequirements *requirements,
+                                                            uint32_t *count);
+
+// The features in `requirements`: a `VkPhysicalDeviceFeatures2` whose
+// `features`, and the structures of its `pNext` chain, have `VK_TRUE` for
+// each feature emberwave needs. Set the same members to `VK_TRUE` in the
+// structures that make the device, or chain copies of the structures the
+// caller's chain lacks; where the caller's chain has
+// `VkPhysicalDeviceVulkan11Features`, `VkPhysicalDeviceVulkan12Features` or
+// `VkPhysicalDeviceVulkan13Features`, set the members there that hold the
+// same features instead, as Vulkan allows only one of the two. Valid while
+// `requirements` lives; `NULL` for `NULL`.
+//
+// # Safety
+//
+// `requirements` is `NULL` or live requirements.
+const void *emberwave_vulkan_requirements_features(const struct EmberwaveVulkanRequirements *requirements);
+
+// Destroys requirements. Destroying `NULL` does nothing.
+//
+// # Safety
+//
+// `requirements` is `NULL`, or requirements from
+// `emberwave_vulkan_requirements_create` that have not been destroyed.
+void emberwave_vulkan_requirements_destroy(struct EmberwaveVulkanRequirements *requirements);
+
+// Creates a context on the caller's own Vulkan device, for emberwave to
+// work on the caller's queue (decision D61). The device keeps belonging to
+// the caller, who destroys it after the context and everything made on it.
+// Only where wgpu runs on Vulkan, on Linux, Android and Windows; elsewhere
+// `EMBERWAVE_STATUS_NO_GPU`.
+//
+// The device must have been made with the extensions and the features of
+// `emberwave_vulkan_requirements_create`: a lacking extension is
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and a lacking feature undefined
+// behaviour, as Vulkan cannot tell which were enabled.
+//
+// The queue is shared:
+// - emberwave submits to it during its calls. Either nothing else uses the
+//   queue during those, or the caller gives `lock_queue` and
+//   `unlock_queue`, which emberwave holds around each submission, and
+//   while it lets go of the queue in a destroy. Do not call emberwave while
+//   holding that lock, and give every context made on one queue the same
+//   callbacks. A second queue of the family, where the device has one,
+//   needs neither.
+// - The decoders and encoders of every context made on the queue take
+//   turns at it, as on Metal (decision D60).
+// - The decodes that wait return once the GPU is done. The decodes that do
+//   not wait, `emberwave_decoder_submit_texture` and
+//   `emberwave_decoder_submit_plane_textures`, are for Metal contexts only.
+//
+// # Safety
+//
+// `device` is `NULL` or points to an `EmberwaveVulkanDevice` that describes
+// a live device made as above, with a queue of that family and index, and
+// callbacks that may be called from any thread. `context` points to where
+// the new context is stored; it is set to `NULL` when the call fails.
+enum EmberwaveStatus emberwave_context_create_vulkan(const struct EmberwaveVulkanDevice *device,
+                                                     struct EmberwaveContext **context);
 
 // Destroys a context. Decoders and encoders created on it keep working, and
 // keep the GPU device until they are destroyed as well.

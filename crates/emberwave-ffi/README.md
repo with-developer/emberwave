@@ -255,6 +255,52 @@ Vulkan and Direct3D 12 handles are not part of the interface yet.
 
 [`examples/ios`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/ios) is an iPhone and iPad app that does all of this in Swift: it times decoding into textures, decoding to planes and encoding on the device's GPU, and draws the last picture from its texture. Its README says how to run it on a phone.
 
+## A context on the client's Vulkan device
+
+On Linux, Android and Windows, where wgpu runs on Vulkan, a context can run on the client's own `VkDevice` and submit to one of its queues (decision D61). The client makes the device with what emberwave needs, besides what it needs itself:
+
+```c
+EmberwaveVulkanInstance instance = {
+    .get_instance_proc_addr = (EmberwaveVkGetInstanceProcAddr)vkGetInstanceProcAddr,
+    .instance = vk_instance,
+    .api_version = VK_API_VERSION_1_3,            /* the instance's apiVersion */
+    .extensions = instance_extensions,            /* the instance's extensions */
+    .extension_count = instance_extension_count,
+};
+EmberwaveVulkanRequirements *needs = NULL;
+emberwave_vulkan_requirements_create(&instance, physical_device, &needs);
+uint32_t count = 0;
+const char *const *names = emberwave_vulkan_requirements_extensions(needs, &count);
+const VkPhysicalDeviceFeatures2 *features = emberwave_vulkan_requirements_features(needs);
+/* ... vkCreateDevice with these extensions and features among the client's ... */
+emberwave_vulkan_requirements_destroy(needs);
+
+EmberwaveVulkanDevice device = {
+    .instance = instance,
+    .physical_device = physical_device,
+    .device = vk_device,
+    .extensions = device_extensions,              /* all the device's extensions */
+    .extension_count = device_extension_count,
+    .queue_family_index = family,
+    .queue_index = 0,
+    .lock_queue = lock_queue,                     /* NULL if nothing else uses the queue meanwhile */
+    .unlock_queue = unlock_queue,
+    .user = &queue_mutex,
+};
+EmberwaveContext *context = NULL;
+emberwave_context_create_vulkan(&device, &context);
+```
+
+- **Features.** `emberwave_vulkan_requirements_features` gives a `VkPhysicalDeviceFeatures2` whose `features`, and the structures chained to it, have `VK_TRUE` for each feature emberwave needs. Set those members in the client's own structures, or chain copies of the structures it lacks. Where the client chains `VkPhysicalDeviceVulkan11Features`, `VkPhysicalDeviceVulkan12Features` or `VkPhysicalDeviceVulkan13Features`, set the same features there: Vulkan allows only one of the two kinds. A missing extension makes `emberwave_context_create_vulkan` fail with `EMBERWAVE_STATUS_INVALID_ARGUMENT`. A missing feature is undefined behaviour, as Vulkan cannot tell which were enabled.
+- **The queue.** Vulkan requires the uses of a queue to be externally synchronised. emberwave calls `lock_queue` and `unlock_queue` with `user` around each of its submissions, and while it lets go of the queue in a destroy, from any thread.
+  - Do not call emberwave while holding that lock.
+  - Give every context on one queue the same callbacks. The decoders and encoders of those contexts take turns at the queue, as on Metal (decision D60).
+  - Without callbacks, nothing else may use the queue during emberwave's calls. A second queue of the family, where the device has one, needs neither.
+- **The device.** It stays the client's: destroy it after the context and everything made on it.
+- **For now, through CPU memory.** Decodes and encodes go through CPU memory, as on a context of `emberwave_context_create`, but on the client's device, without a second one. The decodes into the client's images, and semaphores to order them without waiting, are the next step ([#115](https://github.com/with-developer/emberwave/issues/115)).
+
+`tests/vulkan.rs` makes an instance and a device as a client does, on Linux CI's lavapipe.
+
 ## Rules
 
 - **Errors.** Functions that can fail return an `EmberwaveStatus`. After a failure, `emberwave_last_error()` describes it, for the thread that made the call, until that thread's next failure.

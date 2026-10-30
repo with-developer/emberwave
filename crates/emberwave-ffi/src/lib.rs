@@ -24,6 +24,7 @@
 use std::cell::RefCell;
 use std::ffi::{CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 use emberwave_core::bitstream::{
     ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, Error as BitstreamError, Header,
@@ -31,7 +32,7 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams};
 use emberwave_core::encode::{self, EncodeError, Signalling};
-use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions};
+use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions, QueueTurns};
 
 /// The result of a call.
 #[repr(C)]
@@ -251,7 +252,7 @@ pub struct EmberwaveContext {
 }
 
 impl EmberwaveContext {
-    /// A new context of `created`'s, on the caller's queue with
+    /// A new context of `created`'s, on the caller's Metal queue with
     /// `shared_queue`.
     fn boxed(created: GpuContext, shared_queue: bool) -> *mut Self {
         let info = created.adapter_info();
@@ -264,12 +265,24 @@ impl EmberwaveContext {
     }
 }
 
+/// Lets go of `object`, made on a context of `turns`, under the caller's lock
+/// of the queue if there is one: the last of wgpu's handles to a queue waits
+/// for it to be idle (decision D61). A panic is caught.
+fn let_go<T>(object: Box<T>, turns: Option<Arc<QueueTurns>>) {
+    let _ = catch_unwind(AssertUnwindSafe(move || match turns {
+        Some(turns) => turns.caller_locked(move || drop(object)),
+        None => drop(object),
+    }));
+}
+
 /// Decodes the frames of one stream: one picture size and chroma format.
 pub struct EmberwaveDecoder {
     decoder: Decoder,
-    /// Whether the decoder's context runs on the caller's own queue, which
-    /// the decoder keeps when the context is destroyed.
+    /// Whether the decoder's context runs on the caller's own Metal queue,
+    /// which the decoder keeps when the context is destroyed.
     shared_queue: bool,
+    /// The turns at the queue of the decoder's context, if it has any.
+    turns: Option<Arc<QueueTurns>>,
 }
 
 /// A texture on a decoder's GPU device that the decodes into textures fill
@@ -353,6 +366,8 @@ impl EmberwaveTexture {
 /// chroma format.
 pub struct EmberwaveEncoder {
     encoder: Encoder,
+    /// The turns at the queue of the encoder's context, if it has any.
+    turns: Option<Arc<QueueTurns>>,
 }
 
 thread_local! {
@@ -1029,19 +1044,23 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
         .map_err(|error| Failure(EmberwaveStatus::NoGpu, error.to_string()))?;
     // Contexts made on one queue share its room for command buffers: their
     // decoders and encoders take turns at it (#126, decision D60).
-    Ok(
-        GpuContext::from_device(adapter, device, queue)
-            .with_queue_turns(queue_turns(queue_address)),
-    )
+    Ok(GpuContext::from_device(adapter, device, queue)
+        .with_queue_turns(queue_turns(queue_address, QueueTurns::new)))
 }
 
-/// The turns of the contexts made on the Metal queue at `address`: the same
-/// for each, while a context, decoder or encoder made on it lives. Those
-/// keep the queue, so that no other queue takes its address meanwhile.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn queue_turns(address: usize) -> std::sync::Arc<emberwave_core::gpu::QueueTurns> {
-    use emberwave_core::gpu::QueueTurns;
-    use std::sync::{Arc, Mutex, PoisonError, Weak};
+/// The turns of the contexts made on the queue at `address`, a Metal queue
+/// or a `VkQueue`: the same for each, while a context, decoder or encoder
+/// made on it lives, and made by `make` for the first. Those keep the
+/// queue, so that no other queue takes its address meanwhile.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android",
+    windows
+))]
+fn queue_turns(address: usize, make: impl FnOnce() -> QueueTurns) -> Arc<QueueTurns> {
+    use std::sync::{Mutex, PoisonError, Weak};
     static TURNS: Mutex<Vec<(usize, Weak<QueueTurns>)>> = Mutex::new(Vec::new());
     let mut all = TURNS.lock().unwrap_or_else(PoisonError::into_inner);
     all.retain(|(_, turns)| turns.strong_count() > 0);
@@ -1052,7 +1071,7 @@ fn queue_turns(address: usize) -> std::sync::Arc<emberwave_core::gpu::QueueTurns
     {
         return turns;
     }
-    let turns = Arc::new(QueueTurns::new());
+    let turns = Arc::new(make());
     all.push((address, Arc::downgrade(&turns)));
     turns
 }
@@ -1063,6 +1082,551 @@ unsafe fn metal_context(_device: *mut c_void, _queue: *mut c_void) -> Result<Gpu
         EmberwaveStatus::NoGpu,
         "Metal contexts are made on iPhones, iPads and Macs only".into(),
     ))
+}
+
+/// `vkGetInstanceProcAddr` of a Vulkan loader, as the C API takes it: cast
+/// the loader's function to this type. Vulkan's calling convention is C's on
+/// the 64-bit systems emberwave runs on.
+pub type EmberwaveVkGetInstanceProcAddr = Option<
+    unsafe extern "C" fn(
+        instance: *mut c_void,
+        name: *const c_char,
+    ) -> Option<unsafe extern "C" fn()>,
+>;
+
+/// A Vulkan instance of the caller's (decision D61).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EmberwaveVulkanInstance {
+    /// `vkGetInstanceProcAddr` of the loader the instance was made with.
+    pub get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
+    /// The `VkInstance`.
+    pub instance: *mut c_void,
+    /// The `apiVersion` the instance was made with, such as
+    /// `VK_API_VERSION_1_3`.
+    pub api_version: u32,
+    /// The instance extensions it was made with: `extension_count` names, or
+    /// `NULL` for none.
+    pub extensions: *const *const c_char,
+    /// How many names `extensions` holds.
+    pub extension_count: u32,
+}
+
+/// A Vulkan device of the caller's, and the queue of it that emberwave is to
+/// submit to (decision D61).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EmberwaveVulkanDevice {
+    /// The instance the device was made with.
+    pub instance: EmberwaveVulkanInstance,
+    /// The `VkPhysicalDevice` the device was made on.
+    pub physical_device: *mut c_void,
+    /// The `VkDevice`, made with the extensions and features that
+    /// `emberwave_vulkan_requirements_create` lists, and more if the caller
+    /// needs them.
+    pub device: *mut c_void,
+    /// The device extensions the device was made with: `extension_count`
+    /// names.
+    pub extensions: *const *const c_char,
+    /// How many names `extensions` holds.
+    pub extension_count: u32,
+    /// The family of the queue emberwave submits to.
+    pub queue_family_index: u32,
+    /// Which queue of that family, as for `vkGetDeviceQueue`.
+    pub queue_index: u32,
+    /// Takes the caller's lock of the queue, waiting for it to be free:
+    /// Vulkan requires the uses of a queue to be externally synchronised.
+    /// emberwave calls it with `user` around each submission, and while it
+    /// lets go of the queue, never twice without `unlock_queue` between,
+    /// from any thread. `NULL`, with `unlock_queue` `NULL` too, if nothing
+    /// else uses the queue during emberwave's calls.
+    pub lock_queue: Option<unsafe extern "C" fn(user: *mut c_void)>,
+    /// Frees the caller's lock of the queue that `lock_queue` took.
+    pub unlock_queue: Option<unsafe extern "C" fn(user: *mut c_void)>,
+    /// Passed to `lock_queue` and `unlock_queue`.
+    pub user: *mut c_void,
+}
+
+/// What emberwave needs a Vulkan device of the caller's to have enabled:
+/// device extensions and features, from
+/// `emberwave_vulkan_requirements_create`.
+pub struct EmberwaveVulkanRequirements {
+    /// The extensions' names, which live as long as the process.
+    extensions: Vec<*const c_char>,
+    /// A `VkPhysicalDeviceFeatures2`, whose chain `_held` keeps.
+    features: *const c_void,
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    _held: vulkan::Held,
+}
+
+/// Lists what a Vulkan device of the caller's must have enabled for
+/// `emberwave_context_create_vulkan`, on the physical device
+/// `physical_device` of `instance` (decision D61): the extensions, which
+/// `emberwave_vulkan_requirements_extensions` gives, and the features, which
+/// `emberwave_vulkan_requirements_features` gives. Make the device with
+/// them, and with whatever else the caller needs. Only where wgpu runs on
+/// Vulkan, on Linux, Android and Windows; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+/// `EMBERWAVE_STATUS_NO_GPU` too for a physical device wgpu cannot use.
+///
+/// # Safety
+///
+/// `instance` is `NULL` or points to an `EmberwaveVulkanInstance` that
+/// describes a live instance, and `physical_device` is `NULL` or a physical
+/// device of it. `requirements` points to where the new requirements are
+/// stored; it is set to `NULL` when the call fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_vulkan_requirements_create(
+    instance: *const EmberwaveVulkanInstance,
+    physical_device: *mut c_void,
+    requirements: *mut *mut EmberwaveVulkanRequirements,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        unsafe { output(requirements, "requirements", std::ptr::null_mut()) }?;
+        // SAFETY: as the caller promises.
+        let Some(instance) = (unsafe { instance.as_ref() }) else {
+            return Err(Failure::argument("instance is NULL"));
+        };
+        // SAFETY: as the caller promises.
+        let made = unsafe { vulkan_requirements(instance, physical_device) }?;
+        // SAFETY: checked by the first output() above.
+        unsafe { requirements.write(Box::into_raw(Box::new(made))) };
+        Ok(())
+    })
+}
+
+/// The names of the device extensions in `requirements`, which stay valid as
+/// long as the process: `*count` of them. `NULL`, and a count of 0, for
+/// `NULL`.
+///
+/// # Safety
+///
+/// `requirements` is `NULL` or live requirements, and `count` points to a
+/// `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_vulkan_requirements_extensions(
+    requirements: *const EmberwaveVulkanRequirements,
+    count: *mut u32,
+) -> *const *const c_char {
+    // SAFETY: as the caller promises.
+    let names = unsafe { requirements.as_ref() }.map_or(&[][..], |r| &r.extensions[..]);
+    if !count.is_null() {
+        // SAFETY: as the caller promises.
+        unsafe { count.write(names.len() as u32) };
+    }
+    if names.is_empty() {
+        std::ptr::null()
+    } else {
+        names.as_ptr()
+    }
+}
+
+/// The features in `requirements`: a `VkPhysicalDeviceFeatures2` whose
+/// `features`, and the structures of its `pNext` chain, have `VK_TRUE` for
+/// each feature emberwave needs. Set the same members to `VK_TRUE` in the
+/// structures that make the device, or chain copies of the structures the
+/// caller's chain lacks; where the caller's chain has
+/// `VkPhysicalDeviceVulkan11Features`, `VkPhysicalDeviceVulkan12Features` or
+/// `VkPhysicalDeviceVulkan13Features`, set the members there that hold the
+/// same features instead, as Vulkan allows only one of the two. Valid while
+/// `requirements` lives; `NULL` for `NULL`.
+///
+/// # Safety
+///
+/// `requirements` is `NULL` or live requirements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_vulkan_requirements_features(
+    requirements: *const EmberwaveVulkanRequirements,
+) -> *const c_void {
+    // SAFETY: as the caller promises.
+    unsafe { requirements.as_ref() }.map_or(std::ptr::null(), |r| r.features)
+}
+
+/// Destroys requirements. Destroying `NULL` does nothing.
+///
+/// # Safety
+///
+/// `requirements` is `NULL`, or requirements from
+/// `emberwave_vulkan_requirements_create` that have not been destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_vulkan_requirements_destroy(
+    requirements: *mut EmberwaveVulkanRequirements,
+) {
+    if !requirements.is_null() {
+        // SAFETY: it came from Box::into_raw, as the caller promises.
+        let boxed = unsafe { Box::from_raw(requirements) };
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+    }
+}
+
+/// Creates a context on the caller's own Vulkan device, for emberwave to
+/// work on the caller's queue (decision D61). The device keeps belonging to
+/// the caller, who destroys it after the context and everything made on it.
+/// Only where wgpu runs on Vulkan, on Linux, Android and Windows; elsewhere
+/// `EMBERWAVE_STATUS_NO_GPU`.
+///
+/// The device must have been made with the extensions and the features of
+/// `emberwave_vulkan_requirements_create`: a lacking extension is
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and a lacking feature undefined
+/// behaviour, as Vulkan cannot tell which were enabled.
+///
+/// The queue is shared:
+/// - emberwave submits to it during its calls. Either nothing else uses the
+///   queue during those, or the caller gives `lock_queue` and
+///   `unlock_queue`, which emberwave holds around each submission, and
+///   while it lets go of the queue in a destroy. Do not call emberwave while
+///   holding that lock, and give every context made on one queue the same
+///   callbacks. A second queue of the family, where the device has one,
+///   needs neither.
+/// - The decoders and encoders of every context made on the queue take
+///   turns at it, as on Metal (decision D60).
+/// - The decodes that wait return once the GPU is done. The decodes that do
+///   not wait, `emberwave_decoder_submit_texture` and
+///   `emberwave_decoder_submit_plane_textures`, are for Metal contexts only.
+///
+/// # Safety
+///
+/// `device` is `NULL` or points to an `EmberwaveVulkanDevice` that describes
+/// a live device made as above, with a queue of that family and index, and
+/// callbacks that may be called from any thread. `context` points to where
+/// the new context is stored; it is set to `NULL` when the call fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_context_create_vulkan(
+    device: *const EmberwaveVulkanDevice,
+    context: *mut *mut EmberwaveContext,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        unsafe { output(context, "context", std::ptr::null_mut()) }?;
+        // SAFETY: as the caller promises.
+        let Some(device) = (unsafe { device.as_ref() }) else {
+            return Err(Failure::argument("device is NULL"));
+        };
+        // SAFETY: as the caller promises.
+        let created = unsafe { vulkan_context(device) }?;
+        // SAFETY: checked by the first output() above.
+        unsafe { context.write(EmberwaveContext::boxed(created, false)) };
+        Ok(())
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+unsafe fn vulkan_requirements(
+    instance: &EmberwaveVulkanInstance,
+    physical_device: *mut c_void,
+) -> Result<EmberwaveVulkanRequirements, Failure> {
+    // SAFETY: as the caller promises.
+    unsafe { vulkan::requirements(instance, physical_device) }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+unsafe fn vulkan_requirements(
+    _instance: &EmberwaveVulkanInstance,
+    _physical_device: *mut c_void,
+) -> Result<EmberwaveVulkanRequirements, Failure> {
+    Err(vulkan_elsewhere())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+unsafe fn vulkan_context(device: &EmberwaveVulkanDevice) -> Result<GpuContext, Failure> {
+    // SAFETY: as the caller promises.
+    unsafe { vulkan::context(device) }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+unsafe fn vulkan_context(_device: &EmberwaveVulkanDevice) -> Result<GpuContext, Failure> {
+    Err(vulkan_elsewhere())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+fn vulkan_elsewhere() -> Failure {
+    Failure(
+        EmberwaveStatus::NoGpu,
+        "Vulkan contexts are made on Linux, Android and Windows only".into(),
+    )
+}
+
+/// The Vulkan side of `emberwave_vulkan_requirements_create` and
+/// `emberwave_context_create_vulkan`, through wgpu's Vulkan objects made
+/// from the caller's (decision D61).
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+mod vulkan {
+    use std::ffi::{CStr, c_char, c_void};
+
+    use ash::vk::{self, Handle};
+    use emberwave_core::gpu::{CallerQueueLock, GpuContext, GpuOptions, QueueTurns};
+    use wgpu::hal::api::Vulkan;
+
+    use super::{
+        EmberwaveStatus, EmberwaveVulkanDevice, EmberwaveVulkanInstance,
+        EmberwaveVulkanRequirements, Failure, queue_turns,
+    };
+
+    /// What keeps the chain of an `EmberwaveVulkanRequirements` alive.
+    pub(super) type Held = (
+        Box<wgpu::hal::vulkan::PhysicalDeviceFeatures>,
+        Box<vk::PhysicalDeviceFeatures2<'static>>,
+    );
+
+    /// The `count` names at `names`, none for a count of 0.
+    ///
+    /// # Safety
+    ///
+    /// `names` is `NULL` or points to `count` pointers, each `NULL` or a C
+    /// string that lives as long as the result.
+    unsafe fn names<'a>(
+        names: *const *const c_char,
+        count: u32,
+        what: &str,
+    ) -> Result<Vec<&'a CStr>, Failure> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if names.is_null() {
+            return Err(Failure::argument(format!(
+                "{what} is NULL, with a count of {count}"
+            )));
+        }
+        // SAFETY: `count` pointers, as the caller promises.
+        let pointers = unsafe { std::slice::from_raw_parts(names, count as usize) };
+        pointers
+            .iter()
+            .map(|&name| {
+                if name.is_null() {
+                    Err(Failure::argument(format!("a name in {what} is NULL")))
+                } else {
+                    // SAFETY: a C string, as the caller promises.
+                    Ok(unsafe { CStr::from_ptr(name) })
+                }
+            })
+            .collect()
+    }
+
+    fn no_gpu(error: impl std::fmt::Display) -> Failure {
+        Failure(EmberwaveStatus::NoGpu, error.to_string())
+    }
+
+    /// wgpu's adapter on `physical_device` of the caller's `instance`.
+    ///
+    /// # Safety
+    ///
+    /// As for `emberwave_vulkan_requirements_create`.
+    unsafe fn adapter(
+        instance: &EmberwaveVulkanInstance,
+        physical_device: *mut c_void,
+    ) -> Result<wgpu::Adapter, Failure> {
+        let Some(get_instance_proc_addr) = instance.get_instance_proc_addr else {
+            return Err(Failure::argument("get_instance_proc_addr is NULL"));
+        };
+        if instance.instance.is_null() {
+            return Err(Failure::argument("instance is NULL"));
+        }
+        if physical_device.is_null() {
+            return Err(Failure::argument("physical_device is NULL"));
+        }
+        // SAFETY: the loader's vkGetInstanceProcAddr, as the caller
+        // promises: that signature, with Vulkan's calling convention, which
+        // is C's on the 64-bit systems emberwave runs on.
+        let get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr =
+            unsafe { std::mem::transmute(get_instance_proc_addr) };
+        // SAFETY: a loader's vkGetInstanceProcAddr.
+        let entry = unsafe {
+            ash::Entry::from_static_fn(ash::StaticFn {
+                get_instance_proc_addr,
+            })
+        };
+        let raw_instance = vk::Instance::from_raw(instance.instance as usize as u64);
+        // SAFETY: a live instance of that loader, as the caller promises.
+        let ash_instance = unsafe { ash::Instance::load(entry.static_fn(), raw_instance) };
+        // SAFETY: as the caller promises.
+        let enabled = unsafe {
+            names(
+                instance.extensions,
+                instance.extension_count,
+                "the instance's extensions",
+            )
+        }?;
+        // The instance extensions wgpu uses, where the caller enabled them.
+        let flags = wgpu::InstanceFlags::empty();
+        let extensions: Vec<&'static CStr> =
+            wgpu::hal::vulkan::Instance::desired_extensions(&entry, instance.api_version, flags)
+                .map_err(no_gpu)?
+                .into_iter()
+                .filter(|name| enabled.contains(name))
+                .collect();
+        // SAFETY: the instance was made from `entry`, with `api_version`
+        // and with `extensions` among its extensions, as the caller
+        // promises. Given a drop callback, wgpu leaves it to the caller.
+        let hal = unsafe {
+            wgpu::hal::vulkan::Instance::from_raw(
+                entry,
+                ash_instance,
+                instance.api_version,
+                0,
+                None,
+                extensions,
+                flags,
+                Default::default(),
+                false,
+                Some(Box::new(|| {})),
+            )
+        }
+        .map_err(no_gpu)?;
+        let exposed = hal
+            .expose_adapter(vk::PhysicalDevice::from_raw(
+                physical_device as usize as u64,
+            ))
+            .ok_or_else(|| no_gpu("wgpu cannot run on that physical device"))?;
+        // SAFETY: an instance of wgpu's Vulkan.
+        let wgpu_instance = unsafe { wgpu::Instance::from_hal::<Vulkan>(hal) };
+        // SAFETY: an adapter of that instance.
+        Ok(unsafe { wgpu_instance.create_adapter_from_hal(exposed) })
+    }
+
+    /// See `emberwave_vulkan_requirements_create`.
+    ///
+    /// # Safety
+    ///
+    /// As for `emberwave_vulkan_requirements_create`.
+    pub(super) unsafe fn requirements(
+        instance: &EmberwaveVulkanInstance,
+        physical_device: *mut c_void,
+    ) -> Result<EmberwaveVulkanRequirements, Failure> {
+        // SAFETY: as the caller promises.
+        let adapter = unsafe { adapter(instance, physical_device) }?;
+        let descriptor = GpuContext::device_descriptor(&adapter, &GpuOptions::default());
+        // SAFETY: only read.
+        let hal =
+            unsafe { adapter.as_hal::<Vulkan>() }.ok_or_else(|| no_gpu("not a Vulkan adapter"))?;
+        let names = hal.required_device_extensions(descriptor.required_features);
+        let mut features =
+            Box::new(hal.physical_device_features(&names, descriptor.required_features));
+        // wgpu chains the structures it needs; the boxes keep them where the
+        // chain points.
+        let chain = features
+            .add_to_device_create(vk::DeviceCreateInfo::default())
+            .p_next;
+        let mut features2 =
+            Box::new(vk::PhysicalDeviceFeatures2::default().features(features.get_core()));
+        features2.p_next = chain.cast_mut();
+        let pointer = std::ptr::from_ref::<vk::PhysicalDeviceFeatures2<'static>>(&features2).cast();
+        Ok(EmberwaveVulkanRequirements {
+            extensions: names.iter().map(|name| name.as_ptr()).collect(),
+            features: pointer,
+            _held: (features, features2),
+        })
+    }
+
+    /// The caller's lock of a queue, through its callbacks.
+    struct Callbacks {
+        lock: unsafe extern "C" fn(user: *mut c_void),
+        unlock: unsafe extern "C" fn(user: *mut c_void),
+        user: *mut c_void,
+    }
+
+    // SAFETY: the caller promises that its callbacks may be called with
+    // `user` from any thread.
+    unsafe impl Send for Callbacks {}
+    // SAFETY: as above.
+    unsafe impl Sync for Callbacks {}
+
+    impl CallerQueueLock for Callbacks {
+        fn lock(&self) {
+            // SAFETY: the caller's callback, as it promises.
+            unsafe { (self.lock)(self.user) }
+        }
+
+        fn unlock(&self) {
+            // SAFETY: as above.
+            unsafe { (self.unlock)(self.user) }
+        }
+    }
+
+    /// See `emberwave_context_create_vulkan`.
+    ///
+    /// # Safety
+    ///
+    /// As for `emberwave_context_create_vulkan`.
+    pub(super) unsafe fn context(device: &EmberwaveVulkanDevice) -> Result<GpuContext, Failure> {
+        if device.device.is_null() {
+            return Err(Failure::argument("device is NULL"));
+        }
+        let lock = match (device.lock_queue, device.unlock_queue) {
+            (Some(lock), Some(unlock)) => Some(Callbacks {
+                lock,
+                unlock,
+                user: device.user,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(Failure::argument(
+                    "lock_queue and unlock_queue are both given or both NULL",
+                ));
+            }
+        };
+        // SAFETY: as the caller promises.
+        let enabled = unsafe {
+            names(
+                device.extensions,
+                device.extension_count,
+                "the device's extensions",
+            )
+        }?;
+        // SAFETY: as the caller promises.
+        let adapter = unsafe { adapter(&device.instance, device.physical_device) }?;
+        let descriptor = GpuContext::device_descriptor(&adapter, &GpuOptions::default());
+        let (open, queue) = {
+            // SAFETY: only read.
+            let hal = unsafe { adapter.as_hal::<Vulkan>() }
+                .ok_or_else(|| no_gpu("not a Vulkan adapter"))?;
+            let required = hal.required_device_extensions(descriptor.required_features);
+            if let Some(missing) = required.iter().find(|name| !enabled.contains(name)) {
+                return Err(Failure::argument(format!(
+                    "the device lacks {}, which emberwave_vulkan_requirements_extensions lists",
+                    missing.to_string_lossy()
+                )));
+            }
+            let instance = hal.shared_instance().raw_instance();
+            // SAFETY: a live device of that instance, as the caller promises.
+            let raw = unsafe {
+                ash::Device::load(
+                    instance.fp_v1_0(),
+                    vk::Device::from_raw(device.device as usize as u64),
+                )
+            };
+            // SAFETY: a queue the device was made with, as the caller
+            // promises.
+            let queue =
+                unsafe { raw.get_device_queue(device.queue_family_index, device.queue_index) };
+            // SAFETY: the device was made on the adapter's physical device,
+            // with that queue, the required extensions among its own and
+            // the features wgpu needs for these, as the caller promises.
+            // Given a drop callback, wgpu leaves it to the caller.
+            let open = unsafe {
+                hal.device_from_raw(
+                    raw,
+                    Some(Box::new(|| {})),
+                    &required,
+                    descriptor.required_features,
+                    &descriptor.required_limits,
+                    &descriptor.memory_hints,
+                    device.queue_family_index,
+                    device.queue_index,
+                )
+            }
+            .map_err(no_gpu)?;
+            (open, queue)
+        };
+        // SAFETY: a device opened on this adapter with the descriptor's
+        // features and limits.
+        let (wgpu_device, wgpu_queue) =
+            unsafe { adapter.create_device_from_hal(open, &descriptor) }.map_err(no_gpu)?;
+        let turns = queue_turns(queue.as_raw() as usize, || match lock {
+            Some(lock) => QueueTurns::with_caller_lock(Box::new(lock)),
+            None => QueueTurns::new(),
+        });
+        Ok(GpuContext::from_device(adapter, wgpu_device, wgpu_queue).with_queue_turns(turns))
+    }
 }
 
 /// Destroys a context. Decoders and encoders created on it keep working, and
@@ -1083,7 +1647,8 @@ pub unsafe extern "C" fn emberwave_context_destroy(context: *mut EmberwaveContex
     if !context.is_null() {
         // SAFETY: it came from Box::into_raw, as the caller promises.
         let boxed = unsafe { Box::from_raw(context) };
-        let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+        let turns = boxed.context.queue_turns().cloned();
+        let_go(boxed, turns);
     }
 }
 
@@ -1136,6 +1701,7 @@ pub unsafe extern "C" fn emberwave_decoder_create(
         let boxed = Box::new(EmberwaveDecoder {
             decoder: created,
             shared_queue: context.shared_queue,
+            turns: context.context.queue_turns().cloned(),
         });
         // SAFETY: checked by the first output() above.
         unsafe { decoder.write(Box::into_raw(boxed)) };
@@ -1159,7 +1725,8 @@ pub unsafe extern "C" fn emberwave_decoder_destroy(decoder: *mut EmberwaveDecode
     if !decoder.is_null() {
         // SAFETY: it came from Box::into_raw, as the caller promises.
         let boxed = unsafe { Box::from_raw(decoder) };
-        let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+        let turns = boxed.turns.clone();
+        let_go(boxed, turns);
     }
 }
 
@@ -2000,8 +2567,8 @@ fn require_shared_queue(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
         Ok(())
     } else {
         Err(Failure::argument(
-            "the decoder's context is not on the caller's queue \
-             (emberwave_context_create_metal), so nothing would order the \
+            "the decoder's context is not on the caller's Metal queue \
+             (emberwave_context_create_metal), where the queue orders the \
              caller's reads after the decode: use the decode that waits",
         ))
     }
@@ -2238,7 +2805,10 @@ pub unsafe extern "C" fn emberwave_encoder_create(
         };
         let created = Encoder::new(&context.context, width, height, chroma, signalling)
             .map_err(creation_failure)?;
-        let boxed = Box::new(EmberwaveEncoder { encoder: created });
+        let boxed = Box::new(EmberwaveEncoder {
+            encoder: created,
+            turns: context.context.queue_turns().cloned(),
+        });
         // SAFETY: checked by the first output() above.
         unsafe { encoder.write(Box::into_raw(boxed)) };
         Ok(())
@@ -2261,7 +2831,8 @@ pub unsafe extern "C" fn emberwave_encoder_destroy(encoder: *mut EmberwaveEncode
     if !encoder.is_null() {
         // SAFETY: it came from Box::into_raw, as the caller promises.
         let boxed = unsafe { Box::from_raw(encoder) };
-        let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+        let turns = boxed.turns.clone();
+        let_go(boxed, turns);
     }
 }
 

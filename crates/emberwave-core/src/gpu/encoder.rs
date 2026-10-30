@@ -26,7 +26,7 @@ use crate::encode::{
     stream_header,
 };
 
-use super::context::{GpuContext, QueueTurns, notice_loss, take_turn};
+use super::context::{GpuContext, QueueTurns, notice_loss, submit, take_turn};
 use super::error::GpuError;
 use super::layout::{
     BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
@@ -588,7 +588,7 @@ impl Encoder {
             self.encode_rate_control(&mut encoder, queries);
             self.encode_packing(&mut encoder, queries);
             self.encode_read_back(&mut encoder, capacity_words);
-            self.queue.submit([encoder.finish()]);
+            submit(&self.queue, turns.as_deref(), [encoder.finish()]);
         })?;
         recording.submitted();
         drop(recording);

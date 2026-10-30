@@ -889,7 +889,11 @@ fn a_decode_without_a_wait_needs_the_callers_own_queue() {
             emberwave_decoder_submit_texture(decoder, ptr::null(), picture),
             EmberwaveStatus::InvalidArgument
         );
-        assert!(last_error().contains("caller's queue"), "{}", last_error());
+        assert!(
+            last_error().contains("caller's Metal queue"),
+            "{}",
+            last_error()
+        );
         assert_eq!(
             emberwave_decoder_submit_plane_textures(decoder, y, cb, cr),
             EmberwaveStatus::InvalidArgument

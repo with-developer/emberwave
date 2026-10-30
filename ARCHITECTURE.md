@@ -1479,3 +1479,32 @@ The queues wgpu makes itself have room for 4096 command buffers.
   - 4 encoder threads on one context on a shared queue of 64 hung in 2 of 3 runs before, and in none of 3 after.
   - Decodes on one context on a shared queue cost the same from 1 thread, about a tenth more from 2 (0.41 to 0.46 ms a call) and 4 % less from 4.
   - Contexts on their own queues decode and encode as before, within 3 % from 1, 2 and 4 threads.
+
+### 2026-10-30 — D61: Vulkan devices of the caller's, the context first
+
+**Context.** Clients and hosts on Linux and Windows hold their pictures in Vulkan or Direct3D textures, and the C API's GPU interop was Metal's only (D43, D44). #115 read what wgpu 30 offers: a wgpu device on the caller's `VkDevice` (`Instance::from_raw`, `expose_adapter`, `Adapter::device_from_raw`), the caller's images (`Device::texture_from_raw`), and semaphores to wait on and signal (`Queue::add_wait_semaphore`, `add_signal_semaphore`). There is no wgpu device on a caller's `ID3D12Device`, only shared handles opened on wgpu's own.
+
+**Decision.** The six choices of #115, decided there on 2026-10-30:
+1. **Vulkan: the caller's device and queue.** As on Metal: one device and no copies. The C API tells the caller what to enable before it makes the device.
+2. **The queue: the caller's lock.** The caller names the queue, and may pass lock and unlock callbacks, as FFmpeg's `AVVulkanDeviceContext` and libplacebo take them. Without callbacks, nothing else uses the queue during emberwave's calls.
+3. **Ordering: semaphores per call, beside the calls that wait.**
+4. **Direct3D: shared NT handles opened on emberwave's device, Direct3D 11 included.** Ordering is by a shared fence. Keyed mutexes are out of scope.
+5. **Tests: lavapipe and WARP in CI.**
+6. **The portability rule.** These are optional entry points beside the portable API, each behind its platform's `cfg`.
+
+This first step is the context:
+- **What to enable.** `emberwave_vulkan_requirements_create` lists the device extensions and features that wgpu needs for emberwave's device descriptor on the caller's instance and physical device (`required_device_extensions`, `physical_device_features`). The features come as a `VkPhysicalDeviceFeatures2` chain of wgpu's own structures, for the caller to merge into its own.
+- **The context.** `emberwave_context_create_vulkan` makes wgpu's instance, adapter and device from the caller's handles. Given drop callbacks, wgpu leaves the instance and the device to the caller. A device that lacks a listed extension is refused; features cannot be checked.
+- **The queue lock.** The caller's callbacks become a `CallerQueueLock` of the turns of D60 (`QueueTurns::with_caller_lock`). emberwave holds it around each of its submissions, and while it lets go of a context, decoder or encoder, since wgpu-core's `Queue::drop` waits for the queue to be idle. Contexts made on one `VkQueue` share their turns.
+- **Where.** Only where wgpu runs on Vulkan: Linux, Android and Windows. Elsewhere the calls give `EMBERWAVE_STATUS_NO_GPU`, as the Metal ones do off Apple's systems.
+
+Next come the caller's images, and the images of emberwave's textures, with semaphores per call. Direct3D 12 through shared handles follows.
+
+**Consequence.**
+- **Tests.** `tests/vulkan.rs` makes an instance and a device as a client would, with exactly what emberwave lists, on Linux CI's lavapipe.
+  - A context on that device decodes and encodes byte for byte as one of emberwave's own.
+  - Two contexts on one queue, each used from a thread, hold the client's lock around every submission and free it every time.
+  - A device without the listed extensions is refused.
+  - A real driver's behaviour and a second process are not tested.
+- **The type check.** On macOS the Vulkan code type-checks only with wgpu's `vulkan-portability`, which the workspace does not enable: CI's Linux and Windows jobs compile it.
+- **What the step does not yet do.** Decodes and encodes on such a context still go through CPU memory, but on the caller's device rather than a second one.
