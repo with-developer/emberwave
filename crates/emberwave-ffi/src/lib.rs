@@ -27,12 +27,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use emberwave_core::bitstream::{
-    ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, Error as BitstreamError, Header,
-    Pwv1Header, SequenceHeader, TransferFunction, YcbcrRange, YcbcrTransform,
+    ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, Error as BitstreamError,
+    FrameLayout, Header, Pwv1Header, SequenceHeader, TransferFunction, YcbcrRange, YcbcrTransform,
 };
 use emberwave_core::color::{ColorMatrix, ColorParams};
 use emberwave_core::encode::{self, EncodeError, Signalling};
-use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions, QueueTurns};
+use emberwave_core::gpu::{
+    Decoder, Encoder, GpuContext, GpuError, GpuOptions, QueueTurns, TexturePicture,
+};
 
 /// The result of a call.
 #[repr(C)]
@@ -113,15 +115,26 @@ pub const EMBERWAVE_TEXTURE_RGBA8: u32 = 0;
 /// surfaces, onto which a copy needs the same order.
 pub const EMBERWAVE_TEXTURE_BGRA8: u32 = 1;
 
-/// The luma plane, for `emberwave_texture_create_plane` and
-/// `emberwave_texture_from_metal_plane`.
+/// The luma plane, for `emberwave_texture_create_plane`, the functions that
+/// wrap a plane of the caller's for decodes
+/// (`emberwave_texture_from_metal_plane`,
+/// `emberwave_texture_from_vulkan_plane`), and those that wrap one to encode
+/// (`emberwave_texture_from_metal_source`,
+/// `emberwave_texture_from_vulkan_source`).
 pub const EMBERWAVE_PLANE_Y: u32 = 0;
-/// The blue-difference chroma plane, for `emberwave_texture_create_plane` and
-/// `emberwave_texture_from_metal_plane`.
+/// The blue-difference chroma plane, for the same functions as
+/// `EMBERWAVE_PLANE_Y`.
 pub const EMBERWAVE_PLANE_CB: u32 = 1;
-/// The red-difference chroma plane, for `emberwave_texture_create_plane` and
-/// `emberwave_texture_from_metal_plane`.
+/// The red-difference chroma plane, for the same functions as
+/// `EMBERWAVE_PLANE_Y`.
 pub const EMBERWAVE_PLANE_CR: u32 = 2;
+/// The two chroma planes interleaved in one texture of two unsigned
+/// normalised 8-bit channels, Cb in the first and Cr in the second, as the
+/// second plane of NV12 holds them: `MTLPixelFormatRG8Unorm` in Metal,
+/// `VK_FORMAT_R8G8_UNORM` in Vulkan. Only for the textures encoders read,
+/// `emberwave_texture_from_metal_source` and
+/// `emberwave_texture_from_vulkan_source` (decision D62).
+pub const EMBERWAVE_PLANE_CBCR: u32 = 3;
 
 /// How `emberwave_context_create` chooses the GPU.
 #[repr(C)]
@@ -297,9 +310,18 @@ pub struct EmberwaveDecoder {
 /// `emberwave_decoder_decode_plane_textures` and
 /// `emberwave_decoder_submit_plane_textures`, for the caller's graphics API
 /// to read on the GPU. emberwave makes it (`emberwave_texture_create`,
-/// `emberwave_texture_create_plane`), or wraps a Metal texture of the
-/// caller's (`emberwave_texture_from_metal`,
-/// `emberwave_texture_from_metal_plane`).
+/// `emberwave_texture_create_plane`), or wraps a Metal texture or a Vulkan
+/// image of the caller's (`emberwave_texture_from_metal`,
+/// `emberwave_texture_from_metal_plane`, `emberwave_texture_from_vulkan`,
+/// `emberwave_texture_from_vulkan_plane`).
+///
+/// Or a texture of the caller's that holds a plane of a picture to encode,
+/// for `emberwave_encoder_encode_textures` to read
+/// (`emberwave_texture_from_metal_source`,
+/// `emberwave_texture_from_vulkan_source`, decision D62). A texture of a
+/// plane serves the decoders and encoders of its context whose pictures
+/// have planes of its size, so planes a decode put into textures can be
+/// encoded again.
 ///
 /// How the decodes and the caller's reads of a texture are ordered:
 /// - On a context of `emberwave_context_create`, emberwave works on a queue
@@ -329,11 +351,12 @@ pub struct EmberwaveDecoder {
 pub struct EmberwaveTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
-    /// The context whose device it is on, which decodes into it must use.
+    /// The context whose device it is on, which decodes into it and encodes
+    /// from it must use.
     context_id: u64,
-    /// The plane the texture is for, or `None` for the RGB picture. A plane
-    /// of 4:4:4 has the size of the others, so only this tells them apart.
-    plane: Option<Component>,
+    /// What the texture holds. A plane of 4:4:4 has the size of the others,
+    /// so only this tells them apart.
+    holds: Holds,
     /// Whether Metal tracks the texture's hazards, which the decodes that do
     /// not wait need (decision D43). Those emberwave makes are tracked, and
     /// a caller's texture from a heap usually is not.
@@ -359,25 +382,137 @@ impl EmberwaveTexture {
         texture: wgpu::Texture,
         plane: Option<Component>,
     ) -> *mut Self {
-        Box::into_raw(Box::new(Self::wrap(decoder, texture, plane, true)))
+        let wrapping = Wrapping::decoder(decoder, plane);
+        Box::into_raw(Box::new(Self::wrap(&wrapping, texture, true)))
     }
 
-    /// `texture`, of `decoder`'s device, for `plane` or for the RGB picture.
-    fn wrap(
-        decoder: &EmberwaveDecoder,
-        texture: wgpu::Texture,
-        plane: Option<Component>,
-        tracked: bool,
-    ) -> Self {
+    /// `texture`, on the device of `wrapping` and for what it holds.
+    fn wrap(wrapping: &Wrapping<'_>, texture: wgpu::Texture, tracked: bool) -> Self {
         let view = texture.create_view(&Default::default());
         Self {
             texture,
             view,
-            context_id: decoder.decoder.context_id(),
-            plane,
+            context_id: wrapping.context_id,
+            holds: wrapping.holds,
             tracked,
-            vulkan: decoder.vulkan,
+            vulkan: wrapping.vulkan,
         }
+    }
+}
+
+/// What an `EmberwaveTexture` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holds {
+    /// The RGB picture, which decodes into a texture put in.
+    Picture,
+    /// The Y, Cb or Cr plane.
+    Plane(Component),
+    /// Cb and Cr interleaved, which encoders read (decision D62).
+    Chroma,
+}
+
+impl Holds {
+    /// The texture's size in pictures of `layout`. Read where textures of
+    /// the caller's are wrapped, as `Wrapping` is.
+    #[cfg_attr(
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "android",
+            all(windows, target_pointer_width = "64")
+        )),
+        allow(dead_code)
+    )]
+    fn size(self, layout: &FrameLayout) -> (u32, u32) {
+        match self {
+            Self::Picture => (layout.width(), layout.height()),
+            Self::Plane(component) => layout.plane_size(component),
+            Self::Chroma => layout.plane_size(Component::Cb),
+        }
+    }
+
+    /// The texture, with its owner, for messages: "the plane's" or so.
+    /// Read where Metal textures are checked.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
+    fn whose(self) -> &'static str {
+        match self {
+            Self::Picture => "picture's",
+            Self::Plane(_) => "plane's",
+            Self::Chroma => "chroma planes'",
+        }
+    }
+}
+
+/// What a texture of the caller's is wrapped for: a decoder that fills it,
+/// or an encoder that reads it. Read where textures of the caller's are
+/// wrapped: Metal's and Vulkan's.
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android",
+        all(windows, target_pointer_width = "64")
+    )),
+    allow(dead_code)
+)]
+struct Wrapping<'a> {
+    device: &'a wgpu::Device,
+    context_id: u64,
+    /// Whether the context runs on the caller's own Vulkan device.
+    vulkan: bool,
+    /// The block layout of the pictures, whose sizes the texture has.
+    layout: &'a FrameLayout,
+    holds: Holds,
+    /// Whether an encoder reads the texture, rather than a decoder fill it.
+    read: bool,
+    /// Whether the decoder stores planes into textures (decision D52), as
+    /// it does on Metal only. Read where Metal textures are wrapped.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
+    stores_planes: bool,
+}
+
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android",
+        all(windows, target_pointer_width = "64")
+    )),
+    allow(dead_code)
+)]
+impl<'a> Wrapping<'a> {
+    /// For the decodes of `decoder`, into the picture or `plane`.
+    fn decoder(decoder: &'a EmberwaveDecoder, plane: Option<Component>) -> Self {
+        Self {
+            device: decoder.decoder.device(),
+            context_id: decoder.decoder.context_id(),
+            vulkan: decoder.vulkan,
+            layout: decoder.decoder.layout(),
+            holds: plane.map_or(Holds::Picture, Holds::Plane),
+            read: false,
+            stores_planes: decoder.decoder.stores_planes(),
+        }
+    }
+
+    /// For the encodes of `encoder`, from what `holds` says.
+    fn encoder(encoder: &'a EmberwaveEncoder, holds: Holds) -> Self {
+        Self {
+            device: encoder.encoder.device(),
+            context_id: encoder.encoder.context_id(),
+            vulkan: encoder.vulkan,
+            layout: encoder.encoder.layout(),
+            holds,
+            read: true,
+            stores_planes: false,
+        }
+    }
+
+    /// The texture's size.
+    fn size(&self) -> (u32, u32) {
+        self.holds.size(self.layout)
     }
 }
 
@@ -385,6 +520,8 @@ impl EmberwaveTexture {
 /// chroma format.
 pub struct EmberwaveEncoder {
     encoder: Encoder,
+    /// Whether the encoder's context runs on the caller's own Vulkan device.
+    vulkan: bool,
     /// The turns at the queue of the encoder's context, if it has any.
     turns: Option<Arc<QueueTurns>>,
 }
@@ -1194,7 +1331,8 @@ pub struct EmberwaveVulkanDevice {
 
 /// An image of the caller's Vulkan device, for
 /// `emberwave_texture_from_vulkan` and `emberwave_texture_from_vulkan_plane`
-/// (decision D61).
+/// (decision D61), and for `emberwave_texture_from_vulkan_source` (decision
+/// D62).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveVulkanImage {
@@ -1202,20 +1340,23 @@ pub struct EmberwaveVulkanImage {
     pub image: u64,
     /// Its `VkFormat`: `VK_FORMAT_B8G8R8A8_UNORM` or
     /// `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` for a
-    /// plane.
+    /// plane, `VK_FORMAT_R8G8_UNORM` for Cb and Cr interleaved.
     pub format: u32,
     /// The `VkImageUsageFlags` it was made with.
     pub usage: u32,
     /// The `VkImageLayout` it is in now: `VK_IMAGE_LAYOUT_UNDEFINED`, whose
     /// contents a decode may discard, or
+    /// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`. For an image to encode,
+    /// the layout it is in whenever an encode reads it, which is
     /// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
     pub layout: u32,
     /// Called with `user` once emberwave and the GPU are done with the
     /// image, after the texture is destroyed and the work of every decode
-    /// into it has completed: from then on the caller may destroy the image
-    /// and free its memory. From any thread, perhaps during another call of
-    /// emberwave's on the context, or in the destroy of its last decoder,
-    /// encoder or context. `NULL` if the caller knows that moment otherwise.
+    /// into it or encode from it has completed: from then on the caller may
+    /// destroy the image and free its memory. From any thread, perhaps
+    /// during another call of emberwave's on the context, or in the destroy
+    /// of its last decoder, encoder or context. `NULL` if the caller knows
+    /// that moment otherwise.
     pub release: Option<unsafe extern "C" fn(user: *mut c_void)>,
     /// Passed to `release`.
     pub user: *mut c_void,
@@ -1588,6 +1729,67 @@ pub unsafe extern "C" fn emberwave_texture_from_vulkan_plane(
     unsafe { texture_from_vulkan(decoder, Some(plane), image, texture) }
 }
 
+/// Wraps the caller's own Vulkan image that holds a plane of a picture for
+/// the encodes of `encoder` to read, `emberwave_encoder_encode_textures` and
+/// `emberwave_encoder_encode_textures_vulkan`, on a context of
+/// `emberwave_context_create_vulkan` (decision D62); for an encoder on
+/// another context, `EMBERWAVE_STATUS_INVALID_ARGUMENT`. `plane` is
+/// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR` for an
+/// image in `VK_FORMAT_R8_UNORM`, or `EMBERWAVE_PLANE_CBCR` for one in
+/// `VK_FORMAT_R8G8_UNORM` with Cb and Cr interleaved.
+///
+/// The image is on the context's device, 2D, of one level, layer and
+/// sample, with optimal tiling and exclusive sharing on the context's queue
+/// family, of the plane's size as `emberwave_encoder_info` gives it (that of
+/// Cb for `EMBERWAVE_PLANE_CBCR`), and as `image` describes it. Its usage
+/// has `VK_IMAGE_USAGE_SAMPLED_BIT`, and its layout is
+/// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, which it is in whenever an
+/// encode reads it: from the first encode on, the caller's barriers start
+/// from that layout and return the image to it before the next encode. An
+/// image that is not as above where `image` says so gives
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is then `NULL`.
+///
+/// emberwave never destroys the image, nor frees its memory: keep both
+/// until `release` is called, or, without it, until the texture is
+/// destroyed. Every encode waits for the GPU, so none still reads the image
+/// then.
+///
+/// # Safety
+///
+/// `encoder` is a live encoder that no other thread is using, `image` is
+/// `NULL` or points to an `EmberwaveVulkanImage` that describes a live image
+/// made as above. `texture` points to where the new texture is stored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_vulkan_source(
+    encoder: *const EmberwaveEncoder,
+    plane: u32,
+    image: *const EmberwaveVulkanImage,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            let holds = source_holds(plane)?;
+            // SAFETY: as the caller promises.
+            let encoder =
+                unsafe { encoder.as_ref() }.ok_or_else(|| Failure::argument("encoder is NULL"))?;
+            // SAFETY: as the caller promises.
+            let Some(image) = (unsafe { image.as_ref() }) else {
+                return Err(Failure::argument("image is NULL"));
+            };
+            require_vulkan(encoder.vulkan, "encoder")?;
+            // SAFETY: as the caller promises.
+            let wrapped = unsafe { vulkan_import(&Wrapping::encoder(encoder, holds), image) }?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { encoder_lost(encoder) },
+    )
+}
+
 /// The work of `emberwave_texture_from_vulkan` and
 /// `emberwave_texture_from_vulkan_plane`.
 ///
@@ -1611,9 +1813,9 @@ unsafe fn texture_from_vulkan(
             let Some(image) = (unsafe { image.as_ref() }) else {
                 return Err(Failure::argument("image is NULL"));
             };
-            require_vulkan(decoder)?;
+            require_vulkan(decoder.vulkan, "decoder")?;
             // SAFETY: as the caller promises.
-            let wrapped = unsafe { vulkan_import(decoder, image, plane) }?;
+            let wrapped = unsafe { vulkan_import(&Wrapping::decoder(decoder, plane), image) }?;
             // SAFETY: checked by the first output() above.
             unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
             Ok(())
@@ -1655,7 +1857,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_texture_vulkan(
         || {
             // SAFETY: as the caller promises.
             let decoder = unsafe { live_mut(decoder) }?;
-            require_vulkan(decoder)?;
+            require_vulkan(decoder.vulkan, "decoder")?;
             // SAFETY: as the caller promises.
             let texture = unsafe { picture_texture(texture, decoder.decoder.context_id()) }?;
             // SAFETY: as the caller promises.
@@ -1697,7 +1899,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_vulkan(
         || {
             // SAFETY: as the caller promises.
             let decoder = unsafe { live_mut(decoder) }?;
-            require_vulkan(decoder)?;
+            require_vulkan(decoder.vulkan, "decoder")?;
             let context_id = decoder.decoder.context_id();
             // SAFETY: as the caller promises.
             let textures = unsafe {
@@ -1722,6 +1924,70 @@ pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_vulkan(
     )
 }
 
+/// Encodes the picture whose planes are in the textures `y`, `cb` and `cr`,
+/// as `emberwave_encoder_encode_textures` does, with the semaphores of
+/// `sync` on its submission, on a context of
+/// `emberwave_context_create_vulkan` (decision D62). Elsewhere
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+///
+/// `sync`, if not `NULL`, has semaphores for the submission. The encode's
+/// GPU work waits for `wait_semaphore`, at every stage, before it reads the
+/// images: the caller signals it once its own GPU work that writes them is
+/// done, such as the copy of a captured picture, unless the queue orders
+/// that work before the encode already. The encode signals
+/// `signal_semaphore` once the GPU has read the images and made the frame,
+/// for the caller's work on other queues that writes them again. The call
+/// waits for the GPU as the other encodes do, so it returns only once its
+/// wait is met: by work submitted to the context's queue before the call,
+/// by work on another queue, or by `vkSignalSemaphore` on another thread.
+/// Work submitted to the context's queue after the call began runs only
+/// after the encode, which waits at every stage, so it cannot meet the
+/// wait. Keep the semaphores until the work that signals them has
+/// completed. When the call fails, the semaphores may or may not have been
+/// waited for and signalled. A budget too small for the smallest frame
+/// shows only once the GPU has encoded the picture: the semaphores have been
+/// waited for and signalled then, so a retry takes others, or new timeline
+/// values.
+///
+/// # Safety
+///
+/// As for `emberwave_encoder_encode_textures`, and `sync` is `NULL` or
+/// points to an `EmberwaveVulkanSync` whose semaphores are of the context's
+/// device.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_encoder_encode_textures_vulkan(
+    encoder: *mut EmberwaveEncoder,
+    y: *const EmberwaveTexture,
+    cb: *const EmberwaveTexture,
+    cr: *const EmberwaveTexture,
+    sync: *const EmberwaveVulkanSync,
+    frame: *mut u8,
+    budget: usize,
+    size: *mut usize,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { frame_arguments(frame, budget, size) }?;
+            // SAFETY: as the caller promises.
+            let encoder = unsafe { live_encoder(encoder) }?;
+            require_vulkan(encoder.vulkan, "encoder")?;
+            // SAFETY: as the caller promises.
+            let picture = unsafe { source_picture(y, cb, cr, encoder.encoder.context_id()) }?;
+            // SAFETY: as the caller promises.
+            let sync = unsafe { vulkan_sync(sync) }?;
+            let mut semaphores = vulkan_semaphores(sync);
+            let encoded = encoder
+                .encoder
+                .encode_textures_with(picture, budget, &mut semaphores);
+            // SAFETY: as the caller promises.
+            unsafe { deliver(encoded, frame, size) }
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { encoder_lost(encoder) },
+    )
+}
+
 /// The semaphores of `sync`, none for `NULL`, or an error for unknown flags.
 ///
 /// # Safety
@@ -1740,16 +2006,16 @@ unsafe fn vulkan_sync(sync: *const EmberwaveVulkanSync) -> Result<EmberwaveVulka
     Ok(sync)
 }
 
-/// An error unless `decoder`'s context runs on the caller's own Vulkan
-/// device.
-fn require_vulkan(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
-    if decoder.vulkan {
+/// An error unless the context of `owner`, a decoder or an encoder, runs on
+/// the caller's own Vulkan device (`vulkan`).
+fn require_vulkan(vulkan: bool, owner: &str) -> Result<(), Failure> {
+    if vulkan {
         Ok(())
     } else {
-        Err(Failure::argument(
-            "the decoder's context is not on the caller's Vulkan device \
-             (emberwave_context_create_vulkan)",
-        ))
+        Err(Failure::argument(format!(
+            "the {owner}'s context is not on the caller's Vulkan device \
+             (emberwave_context_create_vulkan)"
+        )))
     }
 }
 
@@ -1789,12 +2055,11 @@ fn vulkan_image(_texture: &EmberwaveTexture) -> u64 {
     all(windows, target_pointer_width = "64")
 ))]
 unsafe fn vulkan_import(
-    decoder: &EmberwaveDecoder,
+    wrapping: &Wrapping<'_>,
     image: &EmberwaveVulkanImage,
-    plane: Option<Component>,
 ) -> Result<EmberwaveTexture, Failure> {
     // SAFETY: as the caller promises.
-    unsafe { vulkan::import(decoder, image, plane) }
+    unsafe { vulkan::import(wrapping, image) }
 }
 
 #[cfg(not(any(
@@ -1803,9 +2068,8 @@ unsafe fn vulkan_import(
     all(windows, target_pointer_width = "64")
 )))]
 unsafe fn vulkan_import(
-    _decoder: &EmberwaveDecoder,
+    _wrapping: &Wrapping<'_>,
     _image: &EmberwaveVulkanImage,
-    _plane: Option<Component>,
 ) -> Result<EmberwaveTexture, Failure> {
     Err(vulkan_elsewhere())
 }
@@ -1902,16 +2166,15 @@ mod vulkan {
     use std::ffi::{CStr, c_char, c_void};
 
     use ash::vk::{self, Handle};
-    use emberwave_core::bitstream::Component;
     use emberwave_core::gpu::{
         CallerQueueLock, GpuContext, GpuOptions, PLANE_FORMAT, QueueTurns, SubmissionHooks,
     };
     use wgpu::hal::api::Vulkan;
 
     use super::{
-        EmberwaveDecoder, EmberwaveStatus, EmberwaveTexture, EmberwaveVkGetInstanceProcAddr,
-        EmberwaveVulkanDevice, EmberwaveVulkanImage, EmberwaveVulkanInstance,
-        EmberwaveVulkanRequirements, EmberwaveVulkanSync, Failure, queue_turns,
+        EmberwaveStatus, EmberwaveTexture, EmberwaveVkGetInstanceProcAddr, EmberwaveVulkanDevice,
+        EmberwaveVulkanImage, EmberwaveVulkanInstance, EmberwaveVulkanRequirements,
+        EmberwaveVulkanSync, Failure, Holds, Wrapping, queue_turns,
     };
 
     /// What keeps the chain of an `EmberwaveVulkanRequirements` alive.
@@ -2263,28 +2526,29 @@ mod vulkan {
     ///
     /// As for `emberwave_texture_from_vulkan`.
     pub(super) unsafe fn import(
-        decoder: &EmberwaveDecoder,
+        wrapping: &Wrapping<'_>,
         image: &EmberwaveVulkanImage,
-        plane: Option<Component>,
     ) -> Result<EmberwaveTexture, Failure> {
         if image.image == 0 {
             return Err(Failure::argument("image is VK_NULL_HANDLE"));
         }
-        let layout = decoder.decoder.layout();
-        let (width, height) = match plane {
-            Some(component) => layout.plane_size(component),
-            None => (layout.width(), layout.height()),
-        };
-        let format = match (plane, vk::Format::from_raw(image.format as i32)) {
-            (Some(_), vk::Format::R8_UNORM) => PLANE_FORMAT,
-            (None, vk::Format::R8G8B8A8_UNORM) => wgpu::TextureFormat::Rgba8Unorm,
-            (None, vk::Format::B8G8R8A8_UNORM) => wgpu::TextureFormat::Bgra8Unorm,
-            (Some(_), format) => {
+        let (width, height) = wrapping.size();
+        let format = match (wrapping.holds, vk::Format::from_raw(image.format as i32)) {
+            (Holds::Plane(_), vk::Format::R8_UNORM) => PLANE_FORMAT,
+            (Holds::Chroma, vk::Format::R8G8_UNORM) => wgpu::TextureFormat::Rg8Unorm,
+            (Holds::Picture, vk::Format::R8G8B8A8_UNORM) => wgpu::TextureFormat::Rgba8Unorm,
+            (Holds::Picture, vk::Format::B8G8R8A8_UNORM) => wgpu::TextureFormat::Bgra8Unorm,
+            (Holds::Plane(_), format) => {
                 return Err(Failure::argument(format!(
                     "the image's format is {format:?}, not VK_FORMAT_R8_UNORM"
                 )));
             }
-            (None, format) => {
+            (Holds::Chroma, format) => {
+                return Err(Failure::argument(format!(
+                    "the image's format is {format:?}, not VK_FORMAT_R8G8_UNORM"
+                )));
+            }
+            (Holds::Picture, format) => {
                 return Err(Failure::argument(format!(
                     "the image's format is {format:?}, not VK_FORMAT_B8G8R8A8_UNORM or \
                      VK_FORMAT_R8G8B8A8_UNORM"
@@ -2293,10 +2557,12 @@ mod vulkan {
         };
         let flags = vk::ImageUsageFlags::from_raw(image.usage);
         if !flags.contains(vk::ImageUsageFlags::SAMPLED) {
-            return Err(Failure::argument(
+            return Err(Failure::argument(if wrapping.read {
+                "the image lacks VK_IMAGE_USAGE_SAMPLED_BIT, which an encode reads it with"
+            } else {
                 "the image lacks VK_IMAGE_USAGE_SAMPLED_BIT: a decode leaves it in \
-                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL",
-            ));
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL"
+            }));
         }
         let mut usage = wgpu::TextureUsages::TEXTURE_BINDING;
         for (flag, use_) in [
@@ -2318,14 +2584,15 @@ mod vulkan {
             }
         }
         let copies = usage.contains(wgpu::TextureUsages::COPY_DST);
-        let fillable = match plane {
-            Some(_) => copies,
-            None => {
+        let fillable = match wrapping.holds {
+            Holds::Picture => {
                 (copies && (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
                     || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
             }
+            Holds::Plane(_) | Holds::Chroma => copies,
         };
-        if !fillable {
+        // An encode only samples the image (decision D62).
+        if !wrapping.read && !fillable {
             return Err(Failure::argument(
                 "neither a copy nor a draw can fill the image: a copy needs \
                  VK_IMAGE_USAGE_TRANSFER_DST_BIT (and for the picture a width of a multiple \
@@ -2333,8 +2600,16 @@ mod vulkan {
             ));
         }
         let state = match vk::ImageLayout::from_raw(image.layout as i32) {
-            vk::ImageLayout::UNDEFINED => wgpu::TextureUses::UNINITIALIZED,
+            // What an encode reads is in the image already: its layout is
+            // the one every encode reads it in.
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => wgpu::TextureUses::RESOURCE,
+            vk::ImageLayout::UNDEFINED if !wrapping.read => wgpu::TextureUses::UNINITIALIZED,
+            other if wrapping.read => {
+                return Err(Failure::argument(format!(
+                    "the image's layout is {other:?}, not \
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, the layout an encode reads it in"
+                )));
+            }
             other => {
                 return Err(Failure::argument(format!(
                     "the image's layout is {other:?}, not VK_IMAGE_LAYOUT_UNDEFINED or \
@@ -2347,7 +2622,7 @@ mod vulkan {
             height,
             depth_or_array_layers: 1,
         };
-        let device = decoder.decoder.device();
+        let device = wrapping.device;
         let hal_texture = {
             // SAFETY: only read.
             let hal = unsafe { device.as_hal::<Vulkan>() }
@@ -2418,7 +2693,7 @@ mod vulkan {
                 state,
             )
         };
-        Ok(EmberwaveTexture::wrap(decoder, texture, plane, true))
+        Ok(EmberwaveTexture::wrap(wrapping, texture, true))
     }
 
     /// The caller's `user` of an `EmberwaveVulkanImage`, for its `release`
@@ -2964,7 +3239,7 @@ pub unsafe extern "C" fn emberwave_texture_from_metal(
             // SAFETY: as the caller promises.
             let decoder = unsafe { live(decoder) }?;
             // SAFETY: as the caller promises.
-            let wrapped = unsafe { metal_import(decoder, metal, None) }?;
+            let wrapped = unsafe { metal_import(&Wrapping::decoder(decoder, None), metal) }?;
             // SAFETY: checked by the first output() above.
             unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
             Ok(())
@@ -3003,7 +3278,8 @@ pub unsafe extern "C" fn emberwave_texture_from_metal_plane(
             let decoder = unsafe { live(decoder) }?;
             let component = plane_component(plane)?;
             // SAFETY: as the caller promises.
-            let wrapped = unsafe { metal_import(decoder, metal, Some(component)) }?;
+            let wrapped =
+                unsafe { metal_import(&Wrapping::decoder(decoder, Some(component)), metal) }?;
             // SAFETY: checked by the first output() above.
             unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
             Ok(())
@@ -3011,6 +3287,77 @@ pub unsafe extern "C" fn emberwave_texture_from_metal_plane(
         // SAFETY: as the caller promises.
         || unsafe { lost(decoder) },
     )
+}
+
+/// Wraps the caller's own Metal texture, `metal`, an `id<MTLTexture>`, that
+/// holds a plane of a picture for the encodes of `encoder` to read,
+/// `emberwave_encoder_encode_textures` (decision D62): a texture of a
+/// `CVPixelBuffer` from a `CVMetalTextureCache`, as a screen capture gives
+/// them, or one the caller drew. `plane` is `EMBERWAVE_PLANE_Y`,
+/// `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR` for a texture in
+/// `MTLPixelFormatR8Unorm`, or `EMBERWAVE_PLANE_CBCR` for one in
+/// `MTLPixelFormatRG8Unorm` with Cb and Cr interleaved, as the second plane
+/// of an NV12 pixel buffer holds them. Only on iPhones, iPads and Macs;
+/// elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not `NULL`.
+///
+/// The texture is on the device of the encoder's context
+/// (`emberwave_context_metal_device`), 2D, of one level, layer and sample,
+/// not a view of another texture nor memoryless, of the plane's size as
+/// `emberwave_encoder_info` gives it (that of Cb for
+/// `EMBERWAVE_PLANE_CBCR`), and has `MTLTextureUsageShaderRead`. A texture
+/// that is not gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is
+/// then `NULL`. On a context that does not run on Metal, a Vulkan context on
+/// a Mac included, no texture is on the context's Metal device.
+///
+/// emberwave keeps a reference to `metal` until the texture is destroyed.
+/// A texture may be wrapped for one encode and destroyed after it, as the
+/// pixel buffers of a capture come and go, or kept for the encodes of many
+/// pictures.
+///
+/// # Safety
+///
+/// `encoder` is a live encoder that no other thread is using, and `metal` is
+/// `NULL` or an `id<MTLTexture>`. `texture` points to where the new texture
+/// is stored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_metal_source(
+    encoder: *const EmberwaveEncoder,
+    plane: u32,
+    metal: *mut c_void,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            // SAFETY: as the caller promises.
+            let encoder =
+                unsafe { encoder.as_ref() }.ok_or_else(|| Failure::argument("encoder is NULL"))?;
+            let holds = source_holds(plane)?;
+            // SAFETY: as the caller promises.
+            let wrapped = unsafe { metal_import(&Wrapping::encoder(encoder, holds), metal) }?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { encoder_lost(encoder) },
+    )
+}
+
+/// What a texture holds that an `EMBERWAVE_PLANE_*` value names for an
+/// encoder, `EMBERWAVE_PLANE_CBCR` included.
+fn source_holds(plane: u32) -> Result<Holds, Failure> {
+    match plane {
+        EMBERWAVE_PLANE_CBCR => Ok(Holds::Chroma),
+        EMBERWAVE_PLANE_Y | EMBERWAVE_PLANE_CB | EMBERWAVE_PLANE_CR => {
+            plane_component(plane).map(Holds::Plane)
+        }
+        other => Err(Failure::argument(format!(
+            "plane is {other}, not EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR \
+             or EMBERWAVE_PLANE_CBCR"
+        ))),
+    }
 }
 
 /// The plane an `EMBERWAVE_PLANE_*` value names.
@@ -3025,18 +3372,17 @@ fn plane_component(plane: u32) -> Result<Component, Failure> {
     }
 }
 
-/// The caller's `id<MTLTexture>` `metal` as a texture of `decoder`'s, for
-/// `plane` or for the picture, once it has passed the checks of
-/// `emberwave_texture_from_metal`.
+/// The caller's `id<MTLTexture>` `metal` as a texture for `wrapping`, once
+/// it has passed the checks of `emberwave_texture_from_metal` or, for an
+/// encoder, of `emberwave_texture_from_metal_source`.
 ///
 /// # Safety
 ///
 /// `metal` is `NULL` or an `id<MTLTexture>`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe fn metal_import(
-    decoder: &EmberwaveDecoder,
+    wrapping: &Wrapping<'_>,
     metal: *mut c_void,
-    plane: Option<Component>,
 ) -> Result<EmberwaveTexture, Failure> {
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
@@ -3049,33 +3395,37 @@ unsafe fn metal_import(
     // wgpu's texture, which keeps it until it is dropped.
     let metal: Retained<ProtocolObject<dyn MTLTexture>> =
         unsafe { Retained::retain(metal.cast()) }.ok_or(Failure::argument("metal is NULL"))?;
-    let device = decoder.decoder.device();
+    let device = wrapping.device;
+    let owner = if wrapping.read { "encoder" } else { "decoder" };
     if !std::ptr::eq(
         Retained::as_ptr(&metal.device()).cast::<c_void>(),
         metal_device(device).cast_const(),
     ) {
-        return Err(Failure::argument(
-            "the texture is not on the Metal device of the decoder's context",
-        ));
+        return Err(Failure::argument(format!(
+            "the texture is not on the Metal device of the {owner}'s context"
+        )));
     }
 
-    let layout = decoder.decoder.layout();
-    let (width, height) = match plane {
-        Some(component) => layout.plane_size(component),
-        None => (layout.width(), layout.height()),
-    };
+    let (width, height) = wrapping.size();
     let format = metal.pixelFormat();
-    let format = match plane {
-        Some(_) if format == MTLPixelFormat::R8Unorm => emberwave_core::gpu::PLANE_FORMAT,
-        None if format == MTLPixelFormat::RGBA8Unorm => wgpu::TextureFormat::Rgba8Unorm,
-        None if format == MTLPixelFormat::BGRA8Unorm => wgpu::TextureFormat::Bgra8Unorm,
-        Some(_) => {
+    let format = match wrapping.holds {
+        Holds::Plane(_) if format == MTLPixelFormat::R8Unorm => emberwave_core::gpu::PLANE_FORMAT,
+        Holds::Chroma if format == MTLPixelFormat::RG8Unorm => wgpu::TextureFormat::Rg8Unorm,
+        Holds::Picture if format == MTLPixelFormat::RGBA8Unorm => wgpu::TextureFormat::Rgba8Unorm,
+        Holds::Picture if format == MTLPixelFormat::BGRA8Unorm => wgpu::TextureFormat::Bgra8Unorm,
+        Holds::Plane(_) => {
             return Err(Failure::argument(format!(
                 "the texture's pixel format is {}, not MTLPixelFormatR8Unorm",
                 format.0
             )));
         }
-        None => {
+        Holds::Chroma => {
+            return Err(Failure::argument(format!(
+                "the texture's pixel format is {}, not MTLPixelFormatRG8Unorm",
+                format.0
+            )));
+        }
+        Holds::Picture => {
             return Err(Failure::argument(format!(
                 "the texture's pixel format is {}, not MTLPixelFormatBGRA8Unorm or \
                  MTLPixelFormatRGBA8Unorm",
@@ -3083,11 +3433,7 @@ unsafe fn metal_import(
             )));
         }
     };
-    let whose = if plane.is_some() {
-        "plane's"
-    } else {
-        "picture's"
-    };
+    let whose = wrapping.holds.whose();
     let problem = if metal.textureType() != MTLTextureType::Type2D {
         Some("is not 2D".to_owned())
     } else if (
@@ -3129,25 +3475,34 @@ unsafe fn metal_import(
     if metal.usage().contains(MTLTextureUsage::ShaderRead) {
         usage |= wgpu::TextureUsages::TEXTURE_BINDING;
     }
-    if plane.is_some()
-        && decoder.decoder.stores_planes()
+    if matches!(wrapping.holds, Holds::Plane(_))
+        && wrapping.stores_planes
         && metal.usage().contains(MTLTextureUsage::ShaderWrite)
     {
         usage |= wgpu::TextureUsages::STORAGE_BINDING;
     }
-    let fillable = match plane {
-        Some(_) => copies,
-        None => {
-            (copies && (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
-                || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+    if wrapping.read {
+        // An encode samples the texture (decision D62).
+        if !usage.contains(wgpu::TextureUsages::TEXTURE_BINDING) {
+            return Err(Failure::argument(
+                "the texture lacks MTLTextureUsageShaderRead, which an encode reads it with",
+            ));
         }
-    };
-    if !fillable {
-        return Err(Failure::argument(
-            "neither a copy nor a draw can fill the texture: a copy needs a texture that is \
-             not framebuffer-only (and for the picture a width of a multiple of 64 pixels), \
-             a draw of the picture MTLTextureUsageRenderTarget",
-        ));
+    } else {
+        let fillable = match wrapping.holds {
+            Holds::Picture => {
+                (copies && (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
+                    || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            }
+            Holds::Plane(_) | Holds::Chroma => copies,
+        };
+        if !fillable {
+            return Err(Failure::argument(
+                "neither a copy nor a draw can fill the texture: a copy needs a texture that \
+                 is not framebuffer-only (and for the picture a width of a multiple of 64 \
+                 pixels), a draw of the picture MTLTextureUsageRenderTarget",
+            ));
+        }
     }
     let tracked = metal.hazardTrackingMode() == MTLHazardTrackingMode::Tracked;
 
@@ -3168,8 +3523,9 @@ unsafe fn metal_import(
             None,
         )
     };
-    // SAFETY: as above, and the usage is what the texture allows; whatever it
-    // holds, a decode writes all of it.
+    // SAFETY: as above, and the usage is what the texture allows. Whatever
+    // it holds, a decode writes all of it, and an encode reads what the
+    // caller put in: wgpu takes a texture of the caller's as initialised.
     let texture = unsafe {
         device.create_texture_from_hal::<wgpu::hal::api::Metal>(
             hal,
@@ -3190,14 +3546,13 @@ unsafe fn metal_import(
             wgpu::TextureUses::UNINITIALIZED,
         )
     };
-    Ok(EmberwaveTexture::wrap(decoder, texture, plane, tracked))
+    Ok(EmberwaveTexture::wrap(wrapping, texture, tracked))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 unsafe fn metal_import(
-    _decoder: &EmberwaveDecoder,
+    _wrapping: &Wrapping<'_>,
     _metal: *mut c_void,
-    _plane: Option<Component>,
 ) -> Result<EmberwaveTexture, Failure> {
     Err(Failure(
         EmberwaveStatus::NoGpu,
@@ -3210,9 +3565,9 @@ unsafe fn metal_import(
 /// # Safety
 ///
 /// `texture` is `NULL`, or a texture from `emberwave_texture_create`,
-/// `emberwave_texture_create_plane`, `emberwave_texture_from_metal` or
-/// `emberwave_texture_from_metal_plane` that has not been destroyed and that
-/// no other thread is using. A Metal texture of one emberwave made goes with
+/// `emberwave_texture_create_plane`, or one of the functions that wrap a
+/// texture or an image of the caller's (`emberwave_texture_from_*`) that has
+/// not been destroyed and that no other thread is using. A Metal texture of one emberwave made goes with
 /// it unless the caller retained it; of one that wraps a texture of the
 /// caller's, only emberwave's reference goes.
 #[unsafe(no_mangle)]
@@ -3301,13 +3656,16 @@ unsafe fn picture_texture<'a>(
             "the texture is on the GPU device of another context",
         ));
     }
-    if let Some(plane) = texture.plane {
-        return Err(Failure::argument(format!(
+    match texture.holds {
+        Holds::Picture => Ok(texture),
+        Holds::Plane(plane) => Err(Failure::argument(format!(
             "the texture is for the {plane:?} plane, which \
              emberwave_decoder_decode_plane_textures fills"
-        )));
+        ))),
+        Holds::Chroma => Err(Failure::argument(
+            "the texture is for Cb and Cr interleaved, which only encoders read",
+        )),
     }
-    Ok(texture)
 }
 
 /// An error unless Metal tracks the hazards of `texture`, the argument
@@ -3537,7 +3895,7 @@ unsafe fn plane_texture<'a>(
             "{name} is on the GPU device of another context"
         )));
     }
-    if texture.plane != Some(plane) {
+    if texture.holds != Holds::Plane(plane) {
         return Err(Failure::argument(format!(
             "{name} is not a texture for the {plane:?} plane"
         )));
@@ -3668,6 +4026,7 @@ pub unsafe extern "C" fn emberwave_encoder_create(
             .map_err(creation_failure)?;
         let boxed = Box::new(EmberwaveEncoder {
             encoder: created,
+            vulkan: context.vulkan,
             turns: context.context.queue_turns().cloned(),
         });
         // SAFETY: checked by the first output() above.
@@ -3757,15 +4116,9 @@ pub unsafe extern "C" fn emberwave_encoder_encode(
     run_or_lost(
         || {
             // SAFETY: as the caller promises.
-            unsafe { output(size, "size", 0) }?;
+            unsafe { frame_arguments(frame, budget, size) }?;
             // SAFETY: as the caller promises.
             let encoder = unsafe { live_encoder(encoder) }?;
-            if frame.is_null() && budget > 0 {
-                return Err(Failure::argument("frame is NULL"));
-            }
-            if budget > isize::MAX as usize {
-                return Err(Failure::argument("budget is too large"));
-            }
             let layout = encoder.encoder.layout();
             let sources = [
                 (y, Component::Y, "y"),
@@ -3780,27 +4133,176 @@ pub unsafe extern "C" fn emberwave_encoder_encode(
                 planes[i] = unsafe { source_plane(source, name, width as usize, height as usize) }?;
                 strides[i] = source.stride;
             }
-            match encoder.encoder.encode_strided(planes, strides, budget) {
-                Ok(bytes) => {
-                    // SAFETY: a frame is at most `budget` bytes, which the
-                    // caller promises may be written.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), frame, bytes.len());
-                        size.write(bytes.len());
-                    }
-                    Ok(())
-                }
-                Err(GpuError::Encode(error @ EncodeError::BudgetTooSmall { minimum, .. })) => {
-                    // SAFETY: as the caller promises.
-                    unsafe { size.write(minimum) };
-                    Err(GpuError::Encode(error).into())
-                }
-                Err(error) => Err(error.into()),
-            }
+            let encoded = encoder.encoder.encode_strided(planes, strides, budget);
+            // SAFETY: as the caller promises.
+            unsafe { deliver(encoded, frame, size) }
         },
         // SAFETY: as the caller promises; the body's borrow has ended.
         || unsafe { encoder_lost(encoder) },
     )
+}
+
+/// Encodes the picture whose planes are in textures on the GPU, as
+/// `emberwave_encoder_encode` encodes one in CPU memory and into the same
+/// bytes (decision D62): `y` holds the Y plane, and `cb` and `cr` the Cb and
+/// Cr planes, or `cb` both of them interleaved (`EMBERWAVE_PLANE_CBCR`) with
+/// `cr` `NULL`. The textures are textures of planes on the encoder's context
+/// with the planes' sizes: the caller's, from
+/// `emberwave_texture_from_metal_source` or
+/// `emberwave_texture_from_vulkan_source`, or textures that decodes put
+/// planes into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any
+/// work on the GPU. A budget too small gives it too, as for
+/// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
+/// frame then, and the sequence number does not move.
+///
+/// Waits for the GPU: when it returns, the GPU has read the textures, and
+/// the caller may write them again or hand them back to a capture's pool.
+/// The GPU reads them after the caller's work on the context's queue that
+/// Metal or Vulkan orders before the encode:
+/// - On a context of `emberwave_context_create_metal`, the caller's command
+///   buffers committed to the queue before the call, for textures whose
+///   hazards Metal tracks.
+/// - On a context of `emberwave_context_create_vulkan`, the caller's work
+///   submitted to the queue before the call, with a barrier that makes its
+///   writes visible to compute shaders and leaves the images in
+///   `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`; semaphores order work on
+///   other queues (`emberwave_encoder_encode_textures_vulkan`).
+/// - Otherwise, on a context of `emberwave_context_create` or for a texture
+///   whose hazards Metal does not track, only work that has completed: the
+///   caller's GPU work that writes the textures completes before the call,
+///   as it has for a capture's pixel buffer once it is delivered.
+///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
+///
+/// # Safety
+///
+/// `encoder` is a live encoder that no other thread is using, `y` and `cb`
+/// are live textures, and `cr` is `NULL` or a live texture. `frame` points
+/// to `budget` bytes that may be written, and `size` to a `size_t`, which do
+/// not overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_encoder_encode_textures(
+    encoder: *mut EmberwaveEncoder,
+    y: *const EmberwaveTexture,
+    cb: *const EmberwaveTexture,
+    cr: *const EmberwaveTexture,
+    frame: *mut u8,
+    budget: usize,
+    size: *mut usize,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { frame_arguments(frame, budget, size) }?;
+            // SAFETY: as the caller promises.
+            let encoder = unsafe { live_encoder(encoder) }?;
+            // SAFETY: as the caller promises.
+            let picture = unsafe { source_picture(y, cb, cr, encoder.encoder.context_id()) }?;
+            let encoded = encoder.encoder.encode_textures(picture, budget);
+            // SAFETY: as the caller promises.
+            unsafe { deliver(encoded, frame, size) }
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { encoder_lost(encoder) },
+    )
+}
+
+/// Checks the arguments where an encode puts the frame, and sets `*size`
+/// to 0 for a failure.
+///
+/// # Safety
+///
+/// `size` is `NULL` or points to a `size_t`.
+unsafe fn frame_arguments(frame: *mut u8, budget: usize, size: *mut usize) -> Result<(), Failure> {
+    // SAFETY: as the caller promises.
+    unsafe { output(size, "size", 0) }?;
+    if frame.is_null() && budget > 0 {
+        return Err(Failure::argument("frame is NULL"));
+    }
+    if budget > isize::MAX as usize {
+        return Err(Failure::argument("budget is too large"));
+    }
+    Ok(())
+}
+
+/// Writes the frame of an encode to `frame` and its size to `*size`, or for
+/// a budget too small the smallest frame's size.
+///
+/// # Safety
+///
+/// As `frame_arguments` checked: `frame` points to `budget` bytes, at least
+/// the frame's, that may be written, and `size` to a `size_t`.
+unsafe fn deliver(
+    encoded: Result<Vec<u8>, GpuError>,
+    frame: *mut u8,
+    size: *mut usize,
+) -> Result<(), Failure> {
+    match encoded {
+        Ok(bytes) => {
+            // SAFETY: a frame is at most `budget` bytes, which the caller
+            // promises may be written.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), frame, bytes.len());
+                size.write(bytes.len());
+            }
+            Ok(())
+        }
+        Err(GpuError::Encode(error @ EncodeError::BudgetTooSmall { minimum, .. })) => {
+            // SAFETY: as the caller promises.
+            unsafe { size.write(minimum) };
+            Err(GpuError::Encode(error).into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The picture of the textures `y`, `cb` and `cr` for an encoder on the
+/// context `context_id`: three planes, or Y and Cb and Cr interleaved, with
+/// `cr` `NULL`.
+///
+/// # Safety
+///
+/// `y`, `cb` and `cr` are `NULL` or live textures, which outlive the borrow.
+unsafe fn source_picture<'a>(
+    y: *const EmberwaveTexture,
+    cb: *const EmberwaveTexture,
+    cr: *const EmberwaveTexture,
+    context_id: u64,
+) -> Result<TexturePicture<'a>, Failure> {
+    // SAFETY: as the caller promises.
+    let luma = unsafe { plane_texture(y, Component::Y, "y", context_id) }?;
+    // SAFETY: as the caller promises.
+    let Some(chroma) = (unsafe { cb.as_ref() }) else {
+        return Err(Failure::argument("cb is NULL"));
+    };
+    if chroma.holds == Holds::Chroma {
+        // Not wgpu's device equality, which devices of two contexts can pass
+        // (GpuContext::id).
+        if chroma.context_id != context_id {
+            return Err(Failure::argument(
+                "cb is on the GPU device of another context",
+            ));
+        }
+        if !cr.is_null() {
+            return Err(Failure::argument(
+                "cr is not NULL, though cb holds Cb and Cr interleaved",
+            ));
+        }
+        return Ok(TexturePicture::LumaChroma {
+            luma: &luma.view,
+            chroma: &chroma.view,
+        });
+    }
+    // SAFETY: as the caller promises.
+    let (cb, cr) = unsafe {
+        (
+            plane_texture(cb, Component::Cb, "cb", context_id)?,
+            plane_texture(cr, Component::Cr, "cr", context_id)?,
+        )
+    };
+    Ok(TexturePicture::Planes([&luma.view, &cb.view, &cr.view]))
 }
 
 /// Splits a frame into packets of at most `max_packet_bytes` bytes, at the

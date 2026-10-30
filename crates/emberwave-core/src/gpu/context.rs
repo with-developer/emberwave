@@ -610,6 +610,39 @@ pub(crate) fn submit(
     };
 }
 
+/// What a caller's graphics API adds to the submission of a decode that
+/// does not wait, or of an encode from textures, such as Vulkan semaphores
+/// to wait on and to signal (decisions D61, D62). Both run during the
+/// call's turn at the queue, if the context has turns (decision D60).
+pub trait SubmissionHooks {
+    /// Runs just before the call's submission.
+    fn before_submit(&mut self, queue: &wgpu::Queue);
+    /// Runs after the submission, or after a failure before or in it
+    /// (`submitted` false), also on a panic, while the turn lasts: to take
+    /// back what `before_submit` added, if the submission did not take it.
+    /// `submitted` says only that no error was caught: a lost device can
+    /// have taken nothing.
+    fn after_submit(&mut self, queue: &wgpu::Queue, submitted: bool);
+}
+
+/// Runs [`SubmissionHooks::after_submit`] as it is dropped. Declared after
+/// the call's [`Turn`], so that it ends first, also on a panic: no other
+/// submission, the turn's of wgpu's writes included, takes what the hooks
+/// added and the call did not submit.
+pub(crate) struct AfterSubmit<'h> {
+    pub(crate) hooks: Option<&'h mut dyn SubmissionHooks>,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) submitted: bool,
+}
+
+impl Drop for AfterSubmit<'_> {
+    fn drop(&mut self) {
+        if let Some(hooks) = self.hooks.take() {
+            hooks.after_submit(&self.queue, self.submitted);
+        }
+    }
+}
+
 /// The value in `cache`, which `build` makes if there is none yet.
 fn cached<T>(
     cache: &Mutex<Option<Arc<T>>>,

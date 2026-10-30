@@ -91,17 +91,29 @@
 // surfaces, onto which a copy needs the same order.
 #define EMBERWAVE_TEXTURE_BGRA8 1
 
-// The luma plane, for `emberwave_texture_create_plane` and
-// `emberwave_texture_from_metal_plane`.
+// The luma plane, for `emberwave_texture_create_plane`, the functions that
+// wrap a plane of the caller's for decodes
+// (`emberwave_texture_from_metal_plane`,
+// `emberwave_texture_from_vulkan_plane`), and those that wrap one to encode
+// (`emberwave_texture_from_metal_source`,
+// `emberwave_texture_from_vulkan_source`).
 #define EMBERWAVE_PLANE_Y 0
 
-// The blue-difference chroma plane, for `emberwave_texture_create_plane` and
-// `emberwave_texture_from_metal_plane`.
+// The blue-difference chroma plane, for the same functions as
+// `EMBERWAVE_PLANE_Y`.
 #define EMBERWAVE_PLANE_CB 1
 
-// The red-difference chroma plane, for `emberwave_texture_create_plane` and
-// `emberwave_texture_from_metal_plane`.
+// The red-difference chroma plane, for the same functions as
+// `EMBERWAVE_PLANE_Y`.
 #define EMBERWAVE_PLANE_CR 2
+
+// The two chroma planes interleaved in one texture of two unsigned
+// normalised 8-bit channels, Cb in the first and Cr in the second, as the
+// second plane of NV12 holds them: `MTLPixelFormatRG8Unorm` in Metal,
+// `VK_FORMAT_R8G8_UNORM` in Vulkan. Only for the textures encoders read,
+// `emberwave_texture_from_metal_source` and
+// `emberwave_texture_from_vulkan_source` (decision D62).
+#define EMBERWAVE_PLANE_CBCR 3
 
 // `wait_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore, to
 // wait for at `wait_value`.
@@ -154,9 +166,18 @@ typedef struct EmberwaveEncoder EmberwaveEncoder;
 // `emberwave_decoder_decode_plane_textures` and
 // `emberwave_decoder_submit_plane_textures`, for the caller's graphics API
 // to read on the GPU. emberwave makes it (`emberwave_texture_create`,
-// `emberwave_texture_create_plane`), or wraps a Metal texture of the
-// caller's (`emberwave_texture_from_metal`,
-// `emberwave_texture_from_metal_plane`).
+// `emberwave_texture_create_plane`), or wraps a Metal texture or a Vulkan
+// image of the caller's (`emberwave_texture_from_metal`,
+// `emberwave_texture_from_metal_plane`, `emberwave_texture_from_vulkan`,
+// `emberwave_texture_from_vulkan_plane`).
+//
+// Or a texture of the caller's that holds a plane of a picture to encode,
+// for `emberwave_encoder_encode_textures` to read
+// (`emberwave_texture_from_metal_source`,
+// `emberwave_texture_from_vulkan_source`, decision D62). A texture of a
+// plane serves the decoders and encoders of its context whose pictures
+// have planes of its size, so planes a decode put into textures can be
+// encoded again.
 //
 // How the decodes and the caller's reads of a texture are ordered:
 // - On a context of `emberwave_context_create`, emberwave works on a queue
@@ -282,26 +303,30 @@ typedef struct EmberwaveVulkanDevice {
 
 // An image of the caller's Vulkan device, for
 // `emberwave_texture_from_vulkan` and `emberwave_texture_from_vulkan_plane`
-// (decision D61).
+// (decision D61), and for `emberwave_texture_from_vulkan_source` (decision
+// D62).
 typedef struct EmberwaveVulkanImage {
   // The `VkImage`.
   uint64_t image;
   // Its `VkFormat`: `VK_FORMAT_B8G8R8A8_UNORM` or
   // `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` for a
-  // plane.
+  // plane, `VK_FORMAT_R8G8_UNORM` for Cb and Cr interleaved.
   uint32_t format;
   // The `VkImageUsageFlags` it was made with.
   uint32_t usage;
   // The `VkImageLayout` it is in now: `VK_IMAGE_LAYOUT_UNDEFINED`, whose
   // contents a decode may discard, or
+  // `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`. For an image to encode,
+  // the layout it is in whenever an encode reads it, which is
   // `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
   uint32_t layout;
   // Called with `user` once emberwave and the GPU are done with the
   // image, after the texture is destroyed and the work of every decode
-  // into it has completed: from then on the caller may destroy the image
-  // and free its memory. From any thread, perhaps during another call of
-  // emberwave's on the context, or in the destroy of its last decoder,
-  // encoder or context. `NULL` if the caller knows that moment otherwise.
+  // into it or encode from it has completed: from then on the caller may
+  // destroy the image and free its memory. From any thread, perhaps
+  // during another call of emberwave's on the context, or in the destroy
+  // of its last decoder, encoder or context. `NULL` if the caller knows
+  // that moment otherwise.
   void (*release)(void *user);
   // Passed to `release`.
   void *user;
@@ -687,6 +712,41 @@ enum EmberwaveStatus emberwave_texture_from_vulkan_plane(const struct EmberwaveD
                                                          const struct EmberwaveVulkanImage *image,
                                                          struct EmberwaveTexture **texture);
 
+// Wraps the caller's own Vulkan image that holds a plane of a picture for
+// the encodes of `encoder` to read, `emberwave_encoder_encode_textures` and
+// `emberwave_encoder_encode_textures_vulkan`, on a context of
+// `emberwave_context_create_vulkan` (decision D62); for an encoder on
+// another context, `EMBERWAVE_STATUS_INVALID_ARGUMENT`. `plane` is
+// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR` for an
+// image in `VK_FORMAT_R8_UNORM`, or `EMBERWAVE_PLANE_CBCR` for one in
+// `VK_FORMAT_R8G8_UNORM` with Cb and Cr interleaved.
+//
+// The image is on the context's device, 2D, of one level, layer and
+// sample, with optimal tiling and exclusive sharing on the context's queue
+// family, of the plane's size as `emberwave_encoder_info` gives it (that of
+// Cb for `EMBERWAVE_PLANE_CBCR`), and as `image` describes it. Its usage
+// has `VK_IMAGE_USAGE_SAMPLED_BIT`, and its layout is
+// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, which it is in whenever an
+// encode reads it: from the first encode on, the caller's barriers start
+// from that layout and return the image to it before the next encode. An
+// image that is not as above where `image` says so gives
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is then `NULL`.
+//
+// emberwave never destroys the image, nor frees its memory: keep both
+// until `release` is called, or, without it, until the texture is
+// destroyed. Every encode waits for the GPU, so none still reads the image
+// then.
+//
+// # Safety
+//
+// `encoder` is a live encoder that no other thread is using, `image` is
+// `NULL` or points to an `EmberwaveVulkanImage` that describes a live image
+// made as above. `texture` points to where the new texture is stored.
+enum EmberwaveStatus emberwave_texture_from_vulkan_source(const struct EmberwaveEncoder *encoder,
+                                                          uint32_t plane,
+                                                          const struct EmberwaveVulkanImage *image,
+                                                          struct EmberwaveTexture **texture);
+
 // Decodes the frame received so far into `texture`, as
 // `emberwave_decoder_decode_texture` does, but returns once the work is
 // submitted to the queue, without waiting for it, on a context of
@@ -728,6 +788,45 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures_vulkan(struct Ember
                                                                     const struct EmberwaveTexture *cb,
                                                                     const struct EmberwaveTexture *cr,
                                                                     const struct EmberwaveVulkanSync *sync);
+
+// Encodes the picture whose planes are in the textures `y`, `cb` and `cr`,
+// as `emberwave_encoder_encode_textures` does, with the semaphores of
+// `sync` on its submission, on a context of
+// `emberwave_context_create_vulkan` (decision D62). Elsewhere
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+//
+// `sync`, if not `NULL`, has semaphores for the submission. The encode's
+// GPU work waits for `wait_semaphore`, at every stage, before it reads the
+// images: the caller signals it once its own GPU work that writes them is
+// done, such as the copy of a captured picture, unless the queue orders
+// that work before the encode already. The encode signals
+// `signal_semaphore` once the GPU has read the images and made the frame,
+// for the caller's work on other queues that writes them again. The call
+// waits for the GPU as the other encodes do, so it returns only once its
+// wait is met: by work submitted to the context's queue before the call,
+// by work on another queue, or by `vkSignalSemaphore` on another thread.
+// Work submitted to the context's queue after the call began runs only
+// after the encode, which waits at every stage, so it cannot meet the
+// wait. Keep the semaphores until the work that signals them has
+// completed. When the call fails, the semaphores may or may not have been
+// waited for and signalled. A budget too small for the smallest frame
+// shows only once the GPU has encoded the picture: the semaphores have been
+// waited for and signalled then, so a retry takes others, or new timeline
+// values.
+//
+// # Safety
+//
+// As for `emberwave_encoder_encode_textures`, and `sync` is `NULL` or
+// points to an `EmberwaveVulkanSync` whose semaphores are of the context's
+// device.
+enum EmberwaveStatus emberwave_encoder_encode_textures_vulkan(struct EmberwaveEncoder *encoder,
+                                                              const struct EmberwaveTexture *y,
+                                                              const struct EmberwaveTexture *cb,
+                                                              const struct EmberwaveTexture *cr,
+                                                              const struct EmberwaveVulkanSync *sync,
+                                                              uint8_t *frame,
+                                                              size_t budget,
+                                                              size_t *size);
 
 // Destroys a context. Decoders and encoders created on it keep working, and
 // keep the GPU device until they are destroyed as well.
@@ -997,14 +1096,49 @@ enum EmberwaveStatus emberwave_texture_from_metal_plane(const struct EmberwaveDe
                                                         void *metal,
                                                         struct EmberwaveTexture **texture);
 
+// Wraps the caller's own Metal texture, `metal`, an `id<MTLTexture>`, that
+// holds a plane of a picture for the encodes of `encoder` to read,
+// `emberwave_encoder_encode_textures` (decision D62): a texture of a
+// `CVPixelBuffer` from a `CVMetalTextureCache`, as a screen capture gives
+// them, or one the caller drew. `plane` is `EMBERWAVE_PLANE_Y`,
+// `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR` for a texture in
+// `MTLPixelFormatR8Unorm`, or `EMBERWAVE_PLANE_CBCR` for one in
+// `MTLPixelFormatRG8Unorm` with Cb and Cr interleaved, as the second plane
+// of an NV12 pixel buffer holds them. Only on iPhones, iPads and Macs;
+// elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not `NULL`.
+//
+// The texture is on the device of the encoder's context
+// (`emberwave_context_metal_device`), 2D, of one level, layer and sample,
+// not a view of another texture nor memoryless, of the plane's size as
+// `emberwave_encoder_info` gives it (that of Cb for
+// `EMBERWAVE_PLANE_CBCR`), and has `MTLTextureUsageShaderRead`. A texture
+// that is not gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and `texture` is
+// then `NULL`. On a context that does not run on Metal, a Vulkan context on
+// a Mac included, no texture is on the context's Metal device.
+//
+// emberwave keeps a reference to `metal` until the texture is destroyed.
+// A texture may be wrapped for one encode and destroyed after it, as the
+// pixel buffers of a capture come and go, or kept for the encodes of many
+// pictures.
+//
+// # Safety
+//
+// `encoder` is a live encoder that no other thread is using, and `metal` is
+// `NULL` or an `id<MTLTexture>`. `texture` points to where the new texture
+// is stored.
+enum EmberwaveStatus emberwave_texture_from_metal_source(const struct EmberwaveEncoder *encoder,
+                                                         uint32_t plane,
+                                                         void *metal,
+                                                         struct EmberwaveTexture **texture);
+
 // Destroys a texture.
 //
 // # Safety
 //
 // `texture` is `NULL`, or a texture from `emberwave_texture_create`,
-// `emberwave_texture_create_plane`, `emberwave_texture_from_metal` or
-// `emberwave_texture_from_metal_plane` that has not been destroyed and that
-// no other thread is using. A Metal texture of one emberwave made goes with
+// `emberwave_texture_create_plane`, or one of the functions that wrap a
+// texture or an image of the caller's (`emberwave_texture_from_*`) that has
+// not been destroyed and that no other thread is using. A Metal texture of one emberwave made goes with
 // it unless the caller retained it; of one that wraps a texture of the
 // caller's, only emberwave's reference goes.
 void emberwave_texture_destroy(struct EmberwaveTexture *texture);
@@ -1231,6 +1365,54 @@ enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
                                               uint8_t *frame,
                                               size_t budget,
                                               size_t *size);
+
+// Encodes the picture whose planes are in textures on the GPU, as
+// `emberwave_encoder_encode` encodes one in CPU memory and into the same
+// bytes (decision D62): `y` holds the Y plane, and `cb` and `cr` the Cb and
+// Cr planes, or `cb` both of them interleaved (`EMBERWAVE_PLANE_CBCR`) with
+// `cr` `NULL`. The textures are textures of planes on the encoder's context
+// with the planes' sizes: the caller's, from
+// `emberwave_texture_from_metal_source` or
+// `emberwave_texture_from_vulkan_source`, or textures that decodes put
+// planes into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any
+// work on the GPU. A budget too small gives it too, as for
+// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
+// frame then, and the sequence number does not move.
+//
+// Waits for the GPU: when it returns, the GPU has read the textures, and
+// the caller may write them again or hand them back to a capture's pool.
+// The GPU reads them after the caller's work on the context's queue that
+// Metal or Vulkan orders before the encode:
+// - On a context of `emberwave_context_create_metal`, the caller's command
+//   buffers committed to the queue before the call, for textures whose
+//   hazards Metal tracks.
+// - On a context of `emberwave_context_create_vulkan`, the caller's work
+//   submitted to the queue before the call, with a barrier that makes its
+//   writes visible to compute shaders and leaves the images in
+//   `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`; semaphores order work on
+//   other queues (`emberwave_encoder_encode_textures_vulkan`).
+// - Otherwise, on a context of `emberwave_context_create` or for a texture
+//   whose hazards Metal does not track, only work that has completed: the
+//   caller's GPU work that writes the textures completes before the call,
+//   as it has for a capture's pixel buffer once it is delivered.
+//
+// On a context of `emberwave_context_create_metal`, do not call it inside a
+// completion handler of a command buffer of the context's queue: the wait
+// never ends there.
+//
+// # Safety
+//
+// `encoder` is a live encoder that no other thread is using, `y` and `cb`
+// are live textures, and `cr` is `NULL` or a live texture. `frame` points
+// to `budget` bytes that may be written, and `size` to a `size_t`, which do
+// not overlap.
+enum EmberwaveStatus emberwave_encoder_encode_textures(struct EmberwaveEncoder *encoder,
+                                                       const struct EmberwaveTexture *y,
+                                                       const struct EmberwaveTexture *cb,
+                                                       const struct EmberwaveTexture *cr,
+                                                       uint8_t *frame,
+                                                       size_t budget,
+                                                       size_t *size);
 
 // Splits a frame into packets of at most `max_packet_bytes` bytes, at the
 // boundaries of its blocks, and stores how many in `*count`. With `packets`

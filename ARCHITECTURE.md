@@ -527,8 +527,14 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_texture_metal`, `emberwave_context_metal_device` | The `id<MTLTexture>` and `id<MTLDevice>` behind a texture and a context, borrowed, or `NULL` off Metal |
 | `emberwave_context_create_metal`, `emberwave_decoder_submit_texture`, `_submit_plane_textures` | A context on the client's own Metal device and queue, and decodes into textures that return without waiting, which only such a context takes |
 | `emberwave_texture_from_metal`, `_from_metal_plane` | The client's own `id<MTLTexture>`, such as a `CVPixelBuffer`'s, as a texture every decode above fills |
+| `emberwave_vulkan_instance_extensions`, `emberwave_vulkan_requirements_create`, `_extensions`, `_features`, `_destroy` | What the client enables on its Vulkan instance and device for a context on them (D61) |
+| `emberwave_context_create_vulkan` | A context on the client's own `VkDevice` and one of its queues, under the client's lock of the queue (D61) |
+| `emberwave_texture_vulkan`, `emberwave_texture_from_vulkan`, `_from_vulkan_plane` | The `VkImage` of a texture on such a context, and the client's own images as textures the decodes fill (D61) |
+| `emberwave_decoder_submit_texture_vulkan`, `_submit_plane_textures_vulkan` | Decodes into textures that return without waiting, with semaphores to wait for and to signal (D61) |
 | `emberwave_encoder_create`, `_destroy`, `_info` | One encoder per picture size and chroma format, with the colours its frames signal; the sizes of its planes |
 | `emberwave_encoder_encode` | Encode planes from the caller's memory, with the caller's strides, into a frame of at most the budget, written into the caller's buffer of that size |
+| `emberwave_texture_from_metal_source`, `_from_vulkan_source` | The host's own texture or image of a plane of the pictures to encode, or of Cb and Cr interleaved as in NV12 (D62) |
+| `emberwave_encoder_encode_textures`, `_encode_textures_vulkan` | Encode a picture from textures of its planes into the bytes of the same picture in CPU memory; on Vulkan with semaphores (D62) |
 | `emberwave_frame_packets` | Where a frame splits into packets of a given size, at its blocks |
 | `emberwave_version`, `emberwave_last_error` | The version, and the message of the last failure on the calling thread |
 
@@ -538,7 +544,7 @@ Every function returns a status, or a value that cannot fail. A Rust panic is ca
 
 For apps on iPhones, iPads and Macs, `scripts/build_xcframework.sh` bundles the static library into `Emberwave.xcframework`, built for devices, for the iOS Simulator and for Macs, all with Apple silicon. It has the header and a module map that Swift imports as `Emberwave` (D35). `examples/swift` is the decoding example in Swift, a SwiftPM package that links the XCFramework.
 
-The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` puts the Y, Cb and Cr planes into three textures for a client that converts the colours itself; on Metal the inverse transform stores them there, in 0.91 to 0.93 ms for the 4K frame (D41, D52). On a context made on the client's own device and queue, the submit functions do the same without waiting, and Metal orders the client's reads after them (D43). The client's own textures, such as those of `CVPixelBuffer`s for an `AVSampleBufferDisplayLayer`, take the decodes as well (D44). Vulkan and Direct3D 12 handles are later work.
+The C API copies the picture to the CPU, which costs about as much as decoding it: a 4K frame to RGB takes 2.7 ms with the copy and 1.2 ms without on an Apple M3 Max (D37). For Metal clients, `emberwave_decoder_decode_texture` puts it into a texture on the GPU instead, whose `id<MTLTexture>` the client reads: 1.3 to 1.4 ms for the 4K frame (D40, D42). `emberwave_decoder_decode_plane_textures` puts the Y, Cb and Cr planes into three textures for a client that converts the colours itself; on Metal the inverse transform stores them there, in 0.91 to 0.93 ms for the 4K frame (D41, D52). On a context made on the client's own device and queue, the submit functions do the same without waiting, and Metal orders the client's reads after them (D43). The client's own textures, such as those of `CVPixelBuffer`s for an `AVSampleBufferDisplayLayer`, take the decodes as well (D44). On Linux, Android and 64-bit Windows a context runs on the client's own Vulkan device and queue, with the client's images, and semaphores where Metal has its queue's order (D61). A host encodes pictures from textures, Metal's or Vulkan's, as a screen capture holds them (D62). Direct3D 12 handles are later work.
 
 Frames from upstream's Metal encoder signal BT.709, full range and centred chroma in their start of frame headers whatever the pictures are, because its API has no way to set the signalling; `testdata/README.md` has the details. `emberwave_decoder_decode_rgb` with a `NULL` colour follows the frame, so a caller with better knowledge, such as the colours of a PWV1 file header, passes them.
 
@@ -1528,3 +1534,34 @@ Direct3D 12 through shared handles follows, and the encoder's input from the cal
   - A 200-pixel-wide picture is drawn into an RGBA image that was wrapped in `SHADER_READ_ONLY_OPTIMAL`. Its `release` is called once by the time the context is gone.
   - An emberwave texture's image is read after a decode that waits.
   - Images that a decode cannot fill or leave readable are refused, and so are unknown flags.
+
+### 2026-10-30 — D62: Pictures to encode in the caller's textures
+
+**Context.** The C API encoded pictures from CPU memory only, and left pictures in GPU memory for later (D33). A host that captures the screen has its pictures on the GPU: ScreenCaptureKit hands out NV12 or BGRA `CVPixelBuffer`s, and a Vulkan capture hands out `VkImage`s. Reading them back only to upload them again costs a copy each way. Rust has encoded from textures since D32. The C API now wraps the caller's Metal textures (D44) and Vulkan images (D61), and D61 promised the encode from the caller's image, with semaphores ([#133](https://github.com/with-developer/emberwave/issues/133)).
+
+**Decision.**
+- **Wrapping.** `emberwave_texture_from_metal_source` and `emberwave_texture_from_vulkan_source` wrap a texture or image of the caller's that holds one plane of an encoder's pictures, as the `_plane` functions do for a decoder.
+  - The plane is Y, Cb or Cr in one 8-bit channel, or the new `EMBERWAVE_PLANE_CBCR`: Cb and Cr interleaved in two channels (`MTLPixelFormatRG8Unorm`, `VK_FORMAT_R8G8_UNORM`). That is the layout of NV12's second plane and of `TexturePicture::LumaChroma`.
+  - The checks are the decode's: device, format, size, one level, layer and sample, no view. An encode only samples, though, so it needs Metal's `MTLTextureUsageShaderRead` or Vulkan's `VK_IMAGE_USAGE_SAMPLED_BIT`, and no usage that a copy or a draw would need.
+- **One texture type.** The texture is an `EmberwaveTexture`, which now records what it holds: the picture, a plane, or Cb and Cr. A texture of a plane serves the decoders and the encoders of its context whose pictures have planes of its size, so planes a decode put into textures can be encoded again. Decodes refuse Cb and Cr interleaved.
+- **Encoding.** `emberwave_encoder_encode_textures(encoder, y, cb, cr, …)` takes three planes, or Y with Cb and Cr interleaved and `cr` `NULL`, and calls `Encoder::encode_textures`. The frame has the bytes of the same picture encoded from CPU memory (D32). The call waits for the GPU, like every encode, so the textures are free once it returns. A capture's pixel buffer can then go back to its pool, and a texture wrapped for one encode needs no rule about when it may go.
+- **Vulkan.** `emberwave_encoder_encode_textures_vulkan` adds an `EmberwaveVulkanSync`.
+  - The core's `SubmissionHooks` now also run around the encode's submission (`Encoder::encode_textures_with`), in the same turn and with the same guard as the decodes'.
+  - The wait semaphore orders the caller's writes, such as a capture's copy, before the reads. The signal semaphore tells the caller's other queues that the reads are done.
+  - An image to encode is in `SHADER_READ_ONLY_OPTIMAL` whenever an encode reads it, the layout D61 keeps between calls. `UNDEFINED` is refused, since a barrier from it may discard the contents.
+  - wgpu takes a texture made from the caller's handle as initialised (`create_texture_from_hal`), so it never clears one before an encode reads it.
+- **Ordering without semaphores**, as for the decodes:
+  - On the caller's Metal queue, Metal orders command buffers committed before the call that write a tracked texture.
+  - On the caller's Vulkan queue, work submitted before the call is ordered by its own barrier.
+  - On emberwave's own queue, only work that has completed is ordered.
+
+**Consequence.**
+- **Every system CI runs.** Planes that a decode left in textures encode into the bytes of the same planes encoded from CPU memory, in 4:2:0 and 4:4:4.
+- **Metal.**
+  - The app's R8 and RG8 textures, wrapped once and filled with picture after picture, encode into the bytes of the same pictures in CPU memory. That holds as three planes and as NV12's layout, on emberwave's queue and on the app's.
+  - On the app's queue, an encode reads what a blit committed before the call wrote, though an event held the blit back until the call had begun. With the context on emberwave's own queue the same test fails, as nothing orders the two. In a probe of the review, untracked textures were ordered the same way on the app's queue, by the queue's wait for the event; the docs keep to tracked textures, which Metal promises to order.
+- **lavapipe, under the validation layer.**
+  - Images the client copied into are encoded without semaphores: after a copy that completed, and after one submitted before the call with its barrier.
+  - A timeline wait signalled from another thread during the call holds the encode back.
+  - Binary semaphores order the encode between the client's copies.
+- **Left for later.** RGB pictures, the format of most captures, need a conversion in the gather pass. Direct3D 12 shared handles follow.

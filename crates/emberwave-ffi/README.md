@@ -251,7 +251,7 @@ emberwave_texture_destroy(texture);   /* the work on the GPU keeps what it uses 
 - **Planes.** `emberwave_texture_from_metal_plane(decoder, plane, metal, &texture)` wraps an R8 texture for one plane. A Metal texture wrapped for two planes is refused by the decode. When all three textures of a decode have `MTLTextureUsageShaderWrite`, as those of `emberwave_texture_create_plane` do, the decode stores the planes into them from its shaders; otherwise it copies them in, which takes a little longer.
 - **Hazards.** A submit takes only textures whose hazards Metal tracks, as it does for those of a `CVMetalTextureCache`. A heap's textures are usually untracked; the waiting decodes take those too.
 
-On Vulkan, see [A context on the client's Vulkan device](#a-context-on-the-clients-vulkan-device); Direct3D 12 handles are not part of the interface yet.
+On Vulkan, see [A context on the client's Vulkan device](#a-context-on-the-clients-vulkan-device); Direct3D 12 handles are not part of the interface yet. A host encodes pictures from textures as well: see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu).
 
 [`examples/ios`](https://github.com/with-developer/emberwave/tree/main/crates/emberwave-ffi/examples/ios) is an iPhone and iPad app that does all of this in Swift: it times decoding into textures, decoding to planes and encoding on the device's GPU, and draws the last picture from its texture. Its README says how to run it on a phone.
 
@@ -336,6 +336,74 @@ A decode that does not wait may still run after `emberwave_texture_destroy` retu
 
 `tests/vulkan.rs` makes an instance, a device and images as a client does, and runs on Linux CI's lavapipe.
 
+## Pictures to encode on the GPU
+
+A host whose pictures are on the GPU already, as a screen capture's are, encodes them from textures. That spares the read-back to CPU memory and the upload. The encoder reads one texture for each plane: Y, Cb and Cr, each with one 8-bit channel. It can also take Y and a second texture with Cb and Cr interleaved in two channels, as the second plane of NV12 holds them (decision D62). The frame has the bytes that `emberwave_encoder_encode` makes of the same picture in CPU memory.
+
+On Metal, `emberwave_texture_from_metal_source` wraps a texture of the host's own, such as the planes of an NV12 pixel buffer from ScreenCaptureKit:
+
+```objc
+/* Once: a cache on the context's device. The capture delivers NV12 pixel buffers of the
+   encoder's size: '420v' for an encoder signalling video range, '420f' for full range. */
+CVMetalTextureCacheRef cache;
+CVMetalTextureCacheCreate(NULL, NULL, device, NULL, &cache);
+
+/* For every picture the capture delivers: */
+CVMetalTextureRef luma, chroma;
+CVMetalTextureCacheCreateTextureFromImage(NULL, cache, pixelBuffer, NULL, MTLPixelFormatR8Unorm,
+                                          width, height, 0, &luma);
+CVMetalTextureCacheCreateTextureFromImage(NULL, cache, pixelBuffer, NULL, MTLPixelFormatRG8Unorm,
+                                          width / 2, height / 2, 1, &chroma);
+EmberwaveTexture *y, *cbcr;
+emberwave_texture_from_metal_source(encoder, EMBERWAVE_PLANE_Y,
+                                    (__bridge void *)CVMetalTextureGetTexture(luma), &y);
+emberwave_texture_from_metal_source(encoder, EMBERWAVE_PLANE_CBCR,
+                                    (__bridge void *)CVMetalTextureGetTexture(chroma), &cbcr);
+emberwave_encoder_encode_textures(encoder, y, cbcr, NULL, frame, budget, &size);   /* waits for the GPU */
+emberwave_texture_destroy(y);
+emberwave_texture_destroy(cbcr);
+CFRelease(luma);
+CFRelease(chroma);
+/* the pixel buffer may go back to the capture */
+```
+
+With three textures of the planes, `emberwave_encoder_encode_textures(encoder, y, cb, cr, …)` takes them in that order.
+
+- **Textures.** They are on the device of the encoder's context, 2D, of one level, layer and sample, of the plane's size as `emberwave_encoder_info` gives it, and readable by shaders.
+  - On Metal: `MTLPixelFormatR8Unorm` for a plane and `MTLPixelFormatRG8Unorm` for Cb and Cr, with `MTLTextureUsageShaderRead`, which textures of a `CVMetalTextureCache` have.
+  - On Vulkan: `VK_FORMAT_R8_UNORM` and `VK_FORMAT_R8G8_UNORM`, with `VK_IMAGE_USAGE_SAMPLED_BIT`.
+  - Textures of planes that a decoder of the same context put a picture into can be encoded again.
+- **Waiting.** Every encode waits for the GPU. When it returns, the GPU has read the textures, and the host may write them again, give the pixel buffer back to its pool or destroy the texture. Wrapping a texture for one encode and destroying it afterwards is cheap, and so is keeping it for many.
+- **Ordering.** The encode reads the textures after the host's work that writes them only where something orders the two:
+  - On a context of the host's own Metal queue, Metal orders the command buffers committed to it before the call, for textures whose hazards it tracks.
+  - On a context of the host's Vulkan device, work submitted to the context's queue before the call orders itself with a barrier that makes its writes visible to compute shaders. Work on other queues needs semaphores (below).
+  - Otherwise, on a context of emberwave's own queue or for untracked textures, only work that has completed is ordered. A captured pixel buffer is complete once the capture delivers it.
+
+On Vulkan, `emberwave_texture_from_vulkan_source` wraps an image of the host's, and `emberwave_encoder_encode_textures_vulkan` takes the semaphores of an `EmberwaveVulkanSync`, as the decodes that do not wait do:
+
+```c
+EmberwaveVulkanImage image = {
+    .image = (uint64_t)luma_image,
+    .format = VK_FORMAT_R8_UNORM,
+    .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,   /* whenever an encode reads it */
+};
+EmberwaveTexture *y, *cbcr;   /* once, for images the host keeps */
+emberwave_texture_from_vulkan_source(encoder, EMBERWAVE_PLANE_Y, &image, &y);
+/* ... and the VK_FORMAT_R8G8_UNORM image of Cb and Cr for EMBERWAVE_PLANE_CBCR */
+
+/* For every picture: the host's copy of the capture into the images signals `copied`. */
+EmberwaveVulkanSync sync = { .wait_semaphore = (uint64_t)copied };
+emberwave_encoder_encode_textures_vulkan(encoder, y, cbcr, NULL, &sync, frame, budget, &size);
+```
+
+- **Layout.** An image is in `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL` whenever an encode reads it. The host's barriers start from that layout and return the image to it before the next encode, as for the images of decodes. An image described in any other layout is refused, `VK_IMAGE_LAYOUT_UNDEFINED` included, whose contents a barrier may discard.
+- **Semaphores.** The encode's GPU work waits for `wait_semaphore` at every stage before it reads the images. It signals `signal_semaphore` once it has read them, for the host's work on other queues that writes them again. As the call waits for the GPU, it returns only once its wait is met. A binary semaphore needs its signal submitted already. A timeline value can be reached by work submitted to the context's queue before the call, by work on another queue, or by `vkSignalSemaphore` on another thread. Work submitted to the context's queue after the call began runs only after the encode, so it never meets the wait, and the call never returns then.
+- **Budgets.** A budget too small for the smallest frame shows only once the GPU has encoded the picture. The semaphores have been waited for and signalled by then, so a retry with the smallest frame's size takes other semaphores, or new timeline values.
+- **Images.** They have optimal tiling and are exclusive to the context's queue family. emberwave never destroys an image: `release`, if given, is called once the texture is destroyed, as nothing reads the image after its encodes.
+
+`tests/metal.rs` and `tests/vulkan.rs` encode the host's own textures and images both ways, against the same pictures encoded from CPU memory.
+
 ## Rules
 
 - **Errors.** Functions that can fail return an `EmberwaveStatus`. After a failure, `emberwave_last_error()` describes it, for the thread that made the call, until that thread's next failure.
@@ -346,7 +414,7 @@ A decode that does not wait may still run after `emberwave_texture_destroy` retu
 - **Panics.** A panic inside emberwave is caught and reported as `EMBERWAVE_STATUS_INTERNAL`; destroy the object it happened in.
 - **Packets.** `emberwave_decoder_push_packet` takes one packet or several back to back, in any order, and ignores a block that arrived already. Frames are told apart by the bitstream's sequence number, which has three bits: a packet of a frame one to three frames newer discards what was received of the older one and starts its own; one four to seven frames newer, or one to four frames older, is ignored; one five to seven frames older passes for a newer frame, and one eight frames off for the same frame. So a transport keeps frame numbers of its own: it drops packets of frames older than the one being received, and before it gives the first packet of a newer frame it decodes the current one if it is ready, then calls `emberwave_decoder_clear`, not after.
 - **Partial frames.** `emberwave_decoder_is_ready` with `allow_partial_frame` accepts a frame that lost packets once every block of the coarsest level and more than 90 percent of the blocks its start of frame header announced have arrived, for a picture despite the loss; `emberwave_decoder_set_partial_share` sets another share, lower to draw frames that lost more, with more of their detail blank, or 1 for whole frames only (decision D59). Until that header arrives the count is of all the picture's blocks. emberwave's encoder sends every block of the coarsest level for this; upstream's leaves out the empty ones, so a frame of it that lost any packet may never be ready in part (decision D58).
-- **Encoding.** `emberwave_encoder_encode` reads planes with a stride of at least their width (`emberwave_encoder_info` gives the sizes) and writes the frame, at most `budget` bytes, into a buffer of that many bytes the caller provides; it waits for the GPU. A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in `size`, and encodes nothing. The frame's sequence number, a three-bit counter from 1 that wraps around, advances only with frames that were encoded. `emberwave_frame_packets` splits a frame at its blocks; a block larger than the packet size gets a packet of its own.
+- **Encoding.** `emberwave_encoder_encode` reads planes with a stride of at least their width (`emberwave_encoder_info` gives the sizes), and `emberwave_encoder_encode_textures` reads them from textures on the GPU (see [Pictures to encode on the GPU](#pictures-to-encode-on-the-gpu)). Both write the frame, at most `budget` bytes, into a buffer of that many bytes the caller provides, and wait for the GPU. A budget below the smallest frame is `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in `size`, and encodes nothing. The frame's sequence number, a three-bit counter from 1 that wraps around, advances only with frames that were encoded. `emberwave_frame_packets` splits a frame at its blocks; a block larger than the packet size gets a packet of its own.
 - **Signalling.** `EmberwaveSignalling` sets what every frame says about its colours: matrix (BT.709 or BT.2020; the format cannot signal BT.601), range, chroma siting, primaries and transfer function (sRGB or PQ). `NULL` means BT.709, video range, centred chroma and sRGB. Its `reserved` words are zero.
 - **Colours.** With a `NULL` colour, `emberwave_decoder_decode_rgb` converts the way the frame's start of frame header says. Upstream's Metal encoder writes BT.709, full range and centred chroma there whatever the pictures are, so pass what you know, such as the colours of a PWV1 file's header from `emberwave_probe_pwv1`.
 

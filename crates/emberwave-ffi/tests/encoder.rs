@@ -695,3 +695,244 @@ fn the_c_decoder_shows_the_c_encoders_pictures() {
     // SAFETY: live, destroyed once.
     unsafe { emberwave_context_destroy(context) };
 }
+
+/// A decoder made through the C API for pictures of `layout`, which must
+/// succeed.
+fn decoder_for(context: *mut EmberwaveContext, layout: &FrameLayout) -> *mut EmberwaveDecoder {
+    let chroma = match layout.chroma() {
+        ChromaSubsampling::Yuv420 => EMBERWAVE_CHROMA_420,
+        ChromaSubsampling::Yuv444 => EMBERWAVE_CHROMA_444,
+    };
+    let mut decoder = ptr::null_mut();
+    // SAFETY: a live context and a pointer to store the decoder.
+    let status = unsafe {
+        emberwave_decoder_create(
+            context,
+            layout.width(),
+            layout.height(),
+            chroma,
+            &mut decoder,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    decoder
+}
+
+/// Three textures of `decoder`'s planes, Y, Cb and Cr.
+fn plane_textures(decoder: *mut EmberwaveDecoder) -> [*mut EmberwaveTexture; 3] {
+    [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+        let mut texture = ptr::null_mut();
+        // SAFETY: a live decoder and a pointer to store the texture.
+        let status = unsafe { emberwave_texture_create_plane(decoder, plane, &mut texture) };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        texture
+    })
+}
+
+/// Encodes the planes in `textures` through the C API: the status, and the
+/// frame or, after a failure, what the size out-parameter holds.
+fn encode_textures_c(
+    encoder: *mut EmberwaveEncoder,
+    [y, cb, cr]: [*const EmberwaveTexture; 3],
+    budget: usize,
+) -> (EmberwaveStatus, Vec<u8>, usize) {
+    let mut frame = vec![0u8; budget];
+    let mut size = usize::MAX;
+    // SAFETY: a live encoder, textures that are NULL or live, and a frame of
+    // `budget` bytes.
+    let status = unsafe {
+        emberwave_encoder_encode_textures(encoder, y, cb, cr, frame.as_mut_ptr(), budget, &mut size)
+    };
+    if status == EmberwaveStatus::Ok {
+        frame.truncate(size);
+    } else {
+        frame.clear();
+    }
+    (status, frame, size)
+}
+
+#[test]
+fn planes_a_decode_left_in_textures_encode_as_the_same_planes_in_memory() {
+    let Some(context) = context() else {
+        return;
+    };
+    for (width, height, chroma) in SHAPES {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let maker = encoder_for(context, &layout, None);
+        let decoder = decoder_for(context, &layout);
+        let textures = plane_textures(decoder);
+        let mut storage = Vec::new();
+        let source = picture(&layout, 4);
+        let (status, frame, _) = encode_c(
+            maker,
+            source_planes(&layout, &source, 0, &mut storage),
+            9_000,
+        );
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+
+        // The decoded planes, in the textures and in CPU memory.
+        let mut decoded: Vec<Vec<u8>> = (0..3)
+            .map(|plane| {
+                let (w, h) = layout.plane_size(Component::ALL[plane]);
+                vec![0; (w * h) as usize]
+            })
+            .collect();
+        // SAFETY: a live decoder, its textures, a frame of the length passed
+        // and planes of its sizes.
+        unsafe {
+            for into_textures in [true, false] {
+                emberwave_decoder_clear(decoder);
+                let status = emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len());
+                assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+                let status = if into_textures {
+                    emberwave_decoder_decode_plane_textures(
+                        decoder,
+                        textures[0],
+                        textures[1],
+                        textures[2],
+                    )
+                } else {
+                    let [y, cb, cr] = [0, 1, 2].map(|plane| EmberwavePlane {
+                        data: decoded[plane].as_mut_ptr(),
+                        stride: layout.plane_size(Component::ALL[plane]).0 as usize,
+                    });
+                    emberwave_decoder_decode_yuv(decoder, y, cb, cr)
+                };
+                assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+            }
+        }
+
+        // Fresh encoders, so that both frames take the first sequence
+        // number.
+        let from_textures = encoder_for(context, &layout, None);
+        let from_memory = encoder_for(context, &layout, None);
+        let (status, frame, _) =
+            encode_textures_c(from_textures, textures.map(|t| t.cast_const()), 6_000);
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        let in_memory = [decoded[0].clone(), decoded[1].clone(), decoded[2].clone()];
+        let (status, expected, _) = encode_c(
+            from_memory,
+            source_planes(&layout, &in_memory, 3, &mut storage),
+            6_000,
+        );
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        assert!(frame == expected, "{width}x{height} {chroma:?}");
+
+        // A budget too small, as from CPU memory.
+        let (status, _, size) =
+            encode_textures_c(from_textures, textures.map(|t| t.cast_const()), 13);
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(size > 13, "the smallest frame's size, not {size}");
+
+        // SAFETY: live, destroyed once each.
+        unsafe {
+            for texture in textures {
+                emberwave_texture_destroy(texture);
+            }
+            emberwave_decoder_destroy(decoder);
+            for encoder in [maker, from_textures, from_memory] {
+                emberwave_encoder_destroy(encoder);
+            }
+        }
+    }
+    // SAFETY: live, destroyed once.
+    unsafe { emberwave_context_destroy(context) };
+}
+
+#[test]
+fn textures_an_encode_cannot_read_are_refused() {
+    let Some(context) = context() else {
+        return;
+    };
+    let layout = FrameLayout::new(200, 120, ChromaSubsampling::Yuv420).unwrap();
+    let encoder = encoder_for(context, &layout, None);
+    let decoder = decoder_for(context, &layout);
+    let [y, cb, cr] = plane_textures(decoder);
+    let mut picture = ptr::null_mut();
+    // SAFETY: a live decoder and a pointer to store the texture.
+    let status =
+        unsafe { emberwave_texture_create(decoder, EMBERWAVE_TEXTURE_RGBA8, &mut picture) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    let other_size = FrameLayout::new(208, 120, ChromaSubsampling::Yuv420).unwrap();
+    let other_decoder = decoder_for(context, &other_size);
+    let [other_y, _, _] = plane_textures(other_decoder);
+    let other_context = context_or_panic();
+    let elsewhere = decoder_for(other_context, &layout);
+    let [elsewhere_y, _, _] = plane_textures(elsewhere);
+
+    let refused = |textures: [*mut EmberwaveTexture; 3], says: &str| {
+        let (status, frame, size) =
+            encode_textures_c(encoder, textures.map(|t| t.cast_const()), 9_000);
+        assert_eq!(status, EmberwaveStatus::InvalidArgument, "{says}");
+        assert!(frame.is_empty() && size == 0, "{says}");
+        let error = last_error();
+        assert!(error.contains(says), "{says}: {error}");
+    };
+    let none = ptr::null_mut();
+    refused([none, cb, cr], "y is NULL");
+    refused([y, none, cr], "cb is NULL");
+    refused([y, cb, none], "cr is NULL");
+    refused([cb, y, cr], "y is not a texture for the Y plane");
+    refused([y, cr, cb], "cb is not a texture for the Cb plane");
+    refused([picture, cb, cr], "y is not a texture for the Y plane");
+    refused([elsewhere_y, cb, cr], "another context");
+    // Of another picture size: the encoder's own check.
+    refused([other_y, cb, cr], "texture");
+
+    // Semaphores and images of the caller's need a Vulkan context.
+    let mut frame = vec![0u8; 100];
+    let mut size = 0;
+    // SAFETY: a live encoder and textures, a frame of the length passed and
+    // pointers to store results in.
+    unsafe {
+        let status = emberwave_encoder_encode_textures_vulkan(
+            encoder,
+            y,
+            cb,
+            cr,
+            ptr::null(),
+            frame.as_mut_ptr(),
+            frame.len(),
+            &mut size,
+        );
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(last_error().contains("not on the caller's Vulkan device"));
+        let image = EmberwaveVulkanImage {
+            image: 1,
+            format: 9,
+            usage: 4,
+            layout: 5,
+            release: None,
+            user: ptr::null_mut(),
+        };
+        let mut texture = ptr::null_mut();
+        let status =
+            emberwave_texture_from_vulkan_source(encoder, EMBERWAVE_PLANE_Y, &image, &mut texture);
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(texture.is_null());
+        let status = emberwave_texture_from_metal_source(encoder, 7, ptr::null_mut(), &mut texture);
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(last_error().contains("EMBERWAVE_PLANE_CBCR"));
+        // Cb and Cr interleaved is for encoders only.
+        let status = emberwave_texture_create_plane(decoder, EMBERWAVE_PLANE_CBCR, &mut texture);
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    }
+
+    // SAFETY: live, destroyed once each.
+    unsafe {
+        for texture in [y, cb, cr, picture, other_y, elsewhere_y] {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_decoder_destroy(decoder);
+        emberwave_decoder_destroy(other_decoder);
+        emberwave_decoder_destroy(elsewhere);
+        emberwave_encoder_destroy(encoder);
+        emberwave_context_destroy(other_context);
+        emberwave_context_destroy(context);
+    }
+}
+
+/// A second context, where the first was made.
+fn context_or_panic() -> *mut EmberwaveContext {
+    context().expect("a second context where there is a first")
+}
