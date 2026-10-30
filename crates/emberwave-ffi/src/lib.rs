@@ -422,6 +422,8 @@ impl Holds {
     }
 
     /// The texture, with its owner, for messages: "the plane's" or so.
+    /// Read where Metal textures are checked.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
     fn whose(self) -> &'static str {
         match self {
             Self::Picture => "picture's",
@@ -443,7 +445,9 @@ struct Wrapping<'a> {
     holds: Holds,
     /// Whether an encoder reads the texture, rather than a decoder fill it.
     read: bool,
-    /// Whether the decoder stores planes into textures (decision D52).
+    /// Whether the decoder stores planes into textures (decision D52), as
+    /// it does on Metal only. Read where Metal textures are wrapped.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
     stores_planes: bool,
 }
 
