@@ -40,7 +40,7 @@ This is PyroWave bitstream v1, which upstream froze on 2026-10-03. It is describ
 
 - Byte oriented, little endian. A *word* is a little-endian `u32`.
 - Bit-fields start at the least significant bit, in the order they are listed.
-- Coefficient blocks are the unit of coding: every 32x32 block of a sub-band is coded in isolation, with no prediction or context. A missing block decodes as zeros.
+- Coefficient blocks are the unit of coding: every 32x32 block of a sub-band is coded in isolation, with no prediction or context. A missing block decodes as zeros, or, where a decoder conceals, as the last frame's where the picture is still (D66).
 
 ### Frames, packets and the PWV1 file
 
@@ -539,6 +539,7 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | `emberwave_context_create_d3d12`, `emberwave_d3d12_fence_open`, `_destroy` | A context on the Direct3D 12 adapter of a LUID, and the client's shared fences opened on its device (D63) |
 | `emberwave_texture_from_d3d12`, `_d3d12_plane`, `_d3d12_source` | The client's textures, shared through NT handles, for a decoder's picture or plane or an encoder's plane or picture in RGB (D63, D65) |
 | `emberwave_decoder_submit_texture_d3d12`, `_submit_plane_textures_d3d12`, `emberwave_encoder_encode_textures_d3d12` | Decodes and encodes on such textures, with fences to wait for and to signal, leaving them in `D3D12_RESOURCE_STATE_COMMON` (D63) |
+| `emberwave_decoder_set_concealment` | Frames drawn in part keep the last frame's detail where the picture is still, for the blocks they lack (D66) |
 | `emberwave_frame_packets` | Where a frame splits into packets of a given size, at its blocks |
 | `emberwave_version`, `emberwave_last_error` | The version, and the message of the last failure on the calling thread |
 
@@ -1638,3 +1639,47 @@ Direct3D 12 through shared handles follows, and the encoder's input from the cal
 - **Time.** On an Apple M3 Max (macOS 27.0.1, Metal, 2026-10-31, `bench-encode --gpu [--textures] [--rgb]`, 600 frames, two rounds), a 4K frame of the benchmark scene at 1.2 MB encodes from a BGRA texture in 1.82 to 1.84 ms. From textures of its planes it takes 1.74 to 1.75 ms, and from its planes in CPU memory 1.87 to 1.88 ms. The conversion takes the transform's pass from 0.44 to 0.54 ms. At 1080p the three take 0.84 to 0.90, 0.79 to 0.84 and 0.83 to 0.84 ms.
 - **RGB in CPU memory.** The first version wrote the picture with `Queue::write_texture`, which stages it in new memory of wgpu's on every call: a 4K frame took 6.0 to 6.1 ms, 3.2 ms of it to prepare. It also made the command buffer that carries such writes before the encode took its turn at the queue (D60), and on a caller's Metal queue held it while the call waited: in the review, encoders of four contexts on a queue with room for 20 command buffers waited for good. The buffer is mapped and written without a command buffer, and the copy goes with the encode's own. Through the buffer the encoder keeps it takes 2.5 to 2.8 ms, 0.58 ms of it to prepare, and a 1080p frame 1.02 ms rather than 1.83 to 1.93 ms (same machine and runs, [#141](https://github.com/with-developer/emberwave/issues/141)). Hosts with their pictures on the GPU take the textures, which spare the copy.
 - **Not done.** Pictures of more than 8 bits, as captures of HDR screens hold them (`Rgb10a2Unorm`, `Rgba16Float`), which the codec's 8-bit planes cannot carry, and Direct3D's NV12 textures (D63).
+
+### 2026-10-31 — D66: Frames drawn in part conceal what they lack where the picture is still
+
+**Context.** A frame drawn in part decodes the blocks it lacks as zeros, so its detail is blank where it lost blocks ([#129](https://github.com/with-developer/emberwave/issues/129)). #123 measured that on a still picture the last picture left on screen is closer to the truth than such a frame: 2 dB closer than one that kept 70 to 80 % of its blocks. After a decode the pyramid still holds that frame's dequantised detail bands (`Decoder::read_band`), and every frame drawn in part has its coarsest level whole (D58), from which a decoder can tell where the picture moved.
+
+The decoder cannot tell a block that was lost from one that the encoder never sent because it had nothing left: both are missing. In a whole frame a missing block is one never sent, which is zero. So only frames drawn in part conceal, where a missing block may be either.
+
+**Measured first**, on the CPU, with a concealing copy of the CPU decoder:
+- **Setup.** 1920x1080 windows of the 4K game frame of #123, still or panned by 1, 2 or 8 pixels a frame, with and without noise of up to 3 levels a sample, and emberwave's 1080p benchmark scene. Each picture was encoded by the CPU encoder at 150 and 400 kB, split into packets of 1403 bytes, and lost bursts of packets past the coarsest level, after a whole frame.
+- **Measure.** Luma PSNR against the source, for frames drawn from 40 to 60 % of their blocks.
+
+| Picture, 150 kB / 400 kB | Zeros | The last frame's detail, always | Where the coarsest level moved by at most 0.03 |
+|---|---|---|---|
+| Still game frame | 19.8 / 23.0 dB | 23.1 / 27.0 dB, the whole frame's | the same |
+| Still, with noise | 19.9 / 22.8 dB | 23.1 / 26.8 dB | 22.7 / 26.8 dB |
+| Panned 1 pixel a frame | 19.8 / 22.1 dB | 21.4 / 22.5 dB | 19.9 / 22.1 dB |
+| Panned 2 pixels a frame | 20.2 / 22.9 dB | 19.6 / 20.9 dB | 20.2 / 22.9 dB |
+| Panned 8 pixels a frame | 20.2 / 23.1 dB | 18.5 / 21.2 dB | 20.2 / 23.1 dB |
+| The benchmark scene, mostly still | 27.7 / 28.0 dB | 40.7 / 44.8 dB | 40.1 / 43.7 dB |
+
+The last frame's detail, always, gains everything on a still picture and loses up to 2 dB on a moving one. Gated by the coarsest level, it keeps most of the gain and loses at most 0.03 dB. A threshold of 0.01 gave up most of the gain on the noisy still picture at 150 kB. One of 0.1 let the 2-pixel pan's detail in, 0.5 to 1.7 dB worse than zeros.
+
+**Decision.**
+- **The rule.** In a frame drawn in part, a block of detail the frame lacks, below the coarsest level, takes the last decode's coefficients where the coarsest level's four bands of its component changed by at most `cpu::CONCEALMENT_THRESHOLD`, 0.03, since that decode. The region compared is where the block lies in the coarsest level, one coefficient around included. Elsewhere the block is zero, as without concealment. Whole frames decode as before.
+- **The reference.** `cpu::Concealer` decodes frames one after another and keeps the coefficients the last decode left.
+- **The GPU.**
+  - A decode that conceals first copies the last decode's coarsest level out of the pyramid, which still holds it (about 400 kB at 4K).
+  - `dequant.wgsl` leaves the blocks of detail the frame lacks as they are, by the `conceal` word of its parameters, the only word that changes from frame to frame.
+  - `conceal.wgsl` follows it in the same compute pass. It takes a workgroup per block, compares the coarsest level around the block, and zeroes the block where the picture moved.
+  - A context compiles the pass when one of its decoders first conceals, as most never do.
+  - The band table carries each band's level and component in what were padding words.
+- **Off by default**, as upstream's decoder has zeros, which D59 kept for other clients' defaults as well:
+  - `gpu::Decoder::set_concealment`;
+  - the C API's `emberwave_decoder_set_concealment`;
+  - the browser player's `set_concealment`.
+
+**Consequence.**
+- **Tests.**
+  - On the CPU, a still picture's frame drawn in part decodes as the whole frame, a changed picture's as without concealment, and nothing is taken from the frame of another size or with no frame before.
+  - On every GPU CI runs, the GPU decoder conceals as `cpu::Concealer` does, within 1 of a sample, through a sequence of whole, still and changed frames. The still frame in part is the whole frame to the byte.
+  - Through the C API, a still frame drawn in part with concealment decodes as the whole frame did.
+- **Cost.** On an Apple M3 Max a 4K frame drawn from 838 of its 1037 packets decodes with read-back in 0.930 to 0.946 ms with concealment, against 0.935 to 0.953 ms without, within the runs' noise.
+- **What the gate misses.** A picture whose motion shows only in fine texture, which the coarsest level averages out, takes the last frame's detail out of place. A unit test met that with texture alone moved by two pixels; natural pictures, the game frame included, move their coarsest level too.
+- **emberwave-stream** turns it on, where a frame drawn in part is what a lossy link leaves when parity falls short.
