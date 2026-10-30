@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.16.0] - 2026-10-31
+
+Still pictures keep their detail through lost packets, and the wavelet transforms take less GPU time. A decoder that conceals, which a client turns on, fills the blocks of detail that a frame drawn in part lacks with the last frame's, wherever the coarsest level shows that the picture has not moved: in Rust, through the C API and in the browser player. The transforms read their rows straight from the bands, with the same output to the byte: on an Apple M3 Max a 4K frame's GPU work takes 0.47 ms instead of 0.54 ms.
 
 ### Added
 
