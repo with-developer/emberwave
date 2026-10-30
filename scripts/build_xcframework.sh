@@ -11,7 +11,9 @@
 #
 # Next to the XCFramework, native-static-libs-SLICE.txt names the system
 # libraries and frameworks that a program linking the library of SLICE needs
-# as well, as rustc reports them.
+# as well, as rustc reports them, and Emberwave.xcframework.zip holds the
+# XCFramework at the top of a zip archive, the shape a SwiftPM binary target
+# downloads: releases publish it as it is.
 #
 # Usage: scripts/build_xcframework.sh [SLICE...]
 #
@@ -82,6 +84,10 @@ for slice in "${slices[@]}"; do
 done
 
 xcodebuild -create-xcframework "${libraries[@]}" -output "$OUT/Emberwave.xcframework"
+# ditto zips a bundle as Apple's tools do, here without the extended
+# attributes that macOS adds to built files, which would go in as ._ files.
+(cd "$OUT" && ditto -c -k --keepParent --norsrc --noextattr --noacl \
+    Emberwave.xcframework Emberwave.xcframework.zip)
 for slice in "${slices[@]}"; do
     echo "$slice needs: $(cat "$OUT/native-static-libs-$slice.txt")"
 done
