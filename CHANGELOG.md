@@ -4,6 +4,15 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ## [Unreleased]
 
+### Added
+
+- Pictures in RGB, as screen captures hold them, encoded without a conversion pass of the host's: the encoder converts R', G' and B' to Y'CbCr as it reads them, by the matrix, range and chroma siting of its signalling, in integers that make the same bytes on every GPU and on the CPU (decision D65). In Rust, `TexturePicture::Rgb` takes an `Rgba8Unorm` or `Bgra8Unorm` texture, `gpu::Encoder::encode_rgb` and `encode_rgb_timed` RGB in CPU memory, and `encode::Encoder::encode_rgb` converts on the CPU; `color::rgb_to_ycbcr8` is the conversion, with `RgbOrder` and `ForwardMatrix`, and `Signalling::color_params` the colours a stream signals. In the C API, `EMBERWAVE_PLANE_RGB` wraps a BGRA or RGBA texture of Metal, Vulkan or Direct3D for `emberwave_encoder_encode_textures` and its `_vulkan` and `_d3d12` forms, which take it as `y` with `cb` and `cr` `NULL`; a picture that a decode put into a texture encodes as well. `emberwave_encoder_encode_rgb` takes RGB in CPU memory. A 4K frame from a BGRA texture encodes in 1.82 to 1.84 ms on an Apple M3 Max, against 1.74 to 1.75 ms from textures of its planes.
+- `emberwave-cli bench-encode --rgb` measures the encoder from BGRA pictures, in CPU memory or with `--textures` in textures.
+
+### Changed
+
+- `gpu::TexturePicture` has a new variant, `Rgb`, and `encode::EncodeError` a new variant, `Picture`, for an RGB picture that does not fit its size and stride: a `match` that names every variant needs an arm for each.
+
 ### Fixed
 
 - A packet whose blocks each start a frame newer than the one before cost the assembler a reset of its whole table of blocks per block: a crafted 512 KiB packet took 31 ms at 4K and 247 ms at the browser player's largest size. A new frame now resets only the blocks that came, and the same packet takes 0.4 ms at any size.
