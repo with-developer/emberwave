@@ -15,7 +15,9 @@ import PackageDescription
 
 let package = Package(
     name: "EmberwaveExample",
-    platforms: [.macOS(.v11), .iOS(.v12)],
+    // macOS 12, the oldest that Xcode 27's Swift Build takes; the library
+    // itself runs on macOS 11.
+    platforms: [.macOS(.v12), .iOS(.v12)],
     targets: [
         .binaryTarget(
             name: "Emberwave",

@@ -2,7 +2,8 @@ name: Release
 
 # Pushing a tag vX.Y.Z builds emberwave-cli and the C library (emberwave-ffi)
 # for Linux, macOS and Windows, and the C library as an XCFramework for iOS
-# and macOS, and publishes a GitHub release with the archives, their
+# and macOS, also in the archive a SwiftPM binary target takes, and
+# publishes a GitHub release with the archives, their
 # checksums and the CHANGELOG.md section of that version as the notes. Run by hand (workflow_dispatch), on a branch or a tag, it builds
 # and packages the same archives without checking or publishing anything: a
 # rehearsal before tagging.
@@ -146,10 +147,16 @@ jobs:
           cp crates/emberwave-ffi/README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md "$name/"
           # ditto zips a bundle as Apple's tools do.
           ditto -c -k --keepParent "$name" "$name.zip"
+          # For SwiftPM, the XCFramework alone at the top of an archive, as
+          # the build made it: a remote binary target downloads it by its
+          # URL and the checksum of SHA256SUMS (decision D64).
+          cp target/xcframework/Emberwave.xcframework.zip .
       - uses: actions/upload-artifact@v7
         with:
           name: xcframework
-          path: emberwave-ffi-*-xcframework.zip
+          path: |
+            emberwave-ffi-*-xcframework.zip
+            Emberwave.xcframework.zip
           if-no-files-found: error
 
   release:
