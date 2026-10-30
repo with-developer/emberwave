@@ -1589,7 +1589,7 @@ Direct3D 12 through shared handles follows, and the encoder's input from the cal
 - **Dependencies.** The `windows` crate 0.62 and `pollster` on Windows, both already used by wgpu's Direct3D 12 backend and the core, at the same versions.
 
 **Consequence.**
-- **Tests.** `tests/d3d12.rs` runs in Windows CI on WARP, Direct3D's software adapter. A Direct3D 11 device stands for a host or a client: it shares textures and a fence through NT handles, and orders its own work with `ID3D11DeviceContext4::Wait` and `Signal`.
+- **Tests.** `tests/d3d12.rs` runs in Windows CI on WARP, Direct3D's software adapter, which every Windows has, so the tests never skip. A Direct3D 11 device stands for a host or a client: it shares textures and a fence through NT handles, and orders its own work with `ID3D11DeviceContext4::Wait` and `Signal`.
   - Pictures, copied at 192 pixels wide and drawn at 200, and planes decode into its textures, and read back after the fence as the decodes that wait give them.
   - Planes, and NV12's layout of Y with Cb and Cr interleaved, encode from its textures into the bytes of the same pictures in CPU memory.
   - Formats and sizes that do not fit are refused, a handle that is not a fence's is refused, a LUID of no adapter is refused, and the calls without fences refuse shared textures.

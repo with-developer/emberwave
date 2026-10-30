@@ -60,17 +60,10 @@ struct Host {
 }
 
 impl Host {
-    /// The host, or `None` where there is no WARP, unless the environment
-    /// insists on a GPU.
-    fn new() -> Option<Self> {
-        let made = Self::make();
-        if made.is_none() {
-            assert!(
-                std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
-                "no Direct3D 11 device on WARP"
-            );
-        }
-        made
+    /// The host. WARP is part of Windows, so the tests never skip, and a
+    /// pass means they ran.
+    fn new() -> Self {
+        Self::make().expect("a Direct3D 11.4 device on WARP, with a shared fence")
     }
 
     fn make() -> Option<Self> {
@@ -352,9 +345,7 @@ fn expected(
 
 #[test]
 fn a_client_reads_pictures_and_planes_after_the_fence() {
-    let Some(mut host) = Host::new() else {
-        return;
-    };
+    let mut host = Host::new();
     // 192 pixels wide, a copy fills the picture's texture; 200, a draw.
     for name in ["noise_192x136_420.pwv1", "gradient_200x120_420.pwv1"] {
         let (frames, size) = stream(name);
@@ -455,9 +446,7 @@ fn a_client_reads_pictures_and_planes_after_the_fence() {
 
 #[test]
 fn a_hosts_shared_planes_are_encoded_after_the_fence() {
-    let Some(mut host) = Host::new() else {
-        return;
-    };
+    let mut host = Host::new();
     let (size, chroma) = ((192usize, 136usize), (96usize, 68usize));
     let mut encoders = [ptr::null_mut(); 3];
     for encoder in &mut encoders {
@@ -644,9 +633,7 @@ fn contexts_need_a_direct3d_12_adapter_and_fences_of_their_own() {
     let status = unsafe { emberwave_context_create_d3d12(0, 0, &mut context) };
     assert_eq!(status, EmberwaveStatus::NoGpu, "{}", last_error());
     assert!(context.is_null());
-    let Some(host) = Host::new() else {
-        return;
-    };
+    let host = Host::new();
     let mut fence = ptr::null_mut();
     // SAFETY: a live context, and a pointer to store the fence in.
     let status = unsafe { emberwave_d3d12_fence_open(host.context, ptr::null_mut(), &mut fence) };
