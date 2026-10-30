@@ -26,7 +26,7 @@ use crate::encode::{
     stream_header,
 };
 
-use super::context::{GpuContext, QueueTurns, notice_loss, submit_writes, take_turn};
+use super::context::{GpuContext, QueueTurns, notice_loss, take_turn};
 use super::error::GpuError;
 use super::layout::{
     BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
@@ -247,7 +247,7 @@ impl Encoder {
 
         // As in the decoder: on a queue of the caller's, the writes below
         // are made during a turn and submitted at once (decision D60).
-        let turn = take_turn(context.turns.as_deref());
+        let turn = take_turn(context.turns.as_deref(), &device, &queue);
         let made = with_error_scope(&device, || {
             let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
             // Tests write and read the buffers between the stages.
@@ -420,9 +420,8 @@ impl Encoder {
             }
         })
         .map_err(|error| context.explain(error));
-        if turn.is_some() {
-            submit_writes(&device, &queue);
-        }
+        // Ending, the turn submits the writes.
+        drop(turn);
         made
     }
 
@@ -565,7 +564,7 @@ impl Encoder {
         // takes its turn at them (decision D60); the upload above waits for
         // the GPU to map its buffer, so it comes first.
         let turns = self.turns.clone();
-        let recording = take_turn(turns.as_deref());
+        let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         with_error_scope(&self.device, || {
             self.queue
                 .write_buffer(&self.frame_params, 0, bytemuck::bytes_of(&params));
@@ -591,6 +590,7 @@ impl Encoder {
             self.encode_read_back(&mut encoder, capacity_words);
             self.queue.submit([encoder.finish()]);
         })?;
+        recording.submitted();
         drop(recording);
         let data = read_back(
             &self.device,

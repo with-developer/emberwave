@@ -16,7 +16,7 @@ use crate::bitstream::{
 };
 use crate::color::ColorParams;
 
-use super::context::{GpuContext, QueueTurns, notice_loss, submit_writes, take_turn};
+use super::context::{GpuContext, QueueTurns, notice_loss, take_turn};
 use super::error::GpuError;
 use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{DrawPipeline, Pipelines, Stage, with_error_scope};
@@ -311,7 +311,7 @@ impl Decoder {
         // until a submission. On a queue of the caller's they are written
         // during a turn and submitted at once, so that a decoder not yet
         // used holds none of its command buffers (decision D60).
-        let turn = take_turn(context.turns.as_deref());
+        let turn = take_turn(context.turns.as_deref(), &device, &queue);
         let made = with_error_scope(&device, || {
             let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
 
@@ -402,9 +402,8 @@ impl Decoder {
             }
         })
         .map_err(|error| context.explain(error));
-        if turn.is_some() {
-            submit_writes(&device, &queue);
-        }
+        // Ending, the turn submits the writes.
+        drop(turn);
         made
     }
 
@@ -919,7 +918,7 @@ impl Decoder {
         // takes its turn at them (decision D60); the upload above waits for
         // the GPU to map its buffer, so it comes first.
         let turns = self.turns.clone();
-        let recording = take_turn(turns.as_deref());
+        let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let output = self.prepare_output(color, read)?;
         let prepare = assembled_in + prepare_start.elapsed();
 
@@ -971,6 +970,7 @@ impl Decoder {
             }
             self.queue.submit([encoder.finish()]);
         })?;
+        recording.submitted();
         drop(recording);
 
         // The wait for the frame polls the device, which records a loss. A
@@ -1118,7 +1118,7 @@ impl Decoder {
     ) -> Result<(), GpuError> {
         self.check_device()?;
         let turns = self.turns.clone();
-        let recording = take_turn(turns.as_deref());
+        let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1131,6 +1131,9 @@ impl Decoder {
                     self.queue.submit([encoder.finish()]);
                 })
             });
+        if outcome.is_ok() {
+            recording.submitted();
+        }
         drop(recording);
         if outcome.is_ok() {
             self.assembler.mark_frame_decoded();
@@ -1497,7 +1500,7 @@ impl Decoder {
         let bytes = u64::from(width) * u64::from(height) * 4;
 
         self.check_device()?;
-        let recording = take_turn(self.turns.as_deref());
+        let mut recording = take_turn(self.turns.as_deref(), &self.device, &self.queue);
         let submitted = with_error_scope(&self.device, || {
             let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("band readback"),
@@ -1514,6 +1517,9 @@ impl Decoder {
             self.queue.submit([encoder.finish()]);
             staging
         });
+        if submitted.is_ok() {
+            recording.submitted();
+        }
         drop(recording);
         let copied = submitted.and_then(|staging| read_back(&self.device, &staging, bytes));
         // As in run_gpu: a failure on a device that was lost meanwhile is the loss.

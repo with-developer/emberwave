@@ -1460,6 +1460,9 @@ The queues wgpu makes itself have room for 4096 command buffers.
 **Decision.**
 - **Turns.** A context made on a queue of the caller's takes turns at making and submitting command buffers (`QueueTurns`). Each of its decoders and encoders holds a turn from the first command buffer a call makes until `Queue::submit` returns. It does not hold one while the call waits for its work on the GPU: an upload that maps a buffer, which waits, comes before the turn, and a readback after. A call can still wait for room on the queue during its turn, as anything that uses the queue can.
 - **Making takes a turn.** Making a context on such a queue, and a decoder or an encoder on one, takes a turn and submits wgpu's writes at once, so that no context holds a command buffer between calls.
+- **A failed call submits too.** A call that fails after it has written through the queue submits those writes as its turn ends.
+- **One context made at a time.** The C API makes the contexts on a client's queue one at a time. From the making of its device until its first turn, a context holds a command buffer outside any turn. A second review found that three contexts made at once, beside a call that waited for room, hung a queue of 20.
+- **The caller's own work.** A caller that records emberwave's work into its own encoder, with `Decoder::encode_rgb` and the like, takes a turn for its submission with `QueueTurns::take`.
 - **One set of turns per queue.** Contexts made on one `MTLCommandQueue` share their turns. The C API finds them by the queue's address while anything made on that queue lives; any client that makes devices on its own queue can use `GpuContext::with_queue_turns`.
 - **No turns on wgpu's queues.** They cannot run out of command buffers, and turns would cost the threads that share one context up to a tenth of their throughput.
 - **Docs.** The C API gives the measured counts and the room a queue needs: 20 command buffers besides those the caller holds uncommitted. It also says that nothing of emberwave may be called inside a completion handler of a command buffer of that queue.
@@ -1470,7 +1473,8 @@ The queues wgpu makes itself have room for 4096 command buffers.
 **Consequence.**
 - **The tests.** `tests/metal.rs` checks both kinds of hang on a queue with room for 20 command buffers. Where a queue does not make the command buffer past its room wait, as a virtual GPU might not, the tests say so and pass, since they cannot tell anything there.
   - Two contexts, each with a thread that encodes and one that decodes, 20 calls each, finish in a second or two. With no turns, or with turns per context rather than per queue, they hung in every run.
-  - 24 contexts on that queue, four of them with a decoder, and an encode on another finish. Without the submissions at making they hung.
+  - 24 contexts on that queue, four of them with a decoder and four with an encoder, and an encode on another finish. Without the submissions at making, by a context, a decoder or an encoder, they hung.
+- **The second review's reproductions.** With the fixes, 3 and 8 threads that make and destroy contexts beside an encode loop on a queue of 20 ran 8 s without a hang, about 1900 contexts. A failed decode left no command buffer held.
 - **Measurements.** On an Apple M3 Max at 1080p:
   - 4 encoder threads on one context on a shared queue of 64 hung in 2 of 3 runs before, and in none of 3 after.
   - Decodes on one context on a shared queue cost the same from 1 thread, about a tenth more from 2 (0.41 to 0.46 ms a call) and 4 % less from 4.

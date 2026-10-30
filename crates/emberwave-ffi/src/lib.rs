@@ -920,7 +920,7 @@ pub unsafe extern "C" fn emberwave_context_create(
 /// - Use the textures in them directly, not through a heap or through an
 ///   argument buffer without `useResource`: Metal does not track those.
 /// - A call makes all its command buffers before it commits them: on an
-///   Apple M3 Max, 9 for a decode to a texture or to RGB, 7 to planes, 6 to
+///   Apple M3 Max, 9 for a decode to a texture or to RGB, 6 to planes or to
 ///   plane textures and 18 for an encode, as wgpu makes one for each pass
 ///   and transition. The decoders and encoders of every context made on
 ///   the queue take turns at this, and hold none between calls. A full
@@ -985,6 +985,14 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
         return Err(Failure::argument("queue is a queue of another device"));
     }
     let queue_address = Retained::as_ptr(&queue) as *const c_void as usize;
+    // One at a time: from the making of its device until its first turn, a
+    // context holds a command buffer of the queue outside any turn, and
+    // several made at once beside a call that waits for room could each hold
+    // one while waiting for that call's turn (decision D60).
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _making = MAKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::METAL;
@@ -1060,6 +1068,11 @@ unsafe fn metal_context(_device: *mut c_void, _queue: *mut c_void) -> Result<Gpu
 /// Destroys a context. Decoders and encoders created on it keep working, and
 /// keep the GPU device until they are destroyed as well.
 ///
+/// It may wait for the GPU, when it lets go of the last hold on the
+/// context's queue. On a context of `emberwave_context_create_metal`, do not
+/// call it inside a completion handler of a command buffer of that queue:
+/// the wait never ends there.
+///
 /// # Safety
 ///
 /// `context` is `NULL`, or a context from `emberwave_context_create` or
@@ -1131,6 +1144,11 @@ pub unsafe extern "C" fn emberwave_decoder_create(
 }
 
 /// Destroys a decoder and frees its GPU memory.
+///
+/// It may wait for the GPU, when it lets go of the last hold on the
+/// context's queue. On a context of `emberwave_context_create_metal`, do not
+/// call it inside a completion handler of a command buffer of that queue:
+/// the wait never ends there.
 ///
 /// # Safety
 ///
@@ -2228,6 +2246,11 @@ pub unsafe extern "C" fn emberwave_encoder_create(
 }
 
 /// Destroys an encoder and frees its GPU memory.
+///
+/// It may wait for the GPU, when it lets go of the last hold on the
+/// context's queue. On a context of `emberwave_context_create_metal`, do not
+/// call it inside a completion handler of a command buffer of that queue:
+/// the wait never ends there.
 ///
 /// # Safety
 ///

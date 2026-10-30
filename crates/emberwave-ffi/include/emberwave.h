@@ -356,7 +356,7 @@ enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptio
 // - Use the textures in them directly, not through a heap or through an
 //   argument buffer without `useResource`: Metal does not track those.
 // - A call makes all its command buffers before it commits them: on an
-//   Apple M3 Max, 9 for a decode to a texture or to RGB, 7 to planes, 6 to
+//   Apple M3 Max, 9 for a decode to a texture or to RGB, 6 to planes or to
 //   plane textures and 18 for an encode, as wgpu makes one for each pass
 //   and transition. The decoders and encoders of every context made on
 //   the queue take turns at this, and hold none between calls. A full
@@ -381,6 +381,11 @@ enum EmberwaveStatus emberwave_context_create_metal(void *device,
 
 // Destroys a context. Decoders and encoders created on it keep working, and
 // keep the GPU device until they are destroyed as well.
+//
+// It may wait for the GPU, when it lets go of the last hold on the
+// context's queue. On a context of `emberwave_context_create_metal`, do not
+// call it inside a completion handler of a command buffer of that queue:
+// the wait never ends there.
 //
 // # Safety
 //
@@ -415,6 +420,11 @@ enum EmberwaveStatus emberwave_decoder_create(const struct EmberwaveContext *con
                                               struct EmberwaveDecoder **decoder);
 
 // Destroys a decoder and frees its GPU memory.
+//
+// It may wait for the GPU, when it lets go of the last hold on the
+// context's queue. On a context of `emberwave_context_create_metal`, do not
+// call it inside a completion handler of a command buffer of that queue:
+// the wait never ends there.
 //
 // # Safety
 //
@@ -823,6 +833,11 @@ enum EmberwaveStatus emberwave_encoder_create(const struct EmberwaveContext *con
                                               struct EmberwaveEncoder **encoder);
 
 // Destroys an encoder and frees its GPU memory.
+//
+// It may wait for the GPU, when it lets go of the last hold on the
+// context's queue. On a context of `emberwave_context_create_metal`, do not
+// call it inside a completion handler of a command buffer of that queue:
+// the wait never ends there.
 //
 // # Safety
 //

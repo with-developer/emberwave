@@ -615,10 +615,10 @@ fn contexts_hold_no_command_buffer_of_an_app_queue_between_calls() {
     }
     // wgpu writes through the queue in making a device, a decoder and an
     // encoder, and holds the writes in a command buffer until a submission:
-    // each context made, and each that made a decoder, held one of the
-    // queue's 20 until its first call (decision D60). So did the making of
-    // more contexts than that wait for good, and so did an encode, which
-    // needs 18, beside a few such contexts.
+    // each context made, and each that made a decoder or an encoder, held
+    // one of the queue's 20 until its first call (decision D60). So did the
+    // making of more contexts than that wait for good, and so did an
+    // encode, which needs 18, beside a few such contexts.
     let device_at: Shared<std::ffi::c_void> = Shared(Retained::as_ptr(&device).cast_mut().cast());
     let queue_at: Shared<std::ffi::c_void> = Shared(Retained::as_ptr(&queue).cast_mut().cast());
     let thread = std::thread::spawn(move || {
@@ -651,11 +651,33 @@ fn contexts_hold_no_command_buffer_of_an_app_queue_between_calls() {
                 decoder
             })
             .collect();
+        let encoders: Vec<*mut EmberwaveEncoder> = contexts[5..9]
+            .iter()
+            .map(|&context| {
+                let mut encoder = ptr::null_mut();
+                // SAFETY: a live context, and a pointer to store the encoder in.
+                let status = unsafe {
+                    emberwave_encoder_create(
+                        context,
+                        192,
+                        136,
+                        EMBERWAVE_CHROMA_420,
+                        ptr::null(),
+                        &mut encoder,
+                    )
+                };
+                assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+                encoder
+            })
+            .collect();
         encode_on(contexts[4]);
         // SAFETY: live objects, which nothing else uses.
         unsafe {
             for decoder in decoders {
                 emberwave_decoder_destroy(decoder);
+            }
+            for encoder in encoders {
+                emberwave_encoder_destroy(encoder);
             }
             for context in contexts {
                 emberwave_context_destroy(context);

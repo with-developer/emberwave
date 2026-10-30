@@ -259,7 +259,7 @@ impl StageQueries {
         turns: Option<&QueueTurns>,
     ) -> Result<Option<Vec<Option<Duration>>>, GpuError> {
         let bytes = u64::from(2 * self.stages) * 8;
-        let recording = take_turn(turns);
+        let mut recording = take_turn(turns, device, queue);
         with_error_scope(device, || {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("timestamps"),
@@ -268,6 +268,7 @@ impl StageQueries {
             encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, bytes);
             queue.submit([encoder.finish()]);
         })?;
+        recording.submitted();
         drop(recording);
         let bytes = read_back(device, &self.readback, bytes)?;
         let ticks: Vec<u64> = bytes
