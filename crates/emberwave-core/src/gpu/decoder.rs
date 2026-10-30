@@ -232,6 +232,19 @@ pub struct Decoder {
     turns: Option<Arc<QueueTurns>>,
 }
 
+/// What a caller's graphics API adds to the submission of a decode that
+/// does not wait, such as Vulkan semaphores to wait on and to signal
+/// (decision D61). Both run during the call's turn at the queue, if the
+/// context has turns (decision D60).
+pub trait SubmissionHooks {
+    /// Runs just before the decode's submission.
+    fn before_submit(&mut self, queue: &wgpu::Queue);
+    /// Runs after the submission, or after a failure before or in it
+    /// (`submitted` false): to take back what `before_submit` added, if the
+    /// submission did not take it.
+    fn after_submit(&mut self, queue: &wgpu::Queue, submitted: bool);
+}
+
 /// The pipeline of `draw.wgsl` for one target format, and its bind group:
 /// the RGBA words and the picture's size, a buffer the bind group keeps.
 struct DrawResources {
@@ -569,7 +582,21 @@ impl Decoder {
         target: &wgpu::TextureView,
     ) -> Result<(), GpuError> {
         self.check_target(target)?;
-        self.submit_assembled(Some(color), Read::Texture(target))
+        self.submit_assembled(Some(color), Read::Texture(target), None)
+    }
+
+    /// As [`submit_assembled_to_texture`](Self::submit_assembled_to_texture),
+    /// with `hooks` around the submission: for what the submission must
+    /// carry for the caller's graphics API, such as Vulkan semaphores to wait
+    /// on and to signal (decision D61).
+    pub fn submit_assembled_to_texture_with(
+        &mut self,
+        color: &ColorParams,
+        target: &wgpu::TextureView,
+        hooks: &mut dyn SubmissionHooks,
+    ) -> Result<(), GpuError> {
+        self.check_target(target)?;
+        self.submit_assembled(Some(color), Read::Texture(target), Some(hooks))
     }
 
     /// A texture that [`encode_rgb_to_texture`](Self::encode_rgb_to_texture)
@@ -659,7 +686,20 @@ impl Decoder {
         targets: [&wgpu::TextureView; 3],
     ) -> Result<(), GpuError> {
         self.check_plane_targets(targets)?;
-        self.submit_assembled(None, Read::Planes(targets))
+        self.submit_assembled(None, Read::Planes(targets), None)
+    }
+
+    /// As
+    /// [`submit_assembled_to_plane_textures`](Self::submit_assembled_to_plane_textures),
+    /// with `hooks` around the submission, as for
+    /// [`submit_assembled_to_texture_with`](Self::submit_assembled_to_texture_with).
+    pub fn submit_assembled_to_plane_textures_with(
+        &mut self,
+        targets: [&wgpu::TextureView; 3],
+        hooks: &mut dyn SubmissionHooks,
+    ) -> Result<(), GpuError> {
+        self.check_plane_targets(targets)?;
+        self.submit_assembled(None, Read::Planes(targets), Some(hooks))
     }
 
     /// A texture that [`encode_to_plane_textures`](Self::encode_to_plane_textures)
@@ -1085,6 +1125,30 @@ impl Decoder {
             }
             _ => {}
         }
+        // The textures end ready for sampling, where they allow it, so that a
+        // caller on Vulkan knows their layout between decodes,
+        // `SHADER_READ_ONLY_OPTIMAL` (decision D61). Elsewhere it changes
+        // nothing that matters.
+        let textures: Vec<&wgpu::Texture> = match read {
+            Read::Texture(target) => vec![target.texture()],
+            Read::Planes(targets) => targets.iter().map(|target| target.texture()).collect(),
+            Read::Nothing | Read::Yuv | Read::Rgb => Vec::new(),
+        };
+        encoder.transition_resources(
+            std::iter::empty(),
+            textures
+                .into_iter()
+                .filter(|texture| {
+                    texture
+                        .usage()
+                        .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+                })
+                .map(|texture| wgpu::TextureTransition {
+                    texture,
+                    selector: None,
+                    state: wgpu::TextureUses::RESOURCE,
+                }),
+        );
     }
 
     /// Records the decode of the frame the assembler holds into `encoder`,
@@ -1115,6 +1179,7 @@ impl Decoder {
         &mut self,
         color: Option<&ColorParams>,
         read: Read<'_>,
+        mut hooks: Option<&mut dyn SubmissionHooks>,
     ) -> Result<(), GpuError> {
         self.check_device()?;
         let turns = self.turns.clone();
@@ -1128,9 +1193,17 @@ impl Decoder {
             .record_assembled(color, read, &mut encoder)
             .and_then(|()| {
                 with_error_scope(&self.device, || {
+                    if let Some(hooks) = &mut hooks {
+                        hooks.before_submit(&self.queue);
+                    }
                     submit(&self.queue, turns.as_deref(), [encoder.finish()]);
                 })
             });
+        // Still during the turn: no other call's submission takes what the
+        // hooks added and the failed call did not.
+        if let Some(hooks) = hooks {
+            hooks.after_submit(&self.queue, outcome.is_ok());
+        }
         if outcome.is_ok() {
             recording.submitted();
         }

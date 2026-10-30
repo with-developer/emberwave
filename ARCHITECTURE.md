@@ -1498,7 +1498,13 @@ This first step is the context:
 - **The queue lock.** The caller's callbacks become a `CallerQueueLock` of the turns of D60 (`QueueTurns::with_caller_lock`). emberwave holds it around each of its submissions, and while it lets go of a context, decoder or encoder, since wgpu-core's `Queue::drop` waits for the queue to be idle. Contexts made on one `VkQueue` share their turns.
 - **Where.** Only where wgpu runs on Vulkan: Linux, Android and Windows. Elsewhere the calls give `EMBERWAVE_STATUS_NO_GPU`, as the Metal ones do off Apple's systems.
 
-Next come the caller's images, and the images of emberwave's textures, with semaphores per call. Direct3D 12 through shared handles follows.
+The second step is the images:
+- **emberwave's textures.** `emberwave_texture_vulkan` gives the `VkImage` of a texture on such a context, and only there: the image of a context of emberwave's own is on another device.
+- **The caller's images.** `emberwave_texture_from_vulkan` and `_plane` wrap a caller's image with wgpu-hal's `texture_from_raw`, external memory and a drop callback, so that wgpu frees neither. The caller describes the image's format, usage and current layout: the layout gives wgpu's initial state, `UNINITIALIZED` or `RESOURCE`.
+- **One layout between calls.** Every decode into a texture ends with a transition to `RESOURCE` (`CommandEncoder::transition_resources`), where the texture can be sampled: on Vulkan that is `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, which the caller then knows, and to which it returns the image before the next call. On Metal and WebGPU the transition changes nothing that matters.
+- **Semaphores.** `emberwave_decoder_submit_texture_vulkan` and `_plane_textures_vulkan` take an `EmberwaveVulkanSync`: a semaphore to wait for and one to signal, binary or timeline. The core's `SubmissionHooks` add them to the decode's submission during its turn (wgpu-hal's `add_wait_semaphore`, `add_signal_semaphore`). A failed call takes them back during the same turn, so no other call's submission carries them.
+
+Direct3D 12 through shared handles follows, and the encoder's input from the caller's images.
 
 **Consequence.**
 - **Tests.** `tests/vulkan.rs` makes an instance and a device as a client would, with exactly what emberwave lists, on Linux CI's lavapipe.
@@ -1507,4 +1513,4 @@ Next come the caller's images, and the images of emberwave's textures, with sema
   - A device without the listed extensions is refused.
   - A real driver's behaviour and a second process are not tested.
 - **The type check.** On macOS the Vulkan code type-checks only with wgpu's `vulkan-portability`, which the workspace does not enable: CI's Linux and Windows jobs compile it.
-- **What the step does not yet do.** Decodes and encodes on such a context still go through CPU memory, but on the caller's device rather than a second one.
+- **The second step's tests.** On lavapipe the test decodes every frame of a test vector into images of its own without waiting, and checks the bytes against the decodes that wait. For the picture it signals a timeline semaphore; the planes are read back on the GPU after a wait for it. An emberwave texture's image is read after a decode that waits, and images that a decode cannot fill or leave readable are refused.
