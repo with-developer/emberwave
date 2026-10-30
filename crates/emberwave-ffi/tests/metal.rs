@@ -547,12 +547,6 @@ fn decode_on_the_app_queue(
     }
 }
 
-/// A context, to hand to another thread: the C API lets several use one.
-struct Shared(*mut EmberwaveContext);
-
-// SAFETY: a context may be used by several threads at once.
-unsafe impl Send for Shared {}
-
 #[test]
 fn calls_on_one_app_queue_take_turns_at_its_command_buffers() {
     let Some(device) = MTLCreateSystemDefaultDevice() else {
@@ -565,61 +559,185 @@ fn calls_on_one_app_queue_take_turns_at_its_command_buffers() {
     // Room for an encode's 18 command buffers, the most a call makes, but
     // not for two calls at once (#126, decision D60).
     let queue = device
-        .newCommandQueueWithMaxCommandBufferCount(24)
+        .newCommandQueueWithMaxCommandBufferCount(20)
         .expect("a command queue");
-    let contexts: Vec<Shared> = (0..2)
-        .map(|_| {
-            let mut context = ptr::null_mut();
-            // SAFETY: a Metal device and its queue, and a pointer to store
-            // the context in.
-            let status = unsafe {
-                emberwave_context_create_metal(
-                    Retained::as_ptr(&device).cast_mut().cast(),
-                    Retained::as_ptr(&queue).cast_mut().cast(),
-                    &mut context,
-                )
-            };
-            assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
-            Shared(context)
-        })
-        .collect();
+    if !holds_to_its_room(&queue, 20) {
+        return;
+    }
+    let contexts: Vec<Shared<EmberwaveContext>> =
+        (0..2).map(|_| metal_context(&device, &queue)).collect();
     let bytes = testdata("noise_192x136_420.pwv1");
     let file = Pwv1File::parse(&bytes).unwrap();
     let frame = file.frames().next().unwrap().unwrap().to_vec();
 
     // On each context a thread that encodes and one that decodes, each into
-    // its own objects, all at once.
-    let (done, finished) = std::sync::mpsc::channel();
-    let mut threads = Vec::new();
-    for context in &contexts {
-        for encodes in [true, false] {
-            let context = Shared(context.0);
+    // its own objects, all at once. One that waits for good waits for
+    // command buffers that the others hold uncommitted, and they for its.
+    let threads: Vec<_> = contexts
+        .iter()
+        .flat_map(|context| [(Shared(context.0), true), (Shared(context.0), false)])
+        .map(|(context, encodes)| {
             let frame = frame.clone();
-            let done = done.clone();
-            threads.push(std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 let context = context;
                 if encodes {
                     encode_on(context.0);
                 } else {
                     decode_on(context.0, &frame);
                 }
-                let _ = done.send(());
-            }));
-        }
-    }
-    // Each thread is done in a second or two; one that waits for good waits
-    // for command buffers that the others hold uncommitted, and they for its.
-    for _ in &threads {
-        finished
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .expect("calls on one queue waited for each other's command buffers (#126)");
-    }
-    for thread in threads {
-        thread.join().unwrap();
-    }
+            })
+        })
+        .collect();
+    finish_within(
+        threads,
+        "calls on one queue waited for each other's command buffers (#126)",
+    );
     for context in contexts {
         // SAFETY: a live context, which no thread uses any more.
         unsafe { emberwave_context_destroy(context.0) };
+    }
+}
+
+#[test]
+fn contexts_hold_no_command_buffer_of_an_app_queue_between_calls() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no Metal device"
+        );
+        return;
+    };
+    let queue = device
+        .newCommandQueueWithMaxCommandBufferCount(20)
+        .expect("a command queue");
+    if !holds_to_its_room(&queue, 20) {
+        return;
+    }
+    // wgpu writes through the queue in making a device, a decoder and an
+    // encoder, and holds the writes in a command buffer until a submission:
+    // each context made, and each that made a decoder, held one of the
+    // queue's 20 until its first call (decision D60). So did the making of
+    // more contexts than that wait for good, and so did an encode, which
+    // needs 18, beside a few such contexts.
+    let device_at: Shared<std::ffi::c_void> = Shared(Retained::as_ptr(&device).cast_mut().cast());
+    let queue_at: Shared<std::ffi::c_void> = Shared(Retained::as_ptr(&queue).cast_mut().cast());
+    let thread = std::thread::spawn(move || {
+        let (device_at, queue_at) = (device_at, queue_at);
+        let contexts: Vec<*mut EmberwaveContext> = (0..24)
+            .map(|_| {
+                let mut context = ptr::null_mut();
+                // SAFETY: a Metal device and its queue, which the test keeps,
+                // and a pointer to store the context in.
+                let status = unsafe {
+                    emberwave_context_create_metal(
+                        device_at.0.cast(),
+                        queue_at.0.cast(),
+                        &mut context,
+                    )
+                };
+                assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+                context
+            })
+            .collect();
+        let decoders: Vec<*mut EmberwaveDecoder> = contexts[..4]
+            .iter()
+            .map(|&context| {
+                let mut decoder = ptr::null_mut();
+                // SAFETY: a live context, and a pointer to store the decoder in.
+                let status = unsafe {
+                    emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder)
+                };
+                assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+                decoder
+            })
+            .collect();
+        encode_on(contexts[4]);
+        // SAFETY: live objects, which nothing else uses.
+        unsafe {
+            for decoder in decoders {
+                emberwave_decoder_destroy(decoder);
+            }
+            for context in contexts {
+                emberwave_context_destroy(context);
+            }
+        }
+    });
+    finish_within(
+        vec![thread],
+        "contexts held command buffers of the queue between calls",
+    );
+}
+
+/// A pointer to hand to another thread: the C API lets several threads use
+/// one context, and Metal's devices and command queues are thread-safe.
+struct Shared<T>(*mut T);
+
+// SAFETY: as above.
+unsafe impl<T> Send for Shared<T> {}
+
+/// A context on `queue` of `device`.
+fn metal_context(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: &Retained<ProtocolObject<dyn MTLCommandQueue>>,
+) -> Shared<EmberwaveContext> {
+    let mut context = ptr::null_mut();
+    // SAFETY: a Metal device and its queue, and a pointer to store the
+    // context in.
+    let status = unsafe {
+        emberwave_context_create_metal(
+            Retained::as_ptr(device).cast_mut().cast(),
+            Retained::as_ptr(queue).cast_mut().cast(),
+            &mut context,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    Shared(context)
+}
+
+/// Whether `queue`, made with room for `room` command buffers, makes the one
+/// past them wait, as Metal does on a Mac. The GPU of a virtual machine may
+/// not, and then no test of the room tells anything: it says so and passes.
+fn holds_to_its_room(queue: &Retained<ProtocolObject<dyn MTLCommandQueue>>, room: usize) -> bool {
+    let held: Vec<_> = (0..room)
+        .map(|_| queue.commandBuffer().expect("a command buffer"))
+        .collect();
+    let at = Shared(Retained::as_ptr(queue).cast_mut());
+    let (made, waited) = std::sync::mpsc::channel();
+    let past = std::thread::spawn(move || {
+        let at = at;
+        // SAFETY: the queue, which the caller keeps until this thread ends.
+        let queue = unsafe { &*at.0 };
+        let commands = queue.commandBuffer().expect("a command buffer");
+        let _ = made.send(());
+        commands.commit();
+    });
+    let holds = waited
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .is_err();
+    for commands in held {
+        commands.commit();
+    }
+    past.join().unwrap();
+    if !holds {
+        eprintln!(
+            "this Metal queue does not make a command buffer past its room wait: not tested here"
+        );
+    }
+    holds
+}
+
+/// Waits for `threads` to end, at most 60 s, and fails with `stuck` if one
+/// has not, or with what a thread panicked with.
+fn finish_within(threads: Vec<std::thread::JoinHandle<()>>, stuck: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while threads.iter().any(|thread| !thread.is_finished()) {
+        assert!(std::time::Instant::now() < deadline, "{stuck}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for thread in threads {
+        if let Err(panic) = thread.join() {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 

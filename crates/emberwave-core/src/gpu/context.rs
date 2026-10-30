@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::GpuError;
 use super::decoder::PLANE_FORMAT;
-use super::pipelines::{EncoderPipelines, Pipelines};
+use super::pipelines::{EncoderPipelines, Pipelines, with_error_scope};
 
 /// Environment variable that restricts the backends considered, for example
 /// `vulkan`, `metal`, `dx12` or a comma separated list. Unset or `auto` means
@@ -151,13 +151,11 @@ pub struct GpuContext {
     /// Why the device was lost, once it has been; shared with the decoders
     /// and the encoders.
     lost: Arc<Mutex<Option<String>>>,
-    /// On a queue of the caller's, held by a decoder or an encoder while it
-    /// makes and submits command buffers, and never while it waits for the
-    /// GPU (decision D60): calls that each held some uncommitted while they
-    /// waited for more could wait for good on a queue with room for few
-    /// (#126). `None` on a queue of wgpu's, with room for 2048, where the
-    /// turns would only cost threads that share a context their overlap.
-    pub(crate) record_lock: Option<Arc<Mutex<()>>>,
+    /// On a queue of the caller's, the turns that its decoders and encoders
+    /// take at making and submitting command buffers (decision D60). `None`
+    /// on a queue of wgpu's, with room for 4096, where turns would only cost
+    /// the threads that share a context their overlap.
+    pub(crate) turns: Option<Arc<QueueTurns>>,
 }
 
 impl GpuContext {
@@ -242,13 +240,24 @@ impl GpuContext {
         }
     }
 
-    /// Makes the decoders and encoders of this context take turns at making
-    /// and submitting command buffers with each other and with those of
-    /// every context given the same `lock`: for contexts made on one queue
-    /// of the caller's, with `wgpu::Adapter::create_device_from_hal`, whose
-    /// room for command buffers they share (#126, decision D60).
-    pub fn share_record_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
-        self.record_lock = Some(lock);
+    /// Makes the decoders and encoders of this context take `turns` at
+    /// making and submitting command buffers, with each other and with those
+    /// of every context given the same: for contexts made on one queue of the
+    /// caller's, with `wgpu::Adapter::create_device_from_hal`, whose room for
+    /// command buffers they share (#126, decision D60). The calls that make
+    /// and submit their own command buffers take turns; those that record
+    /// into the caller's encoder, such as `Decoder::encode_rgb`, leave the
+    /// submission and the turn to the caller.
+    ///
+    /// wgpu writes through the queue in making a device, and holds the
+    /// writes in a command buffer of the queue until the next submission:
+    /// they are submitted here, and a decoder or an encoder made on the
+    /// context submits its own once made.
+    pub fn with_queue_turns(mut self, turns: Arc<QueueTurns>) -> Self {
+        let turn = take_turn(Some(&turns));
+        submit_writes(&self.device, &self.queue);
+        drop(turn);
+        self.turns = Some(turns);
         self
     }
 
@@ -289,7 +298,7 @@ impl GpuContext {
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             lost,
-            record_lock: None,
+            turns: None,
         }
     }
 
@@ -436,11 +445,37 @@ pub(crate) fn notice_loss(device: &wgpu::Device, lost: &Mutex<Option<String>>) {
     }
 }
 
-/// Takes the turn at making and submitting command buffers of `lock`, the
-/// record lock of a context on a queue of the caller's, if there is one
-/// (decision D60).
-pub(crate) fn take_turn(lock: Option<&Mutex<()>>) -> Option<MutexGuard<'_, ()>> {
-    lock.map(|lock| lock.lock().unwrap_or_else(PoisonError::into_inner))
+/// The turns that the decoders and encoders of the contexts made on one
+/// queue of the caller's take at making and submitting command buffers
+/// (decision D60). A Metal queue has room for a fixed number of command
+/// buffers in flight, and a call makes all of its own before it commits
+/// them: calls that each held some while they waited for more could wait
+/// for good (#126). Give the contexts of one queue the same turns, with
+/// [`GpuContext::with_queue_turns`].
+#[derive(Debug, Default)]
+pub struct QueueTurns {
+    turn: Mutex<()>,
+}
+
+impl QueueTurns {
+    /// Turns for the contexts of one queue.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Takes a turn of `turns`, those of a context on a queue of the caller's,
+/// if there are any (decision D60).
+pub(crate) fn take_turn(turns: Option<&QueueTurns>) -> Option<MutexGuard<'_, ()>> {
+    turns.map(|turns| turns.turn.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Submits what wgpu wrote through `queue` and holds in a command buffer of
+/// the queue until the next submission, during a turn of a context on a
+/// queue of the caller's (decision D60).
+pub(crate) fn submit_writes(device: &wgpu::Device, queue: &wgpu::Queue) {
+    // On a device lost meanwhile, the next call fails instead.
+    let _ = with_error_scope(device, || queue.submit([]));
 }
 
 /// The value in `cache`, which `build` makes if there is none yet.

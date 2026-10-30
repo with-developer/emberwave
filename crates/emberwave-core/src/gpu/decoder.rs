@@ -16,7 +16,7 @@ use crate::bitstream::{
 };
 use crate::color::ColorParams;
 
-use super::context::{GpuContext, notice_loss, take_turn};
+use super::context::{GpuContext, QueueTurns, notice_loss, submit_writes, take_turn};
 use super::error::GpuError;
 use super::layout::{BufferLayout, DequantParams, TransformLevel, YuvParams};
 use super::pipelines::{DrawPipeline, Pipelines, Stage, with_error_scope};
@@ -227,7 +227,9 @@ pub struct Decoder {
 
     /// Why the device was lost, once it has been (see [`GpuContext::lost`]).
     lost: Arc<Mutex<Option<String>>>,
-    record_lock: Option<Arc<Mutex<()>>>,
+    /// The turns at the queue of a context on a queue of the caller's
+    /// (decision D60).
+    turns: Option<Arc<QueueTurns>>,
 }
 
 /// The pipeline of `draw.wgsl` for one target format, and its bind group:
@@ -305,7 +307,12 @@ impl Decoder {
         check_size(&device, "the wavelet pyramid", buffers.pyramid_floats * 4)?;
         check_size(&device, "the packed planes", buffers.packed_words * 4)?;
 
-        with_error_scope(&device, || {
+        // The parameters written below wait in a command buffer of the queue
+        // until a submission. On a queue of the caller's they are written
+        // during a turn and submitted at once, so that a decoder not yet
+        // used holds none of its command buffers (decision D60).
+        let turn = take_turn(context.turns.as_deref());
+        let made = with_error_scope(&device, || {
             let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
 
             let payload_capacity_words = MIN_PAYLOAD_WORDS;
@@ -390,11 +397,15 @@ impl Decoder {
                 draw: None,
                 timestamps,
                 lost: context.lost_record(),
-                record_lock: context.record_lock.clone(),
+                turns: context.turns.clone(),
                 context_id: context.id(),
             }
         })
-        .map_err(|error| context.explain(error))
+        .map_err(|error| context.explain(error));
+        if turn.is_some() {
+            submit_writes(&device, &queue);
+        }
+        made
     }
 
     /// Why the device of this decoder was lost, if it was. See
@@ -907,8 +918,8 @@ impl Decoder {
         // The decode makes command buffers from here to its submission, and
         // takes its turn at them (decision D60); the upload above waits for
         // the GPU to map its buffer, so it comes first.
-        let record_lock = self.record_lock.clone();
-        let recording = take_turn(record_lock.as_deref());
+        let turns = self.turns.clone();
+        let recording = take_turn(turns.as_deref());
         let output = self.prepare_output(color, read)?;
         let prepare = assembled_in + prepare_start.elapsed();
 
@@ -1106,8 +1117,8 @@ impl Decoder {
         read: Read<'_>,
     ) -> Result<(), GpuError> {
         self.check_device()?;
-        let record_lock = self.record_lock.clone();
-        let recording = take_turn(record_lock.as_deref());
+        let turns = self.turns.clone();
+        let recording = take_turn(turns.as_deref());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1452,8 +1463,7 @@ impl Decoder {
         queries: &StageQueries,
         with_rgb: bool,
     ) -> Result<Option<StageTimings>, GpuError> {
-        let Some(stages) = queries.read(&self.device, &self.queue, self.record_lock.as_deref())?
-        else {
+        let Some(stages) = queries.read(&self.device, &self.queue, self.turns.as_deref())? else {
             return Ok(None);
         };
         Ok(match (stages[0], stages[1]) {
@@ -1487,7 +1497,7 @@ impl Decoder {
         let bytes = u64::from(width) * u64::from(height) * 4;
 
         self.check_device()?;
-        let recording = take_turn(self.record_lock.as_deref());
+        let recording = take_turn(self.turns.as_deref());
         let submitted = with_error_scope(&self.device, || {
             let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("band readback"),

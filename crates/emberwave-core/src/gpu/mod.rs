@@ -16,7 +16,7 @@ mod layout;
 mod pipelines;
 mod resources;
 
-pub use context::{BACKEND_ENV, GpuContext, GpuOptions, parse_backends};
+pub use context::{BACKEND_ENV, GpuContext, GpuOptions, QueueTurns, parse_backends};
 pub use decoder::{
     Decoder, Frame, FramePlane, PLANE_FORMAT, RgbFrame, StageTimings, TEXTURE_FORMATS, TimedOutput,
     Timings,

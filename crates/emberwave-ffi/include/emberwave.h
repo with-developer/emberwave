@@ -359,9 +359,11 @@ enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptio
 //   Apple M3 Max, 9 for a decode to a texture or to RGB, 7 to planes, 6 to
 //   plane textures and 18 for an encode, as wgpu makes one for each pass
 //   and transition. The decoders and encoders of every context made on
-//   the queue take turns at this. A full queue makes a call wait until the
-//   GPU frees one; a queue without room for 20 besides those the caller
-//   holds uncommitted can wait for good. The default of 64 is plenty.
+//   the queue take turns at this, and hold none between calls. A full
+//   queue makes a call wait until one of its command buffers has completed
+//   and that buffer's completed handlers have returned; a queue without
+//   room for 20 besides those the caller holds uncommitted can wait for
+//   good. The default of 64 is plenty.
 // - Do not call emberwave inside a completion handler of a command buffer
 //   of this queue. A call that waits for the GPU never returns there: the
 //   wait ends in a handler of emberwave's that Metal runs after that one.
@@ -503,6 +505,10 @@ void emberwave_decoder_clear(struct EmberwaveDecoder *decoder);
 // Waits for the GPU. The rows go from the GPU's memory straight to the
 // planes, so a call that fails may have written some of them.
 //
+// On a context of `emberwave_context_create_metal`, do not call it inside a
+// completion handler of a command buffer of the context's queue: the wait
+// never ends there.
+//
 // # Safety
 //
 // `decoder` is a live decoder that no other thread is using. Each plane's
@@ -523,6 +529,10 @@ enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decod
 // better, such as from the header of a PWV1 file, passes that. Waits for the
 // GPU. The rows go from the GPU's memory straight to `rgb`, so a call that
 // fails may have written some of them.
+//
+// On a context of `emberwave_context_create_metal`, do not call it inside a
+// completion handler of a command buffer of the context's queue: the wait
+// never ends there.
 //
 // # Safety
 //
@@ -663,6 +673,10 @@ void emberwave_texture_destroy(struct EmberwaveTexture *texture);
 // of another picture size gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` and
 // leaves the frame to decode.
 //
+// On a context of `emberwave_context_create_metal`, do not call it inside a
+// completion handler of a command buffer of the context's queue: the wait
+// never ends there.
+//
 // # Safety
 //
 // `decoder` is a live decoder that no other thread is using, `texture` is a
@@ -739,6 +753,10 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures(struct EmberwaveDec
 // caller's GPU work that still reads the textures, and how many sets of
 // three to keep in turn depends on the context and the textures: see
 // `EmberwaveTexture`.
+//
+// On a context of `emberwave_context_create_metal`, do not call it inside a
+// completion handler of a command buffer of the context's queue: the wait
+// never ends there.
 //
 // # Safety
 //
@@ -830,6 +848,10 @@ enum EmberwaveStatus emberwave_encoder_info(struct EmberwaveEncoder *encoder,
 // `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
 // `*size`; nothing is encoded then, and the next frame takes the sequence
 // number this one would have had. Waits for the GPU.
+//
+// On a context of `emberwave_context_create_metal`, do not call it inside a
+// completion handler of a command buffer of the context's queue: the wait
+// never ends there.
 //
 // # Safety
 //

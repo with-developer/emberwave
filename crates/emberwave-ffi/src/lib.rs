@@ -923,9 +923,11 @@ pub unsafe extern "C" fn emberwave_context_create(
 ///   Apple M3 Max, 9 for a decode to a texture or to RGB, 7 to planes, 6 to
 ///   plane textures and 18 for an encode, as wgpu makes one for each pass
 ///   and transition. The decoders and encoders of every context made on
-///   the queue take turns at this. A full queue makes a call wait until the
-///   GPU frees one; a queue without room for 20 besides those the caller
-///   holds uncommitted can wait for good. The default of 64 is plenty.
+///   the queue take turns at this, and hold none between calls. A full
+///   queue makes a call wait until one of its command buffers has completed
+///   and that buffer's completed handlers have returned; a queue without
+///   room for 20 besides those the caller holds uncommitted can wait for
+///   good. The default of 64 is plenty.
 /// - Do not call emberwave inside a completion handler of a command buffer
 ///   of this queue. A call that waits for the GPU never returns there: the
 ///   wait ends in a handler of emberwave's that Metal runs after that one.
@@ -1021,29 +1023,30 @@ unsafe fn metal_context(device: *mut c_void, queue: *mut c_void) -> Result<GpuCo
     // decoders and encoders take turns at it (#126, decision D60).
     Ok(
         GpuContext::from_device(adapter, device, queue)
-            .share_record_lock(queue_lock(queue_address)),
+            .with_queue_turns(queue_turns(queue_address)),
     )
 }
 
-/// The lock of the contexts made on the Metal queue at `address`: one for
-/// each queue, while a context, decoder or encoder made on it lives. Those
+/// The turns of the contexts made on the Metal queue at `address`: the same
+/// for each, while a context, decoder or encoder made on it lives. Those
 /// keep the queue, so that no other queue takes its address meanwhile.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn queue_lock(address: usize) -> std::sync::Arc<std::sync::Mutex<()>> {
+fn queue_turns(address: usize) -> std::sync::Arc<emberwave_core::gpu::QueueTurns> {
+    use emberwave_core::gpu::QueueTurns;
     use std::sync::{Arc, Mutex, PoisonError, Weak};
-    static LOCKS: Mutex<Vec<(usize, Weak<Mutex<()>>)>> = Mutex::new(Vec::new());
-    let mut locks = LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
-    locks.retain(|(_, lock)| lock.strong_count() > 0);
-    if let Some(lock) = locks
+    static TURNS: Mutex<Vec<(usize, Weak<QueueTurns>)>> = Mutex::new(Vec::new());
+    let mut all = TURNS.lock().unwrap_or_else(PoisonError::into_inner);
+    all.retain(|(_, turns)| turns.strong_count() > 0);
+    if let Some(turns) = all
         .iter()
         .find(|&&(at, _)| at == address)
-        .and_then(|(_, lock)| lock.upgrade())
+        .and_then(|(_, turns)| turns.upgrade())
     {
-        return lock;
+        return turns;
     }
-    let lock = Arc::new(Mutex::new(()));
-    locks.push((address, Arc::downgrade(&lock)));
-    lock
+    let turns = Arc::new(QueueTurns::new());
+    all.push((address, Arc::downgrade(&turns)));
+    turns
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -1287,6 +1290,10 @@ pub unsafe extern "C" fn emberwave_decoder_clear(decoder: *mut EmberwaveDecoder)
 /// Waits for the GPU. The rows go from the GPU's memory straight to the
 /// planes, so a call that fails may have written some of them.
 ///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
+///
 /// # Safety
 ///
 /// `decoder` is a live decoder that no other thread is using. Each plane's
@@ -1341,6 +1348,10 @@ pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
 /// better, such as from the header of a PWV1 file, passes that. Waits for the
 /// GPU. The rows go from the GPU's memory straight to `rgb`, so a call that
 /// fails may have written some of them.
+///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
 ///
 /// # Safety
 ///
@@ -1791,6 +1802,10 @@ pub unsafe extern "C" fn emberwave_texture_destroy(texture: *mut EmberwaveTextur
 /// of another picture size gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` and
 /// leaves the frame to decode.
 ///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
+///
 /// # Safety
 ///
 /// `decoder` is a live decoder that no other thread is using, `texture` is a
@@ -1998,6 +2013,10 @@ fn require_shared_queue(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
 /// caller's GPU work that still reads the textures, and how many sets of
 /// three to keep in turn depends on the context and the textures: see
 /// `EmberwaveTexture`.
+///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
 ///
 /// # Safety
 ///
@@ -2259,6 +2278,10 @@ pub unsafe extern "C" fn emberwave_encoder_info(
 /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
 /// `*size`; nothing is encoded then, and the next frame takes the sequence
 /// number this one would have had. Waits for the GPU.
+///
+/// On a context of `emberwave_context_create_metal`, do not call it inside a
+/// completion handler of a command buffer of the context's queue: the wait
+/// never ends there.
 ///
 /// # Safety
 ///
