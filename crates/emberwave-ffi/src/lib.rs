@@ -5198,10 +5198,10 @@ fn rgb_order(format: u32) -> Result<RgbOrder, Failure> {
 ///
 /// # Safety
 ///
-/// `encoder` is a live encoder that no other thread is using, `y` and `cb`
-/// are live textures, and `cr` is `NULL` or a live texture. `frame` points
-/// to `budget` bytes that may be written, and `size` to a `size_t`, which do
-/// not overlap.
+/// `encoder` is a live encoder that no other thread is using, `y` is a live
+/// texture, and `cb` and `cr` are `NULL` or live textures. `frame` points to
+/// `budget` bytes that may be written, and `size` to a `size_t`, which do not
+/// overlap.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_encoder_encode_textures(
     encoder: *mut EmberwaveEncoder,

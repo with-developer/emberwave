@@ -375,9 +375,13 @@ pub(crate) fn check_rgb(
     if (stride as u64) < row && height > 1 {
         return Err(ColorError::StrideTooSmall { stride, row });
     }
+    // Saturating: a stride too large for the arithmetic needs more bytes
+    // than any slice has.
     let needed = match height {
         0 => 0,
-        _ => (u64::from(height) - 1) * stride as u64 + row,
+        _ => (u64::from(height) - 1)
+            .saturating_mul(stride as u64)
+            .saturating_add(row),
     };
     if (bytes as u64) < needed {
         return Err(ColorError::PictureTooSmall {

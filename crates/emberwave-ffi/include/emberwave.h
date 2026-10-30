@@ -1673,10 +1673,10 @@ enum EmberwaveStatus emberwave_encoder_encode_rgb(struct EmberwaveEncoder *encod
 //
 // # Safety
 //
-// `encoder` is a live encoder that no other thread is using, `y` and `cb`
-// are live textures, and `cr` is `NULL` or a live texture. `frame` points
-// to `budget` bytes that may be written, and `size` to a `size_t`, which do
-// not overlap.
+// `encoder` is a live encoder that no other thread is using, `y` is a live
+// texture, and `cb` and `cr` are `NULL` or live textures. `frame` points to
+// `budget` bytes that may be written, and `size` to a `size_t`, which do not
+// overlap.
 enum EmberwaveStatus emberwave_encoder_encode_textures(struct EmberwaveEncoder *encoder,
                                                        const struct EmberwaveTexture *y,
                                                        const struct EmberwaveTexture *cb,

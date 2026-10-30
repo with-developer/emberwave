@@ -11,7 +11,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Changed
 
-- `gpu::TexturePicture` has a new variant, `Rgb`, and `encode::EncodeError` a new variant, `Picture`, for an RGB picture that does not fit its size and stride: a `match` that names every variant needs an arm for each.
+- `gpu::TexturePicture` has a new variant, `Rgb`; `encode::EncodeError` a new variant, `Picture`, for an RGB picture that does not fit its size and stride; and `color::ColorError` two, `PictureTooSmall` and `StrideTooSmall`, for the same: a `match` that names every variant needs an arm for each.
 
 ### Fixed
 

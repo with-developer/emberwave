@@ -829,6 +829,26 @@ fn a_hosts_shared_bgra_picture_is_encoded_as_rgb() {
         assert!(frame == expected, "picture {seed}");
     }
 
+    // The encodes that take no fences refuse the shared texture, as they
+    // refuse shared planes.
+    let mut frame = vec![0u8; 9_000];
+    let mut length = 0;
+    // SAFETY: a live encoder, a live texture, and a frame of the length
+    // passed.
+    let status = unsafe {
+        emberwave_encoder_encode_textures(
+            from_texture,
+            rgb,
+            ptr::null(),
+            ptr::null(),
+            frame.as_mut_ptr(),
+            frame.len(),
+            &mut length,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(last_error().contains("_d3d12"), "{}", last_error());
+
     // An sRGB texture, whose reads would undo the transfer function, is
     // refused.
     let (srgb, handle) = host.texture(

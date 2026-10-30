@@ -115,7 +115,9 @@ pub enum TexturePicture<'a> {
     /// that [`rgb_to_ycbcr8`](crate::color::rgb_to_ycbcr8) makes of the same
     /// picture in CPU memory (decision D65). R', G' and B' are taken as the
     /// texture stores them, with their transfer function: a texture of an
-    /// sRGB format, whose reads undo it, is not taken.
+    /// sRGB format, whose reads undo it, is not taken. Nor is a view of
+    /// another format to be: an sRGB view of an `Rgba8Unorm` texture would
+    /// undo it as well, and the encoder cannot tell a view's format.
     Rgb(&'a wgpu::TextureView),
 }
 

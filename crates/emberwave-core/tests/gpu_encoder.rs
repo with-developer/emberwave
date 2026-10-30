@@ -824,9 +824,10 @@ fn pictures_in_rgb_encode_as_the_planes_they_convert_to_do() {
             let layout = &vector.layout;
             let (width, height) = (layout.width(), layout.height());
             // An encoder for each way, so that their frames are numbered
-            // alike.
+            // alike, and one that takes the two orders in turn.
             let mut from_planes = encoder_for(context, layout);
             let mut from_rgb: Vec<Encoder> = (0..4).map(|_| encoder_for(context, layout)).collect();
+            let mut alternating = encoder_for(context, layout);
             let cpu = || {
                 encode::Encoder::new(width, height, layout.chroma(), Signalling::default()).unwrap()
             };
@@ -888,6 +889,16 @@ fn pictures_in_rgb_encode_as_the_planes_they_convert_to_do() {
                         what(&format!("{order:?} in CPU memory"))
                     );
                 }
+                let order = if index % 2 == 0 {
+                    RgbOrder::Rgba
+                } else {
+                    RgbOrder::Bgra
+                };
+                let picture = rgb_of(layout, source, order, row);
+                let frame = alternating
+                    .encode_rgb(&picture, row, order, vector.budget)
+                    .unwrap();
+                assert!(frame == expected, "{}", what(&format!("{order:?} in turn")));
                 // The CPU encoder converts alike.
                 let expected = cpu_planes
                     .encode(planes(&converted), vector.budget)
@@ -1002,11 +1013,50 @@ fn encoding_rgb_frame_after_frame_allocates_nothing() {
         before,
         "live GPU objects and memory"
     );
-    // The other order replaces the texture rather than adding one.
+    // The other order replaces the buffer and the texture rather than
+    // adding others. Their memory tells: wgpu-hal 30's Vulkan backend counts
+    // the textures it destroys but not those it makes.
+    let memory = |context: &GpuContext| {
+        let hal = context.device().get_internal_counters().hal;
+        (
+            hal.buffers.read(),
+            hal.buffer_memory.read(),
+            hal.texture_memory.read(),
+        )
+    };
+    let before = memory(&context);
     encoder
         .encode_rgb(&pictures[0], row, RgbOrder::Rgba, vector.budget)
         .unwrap();
-    assert_eq!(live_resources(&context), before, "after the other order");
+    assert_eq!(memory(&context), before, "after the other order");
+}
+
+#[test]
+fn one_row_rgb_pictures_take_any_stride() {
+    // A picture of one row has no stride to keep: zero, less than the row,
+    // or past what a copy takes, it encodes as the row's planes do.
+    let context = gpu_or_return!();
+    let layout = FrameLayout::new(64, 1, ChromaSubsampling::Yuv444).unwrap();
+    let row: Vec<u8> = (0..64 * 4).map(|i| (i * 37 % 251) as u8).collect();
+    let converted = rgb_to_ycbcr8(
+        &row,
+        256,
+        RgbOrder::Bgra,
+        64,
+        1,
+        ChromaSubsampling::Yuv444,
+        &Signalling::default().color_params(),
+    )
+    .unwrap();
+    for stride in [0, 255, 256, 1 << 33] {
+        let expected = encoder_for(context, &layout)
+            .encode(planes(&converted), 4_000)
+            .unwrap();
+        let frame = encoder_for(context, &layout)
+            .encode_rgb(&row, stride, RgbOrder::Bgra, 4_000)
+            .unwrap();
+        assert!(frame == expected, "stride {stride}");
+    }
 }
 
 #[test]

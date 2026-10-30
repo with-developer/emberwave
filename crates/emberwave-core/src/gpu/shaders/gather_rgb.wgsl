@@ -49,9 +49,12 @@ fn pixel(x: i32, y: u32) -> vec3<i32> {
 }
 
 // ForwardMatrix::apply: `row` of the matrix for pixels whose R', G' and B',
-// each weighed, add up to `sum`, the weights to 1 << shift.
+// each weighed, add up to `sum`, the weights to 1 << shift. The products are
+// spelt out rather than a dot(): totals pass 2^24, which a compiler that took
+// an integer dot product through floats would round.
 fn apply(row: vec4<i32>, sum: vec3<i32>, shift: u32) -> u32 {
-    let total = dot(row.xyz, sum) + (row.w << shift) + (1i << (FORWARD_BITS + shift - 1u));
+    let total = row.x * sum.x + row.y * sum.y + row.z * sum.z + (row.w << shift)
+        + (1i << (FORWARD_BITS + shift - 1u));
     return u32(clamp(total >> (FORWARD_BITS + shift), 0i, 255i));
 }
 
