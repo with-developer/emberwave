@@ -249,18 +249,22 @@ pub struct EmberwaveContext {
     /// Whether the context runs on the caller's own Metal queue
     /// (`emberwave_context_create_metal`), where decodes need not wait.
     shared_queue: bool,
+    /// Whether the context runs on the caller's own Vulkan device
+    /// (`emberwave_context_create_vulkan`).
+    vulkan: bool,
 }
 
 impl EmberwaveContext {
     /// A new context of `created`'s, on the caller's Metal queue with
-    /// `shared_queue`.
-    fn boxed(created: GpuContext, shared_queue: bool) -> *mut Self {
+    /// `shared_queue`, on the caller's Vulkan device with `vulkan`.
+    fn boxed(created: GpuContext, shared_queue: bool, vulkan: bool) -> *mut Self {
         let info = created.adapter_info();
         let adapter = format!("{} ({:?})", info.name, info.backend).replace('\0', "");
         Box::into_raw(Box::new(Self {
             context: created,
             adapter: CString::new(adapter).unwrap_or_default(),
             shared_queue,
+            vulkan,
         }))
     }
 }
@@ -281,6 +285,8 @@ pub struct EmberwaveDecoder {
     /// Whether the decoder's context runs on the caller's own Metal queue,
     /// which the decoder keeps when the context is destroyed.
     shared_queue: bool,
+    /// Whether the decoder's context runs on the caller's own Vulkan device.
+    vulkan: bool,
     /// The turns at the queue of the decoder's context, if it has any.
     turns: Option<Arc<QueueTurns>>,
 }
@@ -332,6 +338,18 @@ pub struct EmberwaveTexture {
     /// not wait need (decision D43). Those emberwave makes are tracked, and
     /// a caller's texture from a heap usually is not.
     tracked: bool,
+    /// Whether the texture is on the caller's own Vulkan device
+    /// (`emberwave_context_create_vulkan`), whose image the caller may use.
+    /// Read only where there are such devices.
+    #[cfg_attr(
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            all(windows, target_pointer_width = "64")
+        )),
+        allow(dead_code)
+    )]
+    vulkan: bool,
 }
 
 impl EmberwaveTexture {
@@ -358,6 +376,7 @@ impl EmberwaveTexture {
             context_id: decoder.decoder.context_id(),
             plane,
             tracked,
+            vulkan: decoder.vulkan,
         }
     }
 }
@@ -912,7 +931,7 @@ pub unsafe extern "C" fn emberwave_context_create(
         };
         let created = GpuContext::new(&gpu_options)?;
         // SAFETY: checked by the first output() above.
-        unsafe { context.write(EmberwaveContext::boxed(created, false)) };
+        unsafe { context.write(EmberwaveContext::boxed(created, false, false)) };
         Ok(())
     })
 }
@@ -972,7 +991,7 @@ pub unsafe extern "C" fn emberwave_context_create_metal(
         // SAFETY: as the caller promises.
         let created = unsafe { metal_context(device, queue) }?;
         // SAFETY: checked by the first output() above.
-        unsafe { context.write(EmberwaveContext::boxed(created, true)) };
+        unsafe { context.write(EmberwaveContext::boxed(created, true, false)) };
         Ok(())
     })
 }
@@ -1172,6 +1191,70 @@ pub struct EmberwaveVulkanDevice {
     /// Passed to `lock_queue` and `unlock_queue`.
     pub user: *mut c_void,
 }
+
+/// An image of the caller's Vulkan device, for
+/// `emberwave_texture_from_vulkan` and `emberwave_texture_from_vulkan_plane`
+/// (decision D61).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EmberwaveVulkanImage {
+    /// The `VkImage`.
+    pub image: u64,
+    /// Its `VkFormat`: `VK_FORMAT_B8G8R8A8_UNORM` or
+    /// `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` for a
+    /// plane.
+    pub format: u32,
+    /// The `VkImageUsageFlags` it was made with.
+    pub usage: u32,
+    /// The `VkImageLayout` it is in now: `VK_IMAGE_LAYOUT_UNDEFINED`, whose
+    /// contents a decode may discard, or
+    /// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
+    pub layout: u32,
+    /// Called with `user` once emberwave and the GPU are done with the
+    /// image, after the texture is destroyed and the work of every decode
+    /// into it has completed: from then on the caller may destroy the image
+    /// and free its memory. From any thread, perhaps during another call of
+    /// emberwave's on the context, or in the destroy of its last decoder,
+    /// encoder or context. `NULL` if the caller knows that moment otherwise.
+    pub release: Option<unsafe extern "C" fn(user: *mut c_void)>,
+    /// Passed to `release`.
+    pub user: *mut c_void,
+}
+
+/// Semaphores for a decode that does not wait, on a context of
+/// `emberwave_context_create_vulkan` (decision D61): binary ones, or
+/// timeline ones where `flags` says so.
+///
+/// A binary semaphore to wait for has a signal submitted already, or the
+/// decode never runs, nor does any later work on the queue; one to signal
+/// is waited for before it is signalled again. A wait that is never met
+/// holds up every later submission to the queue, the caller's too, as the
+/// decode's waits at every stage.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmberwaveVulkanSync {
+    /// A `VkSemaphore` the decode's GPU work waits for, such as one the
+    /// caller signals once its reads of the textures are done, or 0 for
+    /// none.
+    pub wait_semaphore: u64,
+    /// For a timeline `wait_semaphore`, the value to wait for.
+    pub wait_value: u64,
+    /// A `VkSemaphore` the decode signals once the textures hold the
+    /// picture, for the caller's reads to wait for, or 0 for none.
+    pub signal_semaphore: u64,
+    /// For a timeline `signal_semaphore`, the value to signal it to.
+    pub signal_value: u64,
+    /// `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
+    /// combined with `|` for timeline semaphores, or 0 for binary ones.
+    pub flags: u32,
+}
+
+/// `wait_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore, to
+/// wait for at `wait_value`.
+pub const EMBERWAVE_SYNC_WAIT_TIMELINE: u32 = 1 << 0;
+/// `signal_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore,
+/// to signal to `signal_value`.
+pub const EMBERWAVE_SYNC_SIGNAL_TIMELINE: u32 = 1 << 1;
 
 /// What emberwave needs a Vulkan device of the caller's to have enabled:
 /// device extensions and features, from
@@ -1414,9 +1497,341 @@ pub unsafe extern "C" fn emberwave_context_create_vulkan(
         // SAFETY: as the caller promises.
         let created = unsafe { vulkan_context(device) }?;
         // SAFETY: checked by the first output() above.
-        unsafe { context.write(EmberwaveContext::boxed(created, false)) };
+        unsafe { context.write(EmberwaveContext::boxed(created, false, true)) };
         Ok(())
     })
+}
+
+/// The `VkImage` of `texture`, a texture on a context of
+/// `emberwave_context_create_vulkan`, for the caller to read the picture or
+/// the plane from on the GPU; 0 for `NULL` and for a texture on another
+/// context (decision D61). The image belongs to the texture, which keeps it
+/// until it is destroyed.
+///
+/// Between emberwave's calls the image is in the layout
+/// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, from the first decode into it
+/// on: a decode leaves it so, and the caller gives it back so before the next
+/// call that uses it. It belongs to the context's queue family, and its
+/// usage is `VK_IMAGE_USAGE_SAMPLED_BIT`, `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`
+/// and what the decodes need.
+///
+/// # Safety
+///
+/// `texture` is `NULL` or a live texture.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_vulkan(texture: *const EmberwaveTexture) -> u64 {
+    // SAFETY: as the caller promises.
+    match unsafe { texture.as_ref() } {
+        Some(texture) => catch_unwind(AssertUnwindSafe(|| vulkan_image(texture))).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Wraps the caller's own Vulkan image for the decodes of `decoder` to put
+/// the picture into, as into one of `emberwave_texture_create`'s, on a
+/// context of `emberwave_context_create_vulkan` (decision D61); for a
+/// decoder on another context, `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+///
+/// The image is on the context's device, 2D, of one level, layer and
+/// sample, with optimal tiling and exclusive sharing on the context's queue
+/// family, of the picture's size, and as `image` describes it. Its usage
+/// has `VK_IMAGE_USAGE_SAMPLED_BIT`, as a decode leaves it in
+/// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`. A decode copies the picture
+/// into it with `VK_IMAGE_USAGE_TRANSFER_DST_BIT` when its width is a
+/// multiple of 64 pixels, and draws it with
+/// `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` otherwise. An image that neither
+/// can fill gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`, and so does one that is
+/// not as above where `image` says so; `texture` is then `NULL`.
+///
+/// emberwave never destroys the image, nor frees its memory: keep both
+/// until `release` is called, or, without it, until the texture is
+/// destroyed and the work of every decode into it has completed; a decode
+/// that does not wait may still run after `emberwave_texture_destroy` has
+/// returned. Between emberwave's calls the image is in
+/// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, as for
+/// `emberwave_texture_vulkan`.
+///
+/// # Safety
+///
+/// `decoder` is a live decoder that no other thread is using, `image` is
+/// `NULL` or points to an `EmberwaveVulkanImage` that describes a live image
+/// made as above, in the layout it gives. `texture` points to where the new
+/// texture is stored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_vulkan(
+    decoder: *const EmberwaveDecoder,
+    image: *const EmberwaveVulkanImage,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    // SAFETY: as the caller promises.
+    unsafe { texture_from_vulkan(decoder, None, image, texture) }
+}
+
+/// Wraps the caller's own Vulkan image for the Y, Cb or Cr plane of the
+/// pictures of `decoder`, as `emberwave_texture_create_plane` makes one:
+/// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+/// `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_vulkan`, but the
+/// image is `VK_FORMAT_R8_UNORM` of the plane's size, and a decode copies
+/// the plane into it, which needs `VK_IMAGE_USAGE_TRANSFER_DST_BIT`.
+///
+/// # Safety
+///
+/// As for `emberwave_texture_from_vulkan`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_from_vulkan_plane(
+    decoder: *const EmberwaveDecoder,
+    plane: u32,
+    image: *const EmberwaveVulkanImage,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    // SAFETY: as the caller promises.
+    unsafe { texture_from_vulkan(decoder, Some(plane), image, texture) }
+}
+
+/// The work of `emberwave_texture_from_vulkan` and
+/// `emberwave_texture_from_vulkan_plane`.
+///
+/// # Safety
+///
+/// As for `emberwave_texture_from_vulkan`.
+unsafe fn texture_from_vulkan(
+    decoder: *const EmberwaveDecoder,
+    plane: Option<u32>,
+    image: *const EmberwaveVulkanImage,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            unsafe { output(texture, "texture", std::ptr::null_mut()) }?;
+            let plane = plane.map(plane_component).transpose()?;
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live(decoder) }?;
+            // SAFETY: as the caller promises.
+            let Some(image) = (unsafe { image.as_ref() }) else {
+                return Err(Failure::argument("image is NULL"));
+            };
+            require_vulkan(decoder)?;
+            // SAFETY: as the caller promises.
+            let wrapped = unsafe { vulkan_import(decoder, image, plane) }?;
+            // SAFETY: checked by the first output() above.
+            unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
+            Ok(())
+        },
+        // SAFETY: as the caller promises.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Decodes the frame received so far into `texture`, as
+/// `emberwave_decoder_decode_texture` does, but returns once the work is
+/// submitted to the queue, without waiting for it, on a context of
+/// `emberwave_context_create_vulkan` (decision D61). Elsewhere
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+///
+/// `sync`, if not `NULL`, has semaphores for the submission. The decode's
+/// GPU work waits for `wait_semaphore`, at every stage, before it writes the
+/// texture: the caller signals it once its own GPU work that reads the
+/// texture is done, unless the queue orders that work before the decode
+/// already. The decode signals `signal_semaphore` once the texture holds the
+/// picture, in `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`: the caller's work
+/// that reads the picture waits for it, unless that work goes to the same
+/// queue after the call, with a barrier from all commands. Keep the
+/// semaphores until the work that signals them has completed. When the call
+/// fails, the semaphores may or may not have been waited for and signalled.
+///
+/// # Safety
+///
+/// As for `emberwave_decoder_decode_texture`, and `sync` is `NULL` or points
+/// to an `EmberwaveVulkanSync` whose semaphores are of the context's device.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_submit_texture_vulkan(
+    decoder: *mut EmberwaveDecoder,
+    color: *const EmberwaveColor,
+    texture: *const EmberwaveTexture,
+    sync: *const EmberwaveVulkanSync,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            require_vulkan(decoder)?;
+            // SAFETY: as the caller promises.
+            let texture = unsafe { picture_texture(texture, decoder.decoder.context_id()) }?;
+            // SAFETY: as the caller promises.
+            let params = unsafe { conversion(decoder, color) }?;
+            // SAFETY: as the caller promises.
+            let sync = unsafe { vulkan_sync(sync) }?;
+            let mut semaphores = vulkan_semaphores(sync);
+            decoder.decoder.submit_assembled_to_texture_with(
+                &params,
+                &texture.view,
+                &mut semaphores,
+            )?;
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// Decodes the frame received so far into the plane textures `y`, `cb` and
+/// `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
+/// the work is submitted, with the semaphores of `sync`, as
+/// `emberwave_decoder_submit_texture_vulkan` does.
+///
+/// # Safety
+///
+/// As for `emberwave_decoder_decode_plane_textures`, and `sync` is `NULL` or
+/// points to an `EmberwaveVulkanSync` whose semaphores are of the context's
+/// device.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_vulkan(
+    decoder: *mut EmberwaveDecoder,
+    y: *const EmberwaveTexture,
+    cb: *const EmberwaveTexture,
+    cr: *const EmberwaveTexture,
+    sync: *const EmberwaveVulkanSync,
+) -> EmberwaveStatus {
+    run_or_lost(
+        || {
+            // SAFETY: as the caller promises.
+            let decoder = unsafe { live_mut(decoder) }?;
+            require_vulkan(decoder)?;
+            let context_id = decoder.decoder.context_id();
+            // SAFETY: as the caller promises.
+            let textures = unsafe {
+                [
+                    plane_texture(y, Component::Y, "y", context_id)?,
+                    plane_texture(cb, Component::Cb, "cb", context_id)?,
+                    plane_texture(cr, Component::Cr, "cr", context_id)?,
+                ]
+            };
+            distinct_images(&textures)?;
+            // SAFETY: as the caller promises.
+            let sync = unsafe { vulkan_sync(sync) }?;
+            let mut semaphores = vulkan_semaphores(sync);
+            let targets = textures.map(|texture| &texture.view);
+            decoder
+                .decoder
+                .submit_assembled_to_plane_textures_with(targets, &mut semaphores)?;
+            Ok(())
+        },
+        // SAFETY: as the caller promises; the body's borrow has ended.
+        || unsafe { lost(decoder) },
+    )
+}
+
+/// The semaphores of `sync`, none for `NULL`, or an error for unknown flags.
+///
+/// # Safety
+///
+/// `sync` is `NULL` or points to an `EmberwaveVulkanSync`.
+unsafe fn vulkan_sync(sync: *const EmberwaveVulkanSync) -> Result<EmberwaveVulkanSync, Failure> {
+    // SAFETY: as the caller promises.
+    let sync = unsafe { sync.as_ref() }.copied().unwrap_or_default();
+    let known = EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE;
+    if sync.flags & !known != 0 {
+        return Err(Failure::argument(format!(
+            "sync's flags {:#x} include unknown ones",
+            sync.flags
+        )));
+    }
+    Ok(sync)
+}
+
+/// An error unless `decoder`'s context runs on the caller's own Vulkan
+/// device.
+fn require_vulkan(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
+    if decoder.vulkan {
+        Ok(())
+    } else {
+        Err(Failure::argument(
+            "the decoder's context is not on the caller's Vulkan device \
+             (emberwave_context_create_vulkan)",
+        ))
+    }
+}
+
+/// An error if two of the planes are the same Vulkan image.
+fn distinct_images(textures: &[&EmberwaveTexture; 3]) -> Result<(), Failure> {
+    let [y, cb, cr] = textures.map(vulkan_image);
+    let same = |a: u64, b: u64| a != 0 && a == b;
+    if same(y, cb) || same(y, cr) || same(cb, cr) {
+        return Err(Failure::argument(
+            "two of the planes are the same Vulkan image",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
+fn vulkan_image(texture: &EmberwaveTexture) -> u64 {
+    vulkan::image(texture)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+)))]
+fn vulkan_image(_texture: &EmberwaveTexture) -> u64 {
+    0
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
+unsafe fn vulkan_import(
+    decoder: &EmberwaveDecoder,
+    image: &EmberwaveVulkanImage,
+    plane: Option<Component>,
+) -> Result<EmberwaveTexture, Failure> {
+    // SAFETY: as the caller promises.
+    unsafe { vulkan::import(decoder, image, plane) }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+)))]
+unsafe fn vulkan_import(
+    _decoder: &EmberwaveDecoder,
+    _image: &EmberwaveVulkanImage,
+    _plane: Option<Component>,
+) -> Result<EmberwaveTexture, Failure> {
+    Err(vulkan_elsewhere())
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
+fn vulkan_semaphores(sync: EmberwaveVulkanSync) -> vulkan::Semaphores {
+    vulkan::Semaphores::new(sync)
+}
+
+/// Where there are no Vulkan contexts, nothing to add to a submission.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+)))]
+fn vulkan_semaphores(_sync: EmberwaveVulkanSync) -> impl emberwave_core::gpu::SubmissionHooks {
+    struct Nothing;
+    impl emberwave_core::gpu::SubmissionHooks for Nothing {
+        fn before_submit(&mut self, _queue: &wgpu::Queue) {}
+        fn after_submit(&mut self, _queue: &wgpu::Queue, _submitted: bool) {}
+    }
+    Nothing
 }
 
 #[cfg(any(
@@ -1487,12 +1902,16 @@ mod vulkan {
     use std::ffi::{CStr, c_char, c_void};
 
     use ash::vk::{self, Handle};
-    use emberwave_core::gpu::{CallerQueueLock, GpuContext, GpuOptions, QueueTurns};
+    use emberwave_core::bitstream::Component;
+    use emberwave_core::gpu::{
+        CallerQueueLock, GpuContext, GpuOptions, PLANE_FORMAT, QueueTurns, SubmissionHooks,
+    };
     use wgpu::hal::api::Vulkan;
 
     use super::{
-        EmberwaveStatus, EmberwaveVkGetInstanceProcAddr, EmberwaveVulkanDevice,
-        EmberwaveVulkanInstance, EmberwaveVulkanRequirements, Failure, queue_turns,
+        EmberwaveDecoder, EmberwaveStatus, EmberwaveTexture, EmberwaveVkGetInstanceProcAddr,
+        EmberwaveVulkanDevice, EmberwaveVulkanImage, EmberwaveVulkanInstance,
+        EmberwaveVulkanRequirements, EmberwaveVulkanSync, Failure, queue_turns,
     };
 
     /// What keeps the chain of an `EmberwaveVulkanRequirements` alive.
@@ -1825,6 +2244,249 @@ mod vulkan {
             unsafe { adapter.create_device_from_hal(open, &descriptor) }.map_err(no_gpu)?;
         Ok(GpuContext::from_device(adapter, wgpu_device, wgpu_queue).with_queue_turns(turns))
     }
+
+    /// The `VkImage` of `texture`, or 0 if it is not on the caller's own
+    /// Vulkan device.
+    pub(super) fn image(texture: &EmberwaveTexture) -> u64 {
+        if !texture.vulkan {
+            return 0;
+        }
+        // SAFETY: only read.
+        unsafe { texture.texture.as_hal::<Vulkan>() }
+            // SAFETY: the image of a live texture.
+            .map_or(0, |hal| unsafe { hal.raw_handle() }.as_raw())
+    }
+
+    /// See `emberwave_texture_from_vulkan`.
+    ///
+    /// # Safety
+    ///
+    /// As for `emberwave_texture_from_vulkan`.
+    pub(super) unsafe fn import(
+        decoder: &EmberwaveDecoder,
+        image: &EmberwaveVulkanImage,
+        plane: Option<Component>,
+    ) -> Result<EmberwaveTexture, Failure> {
+        if image.image == 0 {
+            return Err(Failure::argument("image is VK_NULL_HANDLE"));
+        }
+        let layout = decoder.decoder.layout();
+        let (width, height) = match plane {
+            Some(component) => layout.plane_size(component),
+            None => (layout.width(), layout.height()),
+        };
+        let format = match (plane, vk::Format::from_raw(image.format as i32)) {
+            (Some(_), vk::Format::R8_UNORM) => PLANE_FORMAT,
+            (None, vk::Format::R8G8B8A8_UNORM) => wgpu::TextureFormat::Rgba8Unorm,
+            (None, vk::Format::B8G8R8A8_UNORM) => wgpu::TextureFormat::Bgra8Unorm,
+            (Some(_), format) => {
+                return Err(Failure::argument(format!(
+                    "the image's format is {format:?}, not VK_FORMAT_R8_UNORM"
+                )));
+            }
+            (None, format) => {
+                return Err(Failure::argument(format!(
+                    "the image's format is {format:?}, not VK_FORMAT_B8G8R8A8_UNORM or \
+                     VK_FORMAT_R8G8B8A8_UNORM"
+                )));
+            }
+        };
+        let flags = vk::ImageUsageFlags::from_raw(image.usage);
+        if !flags.contains(vk::ImageUsageFlags::SAMPLED) {
+            return Err(Failure::argument(
+                "the image lacks VK_IMAGE_USAGE_SAMPLED_BIT: a decode leaves it in \
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL",
+            ));
+        }
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING;
+        for (flag, use_) in [
+            (
+                vk::ImageUsageFlags::TRANSFER_SRC,
+                wgpu::TextureUsages::COPY_SRC,
+            ),
+            (
+                vk::ImageUsageFlags::TRANSFER_DST,
+                wgpu::TextureUsages::COPY_DST,
+            ),
+            (
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            ),
+        ] {
+            if flags.contains(flag) {
+                usage |= use_;
+            }
+        }
+        let copies = usage.contains(wgpu::TextureUsages::COPY_DST);
+        let fillable = match plane {
+            Some(_) => copies,
+            None => {
+                (copies && (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
+                    || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            }
+        };
+        if !fillable {
+            return Err(Failure::argument(
+                "neither a copy nor a draw can fill the image: a copy needs \
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT (and for the picture a width of a multiple \
+                 of 64 pixels), a draw of the picture VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT",
+            ));
+        }
+        let state = match vk::ImageLayout::from_raw(image.layout as i32) {
+            vk::ImageLayout::UNDEFINED => wgpu::TextureUses::UNINITIALIZED,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => wgpu::TextureUses::RESOURCE,
+            other => {
+                return Err(Failure::argument(format!(
+                    "the image's layout is {other:?}, not VK_IMAGE_LAYOUT_UNDEFINED or \
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL"
+                )));
+            }
+        };
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let device = decoder.decoder.device();
+        let hal_texture = {
+            // SAFETY: only read.
+            let hal = unsafe { device.as_hal::<Vulkan>() }
+                .ok_or_else(|| no_gpu("not a Vulkan device"))?;
+            // What wgpu-core takes each usage of the texture's for.
+            let mut uses = wgpu::TextureUses::RESOURCE;
+            for (use_, internal) in [
+                (wgpu::TextureUsages::COPY_SRC, wgpu::TextureUses::COPY_SRC),
+                (wgpu::TextureUsages::COPY_DST, wgpu::TextureUses::COPY_DST),
+                (
+                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    wgpu::TextureUses::COLOR_TARGET,
+                ),
+            ] {
+                if usage.contains(use_) {
+                    uses |= internal;
+                }
+            }
+            // wgpu calls a drop callback, rather than destroying the image,
+            // once it and the GPU are done with it: the caller's `release`.
+            let release = SendPointer(image.user);
+            let release: wgpu::hal::DropCallback = match image.release {
+                Some(callback) => Box::new(move || {
+                    let release = release;
+                    // SAFETY: the caller's callback with its `user`, which
+                    // it promises may be called from any thread.
+                    unsafe { callback(release.0) }
+                }),
+                None => Box::new(|| {}),
+            };
+            // SAFETY: an image of the device, made as described, as the
+            // caller promises. Given a drop callback and external memory,
+            // wgpu leaves both to the caller.
+            unsafe {
+                hal.texture_from_raw(
+                    vk::Image::from_raw(image.image),
+                    &wgpu::hal::TextureDescriptor {
+                        label: Some("caller's image"),
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: uses,
+                        memory_flags: wgpu::hal::MemoryFlags::empty(),
+                        view_formats: Vec::new(),
+                    },
+                    Some(release),
+                    wgpu::hal::vulkan::TextureMemory::External,
+                )
+            }
+        };
+        // SAFETY: a texture of the device's, made as described, in the state
+        // its layout gives, as the caller promises.
+        let texture = unsafe {
+            device.create_texture_from_hal::<Vulkan>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("caller's image"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                },
+                state,
+            )
+        };
+        Ok(EmberwaveTexture::wrap(decoder, texture, plane, true))
+    }
+
+    /// The caller's `user` of an `EmberwaveVulkanImage`, for its `release`
+    /// on whichever thread wgpu calls it.
+    struct SendPointer(*mut c_void);
+
+    // SAFETY: the caller promises that `release` may be called with `user`
+    // from any thread.
+    unsafe impl Send for SendPointer {}
+    // SAFETY: as above.
+    unsafe impl Sync for SendPointer {}
+
+    /// The semaphores of an `EmberwaveVulkanSync`, added to a decode's
+    /// submission, and taken back if it was not made.
+    pub(super) struct Semaphores {
+        wait: Option<(vk::Semaphore, Option<u64>)>,
+        signal: Option<(vk::Semaphore, Option<u64>)>,
+    }
+
+    impl Semaphores {
+        pub(super) fn new(sync: EmberwaveVulkanSync) -> Self {
+            let semaphore = |handle: u64, timeline: bool, value: u64| {
+                (handle != 0).then(|| (vk::Semaphore::from_raw(handle), timeline.then_some(value)))
+            };
+            let timeline = |flag| sync.flags & flag != 0;
+            Self {
+                wait: semaphore(
+                    sync.wait_semaphore,
+                    timeline(super::EMBERWAVE_SYNC_WAIT_TIMELINE),
+                    sync.wait_value,
+                ),
+                signal: semaphore(
+                    sync.signal_semaphore,
+                    timeline(super::EMBERWAVE_SYNC_SIGNAL_TIMELINE),
+                    sync.signal_value,
+                ),
+            }
+        }
+    }
+
+    impl SubmissionHooks for Semaphores {
+        fn before_submit(&mut self, queue: &wgpu::Queue) {
+            // SAFETY: only adds to the next submission, the decode's.
+            if let Some(hal) = unsafe { queue.as_hal::<Vulkan>() } {
+                if let Some((semaphore, value)) = self.wait {
+                    hal.add_wait_semaphore(semaphore, value, vk::PipelineStageFlags::ALL_COMMANDS);
+                }
+                if let Some((semaphore, value)) = self.signal {
+                    hal.add_signal_semaphore(semaphore, value);
+                }
+            }
+        }
+
+        fn after_submit(&mut self, queue: &wgpu::Queue, _submitted: bool) {
+            // Whatever the call says: a submission that took them leaves
+            // nothing to take back, and one that did not, as on a device lost
+            // meanwhile, must not hand them to another.
+            // SAFETY: only takes back what before_submit added.
+            if let Some(hal) = unsafe { queue.as_hal::<Vulkan>() } {
+                if let Some((semaphore, _)) = self.wait {
+                    hal.remove_wait_semaphore(semaphore);
+                }
+                if let Some((semaphore, _)) = self.signal {
+                    hal.remove_signal_semaphore(semaphore);
+                }
+            }
+        }
+    }
 }
 
 /// Destroys a context. Decoders and encoders created on it keep working, and
@@ -1899,6 +2561,7 @@ pub unsafe extern "C" fn emberwave_decoder_create(
         let boxed = Box::new(EmberwaveDecoder {
             decoder: created,
             shared_queue: context.shared_queue,
+            vulkan: context.vulkan,
             turns: context.context.queue_turns().cloned(),
         });
         // SAFETY: checked by the first output() above.

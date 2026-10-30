@@ -302,9 +302,39 @@ emberwave_context_create_vulkan(&device, &context);
   - Give every context on one queue the same callbacks and `user`, and keep them valid until everything made on those contexts is destroyed. A context with other callbacks is refused. The decoders and encoders of those contexts take turns at the queue, as on Metal (decision D60).
   - Without callbacks, nothing else may use the queue during emberwave's calls. A second queue of the family, where the device has one, needs neither.
 - **The device.** It stays the client's: destroy it after the context and everything made on it.
-- **For now, through CPU memory.** Decodes and encodes go through CPU memory, as on a context of `emberwave_context_create`, but on the client's device, without a second one. The decodes into the client's images, and semaphores to order them without waiting, are the next step ([#115](https://github.com/with-developer/emberwave/issues/115)).
 
-`tests/vulkan.rs` makes an instance and a device as a client does, on Linux CI's lavapipe.
+### Pictures in the client's Vulkan images
+
+On such a context the decodes into textures put the picture, or its planes, into Vulkan images that the client reads on the GPU:
+- `emberwave_texture_vulkan` gives the `VkImage` of a texture of `emberwave_texture_create` or `emberwave_texture_create_plane`.
+- `emberwave_texture_from_vulkan` and `emberwave_texture_from_vulkan_plane` wrap an image of the client's own, described by an `EmberwaveVulkanImage`: its `VkImage`, `VkFormat` (`VK_FORMAT_B8G8R8A8_UNORM` or `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` for a plane), usage, and current layout.
+
+The images are 2D, of one level, layer and sample, with optimal tiling, exclusive to the context's queue family, and have `VK_IMAGE_USAGE_SAMPLED_BIT`. A decode copies the picture in with `VK_IMAGE_USAGE_TRANSFER_DST_BIT` when its width is a multiple of 64 pixels, and draws it in with `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` otherwise. Planes are copied.
+
+Between emberwave's calls an image is in `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, from the first decode into it on. A decode leaves it so, and the client's barriers start from that layout and return the image to it before the next call that uses it. An image wrapped in `VK_IMAGE_LAYOUT_UNDEFINED` may lose its contents to the first decode.
+
+The decodes that wait, `emberwave_decoder_decode_texture` and `emberwave_decoder_decode_plane_textures`, return once the GPU has written the images. The ones that do not wait take semaphores instead:
+
+```c
+EmberwaveVulkanSync sync = {
+    .wait_semaphore = (uint64_t)reads_done,       /* signalled when the client's reads of the image end */
+    .wait_value = frame,
+    .signal_semaphore = (uint64_t)picture_ready,  /* the client's reads wait for it */
+    .signal_value = frame + 1,
+    .flags = EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE,  /* 0 for binary semaphores */
+};
+emberwave_decoder_submit_texture_vulkan(decoder, NULL, texture, &sync);
+/* ... the client's command buffer that samples the image waits for picture_ready at frame + 1 ... */
+```
+
+`emberwave_decoder_submit_plane_textures_vulkan` does the same for the planes. Either semaphore may be 0, and `sync` `NULL`. The queue orders the work it carries, but not memory: work of the client's on the same queue after the call needs a barrier from all commands, or the signal semaphore.
+- A binary semaphore to wait for has its signal submitted already, and one to signal is waited for before it is signalled again.
+- A wait that is never met holds up every later submission to the queue, the client's too: the decode waits at every stage.
+- Keep the semaphores until the work that signals them has completed. When the call fails, the semaphores may or may not have been waited for and signalled.
+
+A decode that does not wait may still run after `emberwave_texture_destroy` returns. So the client destroys a wrapped image only once `release` of its `EmberwaveVulkanImage` has been called, which emberwave does when it and the GPU are done with the image, from any thread. Without `release`, the client waits for the work of every decode into the image itself.
+
+`tests/vulkan.rs` makes an instance, a device and images as a client does, and runs on Linux CI's lavapipe.
 
 ## Rules
 
