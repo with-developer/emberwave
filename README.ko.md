@@ -146,8 +146,7 @@ iPhone 17의 Safari에서는 [벤치마크 페이지](https://with-developer.git
 
 앞으로 할 일입니다. 준비되는 대로 각각 릴리스합니다.
 
-- **실사용 환경에서 측정.** 클라이언트의 화면 출력 루프 안에서 디코딩해, 화면에 나오기까지의 시간을 Mac과 iPhone에서 잽니다([#81](https://github.com/with-developer/emberwave/issues/81)). NVENC로 만든 HEVC와 AV1 스트림을 emberwave 스트림과 나란히 디코딩하고, 움직이는 게임 영상의 화질을 같은 비트레이트에서 예측 프레임을 쓰는 HEVC와 비교합니다([#82](https://github.com/with-developer/emberwave/issues/82)). [#86](https://github.com/with-developer/emberwave/issues/86)의 마지막 항목인, 프레임마다 하는 CPU 준비 작업도 줄입니다.
-- **화질.** 인코더가 줄이려는 오차 기준으로는 개선 여지가 1%도 남지 않았습니다([#136](https://github.com/with-developer/emberwave/issues/136)). 눈에 띄게 나아지려면 사람이 느끼는 화질을 재는 지표에 맞춰 대역 가중치를 다시 정해야 하므로, 그 지표부터 고릅니다.
+- **실사용 환경에서 측정.** 클라이언트의 화면 출력 루프 안에서 디코딩해, 화면에 나오기까지의 시간을 Mac과 iPhone에서 잽니다([#81](https://github.com/with-developer/emberwave/issues/81)). NVENC로 만든 HEVC와 AV1 스트림을 emberwave 스트림과 나란히 디코딩하고, 움직이는 게임 영상의 화질을 같은 비트레이트에서 예측 프레임을 쓰는 HEVC와 비교합니다([#82](https://github.com/with-developer/emberwave/issues/82)). 이 비교로 색차 대역 가중치를 바꿀지도 정합니다(결정 D67). [#86](https://github.com/with-developer/emberwave/issues/86)의 마지막 항목인, 프레임마다 하는 CPU 준비 작업도 줄입니다.
 - **1.0을 향해: 클라이언트.** emberwave가 코덱으로 남도록, 브라우저 스트리밍은 별도 저장소에서 만듭니다. 호스트 화면을 GPU에서 인코딩해 로컬 네트워크로 보내고, 브라우저 탭에서 WebGPU로 디코딩합니다. 지연 시간부터 잽니다. 그다음에는 PyroWave로 스트리밍하는 호스트들에 emberwave 인코더를 제안합니다. 1.0이 되려면 안정된 C·Rust API, 실제로 쓰이는 클라이언트 하나, 그리고 프레임이 실제 스트림의 간격으로 들어올 때 업스트림만큼 빠른 디코딩이 필요합니다.
 
 ## 저장소 구성
