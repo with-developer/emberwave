@@ -157,17 +157,23 @@ pub(crate) struct BandInfo {
     pub width: u32,
     pub height: u32,
     pub dst_offset: u32,
-    pub pad: [u32; 3],
+    /// The band's decomposition level and component index, for the
+    /// concealment of frames drawn in part (decision D66).
+    pub level: u32,
+    pub component: u32,
+    pub pad: u32,
 }
 
-/// Uniform block of `dequant.wgsl`.
+/// Uniform block of `dequant.wgsl`, which `conceal.wgsl` reads as well.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct DequantParams {
     pub band_count: u32,
     pub block_count: u32,
     pub grid_width: u32,
-    pub pad: u32,
+    /// 1 for a frame drawn in part that the decoder conceals: the one word
+    /// that changes from frame to frame, at [`DequantParams::CONCEAL_OFFSET`].
+    pub conceal: u32,
     pub bands: [BandInfo; MAX_BANDS],
 }
 
@@ -184,7 +190,9 @@ impl DequantParams {
                 dst_offset: buffers
                     .band_offset(component, level, band)
                     .expect("a transmitted band has pyramid space"),
-                pad: [0; 3],
+                level: level as u32,
+                component: component.index() as u32,
+                pad: 0,
             };
             count += 1;
         }
@@ -194,9 +202,68 @@ impl DequantParams {
         params
     }
 
+    /// Where `conceal` is in the uniform block, in bytes.
+    pub(crate) const CONCEAL_OFFSET: u64 = 12;
+
     /// Workgroup grid of the dispatch: one workgroup per block.
     pub(crate) fn grid(&self) -> (u32, u32) {
         grid_for(u64::from(self.block_count))
+    }
+}
+
+/// Uniform block of `conceal.wgsl` (decision D66).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct ConcealParams {
+    /// Per component, Y, Cb and Cr (the fourth unused): where the coarsest
+    /// level's four bands start, LL, HL, LH and HH one after the other, in
+    /// the pyramid and in the copy of the last decode's, in floats.
+    pub pyramid_offset: [u32; 4],
+    pub last_offset: [u32; 4],
+    /// The size of a band of the coarsest level, the same in every
+    /// component.
+    pub coarse_width: u32,
+    pub coarse_height: u32,
+    /// [`CONCEALMENT_THRESHOLD`](crate::cpu::CONCEALMENT_THRESHOLD).
+    pub threshold: f32,
+    pub pad: u32,
+}
+
+impl ConcealParams {
+    pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout) -> Self {
+        let coarsest = DECOMPOSITION_LEVELS - 1;
+        let (width, height) = layout.level_size(coarsest);
+        let floats = width * height;
+        let mut params = Self::zeroed();
+        for component in Component::ALL {
+            let i = component.index();
+            params.pyramid_offset[i] = buffers
+                .band_offset(component, coarsest, Band::Ll)
+                .expect("every component has the coarsest level");
+            params.last_offset[i] = i as u32 * BANDS_PER_LEVEL as u32 * floats;
+            // The copy takes the four bands as one run.
+            for (n, band) in Band::ALL.into_iter().enumerate() {
+                debug_assert_eq!(
+                    buffers.band_offset(component, coarsest, band),
+                    Some(params.pyramid_offset[i] + n as u32 * floats)
+                );
+                debug_assert_eq!(
+                    layout
+                        .band(component, coarsest, band)
+                        .map(|b| (b.width, b.height)),
+                    Some((width, height))
+                );
+            }
+        }
+        params.coarse_width = width;
+        params.coarse_height = height;
+        params.threshold = crate::cpu::CONCEALMENT_THRESHOLD;
+        params
+    }
+
+    /// Floats of a component's coarsest level: its four bands.
+    pub(crate) fn coarse_floats(&self) -> u32 {
+        BANDS_PER_LEVEL as u32 * self.coarse_width * self.coarse_height
     }
 }
 

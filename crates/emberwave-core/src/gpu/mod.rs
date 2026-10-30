@@ -31,6 +31,9 @@ pub use error::GpuError;
 pub mod shader_sources {
     /// Coefficient decoding and dequantisation.
     pub const DEQUANT: &str = include_str!("shaders/dequant.wgsl");
+    /// The blocks of detail a frame drawn in part lacks, after the
+    /// dequantisation (decision D66).
+    pub const CONCEAL: &str = include_str!("shaders/conceal.wgsl");
     /// Inverse wavelet transform of one level, whose last level packs the
     /// planes into a buffer.
     pub const IDWT: &str = concat!(
@@ -74,8 +77,9 @@ pub mod shader_sources {
     );
 
     /// Every shader, by name, with its compute entry points.
-    pub const ALL: [(&str, &str, &[&str]); 10] = [
+    pub const ALL: [(&str, &str, &[&str]); 11] = [
         ("dequant", DEQUANT, &["main"]),
+        ("conceal", CONCEAL, &["main"]),
         ("idwt", IDWT, &["main"]),
         ("yuv2rgb", YUV2RGB, &["main"]),
         ("gather", GATHER, &["main"]),

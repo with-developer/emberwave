@@ -1120,6 +1120,131 @@ fn an_incomplete_frame_is_an_error_until_it_is_allowed_to_be_partial() {
     assert_ne!(frame, complete, "the missing blocks must make a difference");
 }
 
+/// A 192x128 4:2:0 picture with texture everywhere, its luma raised by
+/// `lift`, and its frame from the CPU encoder.
+fn textured_frame(lift: u8) -> (FrameLayout, Vec<u8>) {
+    let (width, height) = (192usize, 128usize);
+    let luma: Vec<u8> = (0..width * height)
+        .map(|i| {
+            let (x, y) = (i % width, i / width);
+            ((x * 37 + y * 101 + (x * y) % 23) % 171) as u8 + 20 + lift
+        })
+        .collect();
+    let chroma = (vec![110; width * height / 4], vec![140; width * height / 4]);
+    let mut encoder = emberwave_core::encode::Encoder::new(
+        width as u32,
+        height as u32,
+        ChromaSubsampling::Yuv420,
+        emberwave_core::encode::Signalling::default(),
+    )
+    .unwrap();
+    let frame = encoder
+        .encode([&luma, &chroma.0, &chroma.1], 20_000)
+        .unwrap();
+    (encoder.layout().clone(), frame)
+}
+
+/// The packets of `frame` but every third that holds blocks below the
+/// coarsest level only, from the `phase`th on, as a stream that lost them.
+fn lossy_packets<'a>(layout: &FrameLayout, frame: &'a [u8], phase: usize) -> Vec<&'a [u8]> {
+    let coarsest = layout
+        .bands()
+        .find(|&(_, level, _, _)| level < DECOMPOSITION_LEVELS - 1)
+        .map_or(layout.block_count(), |(.., band)| band.first_block);
+    emberwave_core::encode::packets(frame, 64)
+        .into_iter()
+        .enumerate()
+        .filter(|(n, packet)| {
+            let detail = matches!(Header::parse(packet), Ok(Header::Block(block)) if block.block_index >= coarsest);
+            !(detail && n % 3 == phase)
+        })
+        .map(|(_, packet)| packet)
+        .collect()
+}
+
+#[test]
+fn frames_drawn_in_part_conceal_what_they_lack_as_the_cpu_does() {
+    // Concealment (decision D66): a frame drawn in part keeps the last
+    // frame's coefficients for the blocks of detail it lacks where the
+    // picture is still, and has zeros where it changed, on the GPU as
+    // cpu::Concealer has them. Whole frames are as without it.
+    let context = gpu_or_return!();
+    let (layout, still) = textured_frame(0);
+    let (_, changed) = textured_frame(40);
+    let mut decoder = decoder_for(context, &layout);
+    assert!(!decoder.concealment());
+    decoder.set_concealment(true);
+    let mut concealer = cpu::Concealer::new();
+    // Whole, the same picture in part, the same whole, a brighter picture in
+    // part, and the brighter in part again, now still against the last,
+    // which has the blocks it lacks.
+    let sequence = [
+        (&still, None),
+        (&still, Some(0)),
+        (&still, None),
+        (&changed, Some(0)),
+        (&changed, Some(1)),
+    ];
+    let mut decoded = Vec::new();
+    for (index, &(frame, phase)) in sequence.iter().enumerate() {
+        let lossy = phase.is_some();
+        let packets = match phase {
+            Some(phase) => lossy_packets(&layout, frame, phase),
+            None => vec![&frame[..]],
+        };
+        decoder.clear();
+        let mut assembler = FrameAssembler::new(layout.clone());
+        for packet in &packets {
+            decoder.push_packet(packet).unwrap();
+            assembler.push_packet(packet).unwrap();
+        }
+        assert_eq!(decoder.is_ready(false), !lossy);
+        let gpu = decoder.decode_assembled().unwrap();
+        let cpu = concealer.decode(&assembler.frame(), lossy).unwrap();
+        for (plane, expected) in gpu.planes.iter().zip(&cpu.planes) {
+            assert!(
+                max_abs_diff(&expected.to_unorm8(), &plane.data) <= 1,
+                "frame {index}: {}",
+                max_abs_diff(&expected.to_unorm8(), &plane.data)
+            );
+        }
+        let zeros = cpu::decode_frame(&assembler.frame()).unwrap();
+        decoded.push((gpu, zeros));
+    }
+    let whole = &decoded[0].0;
+    // The still picture in part is the whole picture.
+    assert_eq!(&decoded[1].0, whole);
+    assert_ne!(
+        decoded[1].0.planes[0].data,
+        decoded[1].1.planes[0].to_unorm8()
+    );
+    // The changed picture in part has zeros where it lacks blocks: as
+    // without concealment, to the GPU's rounding.
+    for (plane, zeros) in decoded[3].0.planes.iter().zip(&decoded[3].1.planes) {
+        assert!(max_abs_diff(&zeros.to_unorm8(), &plane.data) <= 1);
+    }
+    // Then still against the frame before, it keeps that frame's detail
+    // rather than the zeros.
+    assert_ne!(
+        decoded[4].0.planes[0].data,
+        decoded[4].1.planes[0].to_unorm8()
+    );
+
+    // Off again, a frame in part has zeros.
+    decoder.set_concealment(false);
+    decoder.clear();
+    let mut assembler = FrameAssembler::new(layout.clone());
+    for packet in lossy_packets(&layout, &still, 0) {
+        decoder.push_packet(packet).unwrap();
+        assembler.push_packet(packet).unwrap();
+    }
+    let gpu = decoder.decode_assembled().unwrap();
+    let zeros = cpu::decode_frame(&assembler.frame()).unwrap();
+    for (plane, expected) in gpu.planes.iter().zip(&zeros.planes) {
+        assert!(max_abs_diff(&expected.to_unorm8(), &plane.data) <= 1);
+    }
+}
+
 #[test]
 fn a_partial_frame_needs_the_share_of_blocks_its_decoder_asks() {
     let context = gpu_or_return!();

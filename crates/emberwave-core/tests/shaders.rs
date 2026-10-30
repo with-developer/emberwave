@@ -110,8 +110,12 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("block8_plane_bytes", 64),
         ("block8_signs", 64),
     ];
-    let lists: [(&str, Vec<Variable>); 10] = [
+    let lists: [(&str, Vec<Variable>); 11] = [
         ("dequant", dequant.to_vec()),
+        (
+            "conceal",
+            vec![("shared_offset", 4), ("largest", 4), ("moved", 4)],
+        ),
         ("idwt", idwt.to_vec()),
         ("yuv2rgb", Vec::new()),
         ("gather", Vec::new()),
