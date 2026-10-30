@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.15.0] - 2026-10-31
+
+Pictures in RGB encoded as hosts' captures hold them. The encoder converts BGRA or RGBA to Y'CbCr as it reads them, from textures of Metal, Vulkan and Direct3D or from CPU memory, in integers that make the same bytes on every GPU and on the CPU. Also a frame assembler that no stream of packets can slow down, and late packets ignored as the docs say.
 
 ### Added
 
