@@ -9,9 +9,10 @@
 //
 // One dispatch combines the LL, HL, LH and HH bands of a level into the LL band
 // of the next finer level (or into the final plane). A workgroup produces a
-// 32x32 tile of the output: it loads the 40x40 interleaved neighbourhood
-// (4 samples of extension on each side, one per lifting step), filters
-// horizontally and then vertically in workgroup memory, and stores the tile.
+// 32x32 tile of the output from its 40x40 interleaved neighbourhood (4 samples
+// of extension on each side, one per lifting step): it lifts the rows of the
+// neighbourhood, read straight from the bands, into workgroup memory, then the
+// columns of the tile from there, and stores the tile.
 // At the last level of a component the tile becomes 8-bit samples, which is
 // what upstream's UNORM storage images hold; the float picture never goes to
 // memory. Workgroup z selects the colour component.
@@ -62,20 +63,20 @@ const DELTA: f32 = 0.443506852043971;
 const K: f32 = 1.230174104914001;
 const INV_K: f32 = 0.8128930661159609;
 
-// Output tile and the interleaved window that feeds it.
+// Output tile, and the extension of its neighbourhood on each side.
 const TILE: u32 = 32u;
-const WINDOW: u32 = 40u;
 const APRON: i32 = 4;
 
 // Shifts the DC level back (bitstream.md, "Inverse DC shift").
 const DC_SHIFT: f32 = 0.5;
 
 // Workgroup memory is not zeroed for this pipeline (decision D25): every
-// element is written before it is read. The load fills all of `window`, the
-// horizontal pass all of `horizontal`, and at the last level the vertical
-// pass rewrites the 32x32 corner of `window` that the packing reads.
-var<workgroup> window: array<f32, 1600>;
+// element is written before it is read. The horizontal pass fills all of
+// `horizontal`, and at the last level the vertical pass all of `levels`,
+// which the store reads.
 var<workgroup> horizontal: array<f32, 1280>;
+// The last level's tile, as 8-bit levels.
+var<workgroup> levels: array<f32, 1024>;
 
 // Whole-sample symmetric mirroring: -1 -> 1, n -> n - 2.
 fn mirror(index: i32, n: i32) -> i32 {
@@ -148,7 +149,7 @@ fn store_ll(comp: CompParams, x: i32, y: i32, value: f32) {
 // A final sample as an 8-bit level: the DC shift is added by the caller, the
 // result clamped to [0, 1] and rounded like a UNORM store. WGSL's round()
 // rounds ties to even on every backend. Kept as a float so that it can wait in
-// the window array; it is a whole number from 0 to 255.
+// the levels array; it is a whole number from 0 to 255.
 fn to_unorm8(v: f32) -> f32 {
     return round(clamp(v, 0.0, 1.0) * 255.0);
 }
@@ -161,42 +162,40 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     let tile_x = i32(wg.x * TILE);
     let tile_y = i32(wg.y * TILE);
 
-    // Load the interleaved window. The low bit of a mirrored coordinate says
-    // which band the sample comes from: LL, HL (odd column), LH (odd row), HH.
-    for (var i = tid; i < WINDOW * WINDOW; i = i + 256u) {
-        let row = i32(i / WINDOW);
-        let col = i32(i % WINDOW);
-        let x = mirror(tile_x + col - APRON, out_width);
-        let y = mirror(tile_y + row - APRON, out_height);
-        let band = u32(x & 1) | (u32(y & 1) << 1u);
-        let index = comp.band_offset[band] + u32(y >> 1u) * params.band_width + u32(x >> 1u);
-        window[i] = pyramid[index];
-    }
-    workgroupBarrier();
-
-    // Horizontal pass: one invocation per segment of a window row. Window
-    // columns 8s..8s+16 give the filtered columns 8s+4..8s+12.
+    // Horizontal pass, straight from the bands: one invocation per segment of
+    // a row of the neighbourhood, whose columns 8s..8s+16 give the filtered
+    // columns 8s+4..8s+12. Each coordinate is mirrored about the level's size;
+    // the low bit of a mirrored coordinate says which band the sample comes
+    // from, LL, HL (odd column), LH (odd row) or HH, and mirroring keeps that
+    // bit, so a row's even columns come from one band and its odd ones from
+    // another. Loading the neighbourhood into workgroup memory first made the
+    // transform take a quarter longer at 4K (decision D68).
     if (tid < 160u) {
         let row = tid / 4u;
         let segment = tid % 4u;
+        let y = mirror(tile_y + i32(row) - APRON, out_height);
+        let row_bands = u32(y & 1) << 1u;
+        let band_row = u32(y >> 1u) * params.band_width;
+        let even = comp.band_offset[row_bands] + band_row;
+        let odd = comp.band_offset[row_bands | 1u] + band_row;
+        let x0 = tile_x + i32(8u * segment) - APRON;
         var v: array<f32, 16>;
-        let base = row * WINDOW + 8u * segment;
-        v[0] = window[base + 0u];
-        v[1] = window[base + 1u];
-        v[2] = window[base + 2u];
-        v[3] = window[base + 3u];
-        v[4] = window[base + 4u];
-        v[5] = window[base + 5u];
-        v[6] = window[base + 6u];
-        v[7] = window[base + 7u];
-        v[8] = window[base + 8u];
-        v[9] = window[base + 9u];
-        v[10] = window[base + 10u];
-        v[11] = window[base + 11u];
-        v[12] = window[base + 12u];
-        v[13] = window[base + 13u];
-        v[14] = window[base + 14u];
-        v[15] = window[base + 15u];
+        v[0] = pyramid[even + u32(mirror(x0 + 0, out_width) >> 1u)];
+        v[1] = pyramid[odd + u32(mirror(x0 + 1, out_width) >> 1u)];
+        v[2] = pyramid[even + u32(mirror(x0 + 2, out_width) >> 1u)];
+        v[3] = pyramid[odd + u32(mirror(x0 + 3, out_width) >> 1u)];
+        v[4] = pyramid[even + u32(mirror(x0 + 4, out_width) >> 1u)];
+        v[5] = pyramid[odd + u32(mirror(x0 + 5, out_width) >> 1u)];
+        v[6] = pyramid[even + u32(mirror(x0 + 6, out_width) >> 1u)];
+        v[7] = pyramid[odd + u32(mirror(x0 + 7, out_width) >> 1u)];
+        v[8] = pyramid[even + u32(mirror(x0 + 8, out_width) >> 1u)];
+        v[9] = pyramid[odd + u32(mirror(x0 + 9, out_width) >> 1u)];
+        v[10] = pyramid[even + u32(mirror(x0 + 10, out_width) >> 1u)];
+        v[11] = pyramid[odd + u32(mirror(x0 + 11, out_width) >> 1u)];
+        v[12] = pyramid[even + u32(mirror(x0 + 12, out_width) >> 1u)];
+        v[13] = pyramid[odd + u32(mirror(x0 + 13, out_width) >> 1u)];
+        v[14] = pyramid[even + u32(mirror(x0 + 14, out_width) >> 1u)];
+        v[15] = pyramid[odd + u32(mirror(x0 + 15, out_width) >> 1u)];
         lift(&v);
         let out = row * TILE + 8u * segment;
         horizontal[out + 0u] = v[4];
@@ -239,16 +238,15 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         lift(&v);
 
         if (is_final) {
-            // The window array is free now: the horizontal pass is done.
             let at = 8u * segment * TILE + column;
-            window[at + 0u * TILE] = to_unorm8(v[4] + DC_SHIFT);
-            window[at + 1u * TILE] = to_unorm8(v[5] + DC_SHIFT);
-            window[at + 2u * TILE] = to_unorm8(v[6] + DC_SHIFT);
-            window[at + 3u * TILE] = to_unorm8(v[7] + DC_SHIFT);
-            window[at + 4u * TILE] = to_unorm8(v[8] + DC_SHIFT);
-            window[at + 5u * TILE] = to_unorm8(v[9] + DC_SHIFT);
-            window[at + 6u * TILE] = to_unorm8(v[10] + DC_SHIFT);
-            window[at + 7u * TILE] = to_unorm8(v[11] + DC_SHIFT);
+            levels[at + 0u * TILE] = to_unorm8(v[4] + DC_SHIFT);
+            levels[at + 1u * TILE] = to_unorm8(v[5] + DC_SHIFT);
+            levels[at + 2u * TILE] = to_unorm8(v[6] + DC_SHIFT);
+            levels[at + 3u * TILE] = to_unorm8(v[7] + DC_SHIFT);
+            levels[at + 4u * TILE] = to_unorm8(v[8] + DC_SHIFT);
+            levels[at + 5u * TILE] = to_unorm8(v[9] + DC_SHIFT);
+            levels[at + 6u * TILE] = to_unorm8(v[10] + DC_SHIFT);
+            levels[at + 7u * TILE] = to_unorm8(v[11] + DC_SHIFT);
         } else {
             let x = tile_x + i32(column);
             let y = tile_y + i32(8u * segment);
@@ -264,7 +262,7 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     }
 
     // At the last level every invocation stores four samples of a row of the
-    // tile, from the window array, in the file behind this one.
+    // tile, from the levels array, in the file behind this one.
     //
     // The barrier is outside the branch on purpose: every level waits, though
     // only the last needs it. Inside `if (is_final)`, uniform as that is, it

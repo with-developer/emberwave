@@ -5,8 +5,9 @@
 // ("Wavelet transform") as emberwave's CPU encoder does it
 // (src/encode/fdwt.rs), in the shape of idwt.wgsl: a workgroup takes a 32x32
 // tile of the level's image with 4 samples of whole-sample symmetric extension
-// on each side (a 40x40 window), lifts its rows and then its columns in
-// registers, and writes the 16x16 corner of each band the tile gives. At a
+// on each side (a 40x40 window), lifts the window's rows, read straight from
+// the image, into workgroup memory, then the tile's columns from there, and
+// writes the 16x16 corner of each band the tile gives. At a
 // component's finest level the image is the 8-bit plane, extended to the
 // aligned size by repeating its last column and row, at the other levels the
 // LL band the level before wrote. Workgroup z selects the colour component.
@@ -61,15 +62,12 @@ const DELTA: f32 = 0.443506852043971;
 const K: f32 = 1.230174104914001;
 const INV_K: f32 = 0.8128930661159609;
 
-// Image tile and the window of it, with its extension, that feeds a workgroup.
+// Image tile, and the extension of its window on each side.
 const TILE: u32 = 32u;
-const WINDOW: u32 = 40u;
 const APRON: i32 = 4;
 
-// Workgroup memory is not zeroed for this pipeline (decision D25): the load
-// fills all of `window` and the horizontal pass all of `horizontal` before
-// either is read.
-var<workgroup> window: array<f32, 1600>;
+// Workgroup memory is not zeroed for this pipeline (decision D25): the
+// horizontal pass fills all of `horizontal` before it is read.
 var<workgroup> horizontal: array<f32, 1280>;
 
 // Whole-sample symmetric mirroring: -1 -> 1, n -> n - 2.
@@ -151,38 +149,32 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     let tile_x = wg.x * TILE;
     let tile_y = wg.y * TILE;
 
-    for (var i = tid; i < WINDOW * WINDOW; i = i + 256u) {
-        let row = i32(i / WINDOW);
-        let col = i32(i % WINDOW);
-        let x = mirror(i32(tile_x) + col - APRON, image_width);
-        let y = mirror(i32(tile_y) + row - APRON, image_height);
-        window[i] = image_at(comp, u32(x), u32(y));
-    }
-    workgroupBarrier();
-
-    // Horizontal pass: one invocation per segment of a window row. Window
-    // columns 8s..8s+16 give the tile columns 8s..8s+8.
+    // Horizontal pass, straight from the image: one invocation per segment of
+    // a window row. Window columns 8s..8s+16 give the tile columns 8s..8s+8.
+    // Loading the window into workgroup memory first made the transform take
+    // a fifth longer at 4K (decision D68).
     if (tid < 160u) {
         let row = tid / 4u;
         let segment = tid % 4u;
+        let y = u32(mirror(i32(tile_y + row) - APRON, image_height));
+        let x0 = i32(tile_x + 8u * segment) - APRON;
         var v: array<f32, 16>;
-        let base = row * WINDOW + 8u * segment;
-        v[0] = window[base + 0u];
-        v[1] = window[base + 1u];
-        v[2] = window[base + 2u];
-        v[3] = window[base + 3u];
-        v[4] = window[base + 4u];
-        v[5] = window[base + 5u];
-        v[6] = window[base + 6u];
-        v[7] = window[base + 7u];
-        v[8] = window[base + 8u];
-        v[9] = window[base + 9u];
-        v[10] = window[base + 10u];
-        v[11] = window[base + 11u];
-        v[12] = window[base + 12u];
-        v[13] = window[base + 13u];
-        v[14] = window[base + 14u];
-        v[15] = window[base + 15u];
+        v[0] = image_at(comp, u32(mirror(x0 + 0, image_width)), y);
+        v[1] = image_at(comp, u32(mirror(x0 + 1, image_width)), y);
+        v[2] = image_at(comp, u32(mirror(x0 + 2, image_width)), y);
+        v[3] = image_at(comp, u32(mirror(x0 + 3, image_width)), y);
+        v[4] = image_at(comp, u32(mirror(x0 + 4, image_width)), y);
+        v[5] = image_at(comp, u32(mirror(x0 + 5, image_width)), y);
+        v[6] = image_at(comp, u32(mirror(x0 + 6, image_width)), y);
+        v[7] = image_at(comp, u32(mirror(x0 + 7, image_width)), y);
+        v[8] = image_at(comp, u32(mirror(x0 + 8, image_width)), y);
+        v[9] = image_at(comp, u32(mirror(x0 + 9, image_width)), y);
+        v[10] = image_at(comp, u32(mirror(x0 + 10, image_width)), y);
+        v[11] = image_at(comp, u32(mirror(x0 + 11, image_width)), y);
+        v[12] = image_at(comp, u32(mirror(x0 + 12, image_width)), y);
+        v[13] = image_at(comp, u32(mirror(x0 + 13, image_width)), y);
+        v[14] = image_at(comp, u32(mirror(x0 + 14, image_width)), y);
+        v[15] = image_at(comp, u32(mirror(x0 + 15, image_width)), y);
         lift(&v);
         let out = row * TILE + 8u * segment;
         horizontal[out + 0u] = v[4];

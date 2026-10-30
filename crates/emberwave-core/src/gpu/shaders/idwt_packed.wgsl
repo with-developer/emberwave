@@ -9,12 +9,12 @@
 
 @group(0) @binding(1) var<storage, read_write> packed: array<u32>;
 
-// The 8-bit level of tile sample `at` collected in the window array, or 0 for
+// The 8-bit level of tile sample `at` collected in the levels array, or 0 for
 // a padding sample past the right edge of the plane. `select` evaluates both
-// arms, so the window is read for padding samples too: the vertical pass has
+// arms, so the array is read for padding samples too: the vertical pass has
 // to write the whole tile, not only the part inside the plane.
 fn level_at(at: u32, x: u32, width: u32) -> u32 {
-    return select(0u, u32(window[at]), x < width);
+    return select(0u, u32(levels[at]), x < width);
 }
 
 // Every invocation writes one word of the tile: four samples of a row. Rows

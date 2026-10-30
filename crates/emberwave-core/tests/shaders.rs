@@ -86,7 +86,8 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("sign_counts", 512),
         ("block_sign_totals", 64),
     ];
-    let idwt: &[Variable] = &[("window", 6400), ("horizontal", 5120)];
+    let idwt: &[Variable] = &[("horizontal", 5120), ("levels", 4096)];
+    let fdwt: &[Variable] = &[("horizontal", 5120)];
     // quantise.wgsl's, in front of equant.wgsl's and pack.wgsl's.
     let quantise: &[Variable] = &[
         ("subblock_largest", 512),
@@ -120,7 +121,7 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("yuv2rgb", Vec::new()),
         ("gather", Vec::new()),
         ("gather_rgb", Vec::new()),
-        ("fdwt", idwt.to_vec()),
+        ("fdwt", fdwt.to_vec()),
         ("equant", [quantise, equant].concat()),
         ("rate", Vec::new()),
         ("scan", vec![("sums", 1024)]),
@@ -203,7 +204,7 @@ fn the_inverse_transform_that_stores_planes_differs_only_in_its_store() {
         .collect();
     assert_eq!(
         workgroup,
-        [("window".to_owned(), 6400), ("horizontal".to_owned(), 5120)]
+        [("horizontal".to_owned(), 5120), ("levels".to_owned(), 4096)]
     );
     let store = naga::StorageAccess::STORE;
     assert_eq!(
