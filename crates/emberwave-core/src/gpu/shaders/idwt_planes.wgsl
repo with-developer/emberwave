@@ -40,16 +40,16 @@ fn store_plane(comp: CompParams, component: u32, tile_x: u32, tile_y: u32, tid: 
     let at = row * TILE + column;
     if (y < comp.plane_height) {
         if (x < comp.plane_width) {
-            store_level(component, vec2<u32>(x, y), window[at]);
+            store_level(component, vec2<u32>(x, y), levels[at]);
         }
         if (x + 1u < comp.plane_width) {
-            store_level(component, vec2<u32>(x + 1u, y), window[at + 1u]);
+            store_level(component, vec2<u32>(x + 1u, y), levels[at + 1u]);
         }
         if (x + 2u < comp.plane_width) {
-            store_level(component, vec2<u32>(x + 2u, y), window[at + 2u]);
+            store_level(component, vec2<u32>(x + 2u, y), levels[at + 2u]);
         }
         if (x + 3u < comp.plane_width) {
-            store_level(component, vec2<u32>(x + 3u, y), window[at + 3u]);
+            store_level(component, vec2<u32>(x + 3u, y), levels[at + 3u]);
         }
     }
 }

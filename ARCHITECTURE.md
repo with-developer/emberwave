@@ -347,17 +347,16 @@ Without subgroup operations the prefix sum costs two barriers and about 20 workg
 
 ### Inverse transform
 
-A workgroup of 256 invocations produces a 32x32 tile of one level's output:
+A workgroup of 256 invocations produces a 32x32 tile of one level's output from the tile's 40x40 neighbourhood in the interleaved image. Each coordinate of the neighbourhood is mirrored about the level's true size, using whole-sample symmetry, which preserves the parity of the coordinate; the parity picks the band (LL, HL, LH or HH) and the mirrored coordinate halved picks the sample. Mirroring keeps the parity up to the level's width less two past an edge, and the stored samples read no further than four, so the horizontal pass can take a row's even samples from one band and its odd ones from another while a level is at least six samples wide. Every level is at least eight, by the minimum image size of 128. Four samples of extension on each side are what four lifting steps need.
 
-1. It loads a 40x40 window of the interleaved image into workgroup memory (6400 bytes). Each window coordinate is mirrored about the level's true size, using whole-sample symmetry, which preserves the parity of the coordinate; the parity picks the band (LL, HL, LH or HH) and the mirrored coordinate halved picks the sample. Four samples of extension on each side are what four lifting steps need.
-2. Horizontal pass: 160 invocations each take 16 samples of a window row, apply the gain and the four lifting steps in registers and keep the 8 valid results (workgroup memory, 5120 bytes). The apron of a segment is recomputed rather than shared.
-3. Vertical pass: 128 invocations do the same down a column and store the 8 results into the LL band of the next level. At the last level of a component they are 8-bit samples instead, packed as described next.
+1. Horizontal pass: 160 invocations each read 16 samples of a row of the neighbourhood straight from the bands, apply the gain and the four lifting steps in registers and keep the 8 valid results (workgroup memory, 5120 bytes). A row's even samples come from one band and its odd ones from another. The apron of a segment is read and recomputed rather than shared.
+2. Vertical pass: 128 invocations do the same down a column of those results and store the 8 results into the LL band of the next level. At the last level of a component they are 8-bit samples instead, collected in workgroup memory (4096 bytes) and packed as described next.
 
-The lifting, and the loads and stores around it, are written out with constant indices, which keeps the samples in registers (D24). Total workgroup memory is 11520 bytes, and it is not zeroed first: the load and the two passes write every element before it is read (D25). Tiles that stick out of the image (the coarsest levels can be 8x8) are computed in full and stored with bounds checks, and mirroring always uses the true level size, never the picture size. The component is the z index of the dispatch; at level 0 a 4:2:0 frame has luma only.
+The lifting, and the loads and stores around it, are written out with constant indices, which keeps the samples in registers (D24). Total workgroup memory is 9216 bytes, and it is not zeroed first: the two passes write every element before it is read (D25). Tiles that stick out of the image (the coarsest levels can be 8x8) are computed in full and stored with bounds checks, and mirroring always uses the true level size, never the picture size. The component is the z index of the dispatch; at level 0 a 4:2:0 frame has luma only. Until D68 a first phase loaded the neighbourhood into workgroup memory, and the horizontal pass read it from there.
 
 ### 8-bit output
 
-The last level of each component writes the decoded plane as 8-bit samples, which is what upstream's UNORM storage images hold. A sample is `round(clamp(v + 0.5, 0, 1) * 255)` (`to_unorm8` in `idwt.wgsl`); the float picture never goes to memory. The vertical pass leaves the 8-bit levels of its 32x32 tile in the window array, which is free by then, and after one barrier each of the 256 invocations writes one word: four samples of a tile row. Every level waits at that barrier, though only the last needs it. Inside `if (is_final)` the barrier would be legal, since `is_final` is the same for the whole workgroup, but there it crashed WARP, Direct3D's software rasteriser, in CI; a bisection of the commits pinned the crash on it.
+The last level of each component writes the decoded plane as 8-bit samples, which is what upstream's UNORM storage images hold. A sample is `round(clamp(v + 0.5, 0, 1) * 255)` (`to_unorm8` in `idwt.wgsl`); the float picture never goes to memory. The vertical pass leaves the 8-bit levels of its 32x32 tile in the levels array, and after one barrier each of the 256 invocations writes one word: four samples of a tile row. Every level waits at that barrier, though only the last needs it. Inside `if (is_final)` the barrier would be legal, since `is_final` is the same for the whole workgroup, but there it crashed WARP, Direct3D's software rasteriser, in CI; a bisection of the commits pinned the crash on it.
 
 WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words with zero samples. A decoder's rows are then padded with words it never writes to a multiple of 256 bytes, the rows a copy into a texture takes, and its planes start at multiples of 512 bytes (D41). The CPU side cuts the padding off.
 
@@ -598,7 +597,7 @@ PSNR is not what either encoder minimises: both minimise the squared error of th
 |---|---|---|---|
 | Input from textures | `gather.wgsl` | 1, in the transform's pass: a workgroup per 64x32 samples of a plane, the component in z | Each sample of the R8 or Rg8 textures, its byte back from the unorm float, packed four to a word with rows padded to whole words: the words the upload writes for the same picture |
 | Input in RGB | `gather_rgb.wgsl` | 1, in the transform's pass: a workgroup per 128x32 pixels for 4:2:0, 64x16 for 4:4:4 | Each pixel's R', G' and B' bytes, converted by `ForwardMatrix` in integers, a 4:2:0 chroma sample from the sums of the pixels it covers: the words the upload writes for the planes `rgb_to_ycbcr8` makes (D65) |
-| Forward transform | `fdwt.wgsl` | 5: one per level, finest first; a workgroup per 32x32 tile of the level's image and component | The inverse transform's shape and parameters (`TransformLevel`), the other way round: a 40x40 window of the image, rows and then columns lifted in registers, and the four bands written. At a component's finest level the image is the 8-bit plane, its last column and row repeated up to the aligned size |
+| Forward transform | `fdwt.wgsl` | 5: one per level, finest first; a workgroup per 32x32 tile of the level's image and component | The inverse transform's shape and parameters (`TransformLevel`), the other way round: a 40x40 window of the image, its rows read straight from the image and lifted, then its columns, in registers, and the four bands written. At a component's finest level the image is the 8-bit plane, its last column and row repeated up to the aligned size |
 | Quantisation | `quantise.wgsl`, `equant.wgsl` | 1: a workgroup of 128 invocations per block | Scales, magnitudes and bit-planes of `quant.rs`, then the block's size and distortion for 0 to 15 dropped planes, its cost table. Each invocation adds up the squared errors of its own 4x2 subblock in registers, and the subblocks are added up per 8x8 block, in the grouping the CPU adds in. Each 8x8 block is measured only up to the drop that leaves nothing of it; beyond, its error is the same sum of the same terms |
 | Rate control | `rate.wgsl`, `scan.wgsl` | 4, and two prefix sums of 3 | Each block's steps, and their saved words added into a histogram of the keys; the key at which the frame fits; what each block's steps of that key save, summed in block order; each block's drop and size, and their sums in block order, which are the blocks' places in the payload |
 | Packing | `quantise.wgsl`, `pack.wgsl` | 1: a workgroup per block | The block quantised again, the chosen planes dropped, its bytes assembled in workgroup memory and written at its place; a block of the coarsest level with nothing left, below `pristine_blocks` in block index order, as an empty 8x8 block (D58) |
@@ -700,7 +699,7 @@ Short-form ADRs, newest last. Each entry is dated.
 
 **Context.** Upstream loads the inverse transform's input through `textureGather` and a mirrored sampler, and stores the wavelet pyramid as FP16 or FP32 storage images. `r16float` storage images are not in the portable set, and the sampler's mirroring is not the whole-sample symmetric extension the format needs without per-coordinate fix-ups.
 
-**Decision.** Explicit mirroring of the interleaved coordinates and plain `f32` storage buffers. A 32x32 output tile per workgroup with a 40x40 window in workgroup memory, as described above. FP16 packing of the pyramid is an optimisation for later, to be weighed against the accuracy it costs (the original's default FP16 storage is why it sits about 20 dB below its FP32 mode).
+**Decision.** Explicit mirroring of the interleaved coordinates and plain `f32` storage buffers. A 32x32 output tile per workgroup with a 40x40 window in workgroup memory, as described above (D68 later read the window's rows straight from the bands). FP16 packing of the pyramid is an optimisation for later, to be weighed against the accuracy it costs (the original's default FP16 storage is why it sits about 20 dB below its FP32 mode).
 
 ### 2026-10-23 — D14: Output as packed 8-bit buffers
 
@@ -1718,3 +1717,33 @@ The last frame's detail, always, gains everything on a still picture and loses u
 - #136 is closed. Within its objective the encoder has under 1 % left, and measured by a metric of perceived quality, the objective itself has a few percent of bytes left.
 - If game footage of more than one frame, such as #82's, shows the chroma tilt's gain, the tilt goes into `gen_encoder_weights.py` as chroma's own sensitivity, for both encoders, and D57's measure keeps upstream's weights.
 - SSIMULACRA2 stays out of the repository. In `emberwave-cli quality` it would add a dependency, and its BSD-2-Clause notice to every release, for a study that ran once.
+
+### 2026-10-31 — D68: The transforms read their rows straight from the bands
+
+**Context.** On an Apple M3 Max the inverse transform is 70 % of a 4K decode's GPU time frame after frame, 0.38 of 0.54 ms. A workgroup loaded its tile's 40x40 neighbourhood into workgroup memory first, then lifted the neighbourhood's rows from there, then the tile's columns from the rows' results: three phases with a barrier after each, the first all loads. The GPU encoder's forward transform has the same shape.
+
+**Measured** on the M3 Max, frame after frame, by the GPU's timestamps of a transform's five dispatches (`emberwave-cli bench` and `bench-encode` on the generated scene streams), the median of 400 frames for the decoder and of 300 for the encoder, three rounds in turn with the build before. The Mac was busy, at a load of 4 to 6, and the rounds it disturbed are left out.
+
+| Inverse transform | 1080p | 4K | Output |
+|---|---|---|---|
+| Before: the neighbourhood loaded first, 11.25 KiB of workgroup memory | 0.104 to 0.107 ms | 0.378 to 0.381 ms | |
+| The rows read straight from the bands, 9 KiB | 0.067 to 0.070 ms | 0.300 to 0.302 ms | The same, byte for byte |
+| The same, the last level's samples kept in the rows' array, 5 KiB | 0.070 to 0.071 ms | 0.302 to 0.306 ms | The same |
+| The same, rows inside the level read without mirroring | 0.068 ms | 0.301 to 0.303 ms | 3360 of 746 million samples one level off |
+| Tiles of 32x48 or 32x64, so that more invocations lift columns | 0.074 to 0.079 ms | 0.303 to 0.310 ms | The same |
+
+| Forward transform, from planes in CPU memory | 1080p | 4K | Output |
+|---|---|---|---|
+| Before | 0.107 to 0.109 ms | 0.378 to 0.381 ms | |
+| The rows read straight from the image | 0.087 ms | 0.317 to 0.320 ms | The same frames, byte for byte |
+
+**Decision.**
+- Both transforms lift the rows of the neighbourhood as they read them, straight from the bands or the image. Mirroring keeps a coordinate's parity, so in the inverse transform a row's even samples come from one band and its odd ones from another. Far enough past an edge, where the second reflection is clamped, it does not, but no sample that is stored reads that far while a level is at least six samples wide, and the minimum image size of 128 makes every level at least eight. A test holds the levels to that. The review compared the old and new shaders' whole outputs at 5760 sizes from 8 to 140 and found them equal. The load phase, its 6400 bytes of workgroup memory and a barrier go.
+- The rest stays as it was: the last level's samples in an array of their own, every coordinate mirrored, and tiles of 32x32. No variant beat them. Reading without mirroring also changed the output, probably where the compiler fused multiplies and adds differently.
+- The output is the same to the byte: the decodes of the generated streams and of the test vectors, and the encoder's frames of the generated scenes and of the game frame of D49. D9's comparisons stand as they were.
+
+**Consequence.**
+- The decoder's GPU time for a 4K frame falls from about 0.54 to 0.47 ms frame after frame, and for a 1080p frame from 0.16 to 0.12 ms. The encoder's falls by about 0.06 ms at 4K.
+- Less workgroup memory alone, 5 KiB instead of 9, made the inverse transform no faster: the load phase held it back, not the memory a workgroup takes. Halving workgroup memory, which D48 counted among the sources of upstream's FP16 gain, would not help emberwave's kernel by itself.
+- `BENCHMARKS.md` keeps its tables until the next full run on a quiet machine.
+- The test of the workgroup variables checked for writes before reads (D25) lists the new ones.

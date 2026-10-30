@@ -761,6 +761,29 @@ mod tests {
     }
 
     #[test]
+    fn every_transform_level_is_at_least_eight_samples_wide() {
+        // idwt.wgsl takes a row's even samples from one band and its odd ones
+        // from the other, as mirroring keeps a coordinate's parity. Past the
+        // level's width less two it does not, and the samples that are stored
+        // read up to four past an edge, so levels have to be at least six
+        // samples wide (decision D68). The minimum image size makes the
+        // smallest frames' coarsest levels eight.
+        for chroma in [ChromaSubsampling::Yuv420, ChromaSubsampling::Yuv444] {
+            let layout = FrameLayout::new(2, 2, chroma).unwrap();
+            let buffers = BufferLayout::new(&layout).unwrap();
+            for level in 0..DECOMPOSITION_LEVELS {
+                let params = TransformLevel::new(&layout, &buffers, level).params;
+                assert!(
+                    params.image_width >= 8 && params.image_height >= 8,
+                    "{chroma:?} level {level}: {}x{}",
+                    params.image_width,
+                    params.image_height
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_largest_frame_fits_the_scans_and_32_bit_word_counts() {
         // 16384x16384 at 4:4:4: three components of 262144 blocks.
         let layout = FrameLayout::new(16384, 16384, ChromaSubsampling::Yuv444).unwrap();
