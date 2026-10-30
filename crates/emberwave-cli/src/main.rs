@@ -10,6 +10,15 @@ macro_rules! out {
     }};
 }
 
+/// `eprintln!` that goes on when standard error is gone, as when it goes to
+/// `head`, rather than panicking: what is not read is not missed.
+macro_rules! err {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod bench;
 mod bench_encode;
 mod compare;
@@ -109,9 +118,11 @@ impl GpuArgs {
 
         let context = GpuContext::new(&options)?;
         let info = context.adapter_info();
-        eprintln!(
+        err!(
             "adapter: {} ({:?}, {:?})",
-            info.name, info.backend, info.device_type
+            info.name,
+            info.backend,
+            info.device_type
         );
         Ok(context)
     }
@@ -205,7 +216,7 @@ fn main() -> ExitCode {
         // Whoever read the output, such as `head`, has all it wanted.
         Err(error) if is_broken_pipe(&*error) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error}");
+            err!("error: {error}");
             ExitCode::FAILURE
         }
     }

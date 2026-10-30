@@ -69,11 +69,13 @@ pub fn run(args: &Args) -> Result<()> {
         return Err("the file has no frames".into());
     }
 
+    // Before the GPU: a directory that cannot be made fails at once.
+    std::fs::create_dir_all(&args.out_dir)
+        .map_err(|error| format!("{}: {error}", args.out_dir.display()))?;
     let context = args.gpu.create_context(false)?;
     let mut decoder = Decoder::new(&context, stream.width, stream.height, stream.chroma)?;
     let color = args.color.resolve(&stream);
 
-    std::fs::create_dir_all(&args.out_dir)?;
     let stem = args
         .input
         .file_stem()
@@ -91,7 +93,7 @@ pub fn run(args: &Args) -> Result<()> {
             };
             if !info.has_frame_rate() {
                 let (num, den) = y4m::DEFAULT_FRAME_RATE;
-                eprintln!("warning: the file has no frame rate, the Y4M file says {num}:{den}");
+                err!("warning: the file has no frame rate, the Y4M file says {num}:{den}");
             }
             Some(y4m::Writer::create(
                 &args.out_dir.join(format!("{stem}.y4m")),
@@ -126,7 +128,7 @@ pub fn run(args: &Args) -> Result<()> {
                 }
             }
         }
-        eprintln!("frame {index:06}: {:.3} ms", times_ms[index]);
+        err!("frame {index:06}: {:.3} ms", times_ms[index]);
     }
 
     if let Some(video) = video {

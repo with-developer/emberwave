@@ -68,7 +68,8 @@ pub struct Writer {
 impl Writer {
     /// Creates the file and writes the stream header.
     pub fn create(path: &Path, info: &StreamInfo) -> Result<Self> {
-        let mut out = BufWriter::new(File::create(path)?);
+        let file = File::create(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut out = BufWriter::new(file);
         writeln!(out, "{}", info.header_line())?;
         Ok(Self { out })
     }

@@ -50,6 +50,10 @@ enum Freshness {
 pub struct FrameAssembler {
     layout: FrameLayout,
     block_offsets: Vec<u32>,
+    /// The indices of the blocks in `block_offsets`, in the order they came:
+    /// a new frame resets those slots alone, so that a stream of tiny blocks
+    /// of ever newer frames costs no more than their bytes.
+    filled: Vec<u32>,
     payload: Vec<u32>,
     received_blocks: u32,
     total_blocks: u32,
@@ -64,6 +68,7 @@ impl FrameAssembler {
         let block_count = layout.block_count();
         let mut assembler = Self {
             block_offsets: vec![MISSING_BLOCK; block_count as usize],
+            filled: Vec::new(),
             payload: Vec::new(),
             received_blocks: 0,
             total_blocks: block_count,
@@ -83,7 +88,10 @@ impl FrameAssembler {
 
     /// Drops everything received so far. Allocated memory is kept.
     pub fn clear(&mut self) {
-        self.block_offsets.fill(MISSING_BLOCK);
+        for &index in &self.filled {
+            self.block_offsets[index as usize] = MISSING_BLOCK;
+        }
+        self.filled.clear();
         self.payload.clear();
         self.received_blocks = 0;
         self.total_blocks = self.layout.block_count();
@@ -146,16 +154,18 @@ impl FrameAssembler {
 
             match header {
                 Header::StartOfFrame(header) => {
+                    // A header of an older frame is ignored, with the rest of
+                    // the packet, whatever else is wrong with it.
+                    let freshness = self.freshness(header.sequence);
+                    if freshness == Freshness::Stale {
+                        return Ok(());
+                    }
+
                     if header.chroma != self.layout.chroma() {
                         return Err(Error::ChromaMismatch {
                             stream: header.chroma,
                             expected: self.layout.chroma(),
                         });
-                    }
-
-                    let freshness = self.freshness(header.sequence);
-                    if freshness == Freshness::Stale {
-                        return Ok(());
                     }
 
                     let stream = (header.width, header.height);
@@ -172,18 +182,19 @@ impl FrameAssembler {
                     data = &data[HEADER_BYTES..];
                 }
                 Header::Block(header) => {
+                    // A block of an older frame is ignored, with the rest of
+                    // the packet, whatever else is wrong with it, as upstream
+                    // ignores it: a late packet cut short included.
+                    let freshness = self.freshness(header.sequence);
+                    if freshness == Freshness::Stale {
+                        return Ok(());
+                    }
                     let size = header.payload_bytes();
                     if size > data.len() {
                         return Err(Error::TruncatedBlock {
                             claimed: size,
                             available: data.len(),
                         });
-                    }
-                    // A block of an older frame is ignored, whatever else is
-                    // wrong with it, as upstream ignores it.
-                    let freshness = self.freshness(header.sequence);
-                    if freshness == Freshness::Stale {
-                        return Ok(());
                     }
                     // Before the data moves on: a block shorter than its
                     // header would not move it.
@@ -315,6 +326,7 @@ impl FrameAssembler {
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
         );
         *slot = offset;
+        self.filled.push(block_index);
         self.received_blocks += 1;
         Ok(())
     }
@@ -509,6 +521,38 @@ mod tests {
             Err(Error::BlockTooSmall { words: 1 })
         ));
         assert_eq!((a.sequence(), a.received_blocks()), (Some(3), 1));
+        // Cut short, as a late packet can come: a block that claims more
+        // bytes than the packet has.
+        let mut cut = block(1, 0, 100);
+        cut.truncate(8);
+        assert!(
+            a.push_packet(&cut).is_ok(),
+            "a late packet cut short is ignored"
+        );
+        // A start of frame header of an older frame, even of another chroma
+        // format.
+        let mut other_chroma = start_of_frame(0, 66);
+        other_chroma[4..8].copy_from_slice(&(66u32 | (1 << 26)).to_le_bytes());
+        assert!(a.push_packet(&other_chroma).is_ok());
+        assert_eq!((a.sequence(), a.received_blocks()), (Some(3), 1));
+    }
+
+    #[test]
+    fn a_new_frame_resets_only_the_blocks_that_came() {
+        let mut a = assembler();
+        a.push_packet(&[block(0, 1, 0), block(5, 1, 0), block(9, 1, 0)].concat())
+            .unwrap();
+        // A packet of tiny blocks, each of the frame after the one before.
+        let packet: Vec<u8> = (0..64u32)
+            .flat_map(|i| block(i, ((2 + i) % 8) as u8, 0))
+            .collect();
+        a.push_packet(&packet).unwrap();
+        // The last block alone is left, of the last frame.
+        assert_eq!((a.sequence(), a.received_blocks()), (Some(1), 1));
+        let left: Vec<u32> = (0..66).filter(|&i| a.frame().block(i).is_some()).collect();
+        assert_eq!(left, [63]);
+        a.clear();
+        assert!((0..66).all(|i| a.frame().block(i).is_none()));
     }
 
     #[test]

@@ -2,6 +2,15 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- A packet whose blocks each start a frame newer than the one before cost the assembler a reset of its whole table of blocks per block: a crafted 512 KiB packet took 31 ms at 4K and 247 ms at the browser player's largest size. A new frame now resets only the blocks that came, and the same packet takes 0.4 ms at any size.
+- A late packet of an older frame is ignored, as the docs say, also when it is cut short or its start of frame header is of another chroma format; such packets were errors before.
+- `emberwave-cli` no longer panics when standard error is closed, as when it goes to `head`. Errors in writing the output name the file, and `decode` checks its output directory before it sets up the GPU.
+- The browser player's `open_stream` takes 30 frames a second for a frame rate that is not a positive finite number, infinity included.
+
 ## [0.14.0] - 2026-10-31
 
 The GPU shared with clients and hosts on every platform. A context runs on the caller's own Vulkan device and decodes into its images with semaphores; on Windows, textures and fences of Direct3D 12 and Direct3D 11 devices come through shared NT handles. Hosts encode pictures that are in their own textures, Metal's, Vulkan's or Direct3D's, as a screen capture holds them, NV12's layout included. Each release also has the XCFramework in the archive a Swift package takes.

@@ -298,8 +298,9 @@ impl Player {
     }
 
     /// Opens a stream of `width` x `height` pictures, in 4:4:4 with
-    /// `chroma_444` and 4:2:0 otherwise, `frame_rate` a second, without a
-    /// file: its frames come as packets through
+    /// `chroma_444` and 4:2:0 otherwise, `frame_rate` a second (30 for one
+    /// that is not a positive finite number), without a file: its frames come
+    /// as packets through
     /// [`push_packet`](Self::push_packet), as a client of a live stream
     /// receives them. Sizes the canvas, and returns a line that describes the
     /// stream. The colours follow each frame's start of frame header, unless
@@ -325,7 +326,7 @@ impl Player {
             ChromaSubsampling::Yuv420
         };
         let decoder = self.new_decoder(width, height, chroma)?;
-        let frame_rate = if frame_rate > 0.0 {
+        let frame_rate = if frame_rate.is_finite() && frame_rate > 0.0 {
             frame_rate
         } else {
             DEFAULT_FRAME_RATE
@@ -420,6 +421,12 @@ impl Player {
     /// frames older than the one being assembled, and before it pushes the
     /// first packet of a newer frame it draws the current one if it is
     /// ready, then calls [`drop_packets`](Self::drop_packets).
+    ///
+    /// A start of frame header of another picture size is an error: the
+    /// stream changed size, and the page opens it again. Blocks alone do not
+    /// say the size, so one of another size can pass for one of this stream
+    /// while its index is in range: after that error, push nothing more to
+    /// this stream.
     pub fn push_packet(&mut self, packet: &[u8]) -> Result<(), JsError> {
         let stream = self
             .stream

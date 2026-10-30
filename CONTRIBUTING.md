@@ -26,7 +26,8 @@ cargo test --workspace
 | Shaders | `crates/emberwave-core/tests/shaders.rs` | The WGSL validates with naga without any optional capability, and the workgroup variables are the reviewed ones, without a GPU |
 | GPU | `crates/emberwave-core/tests/gpu.rs` | The GPU decoder against the CPU decoder and against upstream, on a real adapter |
 | CLI | `crates/emberwave-cli/tests/cli.rs` | The `emberwave-cli` binary end to end |
-| C API | `crates/emberwave-ffi/tests/api.rs`, `tests/encoder.rs`, `tests/header.rs` | The C functions called through raw pointers against the Rust decoder and encoder; the committed header against cbindgen's output |
+| C API | `crates/emberwave-ffi/tests/api.rs`, `tests/encoder.rs`, `tests/header.rs`, `tests/thread_end.rs` | The C functions called through raw pointers against the Rust decoder and encoder; the committed header against cbindgen's output; threads that end while contexts live |
+| GPU interop | `crates/emberwave-ffi/tests/metal.rs`, `tests/vulkan.rs`, `tests/d3d12.rs`, `crates/emberwave-core/tests/gpu_hooks.rs` | The C API on a client's own Metal queue and textures (macOS), Vulkan device and images (Linux's lavapipe, under the validation layer), and Direct3D 11 textures and fences (Windows' WARP); the order of the submission hooks on every backend |
 | Encoder | `crates/emberwave-core/tests/encoder.rs`, `src/encode/` | The encoder makes the committed bytes again, its frames fit their budgets, and emberwave decodes them as upstream does |
 | GPU encoder | `crates/emberwave-core/tests/gpu_encoder.rs`, `src/gpu/encoder/tests.rs` | Each stage of the GPU encoder given the CPU encoder's input, against the CPU's output; whole frames against the committed vectors, on a real adapter; pictures in textures against the same pictures in CPU memory |
 | C example | `scripts/check_c_example.sh` | The C examples, built with CMake against the shared library: one decodes every vector, the other encodes two of the encoder's sources and decodes its packets again (CI runs it after the tests) |
@@ -60,7 +61,7 @@ After a deliberate change to what the encoder writes, `scripts/gen_encoder_vecto
 - **Constant indices for local arrays in WGSL.** An array local to an invocation that is indexed by a loop variable can end up in memory instead of registers; that made the inverse transform 4.5 times slower (decision D24). Write such code out, and measure with `scripts/bench.sh` before and after.
 - **Write workgroup memory before reading it.** The pipelines do not zero workgroup memory (decision D25), so a shader that reads an element no invocation of its workgroup has written gets whatever an earlier workgroup left there. Every workgroup variable is written in full, followed by a barrier, before it is read. Adding, removing or resizing one makes `tests/shaders.rs` fail until its list is updated; check the writes and reads before you update it. The GPU tests compare every level with the CPU exactly, which catches a slip in practice, but only if the stale values differ from the right ones.
 - **No code from upstream.** Understand upstream's algorithm and write it again; only the algorithm and the bitstream format are shared. Bitstream constants get names, with a comment saying where upstream defines them.
-- **No `unsafe`.** The workspace forbids it.
+- **No `unsafe`,** but in `emberwave-ffi`. The workspace forbids it; the C API cannot do without it, so that crate has a lint table of its own, where every unsafe operation sits in an `unsafe` block of its own with a comment saying why it is sound.
 - **Public items have doc comments.**
 - **No "fix later" comments.** Open an issue instead.
 - **New dependencies** need a reason in the pull request.
