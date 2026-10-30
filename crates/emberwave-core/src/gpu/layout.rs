@@ -8,7 +8,9 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::bitstream::consts::{BANDS_PER_LEVEL, DECOMPOSITION_LEVELS, NUM_COMPONENTS};
 use crate::bitstream::{Band, ChromaSiting, ChromaSubsampling, Component, FrameLayout, YcbcrRange};
-use crate::color::{CHROMA_CENTRE, CHROMA_SCALE, ColorParams, INV_255, LUMA_BLACK, LUMA_SCALE};
+use crate::color::{
+    CHROMA_CENTRE, CHROMA_SCALE, ColorParams, ForwardMatrix, INV_255, LUMA_BLACK, LUMA_SCALE,
+};
 use crate::encode::quant::{BandQuant, DROP_STEPS};
 
 use super::GpuError;
@@ -424,6 +426,66 @@ impl GatherParams {
         let words = self.stride.iter().copied().max().unwrap_or(0);
         let rows = self.height.iter().copied().max().unwrap_or(0);
         (words.div_ceil(16), rows.div_ceil(2).div_ceil(16), 3)
+    }
+}
+
+/// Uniform block of `gather_rgb.wgsl` (decision D65).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct RgbGatherParams {
+    /// Per component, Y, Cb and Cr (the fourth is unused), as in
+    /// [`GatherParams`].
+    pub width: [u32; 4],
+    pub height: [u32; 4],
+    pub offset: [u32; 4],
+    pub stride: [u32; 4],
+    /// [`ForwardMatrix`]'s rows for Y, Cb and Cr: the factors of R', G' and
+    /// B', and the offset.
+    pub rows: [[i32; 4]; 3],
+    /// 1 where 4:2:0's chroma is sited on the left.
+    pub left: u32,
+    pub pad: [u32; 3],
+}
+
+impl RgbGatherParams {
+    /// The parameters for pictures of `layout` converted as `color` says.
+    pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout, color: &ColorParams) -> Self {
+        let planes = GatherParams::new(layout, buffers, false);
+        let forward = ForwardMatrix::new(color.matrix, color.range);
+        // Each workgroup of 4:2:0 writes the two luma words over a chroma
+        // word: the luma rows' words must not outnumber twice the chroma's.
+        debug_assert!(
+            layout.chroma() == ChromaSubsampling::Yuv444
+                || planes.stride[0] <= 2 * planes.stride[1]
+        );
+        Self {
+            width: planes.width,
+            height: planes.height,
+            offset: planes.offset,
+            stride: planes.stride,
+            rows: std::array::from_fn(|i| {
+                let [r, g, b] = forward.rows[i];
+                [r, g, b, forward.offsets[i]]
+            }),
+            left: u32::from(color.chroma_siting == ChromaSiting::Left),
+            pad: [0; 3],
+        }
+    }
+
+    /// Workgroups of the dispatch, 16 by 16 invocations each: for 4:4:4 one
+    /// invocation per word of a row of the planes, for 4:2:0 per word of a
+    /// row of the chroma planes.
+    pub(crate) fn grid(&self, chroma: ChromaSubsampling) -> (u32, u32, u32) {
+        let component = match chroma {
+            ChromaSubsampling::Yuv444 => Component::Y,
+            ChromaSubsampling::Yuv420 => Component::Cb,
+        }
+        .index();
+        (
+            self.stride[component].div_ceil(16),
+            self.height[component].div_ceil(16),
+            1,
+        )
     }
 }
 

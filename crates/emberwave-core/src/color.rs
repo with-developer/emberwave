@@ -1,5 +1,7 @@
 //! YCbCr to RGB conversion: the definitions shared by the CPU reference and
-//! the GPU shader (`yuv2rgb.wgsl`).
+//! the GPU shader (`yuv2rgb.wgsl`). And the other way, RGB to YCbCr for the
+//! encoder, in integers that the CPU and the GPU (`gather_rgb.wgsl`) compute
+//! alike to the last bit ([`rgb_to_ycbcr8`], decision D65).
 //!
 //! The decoder produces Y, Cb and Cr planes. Turning them into RGB is a
 //! separate step that the bitstream leaves to the application; this module
@@ -132,7 +134,7 @@ pub fn chroma_taps(p: u32, siting: AxisSiting) -> (i32, u32) {
     }
 }
 
-/// Why [`yuv_to_rgb8`] refused its input.
+/// Why [`yuv_to_rgb8`] or [`rgb_to_ycbcr8`] refused its input.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ColorError {
     /// A plane holds fewer samples than the picture size needs.
@@ -144,6 +146,25 @@ pub enum ColorError {
         needed: u64,
         /// Samples the plane has.
         actual: usize,
+    },
+    /// An RGB picture holds fewer bytes than its size and stride need.
+    #[error("the RGB picture has {actual} bytes, but its size and stride need {needed}")]
+    PictureTooSmall {
+        /// Bytes the picture needs: its rows but the last at the stride,
+        /// and the last row's pixels.
+        needed: u64,
+        /// Bytes given.
+        actual: usize,
+    },
+    /// An RGB picture's rows are closer together than a row's pixels take.
+    #[error(
+        "the rows of the RGB picture are {stride} bytes apart, less than the {row} bytes of a row"
+    )]
+    StrideTooSmall {
+        /// Bytes from the start of one row to the start of the next.
+        stride: usize,
+        /// Bytes of a row's pixels, four each.
+        row: u64,
     },
 }
 
@@ -255,6 +276,204 @@ pub fn yuv_to_rgb8(
         }
     }
     Ok(rgb)
+}
+
+/// The order of a pixel's four bytes in an RGB picture: R', G' and B', and
+/// a fourth that is not read, such as alpha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RgbOrder {
+    /// R', G', B', then the fourth byte.
+    Rgba,
+    /// B', G', R', then the fourth byte, as screen captures mostly hold them.
+    Bgra,
+}
+
+/// Fractional bits of [`ForwardMatrix`]'s factors.
+pub const FORWARD_BITS: u32 = 16;
+
+/// RGB to YCbCr in integers, as [`rgb_to_ycbcr8`] and the encoder's
+/// `gather_rgb.wgsl` compute it (decision D65): each of Y, Cb and Cr is a
+/// row's factors times the 8-bit R', G' and B' of a pixel, or their sums over
+/// the pixels a chroma sample covers, with the row's offset and half a step,
+/// shifted right and clamped to a byte ([`ForwardMatrix::apply`]).
+///
+/// The factors are the standard's, scaled by `2^FORWARD_BITS` and rounded
+/// once; G's factor of each row is what makes the row's sum exact, so that
+/// grey has Cb and Cr of 128 and the full range's white a Y of 255 (219 and
+/// 224 steps of 255 in the video range). Sums over up to 8 pixels stay
+/// well within 32 bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardMatrix {
+    /// Factors of R', G' and B' for Y, Cb and Cr.
+    pub rows: [[i32; 3]; 3],
+    /// What each row adds for one pixel, scaled alike: the black level for
+    /// Y, 128 for Cb and Cr.
+    pub offsets: [i32; 3],
+}
+
+impl ForwardMatrix {
+    /// The matrix of `matrix`'s coefficients into `range`.
+    pub fn new(matrix: ColorMatrix, range: YcbcrRange) -> Self {
+        let (kr, kb) = matrix.luma_weights();
+        let kg = 1.0 - kr - kb;
+        let one = f64::from(1u32 << FORWARD_BITS);
+        let (luma_scale, chroma_scale, black) = match range {
+            YcbcrRange::Full => (1.0, 1.0, 0),
+            YcbcrRange::Limited => (219.0 / 255.0, 224.0 / 255.0, 16),
+        };
+        let fixed = |value: f64| (value * one).round() as i32;
+        // R' and B' as the standard has them; G' takes the rest of the
+        // row's sum.
+        let luma_sum = fixed(luma_scale);
+        let (y_r, y_b) = (fixed(luma_scale * kr), fixed(luma_scale * kb));
+        let (cb_r, cb_b) = (
+            fixed(-chroma_scale * kr / (2.0 * (1.0 - kb))),
+            fixed(chroma_scale * 0.5),
+        );
+        let (cr_r, cr_b) = (
+            fixed(chroma_scale * 0.5),
+            fixed(-chroma_scale * kb / (2.0 * (1.0 - kr))),
+        );
+        debug_assert!(fixed(luma_scale * kg).abs_diff(luma_sum - y_r - y_b) <= 1);
+        Self {
+            rows: [
+                [y_r, luma_sum - y_r - y_b, y_b],
+                [cb_r, -cb_r - cb_b, cb_b],
+                [cr_r, -cr_r - cr_b, cr_b],
+            ],
+            offsets: [
+                black << FORWARD_BITS,
+                128 << FORWARD_BITS,
+                128 << FORWARD_BITS,
+            ],
+        }
+    }
+
+    /// Component `row` (0 for Y, 1 for Cb, 2 for Cr) of pixels whose R', G'
+    /// and B', each weighed, add up to `sum`, the weights to `1 << shift`:
+    /// one pixel with a shift of 0, four of 4:2:0's centred chroma with 2.
+    pub fn apply(&self, row: usize, sum: [i32; 3], shift: u32) -> u8 {
+        let [r, g, b] = self.rows[row];
+        let total = r * sum[0]
+            + g * sum[1]
+            + b * sum[2]
+            + (self.offsets[row] << shift)
+            + (1 << (FORWARD_BITS + shift - 1));
+        (total >> (FORWARD_BITS + shift)).clamp(0, 255) as u8
+    }
+}
+
+/// An error if `bytes` of an RGB picture of `width` x `height` pixels, four
+/// bytes each, with rows `stride` bytes apart, do not hold it.
+pub(crate) fn check_rgb(
+    bytes: usize,
+    stride: usize,
+    width: u32,
+    height: u32,
+) -> Result<(), ColorError> {
+    let row = u64::from(width) * 4;
+    if (stride as u64) < row && height > 1 {
+        return Err(ColorError::StrideTooSmall { stride, row });
+    }
+    let needed = match height {
+        0 => 0,
+        _ => (u64::from(height) - 1) * stride as u64 + row,
+    };
+    if (bytes as u64) < needed {
+        return Err(ColorError::PictureTooSmall {
+            needed,
+            actual: bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Converts an RGB picture to 8-bit Y, Cb and Cr planes, as the GPU encoder
+/// does for a picture in a texture and into the same bytes (decision D65).
+///
+/// `rgb` holds `height` rows of `width` pixels, four bytes each in `order`,
+/// the rows `stride` bytes apart. R', G' and B' are as the picture stores
+/// them, with the transfer function applied, as a screen capture has them.
+/// The chroma planes are the same size as the luma plane for 4:4:4 and half
+/// of it, rounded up, for 4:2:0. A 4:2:0 chroma sample is the average of the
+/// pixels it covers: those of two rows, and across two columns where
+/// `params` sites chroma in the centre, or with weights 1, 2 and 1 across
+/// three where it sites chroma on the left one, as [`yuv_to_rgb8`] reads it
+/// back. Pixels past an edge repeat the edge.
+///
+/// # Errors
+///
+/// [`ColorError::StrideTooSmall`] if a row's pixels do not fit the stride,
+/// and [`ColorError::PictureTooSmall`] if `rgb` is smaller than the picture
+/// size and stride say.
+pub fn rgb_to_ycbcr8(
+    rgb: &[u8],
+    stride: usize,
+    order: RgbOrder,
+    width: u32,
+    height: u32,
+    chroma: ChromaSubsampling,
+    params: &ColorParams,
+) -> Result<[Vec<u8>; 3], ColorError> {
+    check_rgb(rgb.len(), stride, width, height)?;
+    let (width, height) = (width as usize, height as usize);
+    let matrix = ForwardMatrix::new(params.matrix, params.range);
+    let (red, blue) = match order {
+        RgbOrder::Rgba => (0, 2),
+        RgbOrder::Bgra => (2, 0),
+    };
+    // R', G' and B' of the pixel at (x, y), clamped to the picture.
+    let pixel = |x: isize, y: usize| {
+        let x = x.clamp(0, width as isize - 1) as usize;
+        let at = y.min(height - 1) * stride + 4 * x;
+        [rgb[at + red], rgb[at + 1], rgb[at + blue]].map(i32::from)
+    };
+    let mut planes: [Vec<u8>; 3] = Default::default();
+    planes[0] = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            planes[0].push(matrix.apply(0, pixel(x as isize, y), 0));
+        }
+    }
+    match chroma {
+        ChromaSubsampling::Yuv444 => {
+            for (plane, row) in planes[1..].iter_mut().zip(1..) {
+                *plane = Vec::with_capacity(width * height);
+                for y in 0..height {
+                    for x in 0..width {
+                        plane.push(matrix.apply(row, pixel(x as isize, y), 0));
+                    }
+                }
+            }
+        }
+        ChromaSubsampling::Yuv420 => {
+            let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+            // Columns and weights, from the chroma sample's left luma column.
+            let (taps, shift): (&[(isize, i32)], u32) = match params.chroma_siting {
+                ChromaSiting::Center => (&[(0, 1), (1, 1)], 2),
+                ChromaSiting::Left => (&[(-1, 1), (0, 2), (1, 1)], 3),
+            };
+            for plane in &mut planes[1..] {
+                *plane = Vec::with_capacity(chroma_width * chroma_height);
+            }
+            for cy in 0..chroma_height {
+                for cx in 0..chroma_width {
+                    let mut sum = [0i32; 3];
+                    for y in [2 * cy, 2 * cy + 1] {
+                        for &(dx, weight) in taps {
+                            let rgb = pixel(2 * cx as isize + dx, y);
+                            for (total, value) in sum.iter_mut().zip(rgb) {
+                                *total += weight * value;
+                            }
+                        }
+                    }
+                    planes[1].push(matrix.apply(1, sum, shift));
+                    planes[2].push(matrix.apply(2, sum, shift));
+                }
+            }
+        }
+    }
+    Ok(planes)
 }
 
 #[cfg(test)]
@@ -556,5 +775,311 @@ mod tests {
         assert!(blue[0] < blue[1] && blue[2] < blue[3], "{blue:?}");
         // Both rows of a 4:2:0 picture with one chroma row are the same.
         assert_eq!(rgb[..12], rgb[12..]);
+    }
+
+    const RANGES: [YcbcrRange; 2] = [YcbcrRange::Limited, YcbcrRange::Full];
+    const MATRICES: [ColorMatrix; 3] =
+        [ColorMatrix::Bt601, ColorMatrix::Bt709, ColorMatrix::Bt2020];
+
+    #[test]
+    fn forward_rows_add_up_exactly() {
+        for matrix in MATRICES {
+            for range in RANGES {
+                let forward = ForwardMatrix::new(matrix, range);
+                let luma: i32 = forward.rows[0].iter().sum();
+                let expected = match range {
+                    YcbcrRange::Full => 1 << FORWARD_BITS,
+                    YcbcrRange::Limited => 56_284, // 219/255 of 2^16, rounded
+                };
+                assert_eq!(luma, expected, "{matrix:?} {range:?}");
+                assert_eq!(forward.rows[1].iter().sum::<i32>(), 0);
+                assert_eq!(forward.rows[2].iter().sum::<i32>(), 0);
+                // Grey, and the levels of black and white, for one pixel and
+                // for the sums of 4:2:0's chroma.
+                for value in [0, 1, 77, 128, 254, 255] {
+                    let grey = [value; 3];
+                    let y = forward.apply(0, grey, 0);
+                    let expected = match range {
+                        YcbcrRange::Full => value as u8,
+                        YcbcrRange::Limited => {
+                            (16.0 + 219.0 * f64::from(value) / 255.0).round() as u8
+                        }
+                    };
+                    assert_eq!(y, expected, "{matrix:?} {range:?} grey {value}");
+                    for (shift, weight) in [(0, 1), (2, 4), (3, 8)] {
+                        let sum = grey.map(|v| v * weight);
+                        assert_eq!(forward.apply(1, sum, shift), 128);
+                        assert_eq!(forward.apply(2, sum, shift), 128);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_integers_round_as_the_definition_does() {
+        // The factors' rounding moves a result by less than 0.006 of a step:
+        // it rounds as the exact value does, but where that is within 0.01
+        // of half a step.
+        let exact = |rgb: [i32; 3], matrix: ColorMatrix, range: YcbcrRange| {
+            let (kr, kb) = matrix.luma_weights();
+            let kg = 1.0 - kr - kb;
+            let [r, g, b] = rgb.map(|v| f64::from(v) / 255.0);
+            let y = kr * r + kg * g + kb * b;
+            let (cb, cr) = ((b - y) / (2.0 * (1.0 - kb)), (r - y) / (2.0 * (1.0 - kr)));
+            match range {
+                YcbcrRange::Limited => [16.0 + 219.0 * y, 128.0 + 224.0 * cb, 128.0 + 224.0 * cr],
+                YcbcrRange::Full => [255.0 * y, 128.0 + 255.0 * cb, 128.0 + 255.0 * cr],
+            }
+        };
+        let mut state = 0x2545_f491_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state % 256) as i32
+        };
+        let mut checked = 0;
+        for matrix in MATRICES {
+            for range in RANGES {
+                let forward = ForwardMatrix::new(matrix, range);
+                for _ in 0..20_000 {
+                    let rgb = [next(), next(), next()];
+                    for (row, value) in exact(rgb, matrix, range).into_iter().enumerate() {
+                        let got = forward.apply(row, rgb, 0);
+                        let rounded = value.round().clamp(0.0, 255.0) as u8;
+                        if ((value - value.floor()) - 0.5).abs() > 0.01 {
+                            assert_eq!(
+                                got, rounded,
+                                "{matrix:?} {range:?} {rgb:?} row {row}: {value}"
+                            );
+                            checked += 1;
+                        } else {
+                            assert!(got.abs_diff(rounded) <= 1);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 340_000, "{checked}");
+    }
+
+    /// A `width` x `height` RGB picture in `order` with rows `stride` bytes
+    /// apart, its pixels from `colour` and the bytes between rows 0xA5.
+    fn picture(
+        width: usize,
+        height: usize,
+        stride: usize,
+        order: RgbOrder,
+        colour: impl Fn(usize, usize) -> [u8; 3],
+    ) -> Vec<u8> {
+        let mut bytes = vec![0xA5; stride * (height - 1) + 4 * width];
+        for y in 0..height {
+            for x in 0..width {
+                let [r, g, b] = colour(x, y);
+                let pixel = match order {
+                    RgbOrder::Rgba => [r, g, b, 0x5A],
+                    RgbOrder::Bgra => [b, g, r, 0x5A],
+                };
+                bytes[y * stride + 4 * x..][..4].copy_from_slice(&pixel);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn rgb_pictures_convert_pixel_by_pixel_in_four_four_four() {
+        let colour = |x: usize, y: usize| [(x * 37) as u8, (y * 53) as u8, ((x + y) * 11) as u8];
+        let params = ColorParams::default();
+        let forward = ForwardMatrix::new(params.matrix, params.range);
+        let rgba = picture(7, 5, 7 * 4, RgbOrder::Rgba, colour);
+        let planes = rgb_to_ycbcr8(
+            &rgba,
+            28,
+            RgbOrder::Rgba,
+            7,
+            5,
+            ChromaSubsampling::Yuv444,
+            &params,
+        )
+        .unwrap();
+        for (i, plane) in planes.iter().enumerate() {
+            assert_eq!(plane.len(), 35);
+            for y in 0..5 {
+                for x in 0..7 {
+                    let rgb = colour(x, y).map(i32::from);
+                    assert_eq!(
+                        plane[y * 7 + x],
+                        forward.apply(i, rgb, 0),
+                        "plane {i} at {x},{y}"
+                    );
+                }
+            }
+        }
+        // The same picture as BGRA, with bytes between the rows that are not
+        // read, gives the same planes.
+        let bgra = picture(7, 5, 7 * 4 + 6, RgbOrder::Bgra, colour);
+        let again = rgb_to_ycbcr8(
+            &bgra,
+            34,
+            RgbOrder::Bgra,
+            7,
+            5,
+            ChromaSubsampling::Yuv444,
+            &params,
+        )
+        .unwrap();
+        assert_eq!(again, planes);
+    }
+
+    #[test]
+    fn four_two_zero_chroma_averages_what_it_covers_as_it_is_sited() {
+        // Blue rising across the columns, one value a column, in a picture
+        // whose rows differ in red, which chroma averages over two rows.
+        let colour = |x: usize, y: usize| [(y * 40) as u8, 0, (x * 30) as u8];
+        let bytes = picture(6, 4, 24, RgbOrder::Rgba, colour);
+        for (siting, columns) in [
+            (
+                ChromaSiting::Center,
+                [[0, 1], [2, 3], [4, 5]].map(|c| c.to_vec()),
+            ),
+            (
+                ChromaSiting::Left,
+                [[0, 0, 0, 1], [1, 2, 2, 3], [3, 4, 4, 5]].map(|c| c.to_vec()),
+            ),
+        ] {
+            let params = ColorParams {
+                chroma_siting: siting,
+                ..ColorParams::default()
+            };
+            let forward = ForwardMatrix::new(params.matrix, params.range);
+            let [luma, cb, cr] = rgb_to_ycbcr8(
+                &bytes,
+                24,
+                RgbOrder::Rgba,
+                6,
+                4,
+                ChromaSubsampling::Yuv420,
+                &params,
+            )
+            .unwrap();
+            assert_eq!((luma.len(), cb.len(), cr.len()), (24, 6, 6));
+            let shift = columns[0].len().ilog2() + 1;
+            for cy in 0..2 {
+                for cx in 0..3 {
+                    let mut sum = [0; 3];
+                    for y in [2 * cy, 2 * cy + 1] {
+                        for &x in &columns[cx] {
+                            for (total, value) in sum.iter_mut().zip(colour(x, y)) {
+                                *total += i32::from(value);
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        cb[cy * 3 + cx],
+                        forward.apply(1, sum, shift),
+                        "{siting:?} Cb {cx},{cy}"
+                    );
+                    assert_eq!(
+                        cr[cy * 3 + cx],
+                        forward.apply(2, sum, shift),
+                        "{siting:?} Cr {cx},{cy}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgb_pictures_of_odd_size_repeat_their_edges() {
+        // 3x3 in 4:2:0: the last chroma column and row cover the last
+        // column and row twice.
+        let flat = picture(3, 3, 12, RgbOrder::Rgba, |_, _| [200, 100, 50]);
+        let [luma, cb, cr] = rgb_to_ycbcr8(
+            &flat,
+            12,
+            RgbOrder::Rgba,
+            3,
+            3,
+            ChromaSubsampling::Yuv420,
+            &ColorParams::default(),
+        )
+        .unwrap();
+        assert_eq!(luma.len(), 9);
+        assert_eq!((cb.len(), cr.len()), (4, 4));
+        assert!(cb.iter().all(|&v| v == cb[0]) && cr.iter().all(|&v| v == cr[0]));
+    }
+
+    #[test]
+    fn rgb_pictures_smaller_than_their_size_are_errors() {
+        let params = ColorParams::default();
+        let bytes = vec![0u8; 4 * 4 * 2];
+        let convert = |bytes: &[u8], stride| {
+            rgb_to_ycbcr8(
+                bytes,
+                stride,
+                RgbOrder::Bgra,
+                4,
+                2,
+                ChromaSubsampling::Yuv420,
+                &params,
+            )
+        };
+        assert!(convert(&bytes, 16).is_ok());
+        assert_eq!(
+            convert(&bytes, 15),
+            Err(ColorError::StrideTooSmall {
+                stride: 15,
+                row: 16
+            })
+        );
+        assert_eq!(
+            convert(&bytes[..31], 16),
+            Err(ColorError::PictureTooSmall {
+                needed: 32,
+                actual: 31
+            })
+        );
+        // The last row needs only its pixels, not the whole stride.
+        assert!(convert(&[0u8; 20 + 16], 20).is_ok());
+        assert!(matches!(
+            convert(&[0u8; 20 + 15], 20),
+            Err(ColorError::PictureTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn rgb_survives_a_round_trip_through_ycbcr() {
+        // A smooth picture: 4:2:0 loses little of it, and the integers and
+        // the floats back meet within a few steps.
+        let colour =
+            |x: usize, y: usize| [(40 + 3 * x) as u8, (200 - 2 * y) as u8, (90 + x + y) as u8];
+        for range in RANGES {
+            for chroma in [ChromaSubsampling::Yuv444, ChromaSubsampling::Yuv420] {
+                for siting in [ChromaSiting::Center, ChromaSiting::Left] {
+                    let params = ColorParams {
+                        matrix: ColorMatrix::Bt709,
+                        range,
+                        chroma_siting: siting,
+                    };
+                    let bytes = picture(16, 8, 64, RgbOrder::Rgba, colour);
+                    let [y, cb, cr] =
+                        rgb_to_ycbcr8(&bytes, 64, RgbOrder::Rgba, 16, 8, chroma, &params).unwrap();
+                    let rgb = convert([&y, &cb, &cr], 16, 8, chroma, &params);
+                    for row in 1..7 {
+                        for x in 1..15 {
+                            let back = &rgb[(row * 16 + x) * 3..][..3];
+                            for (got, want) in back.iter().zip(colour(x, row)) {
+                                assert!(
+                                    got.abs_diff(want) <= 3,
+                                    "{range:?} {chroma:?} {siting:?} at {x},{row}: {back:?} for {:?}",
+                                    colour(x, row)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

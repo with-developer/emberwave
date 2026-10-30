@@ -33,6 +33,7 @@ use crate::bitstream::{
     Band, ChromaSiting, ChromaSubsampling, ColorPrimaries, Component, Error, FrameLayout,
     FrameView, SequenceHeader, TransferFunction, YcbcrRange, YcbcrTransform,
 };
+use crate::color::{ColorError, ColorParams, RgbOrder, rgb_to_ycbcr8};
 use quant::{BandQuant, Blocks8};
 use rate::BlockCost;
 
@@ -50,6 +51,18 @@ pub struct Signalling {
     pub ycbcr_range: YcbcrRange,
     /// Position of 4:2:0 chroma.
     pub chroma_siting: ChromaSiting,
+}
+
+impl Signalling {
+    /// How a picture's R', G' and B' become the Y, Cb and Cr the stream says
+    /// it has: its matrix, range and chroma siting.
+    pub fn color_params(&self) -> ColorParams {
+        ColorParams {
+            matrix: self.ycbcr_transform.into(),
+            range: self.ycbcr_range,
+            chroma_siting: self.chroma_siting,
+        }
+    }
 }
 
 impl Default for Signalling {
@@ -101,6 +114,9 @@ pub enum EncodeError {
     /// A frame to measure with [`coefficient_error`] does not decode.
     #[error("the frame does not decode: {0}")]
     Frame(Error),
+    /// An RGB picture does not fit its size and stride.
+    #[error(transparent)]
+    Picture(#[from] ColorError),
 }
 
 /// The blocks that a partial decode needs whole, which every frame carries
@@ -227,6 +243,30 @@ impl Encoder {
         ));
         debug_assert!(frame.len() <= budget);
         Ok(frame)
+    }
+
+    /// Encodes like [`encode`](Self::encode) a picture of R', G' and B':
+    /// rows `stride` bytes apart of four bytes a pixel in `order`, the fourth
+    /// not read, converted to Y'CbCr as the stream's signalling says, by
+    /// [`rgb_to_ycbcr8`] (decision D65). A picture smaller than its size and
+    /// stride say is [`EncodeError::Picture`].
+    pub fn encode_rgb(
+        &mut self,
+        rgb: &[u8],
+        stride: usize,
+        order: RgbOrder,
+        budget: usize,
+    ) -> Result<Vec<u8>, EncodeError> {
+        let planes = rgb_to_ycbcr8(
+            rgb,
+            stride,
+            order,
+            self.layout.width(),
+            self.layout.height(),
+            self.layout.chroma(),
+            &self.signalling.color_params(),
+        )?;
+        self.encode([&planes[0], &planes[1], &planes[2]], budget)
     }
 
     /// The forward transform of a picture whose planes have the right sizes.

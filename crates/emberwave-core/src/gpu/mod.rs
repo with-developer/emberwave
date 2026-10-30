@@ -52,6 +52,9 @@ pub mod shader_sources {
     pub const DRAW: &str = include_str!("shaders/draw.wgsl");
     /// A picture in textures packed into the encoder's planes buffer.
     pub const GATHER: &str = include_str!("shaders/gather.wgsl");
+    /// A picture in an RGB texture converted to YCbCr into the encoder's
+    /// planes buffer (decision D65).
+    pub const GATHER_RGB: &str = include_str!("shaders/gather_rgb.wgsl");
     /// Forward wavelet transform of one level, for the encoder.
     pub const FDWT: &str = include_str!("shaders/fdwt.wgsl");
     /// Quantisation and the cost tables of the rate control, behind the
@@ -71,11 +74,12 @@ pub mod shader_sources {
     );
 
     /// Every shader, by name, with its compute entry points.
-    pub const ALL: [(&str, &str, &[&str]); 9] = [
+    pub const ALL: [(&str, &str, &[&str]); 10] = [
         ("dequant", DEQUANT, &["main"]),
         ("idwt", IDWT, &["main"]),
         ("yuv2rgb", YUV2RGB, &["main"]),
         ("gather", GATHER, &["main"]),
+        ("gather_rgb", GATHER_RGB, &["yuv444", "yuv420"]),
         ("fdwt", FDWT, &["main"]),
         ("equant", EQUANT, &["main"]),
         ("rate", RATE, &["analyse", "cutoff", "ties", "choose"]),

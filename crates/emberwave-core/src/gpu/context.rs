@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::GpuError;
 use super::decoder::PLANE_FORMAT;
-use super::pipelines::{EncoderPipelines, Pipelines, with_error_scope};
+use super::pipelines::{EncoderPipelines, Pipelines, RgbStages, with_error_scope};
 
 /// Environment variable that restricts the backends considered, for example
 /// `vulkan`, `metal`, `dx12` or a comma separated list. Unset or `auto` means
@@ -150,6 +150,9 @@ pub struct GpuContext {
     /// decoder's and the encoder's, so that neither compiles the other's.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
     encoder_pipelines: Arc<Mutex<Option<Arc<EncoderPipelines>>>>,
+    /// The encoders' pipelines for RGB pictures, built when one first takes
+    /// one (decision D65).
+    rgb_pipelines: RgbPipelines,
     /// Why the device was lost, once it has been; shared with the decoders
     /// and the encoders.
     lost: Arc<Mutex<Option<String>>>,
@@ -308,6 +311,7 @@ impl GpuContext {
             shared_uploads,
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
+            rgb_pipelines: RgbPipelines::default(),
             lost,
             turns: None,
         }
@@ -408,6 +412,25 @@ impl GpuContext {
         cached(&self.encoder_pipelines, || {
             EncoderPipelines::new(&self.device)
         })
+    }
+
+    /// Where the encoders find the pipelines for RGB pictures, which the
+    /// first that needs them builds.
+    pub(crate) fn rgb_pipelines(&self) -> RgbPipelines {
+        self.rgb_pipelines.clone()
+    }
+}
+
+/// A context's pipelines for RGB pictures, shared by its encoders and built
+/// when the first of them takes such a picture (decision D65).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RgbPipelines(Arc<Mutex<Option<Arc<RgbStages>>>>);
+
+impl RgbPipelines {
+    /// The pipelines, compiled on `device`, the context's, if they are not
+    /// yet.
+    pub(crate) fn get(&self, device: &wgpu::Device) -> Result<Arc<RgbStages>, GpuError> {
+        cached(&self.0, || RgbStages::new(device))
     }
 }
 

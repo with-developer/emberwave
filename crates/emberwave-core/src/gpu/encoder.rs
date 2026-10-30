@@ -2,7 +2,8 @@
 //! shaders, so that a picture goes up once and its frame comes back once.
 //!
 //! The picture comes from CPU memory through an upload buffer, or from
-//! textures on the GPU, which `gather.wgsl` packs into the same planes.
+//! textures on the GPU, which `gather.wgsl` packs into the same planes, or
+//! as RGB, which `gather_rgb.wgsl` converts into them (decision D65).
 //! `fdwt.wgsl` transforms the planes level by level, from the finest.
 //! `equant.wgsl` quantises every block and measures it with 0 to 15
 //! bit-planes dropped. `rate.wgsl`, with the prefix sums of `scan.wgsl`,
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES};
 use crate::bitstream::{ChromaSubsampling, Component, FrameLayout, SequenceHeader};
+use crate::color::{RgbOrder, check_rgb};
 use crate::encode::fdwt::sample_level;
 use crate::encode::{
     EncodeError, Signalling, check_planes, check_strided_planes, next_sequence, start_of_frame,
@@ -27,12 +29,13 @@ use crate::encode::{
 };
 
 use super::context::{
-    AfterSubmit, GpuContext, QueueTurns, SubmissionHooks, notice_loss, submit, take_turn,
+    AfterSubmit, GpuContext, QueueTurns, RgbPipelines, SubmissionHooks, notice_loss, submit,
+    take_turn,
 };
 use super::error::GpuError;
 use super::layout::{
     BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
-    RATE_STATE_BYTES, RateSummary, ScanParams, TransformLevel, rate_grid,
+    RATE_STATE_BYTES, RateSummary, RgbGatherParams, ScanParams, TransformLevel, rate_grid,
 };
 use super::pipelines::{EncoderPipelines, with_error_scope};
 use super::resources::{
@@ -105,6 +108,15 @@ pub enum TexturePicture<'a> {
         /// The Cb and Cr planes, interleaved.
         chroma: &'a wgpu::TextureView,
     },
+    /// The picture as R', G' and B', in one `Rgba8Unorm` or `Bgra8Unorm`
+    /// texture of the picture's size, as a screen capture holds it; alpha is
+    /// not read. The encoder converts it to Y'CbCr as it reads it, by the
+    /// matrix, range and chroma siting of its [`Signalling`], into the planes
+    /// that [`rgb_to_ycbcr8`](crate::color::rgb_to_ycbcr8) makes of the same
+    /// picture in CPU memory (decision D65). R', G' and B' are taken as the
+    /// texture stores them, with their transfer function: a texture of an
+    /// sRGB format, whose reads undo it, is not taken.
+    Rgb(&'a wgpu::TextureView),
 }
 
 /// Where a picture to encode is.
@@ -115,6 +127,20 @@ enum Input<'a> {
     Planes([&'a [u8]; 3], Option<[usize; 3]>),
     /// In textures on the GPU.
     Textures(TexturePicture<'a>),
+    /// In CPU memory as R', G' and B': rows `stride` bytes apart of four
+    /// bytes a pixel in `order`.
+    Rgb {
+        rgb: &'a [u8],
+        stride: usize,
+        order: RgbOrder,
+    },
+}
+
+/// The pass that packs a picture in textures into the planes buffer.
+struct Gather {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    grid: (u32, u32, u32),
 }
 
 /// The stages that are timed, in order: transform, quantisation, rate
@@ -170,6 +196,15 @@ pub struct Encoder {
     gather_grid: (u32, u32, u32),
     /// The sampler `gather.wgsl`'s textureGather needs.
     gather_sampler: wgpu::Sampler,
+    /// `gather_rgb.wgsl`'s parameters and workgroups, and its pipelines,
+    /// which the context builds for the first picture in RGB.
+    gather_rgb: wgpu::Buffer,
+    gather_rgb_grid: (u32, u32, u32),
+    rgb_pipelines: RgbPipelines,
+    /// The texture that a picture in RGB in CPU memory goes into, in the
+    /// format of its order: made for the first, and again when the order
+    /// changes.
+    rgb_upload: Option<(RgbOrder, wgpu::Texture)>,
     pyramid: wgpu::Buffer,
     /// A [`CostRecord`] per block, in block index order.
     costs: wgpu::Buffer,
@@ -299,6 +334,9 @@ impl Encoder {
                 "gather params, luma and chroma",
                 &GatherParams::new(&layout, &buffers, true),
             );
+            let gather_rgb_data =
+                RgbGatherParams::new(&layout, &buffers, &signalling.color_params());
+            let gather_rgb = uniform_buffer(&device, &queue, "gather rgb params", &gather_rgb_data);
             // Nearest and clamped to the edge, which are also the defaults.
             let gather_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("gather"),
@@ -394,6 +432,10 @@ impl Encoder {
                 gather_luma_chroma,
                 gather_grid: gather_planes_data.grid(),
                 gather_sampler,
+                gather_rgb,
+                gather_rgb_grid: gather_rgb_data.grid(layout.chroma()),
+                rgb_pipelines: context.rgb_pipelines(),
+                rgb_upload: None,
                 pyramid,
                 costs,
                 rate_state,
@@ -542,6 +584,36 @@ impl Encoder {
         self.run_encode(Input::Textures(picture), budget, true, None)
     }
 
+    /// Encodes a picture of R', G' and B' in CPU memory: rows `stride`
+    /// bytes apart of four bytes a pixel in `order`, the fourth not read. It
+    /// goes to the GPU as it is, into a texture the encoder keeps, and is
+    /// converted there as [`TexturePicture::Rgb`] says, into the frame of
+    /// the same picture in a texture (decision D65). A picture smaller than
+    /// its size and stride say is [`EncodeError::Picture`].
+    pub fn encode_rgb(
+        &mut self,
+        rgb: &[u8],
+        stride: usize,
+        order: RgbOrder,
+        budget: usize,
+    ) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(Input::Rgb { rgb, stride, order }, budget, false, None)
+            .map(|(frame, _)| frame)
+    }
+
+    /// Encodes like [`encode_rgb`](Self::encode_rgb) and says where the
+    /// time went, as [`encode_timed`](Self::encode_timed) does: the upload
+    /// of the picture into the encoder's texture counts as preparation.
+    pub fn encode_rgb_timed(
+        &mut self,
+        rgb: &[u8],
+        stride: usize,
+        order: RgbOrder,
+        budget: usize,
+    ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
+        self.run_encode(Input::Rgb { rgb, stride, order }, budget, true, None)
+    }
+
     fn run_encode(
         &mut self,
         input: Input<'_>,
@@ -577,7 +649,11 @@ impl Encoder {
                 self.upload_planes(planes, strides)?;
                 None
             }
-            Input::Textures(picture) => Some(self.gather_bind_group(picture)?),
+            Input::Textures(picture) => Some(self.gather(picture)?),
+            Input::Rgb { rgb, stride, order } => {
+                let view = self.upload_rgb(rgb, stride, order)?;
+                Some(self.gather(TexturePicture::Rgb(&view))?)
+            }
         };
         // No frame takes more than every block at its largest, which fits
         // 32 bits; neither need the budget.
@@ -837,16 +913,16 @@ impl Encoder {
         Ok(())
     }
 
-    /// The bind group of `gather.wgsl` for `picture`, or an error if its
-    /// textures cannot hold their planes.
-    fn gather_bind_group(&self, picture: TexturePicture<'_>) -> Result<wgpu::BindGroup, GpuError> {
+    /// The pass that packs `picture` into the planes buffer, or an error if
+    /// its textures cannot hold their planes.
+    fn gather(&self, picture: TexturePicture<'_>) -> Result<Gather, GpuError> {
         let size = |component| self.layout.plane_size(component);
         let (views, params) = match picture {
             TexturePicture::Planes(views) => {
                 for ((view, component), name) in
                     views.iter().zip(Component::ALL).zip(["Y", "Cb", "Cr"])
                 {
-                    check_texture(view, name, wgpu::TextureFormat::R8Unorm, size(component))?;
+                    check_texture(view, name, &[wgpu::TextureFormat::R8Unorm], size(component))?;
                 }
                 (views, &self.gather_planes)
             }
@@ -854,22 +930,24 @@ impl Encoder {
                 check_texture(
                     luma,
                     "luma",
-                    wgpu::TextureFormat::R8Unorm,
+                    &[wgpu::TextureFormat::R8Unorm],
                     size(Component::Y),
                 )?;
                 check_texture(
                     chroma,
                     "chroma",
-                    wgpu::TextureFormat::Rg8Unorm,
+                    &[wgpu::TextureFormat::Rg8Unorm],
                     size(Component::Cb),
                 )?;
                 ([luma, chroma, chroma], &self.gather_luma_chroma)
             }
+            TexturePicture::Rgb(view) => return self.gather_rgb(view),
         };
-        with_error_scope(&self.device, || {
+        let stage = &self.pipelines.gather;
+        let bind_group = with_error_scope(&self.device, || {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("gather"),
-                layout: &self.pipelines.gather.layout,
+                layout: &stage.layout,
                 entries: &[
                     entry(0, &self.planes),
                     entry(1, params),
@@ -882,6 +960,104 @@ impl Encoder {
                     },
                 ],
             })
+        })?;
+        Ok(Gather {
+            pipeline: stage.pipeline.clone(),
+            bind_group,
+            grid: self.gather_grid,
+        })
+    }
+
+    /// The pass that converts a picture in an RGB texture into the planes
+    /// buffer (decision D65), with the context's pipelines for it, built
+    /// now if no encoder of the context needed them before.
+    fn gather_rgb(&self, view: &wgpu::TextureView) -> Result<Gather, GpuError> {
+        check_texture(
+            view,
+            "RGB",
+            &RGB_FORMATS,
+            self.layout.plane_size(Component::Y),
+        )?;
+        let stages = self.rgb_pipelines.get(&self.device)?;
+        let stage = stages.for_chroma(self.layout.chroma());
+        let bind_group = with_error_scope(&self.device, || {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gather rgb"),
+                layout: &stage.layout,
+                entries: &[
+                    entry(0, &self.planes),
+                    entry(1, &self.gather_rgb),
+                    texture(2, view),
+                ],
+            })
+        })?;
+        Ok(Gather {
+            pipeline: stage.pipeline.clone(),
+            bind_group,
+            grid: self.gather_rgb_grid,
+        })
+    }
+
+    /// Writes a picture of R', G' and B' in CPU memory into the texture the
+    /// encoder keeps for it, and returns a view of the texture, or an error
+    /// if the bytes do not hold the picture.
+    fn upload_rgb(
+        &mut self,
+        rgb: &[u8],
+        stride: usize,
+        order: RgbOrder,
+    ) -> Result<wgpu::TextureView, GpuError> {
+        let (width, height) = self.layout.plane_size(Component::Y);
+        check_rgb(rgb.len(), stride, width, height).map_err(EncodeError::Picture)?;
+        // A row's pixels, for a picture of one row, whose stride is not read.
+        let stride = stride.max(width as usize * 4);
+        let bytes_per_row = u32::try_from(stride).map_err(|_| {
+            GpuError::Device(format!("rows {stride} bytes apart exceed what wgpu copies"))
+        })?;
+        if self
+            .rgb_upload
+            .as_ref()
+            .is_none_or(|(kept, _)| *kept != order)
+        {
+            let format = match order {
+                RgbOrder::Rgba => wgpu::TextureFormat::Rgba8Unorm,
+                RgbOrder::Bgra => wgpu::TextureFormat::Bgra8Unorm,
+            };
+            let made = with_error_scope(&self.device, || {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("rgb upload"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                })
+            })?;
+            if let Some((_, old)) = self.rgb_upload.replace((order, made)) {
+                old.destroy();
+            }
+        }
+        let (_, texture) = self.rgb_upload.as_ref().expect("made above");
+        with_error_scope(&self.device, || {
+            // Staged by wgpu, and copied before the next submission on the
+            // queue, the encode's or one before it.
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                rgb,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+                texture.size(),
+            );
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
         })
     }
 
@@ -904,7 +1080,7 @@ impl Encoder {
     fn encode_transform(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        gather: Option<&wgpu::BindGroup>,
+        gather: Option<&Gather>,
         queries: Option<&StageQueries>,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -913,10 +1089,10 @@ impl Encoder {
         });
         // A dispatch of a compute pass sees the writes of the dispatches
         // before it.
-        if let Some(bind_group) = gather {
-            pass.set_pipeline(&self.pipelines.gather.pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            let (x, y, z) = self.gather_grid;
+        if let Some(gather) = gather {
+            pass.set_pipeline(&gather.pipeline);
+            pass.set_bind_group(0, &gather.bind_group, &[]);
+            let (x, y, z) = gather.grid;
             pass.dispatch_workgroups(x, y, z);
         }
         pass.set_pipeline(&self.pipelines.fdwt.pipeline);
@@ -1075,19 +1251,31 @@ impl PackBuffers<'_> {
     }
 }
 
+/// The formats of the textures of [`TexturePicture::Rgb`].
+const RGB_FORMATS: [wgpu::TextureFormat; 2] = [
+    wgpu::TextureFormat::Rgba8Unorm,
+    wgpu::TextureFormat::Bgra8Unorm,
+];
+
 /// An error unless the texture of `view` can hold a plane of `width` x
-/// `height` samples in `format`; `name` names the plane in the error.
+/// `height` samples in one of `formats`; `name` names the plane in the
+/// error.
 fn check_texture(
     view: &wgpu::TextureView,
     name: &str,
-    format: wgpu::TextureFormat,
+    formats: &[wgpu::TextureFormat],
     (width, height): (u32, u32),
 ) -> Result<(), GpuError> {
     let texture = view.texture();
     let problem = if texture.dimension() != wgpu::TextureDimension::D2 {
         format!("is {:?} rather than 2D", texture.dimension())
-    } else if texture.format() != format {
-        format!("is {:?} rather than {format:?}", texture.format())
+    } else if !formats.contains(&texture.format()) {
+        let names: Vec<String> = formats.iter().map(|format| format!("{format:?}")).collect();
+        format!(
+            "is {:?} rather than {}",
+            texture.format(),
+            names.join(" or ")
+        )
     } else if (texture.width(), texture.height()) != (width, height) {
         format!(
             "is {}x{} rather than {width}x{height}",
