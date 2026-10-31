@@ -1764,12 +1764,14 @@ The last frame's detail, always, gains everything on a still picture and loses u
   - A struct passed in is read up to its size, and the members past it are zeros, their defaults. A struct filled in is written up to its size. Members are added at the end only.
   - `EmberwaveVulkanDevice` points to its instance instead of holding it, so that each can grow.
   - `EmberwaveSignalling`'s reserved words go, as its size does their work.
+  - No padding may follow a struct's last member, or a member added there would leave the size, and so `struct_size`, as it was. `EmberwaveVulkanInstance` and `EmberwaveVulkanSync` put their 32-bit members first for that.
+  - Each struct's first size is where the last member of its first layout ends. A macro takes that member and the last one now, and checks at compile time that `struct_size` comes first and that no padding follows. A test pins the first sizes on 64-bit systems.
   - `EmberwavePacket` stays as it is: it is the element of an array, whose stride is its size.
 - **Planes carry `size`,** the bytes at `data`, and the calls check it.
   - A decode's plane that is too small gives `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`. An encode's gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
   - They stay passed by value, since another pixel format would be another call.
 - **Two new statuses.**
-  - `EMBERWAVE_STATUS_UNSUPPORTED`, which was `NO_GPU`, is for a call the system lacks: Metal's off Apple's systems, Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off Windows.
+  - `EMBERWAVE_STATUS_UNSUPPORTED`, which was `NO_GPU`, is for a call whose graphics API the system lacks, one that makes a context on it or wraps one of its objects: Metal's off Apple's systems, Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off Windows. The calls that take what such a context made give `INVALID_ARGUMENT` for a context of another kind, as before: a caller cannot have made the right kind there.
   - `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, which was `INVALID_ARGUMENT`, is for an output array, a plane or an encode's budget that is too small.
   - The header says to treat any status but `OK` as a failure, as later versions may add more.
   - The status stays a C enum of `int`'s width, as Rust's `repr(C)` gives it. Fixing it to `int32_t` would change how Swift imports it, for the sake of compilers set to `-fshort-enums`, which break other libraries' enums as well.

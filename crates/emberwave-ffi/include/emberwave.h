@@ -189,12 +189,15 @@ typedef enum EmberwaveStatus {
   EMBERWAVE_STATUS_DEVICE_LOST = 6,
   // A bug in emberwave. Destroy the object the call was made on.
   EMBERWAVE_STATUS_INTERNAL = 7,
-  // The call is not available on this system: Metal's off Apple's
-  // systems, Vulkan's off Linux, Android and 64-bit Windows, Direct3D's
-  // off Windows.
+  // The system lacks the graphics API of the call, which makes a context
+  // on it or wraps one of its objects: Metal's off Apple's systems,
+  // Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off
+  // Windows. The calls that take what such a context made give
+  // `EMBERWAVE_STATUS_INVALID_ARGUMENT` for a context of another kind.
   EMBERWAVE_STATUS_UNSUPPORTED = 8,
   // An output array or buffer of the caller's, or an encode's budget, is
-  // too small. The call says where it stores the size it needs.
+  // too small. Where the call can tell how much it needs, it stores that
+  // where its documentation says.
   EMBERWAVE_STATUS_BUFFER_TOO_SMALL = 9,
 } EmberwaveStatus;
 
@@ -334,19 +337,19 @@ typedef void (*(*EmberwaveVkGetInstanceProcAddr)(void *instance, const char *nam
 typedef struct EmberwaveVulkanInstance {
   // `sizeof(EmberwaveVulkanInstance)` (decision D69).
   uint32_t struct_size;
-  // `vkGetInstanceProcAddr` of the loader the instance was made with.
-  EmberwaveVkGetInstanceProcAddr get_instance_proc_addr;
-  // The `VkInstance`.
-  void *instance;
   // The `apiVersion` the instance was made with, such as
   // `VK_API_VERSION_1_3`: at least the physical device's, up to 1.3,
   // which wgpu uses.
   uint32_t api_version;
+  // How many names `extensions` holds.
+  uint32_t extension_count;
+  // `vkGetInstanceProcAddr` of the loader the instance was made with.
+  EmberwaveVkGetInstanceProcAddr get_instance_proc_addr;
+  // The `VkInstance`.
+  void *instance;
   // The instance extensions it was made with: `extension_count` names, or
   // `NULL` for none.
   const char *const *extensions;
-  // How many names `extensions` holds.
-  uint32_t extension_count;
 } EmberwaveVulkanInstance;
 
 // A Vulkan device of the caller's, and the queue of it that emberwave is to
@@ -446,6 +449,9 @@ typedef struct EmberwaveColor {
 typedef struct EmberwaveVulkanSync {
   // `sizeof(EmberwaveVulkanSync)` (decision D69).
   uint32_t struct_size;
+  // `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
+  // combined with `|` for timeline semaphores, or 0 for binary ones.
+  uint32_t flags;
   // A `VkSemaphore` the decode's GPU work waits for, such as one the
   // caller signals once its reads of the textures are done, or 0 for
   // none.
@@ -457,9 +463,6 @@ typedef struct EmberwaveVulkanSync {
   uint64_t signal_semaphore;
   // For a timeline `signal_semaphore`, the value to signal it to.
   uint64_t signal_value;
-  // `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
-  // combined with `|` for timeline semaphores, or 0 for binary ones.
-  uint32_t flags;
 } EmberwaveVulkanSync;
 
 // Fences for a call on textures shared with the caller's Direct3D 12 or
@@ -630,7 +633,7 @@ enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptio
 // the command buffers the caller commits to the queue after such a call
 // after the decode, and a decode after the command buffers committed before
 // it, for the textures they share (decision D43). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 // `NULL`.
 //
 // The queue is shared:
@@ -693,8 +696,8 @@ enum EmberwaveStatus emberwave_vulkan_instance_extensions(EmberwaveVkGetInstance
 // `emberwave_vulkan_requirements_features` gives. Make the device with
 // them, and with whatever else the caller needs. Only where wgpu runs on
 // Vulkan, on Linux, Android and 64-bit Windows; elsewhere
-// `EMBERWAVE_STATUS_NO_GPU`.
-// `EMBERWAVE_STATUS_NO_GPU` too for a physical device wgpu cannot use.
+// `EMBERWAVE_STATUS_UNSUPPORTED`. `EMBERWAVE_STATUS_NO_GPU` for a physical
+// device wgpu cannot use.
 //
 // # Safety
 //
@@ -747,7 +750,7 @@ void emberwave_vulkan_requirements_destroy(struct EmberwaveVulkanRequirements *r
 // work on the caller's queue (decision D61). The device keeps belonging to
 // the caller, who destroys it after the context and everything made on it.
 // Only where wgpu runs on Vulkan, on Linux, Android and 64-bit Windows;
-// elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+// elsewhere `EMBERWAVE_STATUS_UNSUPPORTED`.
 //
 // The device must have been made with the extensions and the features of
 // `emberwave_vulkan_requirements_create`. A lacking extension is
@@ -780,7 +783,9 @@ void emberwave_vulkan_requirements_destroy(struct EmberwaveVulkanRequirements *r
 //
 // `device` is `NULL` or points to an `EmberwaveVulkanDevice` that describes
 // a live device made as above, with a queue of that family and index, and
-// callbacks that may be called from any thread. `context` points to where
+// callbacks that may be called from any thread; its `instance` is `NULL`
+// or points to an `EmberwaveVulkanInstance` with its `struct_size` set.
+// `context` points to where
 // the new context is stored; it is set to `NULL` when the call fails.
 enum EmberwaveStatus emberwave_context_create_vulkan(const struct EmberwaveVulkanDevice *device,
                                                      struct EmberwaveContext **context);
@@ -1324,9 +1329,9 @@ void emberwave_decoder_clear(struct EmberwaveDecoder *decoder);
 // # Safety
 //
 // `decoder` is a live decoder that no other thread is using. Each plane's
-// `data` points to `stride * (height - 1) + width` bytes that may be
-// written, with the sizes of `emberwave_decoder_info`, and the planes do
-// not overlap.
+// `data` points to `size` bytes that may be written, `size` being at least
+// `stride * (height - 1) + width` for the sizes of
+// `emberwave_decoder_info`, and the planes do not overlap.
 enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decoder,
                                                   struct EmberwavePlane y,
                                                   struct EmberwavePlane cb,
@@ -1350,7 +1355,8 @@ enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decod
 //
 // `decoder` is a live decoder that no other thread is using, `color` is
 // `NULL` or points to an `EmberwaveColor`, and `rgb.data` points to
-// `stride * (height - 1) + 3 * width` bytes that may be written.
+// `rgb.size` bytes that may be written, `rgb.size` being at least
+// `stride * (height - 1) + 3 * width`.
 enum EmberwaveStatus emberwave_decoder_decode_rgb(struct EmberwaveDecoder *decoder,
                                                   const struct EmberwaveColor *color,
                                                   struct EmberwavePlane rgb);
@@ -1397,7 +1403,7 @@ enum EmberwaveStatus emberwave_texture_create_plane(const struct EmberwaveDecode
 // `emberwave_texture_create`'s: a texture of a `CVPixelBuffer` from a
 // `CVMetalTextureCache`, to hand to an `AVSampleBufferDisplayLayer`, one the
 // caller made, or a drawable (decision D44). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 // `NULL`.
 //
 // The texture is on the device of the decoder's context
@@ -1460,7 +1466,7 @@ enum EmberwaveStatus emberwave_texture_from_metal_plane(const struct EmberwaveDe
 // of an NV12 pixel buffer holds them, or `EMBERWAVE_PLANE_RGB` for the
 // whole picture in `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm`,
 // as a BGRA pixel buffer holds it (decision D65). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 // `NULL`.
 //
 // The texture is on the device of the encoder's context
@@ -1715,7 +1721,7 @@ enum EmberwaveStatus emberwave_encoder_info(struct EmberwaveEncoder *encoder,
 // decoder. The planes have the sizes of `emberwave_encoder_info`, each row
 // `stride` bytes from the next, and the bytes between the rows are not
 // read. A budget too small for even the smallest frame is
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
+// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL` with the smallest frame's size in
 // `*size`; nothing is encoded then, and the next frame takes the sequence
 // number this one would have had. Waits for the GPU.
 //
@@ -1726,7 +1732,8 @@ enum EmberwaveStatus emberwave_encoder_info(struct EmberwaveEncoder *encoder,
 // # Safety
 //
 // `encoder` is a live encoder that no other thread is using. Each plane's
-// `data` points to `stride * (height - 1) + width` readable bytes. `frame`
+// `data` points to `size` readable bytes, `size` being at least
+// `stride * (height - 1) + width`. `frame`
 // points to `budget` bytes that may be written, and `size` to a `size_t`;
 // neither overlaps the planes or the other.
 enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
@@ -1752,8 +1759,9 @@ enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
 // # Safety
 //
 // `encoder` is a live encoder that no other thread is using. `rgb.data`
-// points to `rgb.stride * (height - 1) + 4 * width` readable bytes, at the
-// size `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
+// points to `rgb.size` readable bytes, `rgb.size` being at least
+// `rgb.stride * (height - 1) + 4 * width` at the size
+// `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
 // may be written, and `size` to a `size_t`; neither overlaps the picture or
 // the other.
 enum EmberwaveStatus emberwave_encoder_encode_rgb(struct EmberwaveEncoder *encoder,
@@ -1776,9 +1784,10 @@ enum EmberwaveStatus emberwave_encoder_encode_rgb(struct EmberwaveEncoder *encod
 // `emberwave_texture_from_vulkan_source`, or textures that decodes put
 // planes or pictures into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT`
 // before any work on the GPU, textures shared from Direct3D included, which
-// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives it too, as for
-// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
-// frame then, and the sequence number does not move.
+// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives
+// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, as for `emberwave_encoder_encode`,
+// once the GPU has encoded the picture: no frame then, and the sequence
+// number does not move.
 //
 // Waits for the GPU: when it returns, the GPU has read the textures, and
 // the caller may write them again or hand them back to a capture's pool.

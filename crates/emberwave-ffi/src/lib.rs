@@ -77,12 +77,15 @@ pub enum EmberwaveStatus {
     DeviceLost = 6,
     /// A bug in emberwave. Destroy the object the call was made on.
     Internal = 7,
-    /// The call is not available on this system: Metal's off Apple's
-    /// systems, Vulkan's off Linux, Android and 64-bit Windows, Direct3D's
-    /// off Windows.
+    /// The system lacks the graphics API of the call, which makes a context
+    /// on it or wraps one of its objects: Metal's off Apple's systems,
+    /// Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off
+    /// Windows. The calls that take what such a context made give
+    /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` for a context of another kind.
     Unsupported = 8,
     /// An output array or buffer of the caller's, or an encode's budget, is
-    /// too small. The call says where it stores the size it needs.
+    /// too small. Where the call can tell how much it needs, it stores that
+    /// where its documentation says.
     BufferTooSmall = 9,
 }
 
@@ -712,20 +715,38 @@ impl From<BitstreamError> for Failure {
 unsafe trait Versioned: Copy {
     /// The struct's name, for errors.
     const NAME: &'static str;
-    /// The least `struct_size` a caller may give: the struct's size when it
-    /// was first versioned, in 0.17.0. When a member is added, this is the
-    /// offset of the first one added.
+    /// The least `struct_size` a caller may give: where the last member of
+    /// the struct's first layout, that of 0.17.0, ends. A member added later
+    /// lies past it.
     const FIRST_SIZE: usize;
 }
 
+/// Makes each struct [`Versioned`], given the last member of its first
+/// layout, which never changes, and its last member now, which changes when
+/// a member is added. It checks at compile time that `struct_size` comes
+/// first, and that no padding follows the last member: a member added there
+/// would leave the struct's size, and so `struct_size`, as it was, and the
+/// library would read it from the padding of an older caller's struct.
 macro_rules! versioned {
-    ($($name:ident),* $(,)?) => {$(
-        // SAFETY: repr(C), `struct_size` first, and integers, raw pointers
-        // and optional function pointers only.
+    ($($name:ident { first_ends_with: $first:ident: $first_ty:ty, ends_with: $last:ident: $last_ty:ty }),* $(,)?) => {$(
+        // SAFETY: repr(C), `struct_size` first, which the assertions below
+        // check, and integers, raw pointers and optional function pointers
+        // only.
         unsafe impl Versioned for $name {
             const NAME: &'static str = stringify!($name);
-            const FIRST_SIZE: usize = std::mem::size_of::<$name>();
+            const FIRST_SIZE: usize =
+                std::mem::offset_of!($name, $first) + std::mem::size_of::<$first_ty>();
         }
+
+        const _: () = {
+            assert!(std::mem::offset_of!($name, struct_size) == 0);
+            assert!(
+                std::mem::offset_of!($name, $last) + std::mem::size_of::<$last_ty>()
+                    == std::mem::size_of::<$name>(),
+                "padding after the last member"
+            );
+            assert!(<$name as Versioned>::FIRST_SIZE <= std::mem::size_of::<$name>());
+        };
 
         /// Zeros, the defaults, with `struct_size` set.
         impl Default for $name {
@@ -740,16 +761,19 @@ macro_rules! versioned {
 }
 
 versioned!(
-    EmberwaveContextOptions,
-    EmberwaveStreamInfo,
-    EmberwaveFrameInfo,
-    EmberwaveColor,
-    EmberwaveSignalling,
-    EmberwaveVulkanInstance,
-    EmberwaveVulkanDevice,
-    EmberwaveVulkanImage,
-    EmberwaveVulkanSync,
-    EmberwaveD3D12Sync,
+    EmberwaveContextOptions { first_ends_with: flags: u32, ends_with: flags: u32 },
+    EmberwaveStreamInfo { first_ends_with: frame_rate_den: u32, ends_with: frame_rate_den: u32 },
+    EmberwaveFrameInfo { first_ends_with: chroma_height: u32, ends_with: chroma_height: u32 },
+    EmberwaveColor { first_ends_with: chroma_siting: u32, ends_with: chroma_siting: u32 },
+    EmberwaveSignalling { first_ends_with: transfer: u32, ends_with: transfer: u32 },
+    EmberwaveVulkanInstance {
+        first_ends_with: extensions: *const *const c_char,
+        ends_with: extensions: *const *const c_char
+    },
+    EmberwaveVulkanDevice { first_ends_with: user: *mut c_void, ends_with: user: *mut c_void },
+    EmberwaveVulkanImage { first_ends_with: user: *mut c_void, ends_with: user: *mut c_void },
+    EmberwaveVulkanSync { first_ends_with: signal_value: u64, ends_with: signal_value: u64 },
+    EmberwaveD3D12Sync { first_ends_with: signal_value: u64, ends_with: signal_value: u64 },
 );
 
 /// The `struct_size` of the struct at `ptr`, `what` to the caller, checked
@@ -1380,7 +1404,7 @@ pub unsafe extern "C" fn emberwave_context_create(
 /// the command buffers the caller commits to the queue after such a call
 /// after the decode, and a decode after the command buffers committed before
 /// it, for the textures they share (decision D43). Only on iPhones, iPads and
-/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+/// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 /// `NULL`.
 ///
 /// The queue is shared:
@@ -1576,19 +1600,19 @@ pub type EmberwaveVkGetInstanceProcAddr = Option<
 pub struct EmberwaveVulkanInstance {
     /// `sizeof(EmberwaveVulkanInstance)` (decision D69).
     pub struct_size: u32,
-    /// `vkGetInstanceProcAddr` of the loader the instance was made with.
-    pub get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
-    /// The `VkInstance`.
-    pub instance: *mut c_void,
     /// The `apiVersion` the instance was made with, such as
     /// `VK_API_VERSION_1_3`: at least the physical device's, up to 1.3,
     /// which wgpu uses.
     pub api_version: u32,
+    /// How many names `extensions` holds.
+    pub extension_count: u32,
+    /// `vkGetInstanceProcAddr` of the loader the instance was made with.
+    pub get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
+    /// The `VkInstance`.
+    pub instance: *mut c_void,
     /// The instance extensions it was made with: `extension_count` names, or
     /// `NULL` for none.
     pub extensions: *const *const c_char,
-    /// How many names `extensions` holds.
-    pub extension_count: u32,
 }
 
 /// A Vulkan device of the caller's, and the queue of it that emberwave is to
@@ -1682,6 +1706,9 @@ pub struct EmberwaveVulkanImage {
 pub struct EmberwaveVulkanSync {
     /// `sizeof(EmberwaveVulkanSync)` (decision D69).
     pub struct_size: u32,
+    /// `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
+    /// combined with `|` for timeline semaphores, or 0 for binary ones.
+    pub flags: u32,
     /// A `VkSemaphore` the decode's GPU work waits for, such as one the
     /// caller signals once its reads of the textures are done, or 0 for
     /// none.
@@ -1693,9 +1720,6 @@ pub struct EmberwaveVulkanSync {
     pub signal_semaphore: u64,
     /// For a timeline `signal_semaphore`, the value to signal it to.
     pub signal_value: u64,
-    /// `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
-    /// combined with `|` for timeline semaphores, or 0 for binary ones.
-    pub flags: u32,
 }
 
 /// `wait_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore, to
@@ -1841,8 +1865,8 @@ fn vulkan_instance_extensions(
 /// `emberwave_vulkan_requirements_features` gives. Make the device with
 /// them, and with whatever else the caller needs. Only where wgpu runs on
 /// Vulkan, on Linux, Android and 64-bit Windows; elsewhere
-/// `EMBERWAVE_STATUS_NO_GPU`.
-/// `EMBERWAVE_STATUS_NO_GPU` too for a physical device wgpu cannot use.
+/// `EMBERWAVE_STATUS_UNSUPPORTED`. `EMBERWAVE_STATUS_NO_GPU` for a physical
+/// device wgpu cannot use.
 ///
 /// # Safety
 ///
@@ -1940,7 +1964,7 @@ pub unsafe extern "C" fn emberwave_vulkan_requirements_destroy(
 /// work on the caller's queue (decision D61). The device keeps belonging to
 /// the caller, who destroys it after the context and everything made on it.
 /// Only where wgpu runs on Vulkan, on Linux, Android and 64-bit Windows;
-/// elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+/// elsewhere `EMBERWAVE_STATUS_UNSUPPORTED`.
 ///
 /// The device must have been made with the extensions and the features of
 /// `emberwave_vulkan_requirements_create`. A lacking extension is
@@ -1973,7 +1997,9 @@ pub unsafe extern "C" fn emberwave_vulkan_requirements_destroy(
 ///
 /// `device` is `NULL` or points to an `EmberwaveVulkanDevice` that describes
 /// a live device made as above, with a queue of that family and index, and
-/// callbacks that may be called from any thread. `context` points to where
+/// callbacks that may be called from any thread; its `instance` is `NULL`
+/// or points to an `EmberwaveVulkanInstance` with its `struct_size` set.
+/// `context` points to where
 /// the new context is stored; it is set to `NULL` when the call fails.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_context_create_vulkan(
@@ -4264,9 +4290,9 @@ pub unsafe extern "C" fn emberwave_decoder_clear(decoder: *mut EmberwaveDecoder)
 /// # Safety
 ///
 /// `decoder` is a live decoder that no other thread is using. Each plane's
-/// `data` points to `stride * (height - 1) + width` bytes that may be
-/// written, with the sizes of `emberwave_decoder_info`, and the planes do
-/// not overlap.
+/// `data` points to `size` bytes that may be written, `size` being at least
+/// `stride * (height - 1) + width` for the sizes of
+/// `emberwave_decoder_info`, and the planes do not overlap.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
     decoder: *mut EmberwaveDecoder,
@@ -4324,7 +4350,8 @@ pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
 ///
 /// `decoder` is a live decoder that no other thread is using, `color` is
 /// `NULL` or points to an `EmberwaveColor`, and `rgb.data` points to
-/// `stride * (height - 1) + 3 * width` bytes that may be written.
+/// `rgb.size` bytes that may be written, `rgb.size` being at least
+/// `stride * (height - 1) + 3 * width`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_decoder_decode_rgb(
     decoder: *mut EmberwaveDecoder,
@@ -4443,7 +4470,7 @@ pub unsafe extern "C" fn emberwave_texture_create_plane(
 /// `emberwave_texture_create`'s: a texture of a `CVPixelBuffer` from a
 /// `CVMetalTextureCache`, to hand to an `AVSampleBufferDisplayLayer`, one the
 /// caller made, or a drawable (decision D44). Only on iPhones, iPads and
-/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+/// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 /// `NULL`.
 ///
 /// The texture is on the device of the decoder's context
@@ -4546,7 +4573,7 @@ pub unsafe extern "C" fn emberwave_texture_from_metal_plane(
 /// of an NV12 pixel buffer holds them, or `EMBERWAVE_PLANE_RGB` for the
 /// whole picture in `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm`,
 /// as a BGRA pixel buffer holds it (decision D65). Only on iPhones, iPads and
-/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+/// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 /// `NULL`.
 ///
 /// The texture is on the device of the encoder's context
@@ -5358,7 +5385,7 @@ pub unsafe extern "C" fn emberwave_encoder_info(
 /// decoder. The planes have the sizes of `emberwave_encoder_info`, each row
 /// `stride` bytes from the next, and the bytes between the rows are not
 /// read. A budget too small for even the smallest frame is
-/// `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
+/// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL` with the smallest frame's size in
 /// `*size`; nothing is encoded then, and the next frame takes the sequence
 /// number this one would have had. Waits for the GPU.
 ///
@@ -5369,7 +5396,8 @@ pub unsafe extern "C" fn emberwave_encoder_info(
 /// # Safety
 ///
 /// `encoder` is a live encoder that no other thread is using. Each plane's
-/// `data` points to `stride * (height - 1) + width` readable bytes. `frame`
+/// `data` points to `size` readable bytes, `size` being at least
+/// `stride * (height - 1) + width`. `frame`
 /// points to `budget` bytes that may be written, and `size` to a `size_t`;
 /// neither overlaps the planes or the other.
 #[unsafe(no_mangle)]
@@ -5426,8 +5454,9 @@ pub unsafe extern "C" fn emberwave_encoder_encode(
 /// # Safety
 ///
 /// `encoder` is a live encoder that no other thread is using. `rgb.data`
-/// points to `rgb.stride * (height - 1) + 4 * width` readable bytes, at the
-/// size `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
+/// points to `rgb.size` readable bytes, `rgb.size` being at least
+/// `rgb.stride * (height - 1) + 4 * width` at the size
+/// `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
 /// may be written, and `size` to a `size_t`; neither overlaps the picture or
 /// the other.
 #[unsafe(no_mangle)]
@@ -5486,9 +5515,10 @@ fn rgb_order(format: u32) -> Result<RgbOrder, Failure> {
 /// `emberwave_texture_from_vulkan_source`, or textures that decodes put
 /// planes or pictures into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT`
 /// before any work on the GPU, textures shared from Direct3D included, which
-/// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives it too, as for
-/// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
-/// frame then, and the sequence number does not move.
+/// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives
+/// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, as for `emberwave_encoder_encode`,
+/// once the GPU has encoded the picture: no frame then, and the sequence
+/// number does not move.
 ///
 /// Waits for the GPU: when it returns, the GPU has read the textures, and
 /// the caller may write them again or hand them back to a capture's pool.
@@ -5732,6 +5762,23 @@ pub unsafe extern "C" fn emberwave_frame_packets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What programs built with the header of 0.17 pass as `struct_size`, on
+    /// 64-bit systems: these sizes may never grow (decision D69).
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_first_sizes_of_the_structs_stay() {
+        assert_eq!(EmberwaveContextOptions::FIRST_SIZE, 12);
+        assert_eq!(EmberwaveStreamInfo::FIRST_SIZE, 36);
+        assert_eq!(EmberwaveFrameInfo::FIRST_SIZE, 24);
+        assert_eq!(EmberwaveColor::FIRST_SIZE, 16);
+        assert_eq!(EmberwaveSignalling::FIRST_SIZE, 24);
+        assert_eq!(EmberwaveVulkanInstance::FIRST_SIZE, 40);
+        assert_eq!(EmberwaveVulkanDevice::FIRST_SIZE, 80);
+        assert_eq!(EmberwaveVulkanImage::FIRST_SIZE, 48);
+        assert_eq!(EmberwaveVulkanSync::FIRST_SIZE, 40);
+        assert_eq!(EmberwaveD3D12Sync::FIRST_SIZE, 40);
+    }
 
     #[test]
     fn a_panic_on_a_lost_device_is_reported_as_the_loss() {

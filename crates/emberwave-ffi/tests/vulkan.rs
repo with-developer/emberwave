@@ -855,6 +855,34 @@ fn a_device_without_the_required_extensions_is_refused() {
             emberwave_context_create_vulkan(ptr::null(), &mut context),
             EmberwaveStatus::InvalidArgument
         );
+        // The device's instance, NULL or too small for an instance.
+        let mut without = described(names.len() as u32, false, false);
+        without.instance = ptr::null();
+        assert_eq!(
+            emberwave_context_create_vulkan(&without, &mut context),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("device.instance is NULL"),
+            "{}",
+            last_error()
+        );
+        let short = EmberwaveVulkanInstance {
+            struct_size: 8,
+            ..instance
+        };
+        let mut shortened = described(names.len() as u32, false, false);
+        shortened.instance = &short;
+        assert_eq!(
+            emberwave_context_create_vulkan(&shortened, &mut context),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("device.instance.struct_size is 8"),
+            "{}",
+            last_error()
+        );
+        assert!(context.is_null());
         let mut requirements = ptr::null_mut();
         assert_eq!(
             emberwave_vulkan_requirements_create(
