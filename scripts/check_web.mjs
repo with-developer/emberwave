@@ -21,6 +21,8 @@ for (const [name, value] of [
   ["Player.max_file_bytes", Player?.max_file_bytes],
   ["Player.prototype.set_partial_share", Player?.prototype.set_partial_share],
   ["Player.prototype.set_concealment", Player?.prototype.set_concealment],
+  ["Player.prototype.received_blocks", Player?.prototype.received_blocks],
+  ["Player.prototype.total_blocks", Player?.prototype.total_blocks],
   ["Bench.create", Bench?.create],
   ["Demo", Demo],
   ["Demo.frames", Demo?.frames],

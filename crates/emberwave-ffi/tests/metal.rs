@@ -379,6 +379,14 @@ fn decodes_on_the_app_queue_need_no_wait() {
         ptr::eq(on.cast_const().cast(), Retained::as_ptr(&device)),
         "the context is on the app's device"
     );
+    let mut info = EmberwaveContextInfo::default();
+    // SAFETY: a live context and a struct as large as its size says.
+    let status = unsafe { emberwave_context_info(context, &mut info) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    assert_eq!(
+        (info.backend, info.kind),
+        (EMBERWAVE_BACKEND_METAL, EMBERWAVE_CONTEXT_KIND_METAL)
+    );
     // 192 pixels wide, the picture is copied into its texture; 200, drawn
     // (decision D42).
     for name in ["noise_192x136_420.pwv1", "gradient_200x120_420.pwv1"] {

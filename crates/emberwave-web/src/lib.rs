@@ -448,6 +448,23 @@ impl Player {
             .is_some_and(|stream| stream.decoder.is_ready(allow_partial))
     }
 
+    /// How many distinct blocks of the frame being assembled have arrived,
+    /// 0 without a stream: for a page that reports its losses.
+    pub fn received_blocks(&self) -> u32 {
+        self.stream
+            .as_ref()
+            .map_or(0, |stream| stream.decoder.received_blocks())
+    }
+
+    /// How many blocks the frame being assembled has: as many as its start
+    /// of frame header announced, or, until that arrives, as many as the
+    /// picture can hold; 0 without a stream.
+    pub fn total_blocks(&self) -> u32 {
+        self.stream
+            .as_ref()
+            .map_or(0, |stream| stream.decoder.total_blocks())
+    }
+
     /// Sets the share of a frame's announced blocks that must have arrived,
     /// with every block of the coarsest level, for `is_ready(true)` and
     /// `draw_assembled` to take a frame that lost packets: 0.9 by default,
