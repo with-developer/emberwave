@@ -2,6 +2,12 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- What a client can ask (#152): `emberwave_decoder_reception` in the C API, `Decoder::received_blocks` and `total_blocks` in Rust, and the browser player's `received_blocks` and `total_blocks` count the blocks of the frame being assembled that arrived, of how many, for a transport that reports its losses. `emberwave_context_info` describes a context's GPU: its backend, the kind of device, its PCI vendor and device, and which call made the context, with the new `EMBERWAVE_DEVICE_*` and `EMBERWAVE_CONTEXT_KIND_*` constants. Both fill structs that carry their size (decision D69).
+
 ## [0.17.0] - 2026-10-31
 
 The C and Rust APIs, readied to stay compatible from 1.0 on, and broken once here for that. The C API's structs carry their size, so that a later version can add a member without breaking programs; its planes carry their capacity, which the calls check; it has statuses for a call the system lacks and for a buffer too small, and versions to compare the header with the library. The Rust API's enums and structs can grow without breaking callers. The changes below say what each caller changes.

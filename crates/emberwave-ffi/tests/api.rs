@@ -1312,3 +1312,89 @@ fn structs_carry_their_size_and_planes_theirs() {
         emberwave_context_destroy(context);
     }
 }
+
+#[test]
+fn a_decoder_tells_what_arrived_and_a_context_its_gpu() {
+    let Some(context) = context() else {
+        return;
+    };
+    // SAFETY: a live context, NULL where the test means it, and structs as
+    // large as their sizes say.
+    unsafe {
+        let mut info = EmberwaveContextInfo::default();
+        assert_eq!(
+            emberwave_context_info(context, &mut info),
+            EmberwaveStatus::Ok
+        );
+        assert!(
+            [
+                EMBERWAVE_BACKEND_VULKAN,
+                EMBERWAVE_BACKEND_METAL,
+                EMBERWAVE_BACKEND_DX12
+            ]
+            .contains(&info.backend),
+            "{info:?}"
+        );
+        assert!(info.device_type <= EMBERWAVE_DEVICE_CPU, "{info:?}");
+        assert_eq!(info.kind, EMBERWAVE_CONTEXT_KIND_OWN);
+        assert_eq!(
+            emberwave_context_info(ptr::null(), &mut info),
+            EmberwaveStatus::InvalidArgument
+        );
+    }
+
+    let bytes = testdata("gradient_200x120_420.pwv1");
+    let decoder = decoder_for(context, &bytes);
+    let frame = frames(&bytes)[0];
+    // The frame's packets: the start of frame header and its first blocks,
+    // then the rest.
+    let ends = emberwave_core::encode::packets(frame, 64);
+    assert!(ends.len() > 2, "{}", ends.len());
+    // SAFETY: a live decoder, packets of its frame, and structs as large as
+    // their sizes say.
+    unsafe {
+        let mut reception = EmberwaveReception::default();
+        assert_eq!(
+            emberwave_decoder_reception(decoder, &mut reception),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            (reception.received_blocks, reception.has_start_of_frame),
+            (0, 0)
+        );
+        let header_first = ends[0];
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, header_first.as_ptr(), header_first.len()),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_reception(decoder, &mut reception),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(reception.has_start_of_frame, 1);
+        let first = reception.received_blocks;
+        assert!(first < reception.total_blocks, "{reception:?}");
+        for packet in &ends[1..] {
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, packet.as_ptr(), packet.len()),
+                EmberwaveStatus::Ok
+            );
+        }
+        assert_eq!(
+            emberwave_decoder_reception(decoder, &mut reception),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(reception.received_blocks, reception.total_blocks);
+        assert!(reception.received_blocks > first);
+        let mut short = EmberwaveReception {
+            struct_size: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            emberwave_decoder_reception(decoder, &mut short),
+            EmberwaveStatus::InvalidArgument
+        );
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}

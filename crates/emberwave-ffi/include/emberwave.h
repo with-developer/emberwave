@@ -78,6 +78,36 @@
 // Only a software adapter will do: Mesa's lavapipe, or WARP on Windows.
 #define EMBERWAVE_CONTEXT_SOFTWARE 1
 
+// A GPU of a kind wgpu does not name.
+#define EMBERWAVE_DEVICE_OTHER 0
+
+// A GPU that shares the CPU's memory, such as Apple silicon's.
+#define EMBERWAVE_DEVICE_INTEGRATED 1
+
+// A GPU with memory of its own.
+#define EMBERWAVE_DEVICE_DISCRETE 2
+
+// A virtual GPU, such as a virtual machine's.
+#define EMBERWAVE_DEVICE_VIRTUAL 3
+
+// A software adapter on the CPU, such as lavapipe or WARP.
+#define EMBERWAVE_DEVICE_CPU 4
+
+// A context of `emberwave_context_create`, on a device and queue of its own.
+#define EMBERWAVE_CONTEXT_KIND_OWN 0
+
+// A context of `emberwave_context_create_metal`, on the caller's Metal
+// device and queue.
+#define EMBERWAVE_CONTEXT_KIND_METAL 1
+
+// A context of `emberwave_context_create_vulkan`, on the caller's Vulkan
+// device and queue.
+#define EMBERWAVE_CONTEXT_KIND_VULKAN 2
+
+// A context of `emberwave_context_create_d3d12`, on a device of its own on
+// the adapter the caller named, for textures it shares.
+#define EMBERWAVE_CONTEXT_KIND_D3D12 3
+
 // The ITU-R BT.601 matrix.
 #define EMBERWAVE_MATRIX_BT601 0
 
@@ -490,6 +520,25 @@ typedef struct EmberwaveD3D12Sync {
   uint64_t signal_value;
 } EmberwaveD3D12Sync;
 
+// The GPU a context runs on, from `emberwave_context_info`.
+typedef struct EmberwaveContextInfo {
+  // `sizeof(EmberwaveContextInfo)`, set by the caller before the call
+  // (decision D69).
+  uint32_t struct_size;
+  // `EMBERWAVE_BACKEND_VULKAN`, `EMBERWAVE_BACKEND_METAL` or
+  // `EMBERWAVE_BACKEND_DX12`.
+  uint32_t backend;
+  // An `EMBERWAVE_DEVICE_*` value: what kind of GPU it is.
+  uint32_t device_type;
+  // The adapter's PCI vendor ID, or 0 where the backend gives none, as
+  // Metal does.
+  uint32_t vendor_id;
+  // The adapter's PCI device ID, or 0 where the backend gives none.
+  uint32_t device_id;
+  // An `EMBERWAVE_CONTEXT_KIND_*` value: which call made the context.
+  uint32_t kind;
+} EmberwaveContextInfo;
+
 // The sizes of the planes a decoder writes or an encoder reads.
 typedef struct EmberwaveFrameInfo {
   // `sizeof(EmberwaveFrameInfo)`, set by the caller before the call
@@ -506,6 +555,21 @@ typedef struct EmberwaveFrameInfo {
   // Height of each chroma plane.
   uint32_t chroma_height;
 } EmberwaveFrameInfo;
+
+// What a decoder has received of the frame it is assembling, from
+// `emberwave_decoder_reception`.
+typedef struct EmberwaveReception {
+  // `sizeof(EmberwaveReception)`, set by the caller before the call
+  // (decision D69).
+  uint32_t struct_size;
+  // Distinct blocks of the frame that have arrived.
+  uint32_t received_blocks;
+  // Blocks the frame has: as many as its start of frame header announced,
+  // or, until that arrives, as many as the picture can hold.
+  uint32_t total_blocks;
+  // 1 once the frame's start of frame header has arrived, 0 before.
+  uint32_t has_start_of_frame;
+} EmberwaveReception;
 
 // Where a decoder writes one plane or picture.
 typedef struct EmberwavePlane {
@@ -1195,6 +1259,15 @@ void emberwave_context_destroy(struct EmberwaveContext *context);
 // `context` is `NULL` or a live context.
 const char *emberwave_context_adapter(const struct EmberwaveContext *context);
 
+// Describes the GPU `context` runs on, and which call made the context.
+//
+// # Safety
+//
+// `context` is `NULL` or a live context, and `info` points to an
+// `EmberwaveContextInfo` to fill in, with its `struct_size` set.
+enum EmberwaveStatus emberwave_context_info(const struct EmberwaveContext *context,
+                                            struct EmberwaveContextInfo *info);
+
 // Creates a decoder on `context` for pictures of `width` x `height` pixels
 // in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. Width and
 // height are from 1 to 16384, and even for 4:2:0; other sizes give
@@ -1277,6 +1350,19 @@ enum EmberwaveStatus emberwave_decoder_push_packet(struct EmberwaveDecoder *deco
 // `decoder` is `NULL` or a live decoder that no other thread is using.
 bool emberwave_decoder_is_ready(const struct EmberwaveDecoder *decoder,
                                 uint32_t allow_partial_frame);
+
+// Describes what has arrived of the frame being assembled: how many of its
+// blocks, of how many, and whether its start of frame header. For a
+// transport that reports its losses, or sets the share of
+// `emberwave_decoder_set_partial_share` from them.
+//
+// # Safety
+//
+// `decoder` is `NULL` or a live decoder that no other thread is using, and
+// `reception` points to an `EmberwaveReception` to fill in, with its
+// `struct_size` set.
+enum EmberwaveStatus emberwave_decoder_reception(const struct EmberwaveDecoder *decoder,
+                                                 struct EmberwaveReception *reception);
 
 // Sets the share of a frame's announced blocks that must have arrived, with
 // every block of the coarsest level, for `emberwave_decoder_is_ready` with

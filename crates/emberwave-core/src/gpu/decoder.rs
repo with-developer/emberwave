@@ -973,6 +973,20 @@ impl Decoder {
         self.assembler.start_of_frame()
     }
 
+    /// How many distinct blocks of the frame being received have arrived:
+    /// for a transport that reports its losses, or sets the share of
+    /// [`set_partial_share`](Self::set_partial_share) from them.
+    pub fn received_blocks(&self) -> u32 {
+        self.assembler.received_blocks()
+    }
+
+    /// How many blocks the frame being received has: as many as its start of
+    /// frame header announced, or, until that arrives, as many as the
+    /// picture can hold.
+    pub fn total_blocks(&self) -> u32 {
+        self.assembler.total_blocks()
+    }
+
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
     /// calls. Blocks that did not arrive decode as zeros, or are concealed
     /// ([`set_concealment`](Self::set_concealment)).

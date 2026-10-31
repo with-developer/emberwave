@@ -146,6 +146,29 @@ pub const EMBERWAVE_BACKEND_DX12: u32 = 4;
 /// Only a software adapter will do: Mesa's lavapipe, or WARP on Windows.
 pub const EMBERWAVE_CONTEXT_SOFTWARE: u32 = 1;
 
+/// A GPU of a kind wgpu does not name.
+pub const EMBERWAVE_DEVICE_OTHER: u32 = 0;
+/// A GPU that shares the CPU's memory, such as Apple silicon's.
+pub const EMBERWAVE_DEVICE_INTEGRATED: u32 = 1;
+/// A GPU with memory of its own.
+pub const EMBERWAVE_DEVICE_DISCRETE: u32 = 2;
+/// A virtual GPU, such as a virtual machine's.
+pub const EMBERWAVE_DEVICE_VIRTUAL: u32 = 3;
+/// A software adapter on the CPU, such as lavapipe or WARP.
+pub const EMBERWAVE_DEVICE_CPU: u32 = 4;
+
+/// A context of `emberwave_context_create`, on a device and queue of its own.
+pub const EMBERWAVE_CONTEXT_KIND_OWN: u32 = 0;
+/// A context of `emberwave_context_create_metal`, on the caller's Metal
+/// device and queue.
+pub const EMBERWAVE_CONTEXT_KIND_METAL: u32 = 1;
+/// A context of `emberwave_context_create_vulkan`, on the caller's Vulkan
+/// device and queue.
+pub const EMBERWAVE_CONTEXT_KIND_VULKAN: u32 = 2;
+/// A context of `emberwave_context_create_d3d12`, on a device of its own on
+/// the adapter the caller named, for textures it shares.
+pub const EMBERWAVE_CONTEXT_KIND_D3D12: u32 = 3;
+
 /// The ITU-R BT.601 matrix.
 pub const EMBERWAVE_MATRIX_BT601: u32 = 0;
 /// The ITU-R BT.709 matrix.
@@ -268,6 +291,44 @@ pub struct EmberwaveFrameInfo {
     pub chroma_width: u32,
     /// Height of each chroma plane.
     pub chroma_height: u32,
+}
+
+/// The GPU a context runs on, from `emberwave_context_info`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EmberwaveContextInfo {
+    /// `sizeof(EmberwaveContextInfo)`, set by the caller before the call
+    /// (decision D69).
+    pub struct_size: u32,
+    /// `EMBERWAVE_BACKEND_VULKAN`, `EMBERWAVE_BACKEND_METAL` or
+    /// `EMBERWAVE_BACKEND_DX12`.
+    pub backend: u32,
+    /// An `EMBERWAVE_DEVICE_*` value: what kind of GPU it is.
+    pub device_type: u32,
+    /// The adapter's PCI vendor ID, or 0 where the backend gives none, as
+    /// Metal does.
+    pub vendor_id: u32,
+    /// The adapter's PCI device ID, or 0 where the backend gives none.
+    pub device_id: u32,
+    /// An `EMBERWAVE_CONTEXT_KIND_*` value: which call made the context.
+    pub kind: u32,
+}
+
+/// What a decoder has received of the frame it is assembling, from
+/// `emberwave_decoder_reception`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EmberwaveReception {
+    /// `sizeof(EmberwaveReception)`, set by the caller before the call
+    /// (decision D69).
+    pub struct_size: u32,
+    /// Distinct blocks of the frame that have arrived.
+    pub received_blocks: u32,
+    /// Blocks the frame has: as many as its start of frame header announced,
+    /// or, until that arrives, as many as the picture can hold.
+    pub total_blocks: u32,
+    /// 1 once the frame's start of frame header has arrived, 0 before.
+    pub has_start_of_frame: u32,
 }
 
 /// Where a decoder writes one plane or picture.
@@ -778,6 +839,11 @@ versioned!(
     EmberwaveVulkanImage { first_ends_with: user: *mut c_void, ends_with: user: *mut c_void },
     EmberwaveVulkanSync { first_ends_with: signal_value: u64, ends_with: signal_value: u64 },
     EmberwaveD3D12Sync { first_ends_with: signal_value: u64, ends_with: signal_value: u64 },
+    EmberwaveContextInfo { first_ends_with: kind: u32, ends_with: kind: u32 },
+    EmberwaveReception {
+        first_ends_with: has_start_of_frame: u32,
+        ends_with: has_start_of_frame: u32
+    },
 );
 
 /// The `struct_size` of the struct at `ptr`, `what` to the caller, checked
@@ -4068,6 +4134,60 @@ pub unsafe extern "C" fn emberwave_context_adapter(
     }
 }
 
+/// Describes the GPU `context` runs on, and which call made the context.
+///
+/// # Safety
+///
+/// `context` is `NULL` or a live context, and `info` points to an
+/// `EmberwaveContextInfo` to fill in, with its `struct_size` set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_context_info(
+    context: *const EmberwaveContext,
+    info: *mut EmberwaveContextInfo,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        let Some(context) = (unsafe { context.as_ref() }) else {
+            return Err(Failure::argument("context is NULL"));
+        };
+        let adapter = context.context.adapter_info();
+        let described = EmberwaveContextInfo {
+            backend: match adapter.backend {
+                wgpu::Backend::Vulkan => EMBERWAVE_BACKEND_VULKAN,
+                wgpu::Backend::Metal => EMBERWAVE_BACKEND_METAL,
+                wgpu::Backend::Dx12 => EMBERWAVE_BACKEND_DX12,
+                other => {
+                    return Err(Failure(
+                        EmberwaveStatus::Internal,
+                        format!("a context on {other:?}, which emberwave does not use"),
+                    ));
+                }
+            },
+            device_type: match adapter.device_type {
+                wgpu::DeviceType::IntegratedGpu => EMBERWAVE_DEVICE_INTEGRATED,
+                wgpu::DeviceType::DiscreteGpu => EMBERWAVE_DEVICE_DISCRETE,
+                wgpu::DeviceType::VirtualGpu => EMBERWAVE_DEVICE_VIRTUAL,
+                wgpu::DeviceType::Cpu => EMBERWAVE_DEVICE_CPU,
+                wgpu::DeviceType::Other => EMBERWAVE_DEVICE_OTHER,
+            },
+            vendor_id: adapter.vendor,
+            device_id: adapter.device,
+            kind: if context.shared_queue {
+                EMBERWAVE_CONTEXT_KIND_METAL
+            } else if context.vulkan {
+                EMBERWAVE_CONTEXT_KIND_VULKAN
+            } else if context.d3d12 {
+                EMBERWAVE_CONTEXT_KIND_D3D12
+            } else {
+                EMBERWAVE_CONTEXT_KIND_OWN
+            },
+            ..Default::default()
+        };
+        // SAFETY: as the caller promises.
+        unsafe { write_struct(info, "info", described) }
+    })
+}
+
 /// Creates a decoder on `context` for pictures of `width` x `height` pixels
 /// in the chroma format `chroma`, an `EMBERWAVE_CHROMA_*` value. Width and
 /// height are from 1 to 16384, and even for 4:2:0; other sizes give
@@ -4224,6 +4344,35 @@ pub unsafe extern "C" fn emberwave_decoder_is_ready(
         .unwrap_or(false),
         None => false,
     }
+}
+
+/// Describes what has arrived of the frame being assembled: how many of its
+/// blocks, of how many, and whether its start of frame header. For a
+/// transport that reports its losses, or sets the share of
+/// `emberwave_decoder_set_partial_share` from them.
+///
+/// # Safety
+///
+/// `decoder` is `NULL` or a live decoder that no other thread is using, and
+/// `reception` points to an `EmberwaveReception` to fill in, with its
+/// `struct_size` set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_decoder_reception(
+    decoder: *const EmberwaveDecoder,
+    reception: *mut EmberwaveReception,
+) -> EmberwaveStatus {
+    run(|| {
+        // SAFETY: as the caller promises.
+        let decoder = &unsafe { live(decoder) }?.decoder;
+        let described = EmberwaveReception {
+            received_blocks: decoder.received_blocks(),
+            total_blocks: decoder.total_blocks(),
+            has_start_of_frame: u32::from(decoder.start_of_frame().is_some()),
+            ..Default::default()
+        };
+        // SAFETY: as the caller promises.
+        unsafe { write_struct(reception, "reception", described) }
+    })
 }
 
 /// Sets the share of a frame's announced blocks that must have arrived, with
@@ -5790,6 +5939,8 @@ mod tests {
         assert_eq!(EmberwaveVulkanImage::FIRST_SIZE, 48);
         assert_eq!(EmberwaveVulkanSync::FIRST_SIZE, 40);
         assert_eq!(EmberwaveD3D12Sync::FIRST_SIZE, 40);
+        assert_eq!(EmberwaveContextInfo::FIRST_SIZE, 24);
+        assert_eq!(EmberwaveReception::FIRST_SIZE, 16);
     }
 
     #[test]
