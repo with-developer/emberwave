@@ -24,7 +24,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
   - the enums `GpuError`, `EncodeError`, `ColorError`, `bitstream::Error`, `bitstream::Header`, `TexturePicture`, `TimedOutput`, `ColorMatrix` and `RgbOrder`;
   - the structs `GpuOptions`, `ColorParams`, `Signalling`, `Timings`, `StageTimings`, `EncodeTimings`, `EncodeStageTimings`, `Frame`, `RgbFrame` and `FramePlane`.
 
-  A `match` on them needs a wildcard arm. A struct is made from its `Default` and changed member by member; `ColorParams::new` takes its three members.
+  A `match` on them needs a wildcard arm, and a pattern of those structs needs `..`. `GpuOptions`, `ColorParams`, `Signalling` and `Timings` are made from their `Default` and changed member by member; `ColorParams::new` takes its three members. The others, the frames, their planes and the stage timings, are what emberwave's calls give: other crates read them and no longer make them.
 - `Decoder::encode_rgb`, `encode_rgb_to_texture` and `encode_to_plane_textures`, which record a decode into the caller's encoder, are now `record_rgb`, `record_rgb_to_texture` and `record_to_plane_textures`.
 - `GpuOptions::default()` no longer reads `EMBERWAVE_BACKEND`; `GpuOptions::from_env()` does.
 - `Decoder::set_partial_share` returns a `Result`. A share outside 0 to 1, or NaN, is `GpuError::InvalidArgument`, a new variant, as in the C API and the browser player; it was clamped before.

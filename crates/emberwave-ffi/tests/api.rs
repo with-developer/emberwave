@@ -290,7 +290,7 @@ fn planes_through_the_c_api_equal_the_rust_decoder() {
             )
         };
 
-        let rust_context = GpuContext::new(&GpuOptions::default()).unwrap();
+        let rust_context = GpuContext::new(&GpuOptions::from_env().unwrap_or_default()).unwrap();
         let header = *Pwv1File::parse(&bytes).unwrap().header();
         let mut rust = Decoder::new(
             &rust_context,
@@ -346,7 +346,7 @@ fn rgb_through_the_c_api_follows_the_stream_or_the_caller() {
     let decoder = decoder_for(context, &bytes);
     let frame = frames(&bytes)[0];
     let header = *Pwv1File::parse(&bytes).unwrap().header();
-    let rust_context = GpuContext::new(&GpuOptions::default()).unwrap();
+    let rust_context = GpuContext::new(&GpuOptions::from_env().unwrap_or_default()).unwrap();
     let mut rust = Decoder::new(&rust_context, 200, 120, header.stream.chroma).unwrap();
 
     let decode = |color: *const EmberwaveColor| {

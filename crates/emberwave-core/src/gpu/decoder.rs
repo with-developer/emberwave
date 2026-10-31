@@ -2418,7 +2418,8 @@ mod tests {
         if test_context().is_none() {
             return;
         }
-        let context = GpuContext::new(&crate::gpu::GpuOptions::default()).expect("a context");
+        let context = GpuContext::new(&crate::gpu::GpuOptions::from_env().unwrap_or_default())
+            .expect("a context");
         let chroma = ChromaSubsampling::Yuv420;
         let mut decoder = Decoder::new(&context, 64, 32, chroma).unwrap();
         decoder

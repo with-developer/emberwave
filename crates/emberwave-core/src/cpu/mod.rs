@@ -122,8 +122,9 @@ impl Concealer {
 
     /// The coefficients the last decode left, concealment included, as the
     /// GPU decoder's pyramid holds them after the same decode
-    /// ([`gpu::Decoder::read_band`](crate::gpu::Decoder::read_band) reads
-    /// the bands that are not LL, and the coarsest LL).
+    /// (`gpu::Decoder::read_band` reads the bands that are not LL, and the
+    /// coarsest LL). For tests: its type is the dequantiser's.
+    #[doc(hidden)]
     pub fn bands(&self) -> Option<&Bands> {
         self.last.as_ref().map(|(_, bands)| bands)
     }

@@ -1131,18 +1131,27 @@ fn chroma_code(chroma: ChromaSubsampling) -> u32 {
     }
 }
 
-fn stream_info(stream: &SequenceHeader) -> EmberwaveStreamInfo {
+fn stream_info(stream: &SequenceHeader) -> Result<EmberwaveStreamInfo, Failure> {
     let color = ColorParams::from_stream(stream);
-    EmberwaveStreamInfo {
+    Ok(EmberwaveStreamInfo {
         struct_size: std::mem::size_of::<EmberwaveStreamInfo>() as u32,
         width: stream.width,
         height: stream.height,
         chroma: chroma_code(stream.chroma),
         matrix: match color.matrix {
             ColorMatrix::Bt601 => EMBERWAVE_MATRIX_BT601,
+            ColorMatrix::Bt709 => EMBERWAVE_MATRIX_BT709,
             ColorMatrix::Bt2020 => EMBERWAVE_MATRIX_BT2020,
-            // A stream signals BT.709 or BT.2020 only.
-            _ => EMBERWAVE_MATRIX_BT709,
+            // A stream signals BT.709 or BT.2020, one bit: a matrix the C API
+            // has no constant for cannot come from one. Should a later
+            // version of the core add one without a constant here, the call
+            // fails as a bug of emberwave's, not with a wrong matrix.
+            other => {
+                return Err(Failure(
+                    EmberwaveStatus::Internal,
+                    format!("the stream's matrix {other:?} has no C constant"),
+                ));
+            }
         },
         range: match color.range {
             YcbcrRange::Limited => EMBERWAVE_RANGE_LIMITED,
@@ -1154,7 +1163,7 @@ fn stream_info(stream: &SequenceHeader) -> EmberwaveStreamInfo {
         },
         frame_rate_num: 0,
         frame_rate_den: 0,
-    }
+    })
 }
 
 fn gpu_options(options: &EmberwaveContextOptions) -> Result<GpuOptions, Failure> {
@@ -1323,7 +1332,7 @@ pub unsafe extern "C" fn emberwave_probe_pwv1(
         let described = EmberwaveStreamInfo {
             frame_rate_num: header.frame_rate_num,
             frame_rate_den: header.frame_rate_den,
-            ..stream_info(&header.stream)
+            ..stream_info(&header.stream)?
         };
         // SAFETY: as the caller promises.
         unsafe { write_struct(info, "info", described) }
@@ -1351,7 +1360,7 @@ pub unsafe extern "C" fn emberwave_probe_packet(
         match Header::parse(bytes)? {
             // SAFETY: as the caller promises.
             Header::StartOfFrame(stream) => unsafe {
-                write_struct(info, "info", stream_info(&stream))
+                write_struct(info, "info", stream_info(&stream)?)
             },
             Header::Block(_) => Err(Failure(
                 EmberwaveStatus::Bitstream,

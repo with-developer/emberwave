@@ -21,7 +21,7 @@ use emberwave_core::bitstream::{
 use emberwave_core::color::{ColorError, RgbOrder, rgb_to_ycbcr8, yuv_to_rgb8};
 use emberwave_core::cpu::decode_frame;
 use emberwave_core::encode::{self, EncodeError, Signalling};
-use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, GpuOptions, TexturePicture};
+use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, TexturePicture};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
@@ -325,7 +325,7 @@ fn errors_are_the_cpu_encoders() {
 fn a_device_limited_to_webgpu_guarantees_encodes_the_same() {
     let context = gpu_or_return!();
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.strict_webgpu = true;
         options
     };
@@ -346,7 +346,7 @@ fn a_device_limited_to_webgpu_guarantees_encodes_the_same() {
 #[test]
 fn encoding_frame_after_frame_allocates_nothing() {
     // A context of its own: the counters belong to the device.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let vector = vectors()
@@ -382,7 +382,7 @@ fn encoding_frame_after_frame_allocates_nothing() {
 #[test]
 fn a_lost_device_is_an_error_rather_than_a_stale_result() {
     // A context of its own, since destroying the device loses it for good.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let vector = vectors()
@@ -406,7 +406,7 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
 fn timing_an_encode_reports_where_the_time_goes() {
     // Timestamp queries are optional, so ask for them and accept their absence.
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.timestamps = true;
         options
     };
@@ -456,7 +456,7 @@ fn nothing_is_made_on_a_lost_device() {
     // the context compiled its pipelines, whose failure is then the first.
     for compiled in [false, true] {
         let lost = || {
-            let context = create_context(&GpuOptions::default())?;
+            let context = create_context(&common::options())?;
             if compiled {
                 Decoder::new(&context, 64, 64, ChromaSubsampling::Yuv420).expect("a decoder");
                 Encoder::new(
@@ -504,7 +504,7 @@ fn pictures_in_textures_encode_as_the_same_planes_do() {
     let context = gpu_or_return!();
     let mut contexts = vec![(context.clone(), usize::MAX)];
     let strict = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.strict_webgpu = true;
         options
     };
@@ -545,7 +545,7 @@ fn planes_written_in_place_encode_as_uploaded_ones() {
     // in turn, and its frames are those of an encoder on the upload path.
     let context = gpu_or_return!();
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.shared_uploads = false;
         options
     };
@@ -743,7 +743,7 @@ fn textures_that_cannot_hold_their_planes_are_errors() {
 fn encoding_from_textures_frame_after_frame_allocates_nothing() {
     // A context of its own: the counters belong to the device. The bind
     // group of each frame's textures goes when the frame is done.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let vector = vectors()
@@ -817,7 +817,7 @@ fn pictures_in_rgb_encode_as_the_planes_they_convert_to_do() {
     let context = gpu_or_return!();
     let mut contexts = vec![(context.clone(), usize::MAX)];
     let strict = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.strict_webgpu = true;
         options
     };
@@ -974,7 +974,7 @@ fn rgb_pictures_that_do_not_fit_are_errors() {
 fn encoding_rgb_frame_after_frame_allocates_nothing() {
     // A context of its own, as for textures: the texture that RGB in CPU
     // memory goes into is kept, and made again only for the other order.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let vector = vectors()

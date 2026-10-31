@@ -10,7 +10,7 @@
 // are packed tightly, as the read-back to the CPU takes them, and a texture
 // without the COPY_DST usage takes none. It also fills BGRA targets. The
 // browser player and the C API put pictures into textures through
-// Decoder::encode_rgb_to_texture (decision D40).
+// Decoder::record_rgb_to_texture (decision D40).
 
 struct Picture {
     width: u32,

@@ -65,8 +65,7 @@ impl GpuOptions {
     }
 
     /// The default options with the backends taken from [`BACKEND_ENV`] if it
-    /// is set. A value that names no backend is an error here, where
-    /// [`Default`] would ignore it.
+    /// is set. A value that names no backend is an error.
     pub fn from_env() -> Result<Self, String> {
         let mut options = Self::base();
         if let Some(value) = std::env::var_os(BACKEND_ENV) {
@@ -391,8 +390,8 @@ impl GpuContext {
 
     /// Whether the decoders store the planes straight into the textures of
     /// decodes into plane textures, those that allow it, rather than copy
-    /// them in: on Metal, unless [`GpuOptions::plane_stores`] was off
-    /// (decision D52). Should the device fail to build the shader that
+    /// them in: on Metal, unless `GpuOptions::plane_stores` was off (decision
+    /// D52). Should the device fail to build the shader that
     /// stores, the decoders copy all the same, which
     /// [`Decoder::stores_planes`](super::Decoder::stores_planes) tells.
     pub fn stores_planes(&self) -> bool {
@@ -402,7 +401,7 @@ impl GpuContext {
     /// Whether the decoders write a frame's data, and the encoders a
     /// picture's planes, where their shaders read them, without an upload
     /// buffer and the copies from it: on Metal on Apple silicon, unless
-    /// [`GpuOptions::shared_uploads`] was off (decisions D53, D54).
+    /// `GpuOptions::shared_uploads` was off (decisions D53, D54).
     pub fn shares_uploads(&self) -> bool {
         self.shared_uploads
     }
@@ -722,19 +721,21 @@ fn cached<T>(
 pub(crate) fn test_context() -> Option<&'static GpuContext> {
     static CONTEXT: std::sync::OnceLock<Option<GpuContext>> = std::sync::OnceLock::new();
     CONTEXT
-        .get_or_init(|| match GpuContext::new(&GpuOptions::default()) {
-            Ok(context) => Some(context),
-            Err(error) => {
-                let required =
-                    std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_some_and(|v| !v.is_empty());
-                assert!(
-                    !required,
-                    "a GPU is required but none is available: {error}"
-                );
-                eprintln!("no GPU available, skipping: {error}");
-                None
-            }
-        })
+        .get_or_init(
+            || match GpuContext::new(&GpuOptions::from_env().unwrap_or_default()) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    let required =
+                        std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_some_and(|v| !v.is_empty());
+                    assert!(
+                        !required,
+                        "a GPU is required but none is available: {error}"
+                    );
+                    eprintln!("no GPU available, skipping: {error}");
+                    None
+                }
+            },
+        )
         .as_ref()
 }
 

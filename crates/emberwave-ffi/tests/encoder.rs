@@ -191,7 +191,8 @@ fn frames_through_the_c_api_equal_the_rust_encoder() {
     let Some(context) = context() else {
         return;
     };
-    let rust_context = GpuContext::new(&GpuOptions::default()).expect("a GPU, as the C API's");
+    let rust_context = GpuContext::new(&GpuOptions::from_env().unwrap_or_default())
+        .expect("a GPU, as the C API's");
     for (width, height, chroma) in SHAPES {
         let layout = FrameLayout::new(width, height, chroma).unwrap();
         let tight = encoder_for(context, &layout, None);

@@ -21,9 +21,7 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams, yuv_to_rgb8};
 use emberwave_core::cpu;
-use emberwave_core::gpu::{
-    Decoder, Frame, GpuContext, GpuError, GpuOptions, TEXTURE_FORMATS, TimedOutput,
-};
+use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuError, TEXTURE_FORMATS, TimedOutput};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
@@ -777,7 +775,7 @@ fn frames_written_in_place_decode_as_copied_ones() {
         info.backend == wgpu::Backend::Metal && info.device_type == wgpu::DeviceType::IntegratedGpu;
     assert_eq!(context.shares_uploads(), shares);
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.shared_uploads = false;
         options
     };
@@ -824,7 +822,7 @@ fn frames_written_in_place_wait_for_the_frame_before() {
     // the payload buffer.
     let context = gpu_or_return!();
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.shared_uploads = false;
         options
     };
@@ -881,7 +879,7 @@ fn frames_written_in_place_wait_for_the_frame_before() {
 #[test]
 fn without_plane_stores_the_planes_are_copied() {
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.plane_stores = false;
         options
     };
@@ -923,7 +921,7 @@ fn decoding_into_plane_textures_frame_after_frame_leaves_nothing_behind() {
     // A context of its own: the counters belong to the device. Where the
     // planes are stored, every decode makes the bind groups of its textures,
     // which must go again.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let (layout, frames) = vector_frames("noise_192x136_420");
@@ -1622,7 +1620,7 @@ fn a_device_limited_to_webgpu_guarantees_decodes_the_same() {
     // shaders needed anything beyond it, creating the pipelines or running
     // them would fail here.
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.strict_webgpu = true;
         options
     };
@@ -1950,7 +1948,7 @@ fn rgb_output_changes_with_the_conversion_settings() {
 fn timing_a_frame_reports_where_the_time_goes() {
     // Timestamp queries are optional, so ask for them and accept their absence.
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.timestamps = true;
         options
     };
@@ -2040,7 +2038,7 @@ fn decoding_frame_after_frame_allocates_nothing() {
     // A context of its own: the counters belong to the device, and the shared
     // context is busy with the other tests.
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.timestamps = true;
         options
     };
@@ -2057,7 +2055,7 @@ fn decoding_frame_after_frame_allocates_nothing() {
 #[test]
 fn a_decoder_makes_its_read_back_buffers_when_a_decode_first_reads_back() {
     // A context of its own: the counters belong to the device.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let buffers = || context.device().get_internal_counters().hal.buffers.read();
@@ -2090,7 +2088,7 @@ fn a_decoder_makes_its_read_back_buffers_when_a_decode_first_reads_back() {
 #[test]
 fn a_lost_device_is_an_error_rather_than_a_stale_result() {
     // A context of its own, since destroying the device loses it for good.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let (layout, frames) = vector_frames("gradient_200x120_420");
@@ -2152,7 +2150,7 @@ fn a_thousand_4k_frames_leave_no_trace() {
         panic!("{}: {error}; run scripts/gen_bench_data.sh", path.display())
     });
     let options = {
-        let mut options = GpuOptions::default();
+        let mut options = common::options();
         options.timestamps = true;
         options
     };
