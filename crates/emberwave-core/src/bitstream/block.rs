@@ -42,6 +42,7 @@ fn block8_plane_bytes(control_word: u16, qscale: u8) -> usize {
 /// Reads outside the block return 0. Callers check sizes first, and this
 /// keeps a malformed block from ever causing a panic.
 #[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
 pub struct BlockBytes<'a> {
     words: &'a [u32],
 }
@@ -77,6 +78,7 @@ impl<'a> BlockBytes<'a> {
 
 /// An 8x8 block that carries data (its `ballot` bit is set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct ActiveBlock8 {
     /// Two bits per subblock: bit-planes on top of `base_planes`.
     pub control_word: u16,
@@ -99,6 +101,7 @@ impl ActiveBlock8 {
 
 /// Where the parts of a block are, worked out from its header and tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct BlockStructure {
     header: BlockHeader,
     blocks8: [Option<ActiveBlock8>; BLOCK8_PER_BLOCK],

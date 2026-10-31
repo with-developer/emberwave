@@ -290,7 +290,7 @@ fn planes_through_the_c_api_equal_the_rust_decoder() {
             )
         };
 
-        let rust_context = GpuContext::new(&GpuOptions::default()).unwrap();
+        let rust_context = GpuContext::new(&GpuOptions::from_env().unwrap_or_default()).unwrap();
         let header = *Pwv1File::parse(&bytes).unwrap().header();
         let mut rust = Decoder::new(
             &rust_context,
@@ -346,7 +346,7 @@ fn rgb_through_the_c_api_follows_the_stream_or_the_caller() {
     let decoder = decoder_for(context, &bytes);
     let frame = frames(&bytes)[0];
     let header = *Pwv1File::parse(&bytes).unwrap().header();
-    let rust_context = GpuContext::new(&GpuOptions::default()).unwrap();
+    let rust_context = GpuContext::new(&GpuOptions::from_env().unwrap_or_default()).unwrap();
     let mut rust = Decoder::new(&rust_context, 200, 120, header.stream.chroma).unwrap();
 
     let decode = |color: *const EmberwaveColor| {
@@ -397,11 +397,11 @@ fn rgb_through_the_c_api_follows_the_stream_or_the_caller() {
     let expected = rust
         .decode_rgb(
             frame,
-            &ColorParams {
-                matrix: emberwave_core::color::ColorMatrix::Bt601,
-                range: emberwave_core::bitstream::YcbcrRange::Full,
-                chroma_siting: emberwave_core::bitstream::ChromaSiting::Left,
-            },
+            &ColorParams::new(
+                emberwave_core::color::ColorMatrix::Bt601,
+                emberwave_core::bitstream::YcbcrRange::Full,
+                emberwave_core::bitstream::ChromaSiting::Left,
+            ),
         )
         .unwrap();
     let rgb = decode(&chosen);
@@ -557,7 +557,7 @@ fn a_partial_frame_needs_the_share_the_caller_sets() {
                 match Header::parse(&packet[at..]) {
                     Ok(Header::StartOfFrame(_)) => at += 8,
                     Ok(Header::Block(block)) => break Some(block.block_index),
-                    Err(_) => break None,
+                    Ok(_) | Err(_) => break None,
                 }
             };
             if first_block.is_some_and(|block| block >= coarsest) && number % 2 == 1 {

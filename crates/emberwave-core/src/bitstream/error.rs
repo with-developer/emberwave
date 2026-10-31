@@ -8,6 +8,7 @@ use super::header::ChromaSubsampling;
 ///
 /// Parsing untrusted input never panics; it returns one of these instead.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Width or height is outside `1..=16384`, or a 4:2:0 picture has an odd
     /// dimension.

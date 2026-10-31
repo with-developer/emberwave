@@ -44,15 +44,21 @@ pub fn live_resources(context: &emberwave_core::gpu::GpuContext) -> String {
     format!("{:?}", context.device().get_internal_counters().hal)
 }
 
+/// The options the tests start from: the defaults, with the backends that
+/// `EMBERWAVE_BACKEND` names, so that a run can force a backend, as the
+/// command line tool does. A value that names none is ignored.
+#[cfg(feature = "gpu")]
+pub fn options() -> emberwave_core::gpu::GpuOptions {
+    emberwave_core::gpu::GpuOptions::from_env().unwrap_or_default()
+}
+
 /// The GPU context shared by the tests of one test binary, or `None` if
 /// there is no GPU and none is required.
 #[cfg(feature = "gpu")]
 pub fn shared_context() -> Option<&'static emberwave_core::gpu::GpuContext> {
     static CONTEXT: std::sync::OnceLock<Option<emberwave_core::gpu::GpuContext>> =
         std::sync::OnceLock::new();
-    CONTEXT
-        .get_or_init(|| create_context(&emberwave_core::gpu::GpuOptions::default()))
-        .as_ref()
+    CONTEXT.get_or_init(|| create_context(&options())).as_ref()
 }
 
 /// Directory with the committed vectors and their reference decodes.

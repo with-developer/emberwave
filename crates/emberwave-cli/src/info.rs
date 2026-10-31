@@ -111,6 +111,10 @@ pub fn run(args: &Args) -> Result<()> {
                     "frame {index:>6}: {:>9} bytes, no start of frame header first",
                     frame.len()
                 ),
+                Ok(_) => out!(
+                    "frame {index:>6}: {:>9} bytes, a header this version does not know",
+                    frame.len()
+                ),
                 Err(error) => out!("frame {index:>6}: {:>9} bytes, {error}", frame.len()),
             }
         }

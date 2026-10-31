@@ -22,22 +22,28 @@ use crate::bitstream::{
 
 /// Reciprocal of 255, so 8-bit samples are scaled by a multiplication (a
 /// division could be turned into a less exact multiplication by a GPU).
+#[doc(hidden)]
 pub const INV_255: f32 = 1.0 / 255.0;
 
 /// The 8-bit video black level (limited range luma).
+#[doc(hidden)]
 pub const LUMA_BLACK: f32 = 16.0 / 255.0;
 
 /// Stretches limited range luma (219 steps) to `[0, 1]`.
+#[doc(hidden)]
 pub const LUMA_SCALE: f32 = 255.0 / 219.0;
 
 /// Stretches limited range chroma (224 steps) to `[-0.5, 0.5]`.
+#[doc(hidden)]
 pub const CHROMA_SCALE: f32 = 255.0 / 224.0;
 
 /// The 8-bit value of zero chroma.
+#[doc(hidden)]
 pub const CHROMA_CENTRE: f32 = 128.0 / 255.0;
 
 /// The set of coefficients that relates Y'CbCr to R'G'B'.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColorMatrix {
     /// ITU-R BT.601.
     Bt601,
@@ -82,6 +88,7 @@ impl From<YcbcrTransform> for ColorMatrix {
 
 /// How to turn decoded planes into RGB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ColorParams {
     /// Matrix coefficients.
     pub matrix: ColorMatrix,
@@ -104,6 +111,16 @@ impl Default for ColorParams {
 }
 
 impl ColorParams {
+    /// The conversion with `matrix`, `range` and `chroma_siting`. A member a
+    /// later version adds takes its default.
+    pub const fn new(matrix: ColorMatrix, range: YcbcrRange, chroma_siting: ChromaSiting) -> Self {
+        Self {
+            matrix,
+            range,
+            chroma_siting,
+        }
+    }
+
     /// Takes the signalling of a stream, from a PWV1 file header or a start
     /// of frame header. The upstream encoder only fills these in in the PWV1
     /// header, so prefer that one.
@@ -122,6 +139,7 @@ impl ColorParams {
 /// Returns `(base, fraction)` where the value is
 /// `(4 - fraction) * chroma[base] + fraction * chroma[base + 1]`, divided by 4.
 /// `base` may be -1, which the caller clamps to the edge.
+#[doc(hidden)]
 pub fn chroma_taps(p: u32, siting: AxisSiting) -> (i32, u32) {
     let half = (p / 2) as i32;
     match (siting, p % 2) {
@@ -136,6 +154,7 @@ pub fn chroma_taps(p: u32, siting: AxisSiting) -> (i32, u32) {
 
 /// Why [`yuv_to_rgb8`] or [`rgb_to_ycbcr8`] refused its input.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ColorError {
     /// A plane holds fewer samples than the picture size needs.
     #[error("plane {plane} has {actual} samples, but the picture needs {needed}")]
@@ -170,6 +189,7 @@ pub enum ColorError {
 
 /// Siting along one axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum AxisSiting {
     /// Chroma sits between the two luma samples it covers.
     Centre,
@@ -281,6 +301,7 @@ pub fn yuv_to_rgb8(
 /// The order of a pixel's four bytes in an RGB picture: R', G' and B', and
 /// a fourth that is not read, such as alpha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RgbOrder {
     /// R', G', B', then the fourth byte.
     Rgba,
@@ -289,6 +310,7 @@ pub enum RgbOrder {
 }
 
 /// Fractional bits of [`ForwardMatrix`]'s factors.
+#[doc(hidden)]
 pub const FORWARD_BITS: u32 = 16;
 
 /// RGB to YCbCr in integers, as [`rgb_to_ycbcr8`] and the encoder's
@@ -303,6 +325,7 @@ pub const FORWARD_BITS: u32 = 16;
 /// 224 steps of 255 in the video range). Sums over up to 8 pixels stay
 /// well within 32 bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct ForwardMatrix {
     /// Factors of R', G' and B' for Y, Cb and Cr.
     pub rows: [[i32; 3]; 3],

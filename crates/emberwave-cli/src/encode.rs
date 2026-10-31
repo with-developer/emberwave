@@ -120,12 +120,14 @@ pub fn run(args: &Args) -> Result<()> {
             YcbcrTransform::Bt2020,
         ),
     };
-    let signalling = Signalling {
-        color_primaries: primaries,
-        transfer_function: transfer,
-        ycbcr_transform: transform,
-        ycbcr_range: header.range,
-        chroma_siting: header.siting,
+    let signalling = {
+        let mut signalling = Signalling::default();
+        signalling.color_primaries = primaries;
+        signalling.transfer_function = transfer;
+        signalling.ycbcr_transform = transform;
+        signalling.ycbcr_range = header.range;
+        signalling.chroma_siting = header.siting;
+        signalling
     };
     let width = u32::try_from(header.width)?;
     let height = u32::try_from(header.height)?;

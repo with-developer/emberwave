@@ -5,6 +5,7 @@ use thiserror::Error;
 /// Everything that can go wrong while setting up the GPU or decoding or
 /// encoding on it.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum GpuError {
     /// No adapter matched the requested backends.
     #[error("no suitable GPU adapter found: {0}")]
@@ -28,6 +29,10 @@ pub enum GpuError {
     /// The frame is so large that 32-bit buffer offsets do not suffice.
     #[error("the frame is too large for 32-bit buffer offsets")]
     TooLarge,
+
+    /// A value the call cannot take, such as a share outside 0 to 1.
+    #[error("{0}")]
+    InvalidArgument(String),
 
     /// The GPU or the driver reported an error.
     #[error("the GPU reported an error: {0}")]

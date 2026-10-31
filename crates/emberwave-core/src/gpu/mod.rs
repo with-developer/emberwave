@@ -7,6 +7,14 @@
 //! inverse transform, which stores the planes into 8-bit textures, runs only
 //! where the adapter allows it, and the portable one everywhere else
 //! (decision D52).
+//!
+//! In a browser nothing may wait for the GPU, so the calls that do, such as
+//! [`Decoder::decode`] and the [`Encoder`]'s encodes, are not built for
+//! wasm32; the decoder's `record_*` and `submit_*` calls are.
+
+// The calls left out of the browser build leave their helpers unused there;
+// the native builds check for code that is dead everywhere.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
 mod context;
 mod decoder;
@@ -40,6 +48,7 @@ const _: () = {
 };
 
 /// The WGSL sources of the pipeline stages, for offline validation.
+#[doc(hidden)]
 pub mod shader_sources {
     /// Coefficient decoding and dequantisation.
     pub const DEQUANT: &str = include_str!("shaders/dequant.wgsl");

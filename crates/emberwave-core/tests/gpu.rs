@@ -21,9 +21,7 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams, yuv_to_rgb8};
 use emberwave_core::cpu;
-use emberwave_core::gpu::{
-    Decoder, Frame, GpuContext, GpuError, GpuOptions, TEXTURE_FORMATS, TimedOutput,
-};
+use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuError, TEXTURE_FORMATS, TimedOutput};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
@@ -410,7 +408,7 @@ fn a_picture_drawn_into_a_texture_is_the_rgb_picture() {
                     view_formats: &[],
                 });
                 let mut encoder = context.device().create_command_encoder(&Default::default());
-                let outcome = decoder.encode_rgb_to_texture(
+                let outcome = decoder.record_rgb_to_texture(
                     &frames[1],
                     &color,
                     &target.create_view(&Default::default()),
@@ -483,7 +481,7 @@ fn only_a_texture_the_picture_fits_takes_it() {
         // The frame is still there to decode.
         assert_eq!(decoder.decode_assembled().expect("decode"), frame);
         let mut encoder = context.device().create_command_encoder(&Default::default());
-        let outcome = decoder.encode_rgb_to_texture(&frames[0], &color, &view, &mut encoder);
+        let outcome = decoder.record_rgb_to_texture(&frames[0], &color, &view, &mut encoder);
         assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
     }
 }
@@ -547,7 +545,7 @@ fn planes_drawn_into_textures_are_the_decoded_planes() {
             .map(|texture| texture.create_view(&Default::default()));
         let mut encoder = context.device().create_command_encoder(&Default::default());
         decoder
-            .encode_to_plane_textures(&frames[1], views.each_ref(), &mut encoder)
+            .record_to_plane_textures(&frames[1], views.each_ref(), &mut encoder)
             .expect("recorded decode into plane textures");
         context.queue().submit([encoder.finish()]);
         for (component, texture) in Component::ALL.into_iter().zip(&textures) {
@@ -749,7 +747,7 @@ fn planes_stored_into_textures_are_the_copied_planes() {
                 } else {
                     let mut encoder = context.device().create_command_encoder(&Default::default());
                     decoder
-                        .encode_to_plane_textures(frame, targets, &mut encoder)
+                        .record_to_plane_textures(frame, targets, &mut encoder)
                         .expect("recorded decode into plane textures");
                     context.queue().submit([encoder.finish()]);
                 }
@@ -776,9 +774,10 @@ fn frames_written_in_place_decode_as_copied_ones() {
     let shares =
         info.backend == wgpu::Backend::Metal && info.device_type == wgpu::DeviceType::IntegratedGpu;
     assert_eq!(context.shares_uploads(), shares);
-    let options = GpuOptions {
-        shared_uploads: false,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = common::options();
+        options.shared_uploads = false;
+        options
     };
     let Some(copied) = create_context(&options) else {
         return;
@@ -807,7 +806,7 @@ fn frames_written_in_place_decode_as_copied_ones() {
             );
             let mut encoder = context.device().create_command_encoder(&Default::default());
             shared
-                .encode_rgb(frame, &color, &mut encoder)
+                .record_rgb(frame, &color, &mut encoder)
                 .expect("recorded decode");
             context.queue().submit([encoder.finish()]);
         }
@@ -822,9 +821,10 @@ fn frames_written_in_place_wait_for_the_frame_before() {
     // frames are large enough to keep the GPU busy, and the first one grows
     // the payload buffer.
     let context = gpu_or_return!();
-    let options = GpuOptions {
-        shared_uploads: false,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = common::options();
+        options.shared_uploads = false;
+        options
     };
     let Some(copied) = create_context(&options) else {
         return;
@@ -842,7 +842,7 @@ fn frames_written_in_place_wait_for_the_frame_before() {
         let (first, second) = (&pair[0], &pair[1]);
         let mut encoder = device.create_command_encoder(&Default::default());
         decoder
-            .encode_rgb(first, &color, &mut encoder)
+            .record_rgb(first, &color, &mut encoder)
             .expect("recorded decode");
         let rgba = decoder.rgba_buffer().expect("RGBA buffer");
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -878,9 +878,10 @@ fn frames_written_in_place_wait_for_the_frame_before() {
 
 #[test]
 fn without_plane_stores_the_planes_are_copied() {
-    let options = GpuOptions {
-        plane_stores: false,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = common::options();
+        options.plane_stores = false;
+        options
     };
     let Some(context) = create_context(&options) else {
         return;
@@ -920,7 +921,7 @@ fn decoding_into_plane_textures_frame_after_frame_leaves_nothing_behind() {
     // A context of its own: the counters belong to the device. Where the
     // planes are stored, every decode makes the bind groups of its textures,
     // which must go again.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let (layout, frames) = vector_frames("noise_192x136_420");
@@ -1002,7 +1003,7 @@ fn only_textures_the_planes_fit_take_them() {
         // The frame is still there to decode.
         assert_eq!(decoder.decode_assembled().expect("decode"), frame);
         let mut encoder = context.device().create_command_encoder(&Default::default());
-        let outcome = decoder.encode_to_plane_textures(&frames[0], views.each_ref(), &mut encoder);
+        let outcome = decoder.record_to_plane_textures(&frames[0], views.each_ref(), &mut encoder);
         assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
     }
 
@@ -1574,7 +1575,7 @@ fn a_partial_frame_needs_the_share_of_blocks_its_decoder_asks() {
             match Header::parse(&packet[at..]) {
                 Ok(Header::StartOfFrame(_)) => at += 8,
                 Ok(Header::Block(block)) => break Some(block.block_index),
-                Err(_) => break None,
+                Ok(_) | Err(_) => break None,
             }
         };
         if first_block.is_some_and(|block| block >= coarsest) && number % 2 == 1 {
@@ -1588,22 +1589,26 @@ fn a_partial_frame_needs_the_share_of_blocks_its_decoder_asks() {
 
     assert_eq!(decoder.partial_share(), 0.9);
     assert!(!decoder.is_ready(true), "90 % by default");
-    decoder.set_partial_share(share - 0.05);
+    decoder.set_partial_share(share - 0.05).unwrap();
     assert!(decoder.is_ready(true));
     assert!(!decoder.is_ready(false));
     // A share above what arrived; the edge itself, where exactly the share
     // is not enough, is the assembler's test.
-    decoder.set_partial_share(share + 0.01);
+    decoder.set_partial_share(share + 0.01).unwrap();
     assert!(!decoder.is_ready(true));
-    decoder.set_partial_share(1.0);
+    decoder.set_partial_share(1.0).unwrap();
     assert!(!decoder.is_ready(true), "1 takes whole frames only");
-    decoder.set_partial_share(-1.0);
-    assert_eq!(decoder.partial_share(), 0.0);
-    decoder.set_partial_share(f32::NAN);
-    assert_eq!(decoder.partial_share(), 0.9);
+    // Outside 0 to 1, or NaN: refused, and the share stays.
+    for refused in [-1.0, 1.01, f32::NAN, f32::INFINITY] {
+        assert!(matches!(
+            decoder.set_partial_share(refused),
+            Err(GpuError::InvalidArgument(_))
+        ));
+        assert_eq!(decoder.partial_share(), 1.0);
+    }
 
     // What arrived decodes, as it always could.
-    decoder.set_partial_share(0.0);
+    decoder.set_partial_share(0.0).unwrap();
     assert!(decoder.is_ready(true));
     let frame = decoder.decode_assembled().unwrap();
     assert_eq!(frame.planes[0].data.len(), 200 * 120);
@@ -1614,9 +1619,10 @@ fn a_device_limited_to_webgpu_guarantees_decodes_the_same() {
     // The portable subset: default limits and no optional features. If the
     // shaders needed anything beyond it, creating the pipelines or running
     // them would fail here.
-    let options = GpuOptions {
-        strict_webgpu: true,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = common::options();
+        options.strict_webgpu = true;
+        options
     };
     let Some(context) = create_context(&options) else {
         return;
@@ -1877,11 +1883,7 @@ fn rgb_conversion_on_the_gpu_matches_the_cpu() {
         for matrix in matrices {
             for range in ranges {
                 for chroma_siting in sitings {
-                    let params = ColorParams {
-                        matrix,
-                        range,
-                        chroma_siting,
-                    };
+                    let params = ColorParams::new(matrix, range, chroma_siting);
                     let rgb = decoder
                         .decode_rgb(&frames[0], &params)
                         .expect("GPU RGB decode");
@@ -1931,11 +1933,7 @@ fn rgb_output_changes_with_the_conversion_settings() {
     // The parameters are read for every call: the same frame converted twice
     // with different settings must differ, and back again must repeat.
     let a = ColorParams::default();
-    let b = ColorParams {
-        matrix: ColorMatrix::Bt601,
-        range: YcbcrRange::Full,
-        chroma_siting: ChromaSiting::Left,
-    };
+    let b = ColorParams::new(ColorMatrix::Bt601, YcbcrRange::Full, ChromaSiting::Left);
     let first = decoder.decode_rgb(&frames[0], &a).unwrap();
     let other = decoder.decode_rgb(&frames[0], &b).unwrap();
     assert_ne!(first, other);
@@ -1949,9 +1947,10 @@ fn rgb_output_changes_with_the_conversion_settings() {
 #[test]
 fn timing_a_frame_reports_where_the_time_goes() {
     // Timestamp queries are optional, so ask for them and accept their absence.
-    let options = GpuOptions {
-        timestamps: true,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = common::options();
+        options.timestamps = true;
+        options
     };
     let Some(context) = create_context(&options) else {
         return;
@@ -2038,9 +2037,10 @@ fn resources_around(
 fn decoding_frame_after_frame_allocates_nothing() {
     // A context of its own: the counters belong to the device, and the shared
     // context is busy with the other tests.
-    let options = GpuOptions {
-        timestamps: true,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = common::options();
+        options.timestamps = true;
+        options
     };
     let Some(context) = create_context(&options) else {
         return;
@@ -2055,7 +2055,7 @@ fn decoding_frame_after_frame_allocates_nothing() {
 #[test]
 fn a_decoder_makes_its_read_back_buffers_when_a_decode_first_reads_back() {
     // A context of its own: the counters belong to the device.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let buffers = || context.device().get_internal_counters().hal.buffers.read();
@@ -2067,7 +2067,7 @@ fn a_decoder_makes_its_read_back_buffers_when_a_decode_first_reads_back() {
     // reading back. The 4K decoder of a browser saves 43.5 MiB this way.
     let mut encoder = context.device().create_command_encoder(&Default::default());
     decoder
-        .encode_rgb(&frames[0], &color, &mut encoder)
+        .record_rgb(&frames[0], &color, &mut encoder)
         .expect("recorded decode");
     context.queue().submit([encoder.finish()]);
     decoder
@@ -2088,7 +2088,7 @@ fn a_decoder_makes_its_read_back_buffers_when_a_decode_first_reads_back() {
 #[test]
 fn a_lost_device_is_an_error_rather_than_a_stale_result() {
     // A context of its own, since destroying the device loses it for good.
-    let Some(context) = create_context(&GpuOptions::default()) else {
+    let Some(context) = create_context(&common::options()) else {
         return;
     };
     let (layout, frames) = vector_frames("gradient_200x120_420");
@@ -2149,9 +2149,10 @@ fn a_thousand_4k_frames_leave_no_trace() {
     let bytes = std::fs::read(&path).unwrap_or_else(|error| {
         panic!("{}: {error}; run scripts/gen_bench_data.sh", path.display())
     });
-    let options = GpuOptions {
-        timestamps: true,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = common::options();
+        options.timestamps = true;
+        options
     };
     let context = create_context(&options).expect("this test needs a GPU");
     let (layout, frames) = frames_of("scene_4k_420", &bytes);
@@ -2181,8 +2182,8 @@ fn encoding_into_a_callers_encoder_gives_the_same_picture() {
     assert!(other.rgba_buffer().is_none());
     let device = context.device();
     let mut encoder = device.create_command_encoder(&Default::default());
-    other.encode_rgb(&frames[1], &color, &mut encoder).unwrap();
-    let rgba = other.rgba_buffer().expect("RGBA buffer after encode_rgb");
+    other.record_rgb(&frames[1], &color, &mut encoder).unwrap();
+    let rgba = other.rgba_buffer().expect("RGBA buffer after record_rgb");
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test readback"),
         size: rgba.size(),
@@ -2206,7 +2207,7 @@ fn encoding_into_a_callers_encoder_gives_the_same_picture() {
     assert_eq!(rgb, expected.data);
 
     // The same decoder, back to the decodes that wait, which upload through a
-    // buffer of their own (decision D34) where encode_rgb writes through the
+    // buffer of their own (decision D34) where record_rgb writes through the
     // queue: each path finds the payload the other left and replaces it.
     for frame in [&frames[0], &frames[1]] {
         let from_both = other.decode_rgb(frame, &color).unwrap();

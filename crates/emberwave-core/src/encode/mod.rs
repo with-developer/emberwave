@@ -40,6 +40,7 @@ use rate::BlockCost;
 /// What a stream says about its colours. It changes nothing in the coding,
 /// only the start of frame headers and a PWV1 file's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Signalling {
     /// Colour primaries.
     pub color_primaries: ColorPrimaries,
@@ -80,6 +81,7 @@ impl Default for Signalling {
 
 /// What can go wrong while encoding a frame.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// A plane does not have the size the stream's pictures have.
     #[error("the {component:?} plane has {actual} samples, {expected} expected")]
@@ -414,6 +416,7 @@ pub(crate) fn check_planes(layout: &FrameLayout, planes: [&[u8]; 3]) -> Result<(
 /// least `(height - 1) * stride + width` bytes in the plane. For the GPU
 /// encoder's strided input.
 #[cfg(feature = "gpu")]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn check_strided_planes(
     layout: &FrameLayout,
     planes: [&[u8]; 3],

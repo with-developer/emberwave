@@ -6,6 +6,7 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ### Added
 
+- `emberwave_core::wgpu` is the wgpu that emberwave is built with, for sharing a device or a texture with it (decision D70).
 - `EMBERWAVE_VERSION`, with `EMBERWAVE_VERSION_MAJOR`, `_MINOR` and `_PATCH`, in the C header, and `emberwave_version_number()` in the library, so that a program can tell the library it runs with from the header it was built with (decision D69, [#152](https://github.com/with-developer/emberwave/issues/152)).
 - The C API's statuses `EMBERWAVE_STATUS_UNSUPPORTED`, for a call the system lacks, and `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, for an output array, a plane or an encode's budget that is too small. Later versions may add more: treat any status but `EMBERWAVE_STATUS_OK` as a failure.
 
@@ -19,6 +20,17 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 - `emberwave_decoder_submit_texture` and `emberwave_decoder_submit_plane_textures`, which only Metal has, are now `emberwave_decoder_submit_texture_metal` and `emberwave_decoder_submit_plane_textures_metal`.
 - `emberwave_vulkan_instance_extensions` takes the capacity of `names` apart from the count it stores, as `emberwave_frame_packets` does.
 - The calls on the caller's Metal, Vulkan and Direct3D objects are provisional: until a client has used them, a minor version may change them.
+- In Rust, the enums and structs that grow are `#[non_exhaustive]` (decision D70):
+  - the enums `GpuError`, `EncodeError`, `ColorError`, `bitstream::Error`, `bitstream::Header`, `TexturePicture`, `TimedOutput`, `ColorMatrix` and `RgbOrder`;
+  - the structs `GpuOptions`, `ColorParams`, `Signalling`, `Timings`, `StageTimings`, `EncodeTimings`, `EncodeStageTimings`, `Frame`, `RgbFrame` and `FramePlane`.
+
+  A `match` on them needs a wildcard arm, and a pattern of those structs needs `..`. `GpuOptions`, `ColorParams`, `Signalling` and `Timings` are made from their `Default` and changed member by member; `ColorParams::new` takes its three members. The others, the frames, their planes and the stage timings, are what emberwave's calls give: other crates read them and no longer make them.
+- `Decoder::encode_rgb`, `encode_rgb_to_texture` and `encode_to_plane_textures`, which record a decode into the caller's encoder, are now `record_rgb`, `record_rgb_to_texture` and `record_to_plane_textures`.
+- `GpuOptions::default()` no longer reads `EMBERWAVE_BACKEND`; `GpuOptions::from_env()` does.
+- `Decoder::set_partial_share` returns a `Result`. A share outside 0 to 1, or NaN, is `GpuError::InvalidArgument`, a new variant, as in the C API and the browser player; it was clamped before.
+- `bitstream::pwv1::HEADER_BYTES` is now `FILE_HEADER_BYTES`.
+- The calls that wait for the GPU are not built for wasm32, where they could not work.
+- Items there for emberwave's own tests are hidden from the docs and not part of the API: `shader_sources`, `Decoder::read_band`, the CPU decoder's dequantiser and transform, the block parser's structures, the colour module's constants and siting helpers, and three of `GpuOptions`' members.
 
 ## [0.16.0] - 2026-10-31
 

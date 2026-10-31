@@ -5,7 +5,9 @@
 //! GPU, and so that shader stages can be compared against something simple.
 //! It is not meant to be fast.
 
+#[doc(hidden)]
 pub mod dequant;
+#[doc(hidden)]
 pub mod idwt;
 
 use crate::bitstream::consts::{BLOCK_SIZE, DC_SHIFT, DECOMPOSITION_LEVELS, NUM_COMPONENTS};
@@ -54,6 +56,7 @@ pub struct DecodedFrame {
 /// component: level 4 comes from the bitstream and the others are produced by
 /// the level above. Row-major with the width of the level as stride.
 #[derive(Debug, Clone, Default)]
+#[doc(hidden)]
 pub struct LlBands {
     levels: [[Option<Vec<f32>>; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
 }
@@ -76,6 +79,7 @@ pub fn decode_frame(frame: &FrameView<'_>) -> Result<DecodedFrame, Error> {
 }
 
 /// Like [`decode_frame`], and also returns the intermediate LL bands.
+#[doc(hidden)]
 pub fn decode_frame_with_ll(frame: &FrameView<'_>) -> Result<(DecodedFrame, LlBands), Error> {
     let layout = frame.layout();
     let mut bands = dequant::dequantize(frame)?;
@@ -118,8 +122,9 @@ impl Concealer {
 
     /// The coefficients the last decode left, concealment included, as the
     /// GPU decoder's pyramid holds them after the same decode
-    /// ([`gpu::Decoder::read_band`](crate::gpu::Decoder::read_band) reads
-    /// the bands that are not LL, and the coarsest LL).
+    /// (`gpu::Decoder::read_band` reads the bands that are not LL, and the
+    /// coarsest LL). For tests: its type is the dequantiser's.
+    #[doc(hidden)]
     pub fn bands(&self) -> Option<&Bands> {
         self.last.as_ref().map(|(_, bands)| bands)
     }

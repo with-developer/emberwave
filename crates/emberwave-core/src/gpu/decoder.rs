@@ -37,6 +37,7 @@ const MIN_PAYLOAD_WORDS: usize = 16 * 1024;
 
 /// One decoded colour plane, 8 bits per sample, rows tightly packed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FramePlane {
     /// Width in samples.
     pub width: u32,
@@ -51,6 +52,7 @@ pub struct FramePlane {
 /// Values are in the range of the stream: this is what the reference decoder
 /// writes to 8-bit UNORM storage, with no colour conversion applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Frame {
     /// Chroma subsampling; chroma planes are half size in 4:2:0.
     pub chroma: ChromaSubsampling,
@@ -60,6 +62,7 @@ pub struct Frame {
 
 /// A decoded frame converted to RGB.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RgbFrame {
     /// Width in pixels.
     pub width: u32,
@@ -71,6 +74,7 @@ pub struct RgbFrame {
 
 /// What [`Decoder::time_frame`] decodes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TimedOutput {
     /// 8-bit Y, Cb and Cr planes in GPU memory.
     Yuv,
@@ -83,6 +87,7 @@ pub enum TimedOutput {
 /// Only available on devices that support them, and then only at the
 /// granularity of a pass: all five inverse transform levels are one pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StageTimings {
     /// Coefficient decoding and dequantisation.
     pub dequant: Duration,
@@ -101,7 +106,8 @@ impl StageTimings {
 }
 
 /// Where the time of one decode went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Timings {
     /// CPU time to assemble the packets and hand the data to the GPU.
     pub prepare: Duration,
@@ -203,7 +209,7 @@ pub struct Decoder {
     payload_capacity_words: usize,
     block_offsets: wgpu::Buffer,
     /// Made on the first decode that waits for its frame, and made again
-    /// when the payload buffer grows; `encode_rgb`, which does not wait,
+    /// when the payload buffer grows; `record_rgb`, which does not wait,
     /// writes through the queue instead, as a browser has to. Never made
     /// where `shared_uploads` is.
     upload: Option<FrameUpload>,
@@ -462,6 +468,7 @@ impl Decoder {
     ///
     /// Whatever was assembled before is discarded, so the same frame may be
     /// decoded repeatedly.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn decode(&mut self, frame: &[u8]) -> Result<Frame, GpuError> {
         self.assemble_complete(frame)?;
         self.decode_assembled()
@@ -469,6 +476,7 @@ impl Decoder {
 
     /// Decodes one complete frame like [`decode`](Self::decode) and converts
     /// it to RGB on the GPU.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn decode_rgb(&mut self, frame: &[u8], color: &ColorParams) -> Result<RgbFrame, GpuError> {
         self.assemble_complete(frame)?;
         self.decode_assembled_rgb(color)
@@ -481,6 +489,7 @@ impl Decoder {
     /// The per-stage times are `Some` only if the context was created with
     /// [`GpuOptions::timestamps`](super::GpuOptions::timestamps) and the device
     /// supports them.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn time_frame(&mut self, frame: &[u8], output: TimedOutput) -> Result<Timings, GpuError> {
         let start = Instant::now();
         self.assemble_complete(frame)?;
@@ -502,7 +511,7 @@ impl Decoder {
     ///
     /// The frame's data goes to the GPU with the next submission on this
     /// decoder's queue, so record one frame per submission.
-    pub fn encode_rgb(
+    pub fn record_rgb(
         &mut self,
         frame: &[u8],
         color: &ColorParams,
@@ -515,7 +524,7 @@ impl Decoder {
         Ok(())
     }
 
-    /// The RGBA words that [`encode_rgb`](Self::encode_rgb) and
+    /// The RGBA words that [`record_rgb`](Self::record_rgb) and
     /// [`decode_rgb`](Self::decode_rgb) write, once one of them has run:
     /// `width * height` words, one per pixel, red in the low byte, alpha 255.
     /// After a decode copied into a BGRA texture they are BGRA words, blue in
@@ -527,7 +536,7 @@ impl Decoder {
     }
 
     /// Records the decode of one complete frame and its conversion to RGB
-    /// into `encoder`, as [`encode_rgb`](Self::encode_rgb) does, and then
+    /// into `encoder`, as [`record_rgb`](Self::record_rgb) does, and then
     /// what puts the picture into `target`. Once the caller has submitted
     /// `encoder`, the texture holds the picture.
     ///
@@ -546,7 +555,7 @@ impl Decoder {
     /// draw needs the view in the texture's own format, which cannot be
     /// checked: a view in another format the texture allows, such as its sRGB
     /// form, fails wgpu's validation when the picture is drawn.
-    pub fn encode_rgb_to_texture(
+    pub fn record_rgb_to_texture(
         &mut self,
         frame: &[u8],
         color: &ColorParams,
@@ -563,11 +572,12 @@ impl Decoder {
 
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
     /// calls, converts it to RGB and draws it into `target`, as
-    /// [`encode_rgb_to_texture`](Self::encode_rgb_to_texture) does, and waits
+    /// [`record_rgb_to_texture`](Self::record_rgb_to_texture) does, and waits
     /// for the GPU. When this returns the texture holds the picture, for any
     /// queue of the device to read; a texture another queue may still be
     /// reading must not be passed. Blocks that did not arrive decode as zeros,
     /// or are concealed ([`set_concealment`](Self::set_concealment)).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn decode_assembled_to_texture(
         &mut self,
         color: &ColorParams,
@@ -617,7 +627,7 @@ impl Decoder {
         self.submit_assembled(Some(color), Read::Texture(target), Some(hooks))
     }
 
-    /// A texture that [`encode_rgb_to_texture`](Self::encode_rgb_to_texture)
+    /// A texture that [`record_rgb_to_texture`](Self::record_rgb_to_texture)
     /// and [`decode_assembled_to_texture`](Self::decode_assembled_to_texture)
     /// can put the picture into: the picture's size, in `format`, one of
     /// [`TEXTURE_FORMATS`], for drawing and copying into, sampling and copying
@@ -641,7 +651,7 @@ impl Decoder {
     }
 
     /// Records the decode of one complete frame into `encoder`, as
-    /// [`encode_rgb_to_texture`](Self::encode_rgb_to_texture) does but
+    /// [`record_rgb_to_texture`](Self::record_rgb_to_texture) does but
     /// without the colour conversion, with its Y, Cb and Cr planes going
     /// into `targets`, in that order. Once the caller has submitted
     /// `encoder`, the textures hold the planes: the samples of the stream, as
@@ -658,7 +668,7 @@ impl Decoder {
     /// the `STORAGE_BINDING` usage, the inverse transform stores the planes
     /// into the views, which must then allow that usage. Otherwise the planes
     /// are copied into the textures.
-    pub fn encode_to_plane_textures(
+    pub fn record_to_plane_textures(
         &mut self,
         frame: &[u8],
         targets: [&wgpu::TextureView; 3],
@@ -674,11 +684,12 @@ impl Decoder {
 
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
     /// calls into its planes in `targets`, as
-    /// [`encode_to_plane_textures`](Self::encode_to_plane_textures) does, and
+    /// [`record_to_plane_textures`](Self::record_to_plane_textures) does, and
     /// waits for the GPU. When this returns the textures hold the planes, for
     /// any queue of the device to read; textures another queue may still be
     /// reading must not be passed. Blocks that did not arrive decode as zeros,
     /// or are concealed ([`set_concealment`](Self::set_concealment)).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn decode_assembled_to_plane_textures(
         &mut self,
         targets: [&wgpu::TextureView; 3],
@@ -721,7 +732,7 @@ impl Decoder {
         self.submit_assembled(None, Read::Planes(targets), Some(hooks))
     }
 
-    /// A texture that [`encode_to_plane_textures`](Self::encode_to_plane_textures)
+    /// A texture that [`record_to_plane_textures`](Self::record_to_plane_textures)
     /// and [`decode_assembled_to_plane_textures`](Self::decode_assembled_to_plane_textures)
     /// can put the plane of `component` into: the plane's size, in
     /// [`PLANE_FORMAT`], for copying into, sampling and copying from
@@ -813,14 +824,18 @@ impl Decoder {
     /// to take a frame that lost packets: 0.9 by default, as upstream's
     /// decoder has it. A lower share takes frames that lost more, with more
     /// of their detail blank, where a client would skip them; 1 takes whole
-    /// frames only. Below 0 counts as 0 and above 1 as 1; NaN sets the
-    /// default again. The share stays until it is set again.
-    pub fn set_partial_share(&mut self, share: f32) {
-        self.partial_share = if share.is_nan() {
-            DEFAULT_MINIMUM_PACKET_RATIO
-        } else {
-            share.clamp(0.0, 1.0)
-        };
+    /// frames only. A share below 0 or above 1, or NaN, is
+    /// [`GpuError::InvalidArgument`], as in the C API and the browser
+    /// player, and leaves the share as it was. The share stays until it is
+    /// set again.
+    pub fn set_partial_share(&mut self, share: f32) -> Result<(), GpuError> {
+        if !(0.0..=1.0).contains(&share) {
+            return Err(GpuError::InvalidArgument(format!(
+                "the share is {share}, not a number from 0 to 1"
+            )));
+        }
+        self.partial_share = share;
+        Ok(())
     }
 
     /// The share of [`set_partial_share`](Self::set_partial_share).
@@ -961,6 +976,7 @@ impl Decoder {
     /// Decodes the frame assembled from [`push_packet`](Self::push_packet)
     /// calls. Blocks that did not arrive decode as zeros, or are concealed
     /// ([`set_concealment`](Self::set_concealment)).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn decode_assembled(&mut self) -> Result<Frame, GpuError> {
         let layout = self.layout();
         let chroma = layout.chroma();
@@ -981,6 +997,7 @@ impl Decoder {
     }
 
     /// Like [`decode_assembled`](Self::decode_assembled), converted to RGB.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn decode_assembled_rgb(&mut self, color: &ColorParams) -> Result<RgbFrame, GpuError> {
         let (width, height) = (self.layout().width(), self.layout().height());
         let mut data = vec![0; width as usize * height as usize * 3];
@@ -1002,6 +1019,7 @@ impl Decoder {
     /// the memory the GPU wrote, so a caller can put them where it wants
     /// them, with its own row strides, at the cost of one copy. A panic in
     /// `row` goes on to the caller, and the decoder can still be used.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn decode_assembled_rows(
         &mut self,
         mut row: impl FnMut(Component, u32, &[u8]),
@@ -1020,6 +1038,7 @@ impl Decoder {
     /// Like [`decode_assembled_rows`](Self::decode_assembled_rows), converted
     /// to RGB: `row` gets the row's index from the top and its pixels, three
     /// bytes each with red first.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn decode_assembled_rgb_rows(
         &mut self,
         color: &ColorParams,
@@ -1718,6 +1737,8 @@ impl Decoder {
     /// results of the inverse transform, and the other bands hold the
     /// dequantised coefficients. Returns `None` if the component has no such
     /// level.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
     pub fn read_band(
         &self,
         component: Component,
@@ -1914,7 +1935,7 @@ impl Decoder {
     }
 
     /// Uploads the block table and the payload of the assembled frame through
-    /// the queue, for `encode_rgb`, which does not wait for its frame and so
+    /// the queue, for `record_rgb`, which does not wait for its frame and so
     /// cannot map the upload buffer.
     fn upload(&self) {
         let frame = self.assembler.frame();
@@ -2397,7 +2418,8 @@ mod tests {
         if test_context().is_none() {
             return;
         }
-        let context = GpuContext::new(&crate::gpu::GpuOptions::default()).expect("a context");
+        let context = GpuContext::new(&crate::gpu::GpuOptions::from_env().unwrap_or_default())
+            .expect("a context");
         let chroma = ChromaSubsampling::Yuv420;
         let mut decoder = Decoder::new(&context, 64, 32, chroma).unwrap();
         decoder

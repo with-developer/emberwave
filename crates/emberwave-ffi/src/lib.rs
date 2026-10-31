@@ -693,7 +693,11 @@ impl From<GpuError> for Failure {
             GpuError::Encode(EncodeError::BudgetTooSmall { .. }) => EmberwaveStatus::BufferTooSmall,
             // Planes the encoder cannot take, from emberwave_encoder_encode;
             // a texture a decode cannot fill.
-            GpuError::Encode(_) | GpuError::Texture(_) => EmberwaveStatus::InvalidArgument,
+            GpuError::Encode(_) | GpuError::Texture(_) | GpuError::InvalidArgument(_) => {
+                EmberwaveStatus::InvalidArgument
+            }
+            // A failure this version does not know of yet.
+            _ => EmberwaveStatus::Internal,
         };
         Self(status, error.to_string())
     }
@@ -1038,13 +1042,14 @@ fn creation_failure(error: GpuError) -> Failure {
 }
 
 fn signalling(value: &EmberwaveSignalling) -> Result<Signalling, Failure> {
-    Ok(Signalling {
-        color_primaries: match value.primaries {
+    Ok({
+        let mut signalling = Signalling::default();
+        signalling.color_primaries = match value.primaries {
             EMBERWAVE_PRIMARIES_SRGB => ColorPrimaries::Srgb,
             EMBERWAVE_PRIMARIES_BT2020 => ColorPrimaries::Bt2020,
             other => return Err(Failure::argument(format!("unknown primaries {other}"))),
-        },
-        transfer_function: match value.transfer {
+        };
+        signalling.transfer_function = match value.transfer {
             EMBERWAVE_TRANSFER_SRGB => TransferFunction::Srgb,
             EMBERWAVE_TRANSFER_PQ => TransferFunction::Pq,
             other => {
@@ -1052,8 +1057,8 @@ fn signalling(value: &EmberwaveSignalling) -> Result<Signalling, Failure> {
                     "unknown transfer function {other}"
                 )));
             }
-        },
-        ycbcr_transform: match value.matrix {
+        };
+        signalling.ycbcr_transform = match value.matrix {
             EMBERWAVE_MATRIX_BT709 => YcbcrTransform::Bt709,
             EMBERWAVE_MATRIX_BT2020 => YcbcrTransform::Bt2020,
             EMBERWAVE_MATRIX_BT601 => {
@@ -1062,17 +1067,18 @@ fn signalling(value: &EmberwaveSignalling) -> Result<Signalling, Failure> {
                 ));
             }
             other => return Err(Failure::argument(format!("unknown matrix {other}"))),
-        },
-        ycbcr_range: match value.range {
+        };
+        signalling.ycbcr_range = match value.range {
             EMBERWAVE_RANGE_LIMITED => YcbcrRange::Limited,
             EMBERWAVE_RANGE_FULL => YcbcrRange::Full,
             other => return Err(Failure::argument(format!("unknown range {other}"))),
-        },
-        chroma_siting: match value.chroma_siting {
+        };
+        signalling.chroma_siting = match value.chroma_siting {
             EMBERWAVE_SITING_CENTER => ChromaSiting::Center,
             EMBERWAVE_SITING_LEFT => ChromaSiting::Left,
             other => return Err(Failure::argument(format!("unknown chroma siting {other}"))),
-        },
+        };
+        signalling
     })
 }
 
@@ -1125,9 +1131,9 @@ fn chroma_code(chroma: ChromaSubsampling) -> u32 {
     }
 }
 
-fn stream_info(stream: &SequenceHeader) -> EmberwaveStreamInfo {
+fn stream_info(stream: &SequenceHeader) -> Result<EmberwaveStreamInfo, Failure> {
     let color = ColorParams::from_stream(stream);
-    EmberwaveStreamInfo {
+    Ok(EmberwaveStreamInfo {
         struct_size: std::mem::size_of::<EmberwaveStreamInfo>() as u32,
         width: stream.width,
         height: stream.height,
@@ -1136,6 +1142,16 @@ fn stream_info(stream: &SequenceHeader) -> EmberwaveStreamInfo {
             ColorMatrix::Bt601 => EMBERWAVE_MATRIX_BT601,
             ColorMatrix::Bt709 => EMBERWAVE_MATRIX_BT709,
             ColorMatrix::Bt2020 => EMBERWAVE_MATRIX_BT2020,
+            // A stream signals BT.709 or BT.2020, one bit: a matrix the C API
+            // has no constant for cannot come from one. Should a later
+            // version of the core add one without a constant here, the call
+            // fails as a bug of emberwave's, not with a wrong matrix.
+            other => {
+                return Err(Failure(
+                    EmberwaveStatus::Internal,
+                    format!("the stream's matrix {other:?} has no C constant"),
+                ));
+            }
         },
         range: match color.range {
             YcbcrRange::Limited => EMBERWAVE_RANGE_LIMITED,
@@ -1147,7 +1163,7 @@ fn stream_info(stream: &SequenceHeader) -> EmberwaveStreamInfo {
         },
         frame_rate_num: 0,
         frame_rate_den: 0,
-    }
+    })
 }
 
 fn gpu_options(options: &EmberwaveContextOptions) -> Result<GpuOptions, Failure> {
@@ -1178,36 +1194,32 @@ fn gpu_options(options: &EmberwaveContextOptions) -> Result<GpuOptions, Failure>
     if backends.is_empty() {
         backends = wgpu::Backends::PRIMARY;
     }
-    Ok(GpuOptions {
-        backends,
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: options.flags & EMBERWAVE_CONTEXT_SOFTWARE != 0,
-        strict_webgpu: false,
-        timestamps: false,
-        plane_stores: true,
-        shared_uploads: true,
-    })
+    let mut chosen = GpuOptions::default();
+    chosen.backends = backends;
+    chosen.power_preference = wgpu::PowerPreference::HighPerformance;
+    chosen.force_fallback_adapter = options.flags & EMBERWAVE_CONTEXT_SOFTWARE != 0;
+    Ok(chosen)
 }
 
 fn color_params(color: &EmberwaveColor) -> Result<ColorParams, Failure> {
-    Ok(ColorParams {
-        matrix: match color.matrix {
+    Ok(ColorParams::new(
+        match color.matrix {
             EMBERWAVE_MATRIX_BT601 => ColorMatrix::Bt601,
             EMBERWAVE_MATRIX_BT709 => ColorMatrix::Bt709,
             EMBERWAVE_MATRIX_BT2020 => ColorMatrix::Bt2020,
             other => return Err(Failure::argument(format!("unknown matrix {other}"))),
         },
-        range: match color.range {
+        match color.range {
             EMBERWAVE_RANGE_LIMITED => YcbcrRange::Limited,
             EMBERWAVE_RANGE_FULL => YcbcrRange::Full,
             other => return Err(Failure::argument(format!("unknown range {other}"))),
         },
-        chroma_siting: match color.chroma_siting {
+        match color.chroma_siting {
             EMBERWAVE_SITING_CENTER => ChromaSiting::Center,
             EMBERWAVE_SITING_LEFT => ChromaSiting::Left,
             other => return Err(Failure::argument(format!("unknown chroma siting {other}"))),
         },
-    })
+    ))
 }
 
 /// Checks that `target` takes `rows` rows of `row_bytes` bytes: its pointer is
@@ -1320,7 +1332,7 @@ pub unsafe extern "C" fn emberwave_probe_pwv1(
         let described = EmberwaveStreamInfo {
             frame_rate_num: header.frame_rate_num,
             frame_rate_den: header.frame_rate_den,
-            ..stream_info(&header.stream)
+            ..stream_info(&header.stream)?
         };
         // SAFETY: as the caller promises.
         unsafe { write_struct(info, "info", described) }
@@ -1348,11 +1360,15 @@ pub unsafe extern "C" fn emberwave_probe_packet(
         match Header::parse(bytes)? {
             // SAFETY: as the caller promises.
             Header::StartOfFrame(stream) => unsafe {
-                write_struct(info, "info", stream_info(&stream))
+                write_struct(info, "info", stream_info(&stream)?)
             },
             Header::Block(_) => Err(Failure(
                 EmberwaveStatus::Bitstream,
                 "the packet starts with a block, not with a start of frame header".into(),
+            )),
+            _ => Err(Failure(
+                EmberwaveStatus::Bitstream,
+                "the packet starts with a header this version does not know".into(),
             )),
         }
     })
@@ -1386,7 +1402,9 @@ pub unsafe extern "C" fn emberwave_context_create(
         // SAFETY: as the caller promises.
         let gpu_options = match unsafe { read_struct(options, "options") }? {
             Some(options) => gpu_options(&options)?,
-            None => GpuOptions::default(),
+            // As the command line tool: the environment may narrow the
+            // backends, and a value that names none is ignored.
+            None => GpuOptions::from_env().unwrap_or_default(),
         };
         let created = GpuContext::new(&gpu_options)?;
         // SAFETY: checked by the first output() above.
@@ -4228,13 +4246,7 @@ pub unsafe extern "C" fn emberwave_decoder_set_partial_share(
     run(|| {
         // SAFETY: as the caller promises.
         let decoder = unsafe { live_mut(decoder) }?;
-        if !(0.0..=1.0).contains(&share) {
-            return Err(Failure::argument(format!(
-                "a share of {share} is not from 0 to 1"
-            )));
-        }
-        decoder.decoder.set_partial_share(share);
-        Ok(())
+        Ok(decoder.decoder.set_partial_share(share)?)
     })
 }
 

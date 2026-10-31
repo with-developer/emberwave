@@ -12,7 +12,7 @@ use super::header::{SequenceHeader, read_words};
 pub const MAGIC: [u8; 4] = *b"PWV1";
 
 /// Size of the PWV1 header in bytes.
-pub const HEADER_BYTES: usize = 24;
+pub const FILE_HEADER_BYTES: usize = 24;
 
 /// The only header version there is.
 pub const HEADER_VERSION: u8 = 1;
@@ -46,7 +46,7 @@ impl Pwv1Header {
     /// Parses the header at the start of `bytes`.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let header = bytes
-            .first_chunk::<HEADER_BYTES>()
+            .first_chunk::<FILE_HEADER_BYTES>()
             .ok_or(Error::TruncatedFile)?;
         if header[..MAGIC.len()] != MAGIC {
             return Err(Error::BadMagic);
@@ -76,8 +76,8 @@ impl Pwv1Header {
     /// The 24 header bytes, the inverse of [`parse`](Self::parse). The
     /// reserved fields of the stream description (`sequence`,
     /// `total_blocks`, `code`) are written as they are; a file has them zero.
-    pub fn to_bytes(&self) -> [u8; HEADER_BYTES] {
-        let mut bytes = [0u8; HEADER_BYTES];
+    pub fn to_bytes(&self) -> [u8; FILE_HEADER_BYTES] {
+        let mut bytes = [0u8; FILE_HEADER_BYTES];
         bytes[..MAGIC.len()].copy_from_slice(&MAGIC);
         let (word0, word1) = self.stream.stream_words();
         bytes[STREAM_OFFSET..STREAM_OFFSET + 4].copy_from_slice(&word0.to_le_bytes());
@@ -105,7 +105,7 @@ impl<'a> Pwv1File<'a> {
         let header = Pwv1Header::parse(bytes)?;
         Ok(Self {
             header,
-            frames: &bytes[HEADER_BYTES..],
+            frames: &bytes[FILE_HEADER_BYTES..],
         })
     }
 
