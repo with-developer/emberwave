@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.17.0] - 2026-10-31
+
+The C and Rust APIs, readied to stay compatible from 1.0 on, and broken once here for that. The C API's structs carry their size, so that a later version can add a member without breaking programs; its planes carry their capacity, which the calls check; it has statuses for a call the system lacks and for a buffer too small, and versions to compare the header with the library. The Rust API's enums and structs can grow without breaking callers. The changes below say what each caller changes.
 
 ### Added
 

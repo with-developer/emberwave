@@ -81,7 +81,7 @@ A Swift package names the XCFramework as a binary target. From a release, it tak
 // In the app's Package.swift, with the version of the release:
 .binaryTarget(
     name: "Emberwave",
-    url: "https://github.com/with-developer/emberwave/releases/download/v0.16.0/Emberwave.xcframework.zip",
+    url: "https://github.com/with-developer/emberwave/releases/download/v0.17.0/Emberwave.xcframework.zip",
     checksum: "..."   // the release's SHA256SUMS line for Emberwave.xcframework.zip
 ),
 .target(
