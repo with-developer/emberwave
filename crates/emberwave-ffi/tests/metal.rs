@@ -180,6 +180,7 @@ fn an_app_reads_the_picture_from_the_metal_texture() {
             let plane = EmberwavePlane {
                 data: rgb.as_mut_ptr(),
                 stride: width * 3,
+                size: rgb.len(),
             };
             assert_eq!(
                 emberwave_decoder_decode_rgb(decoder, ptr::null(), plane),
@@ -293,9 +294,10 @@ fn read_planes(
         // The planes in CPU memory, then the same frame into textures.
         let mut planes = sizes.map(|(width, height)| vec![0u8; width * height]);
         let [y, cb, cr] = planes.each_mut().map(|plane| plane.as_mut_ptr());
-        let target = |data, (width, _): (usize, usize)| EmberwavePlane {
+        let target = |data, (width, height): (usize, usize)| EmberwavePlane {
             data,
             stride: width,
+            size: width * height,
         };
         assert_eq!(
             emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
@@ -445,6 +447,7 @@ fn decode_on_the_app_queue(
                 let target = EmberwavePlane {
                     data: rgb.as_mut_ptr(),
                     stride: width * 3,
+                    size: rgb.len(),
                 };
                 assert_eq!(
                     emberwave_decoder_decode_rgb(decoder, ptr::null(), target),
@@ -452,7 +455,11 @@ fn decode_on_the_app_queue(
                 );
                 let mut planes = sizes.map(|(w, h)| vec![0u8; w * h]);
                 let [y, cb, cr] = planes.each_mut().map(|plane| plane.as_mut_ptr());
-                let plane = |data, (w, _): (usize, usize)| EmberwavePlane { data, stride: w };
+                let plane = |data, (w, h): (usize, usize)| EmberwavePlane {
+                    data,
+                    stride: w,
+                    size: w * h,
+                };
                 // The same frames again: forget their order.
                 emberwave_decoder_clear(decoder);
                 assert_eq!(
@@ -509,7 +516,7 @@ fn decode_on_the_app_queue(
                 EmberwaveStatus::Ok
             );
             assert_eq!(
-                emberwave_decoder_submit_texture(decoder, ptr::null(), texture),
+                emberwave_decoder_submit_texture_metal(decoder, ptr::null(), texture),
                 EmberwaveStatus::Ok,
                 "{}",
                 last_error()
@@ -521,7 +528,9 @@ fn decode_on_the_app_queue(
                 EmberwaveStatus::Ok
             );
             assert_eq!(
-                emberwave_decoder_submit_plane_textures(decoder, planes[0], planes[1], planes[2]),
+                emberwave_decoder_submit_plane_textures_metal(
+                    decoder, planes[0], planes[1], planes[2]
+                ),
                 EmberwaveStatus::Ok,
                 "{}",
                 last_error()
@@ -840,6 +849,7 @@ fn encode_on(context: *mut EmberwaveContext) {
         let plane = |data: &[u8], stride| EmberwaveSourcePlane {
             data: data.as_ptr(),
             stride,
+            size: data.len(),
         };
         for _ in 0..20 {
             let mut size = 0;
@@ -889,7 +899,7 @@ fn decode_on(context: *mut EmberwaveContext, frame: &[u8]) {
             let status = if round % 2 == 0 {
                 emberwave_decoder_decode_texture(decoder, ptr::null(), texture)
             } else {
-                emberwave_decoder_submit_texture(decoder, ptr::null(), texture)
+                emberwave_decoder_submit_texture_metal(decoder, ptr::null(), texture)
             };
             assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
         }
@@ -1017,6 +1027,7 @@ fn into_app_textures(
                 let target = EmberwavePlane {
                     data: rgb.as_mut_ptr(),
                     stride: width * 3,
+                    size: rgb.len(),
                 };
                 assert_eq!(
                     emberwave_decoder_decode_rgb(decoder, ptr::null(), target),
@@ -1024,7 +1035,11 @@ fn into_app_textures(
                 );
                 let mut planes = sizes.map(|(w, h)| vec![0u8; w * h]);
                 let [y, cb, cr] = planes.each_mut().map(|plane| plane.as_mut_ptr());
-                let plane = |data, (w, _): (usize, usize)| EmberwavePlane { data, stride: w };
+                let plane = |data, (w, h): (usize, usize)| EmberwavePlane {
+                    data,
+                    stride: w,
+                    size: w * h,
+                };
                 push(frame);
                 assert_eq!(
                     emberwave_decoder_decode_yuv(
@@ -1071,7 +1086,7 @@ fn into_app_textures(
         // Without a wait, read by the app's next command buffer.
         push(frames[1]);
         assert_eq!(
-            emberwave_decoder_submit_texture(decoder, ptr::null(), texture),
+            emberwave_decoder_submit_texture_metal(decoder, ptr::null(), texture),
             EmberwaveStatus::Ok,
             "{}",
             last_error()
@@ -1148,7 +1163,7 @@ fn into_app_textures(
         }
         push(frames[1]);
         assert_eq!(
-            emberwave_decoder_submit_plane_textures(
+            emberwave_decoder_submit_plane_textures_metal(
                 decoder,
                 writable[0].1,
                 writable[1].1,
@@ -1192,7 +1207,7 @@ fn into_app_textures(
             last_error()
         );
         assert_eq!(
-            emberwave_decoder_submit_plane_textures(decoder, planes[0].1, twice[0], twice[1]),
+            emberwave_decoder_submit_plane_textures_metal(decoder, planes[0].1, twice[0], twice[1]),
             EmberwaveStatus::InvalidArgument
         );
         assert!(
@@ -1225,7 +1240,7 @@ fn into_app_textures(
         );
         assert!(read(device, &untracked) == expected[0].0, "untracked");
         assert_eq!(
-            emberwave_decoder_submit_texture(decoder, ptr::null(), loose),
+            emberwave_decoder_submit_texture_metal(decoder, ptr::null(), loose),
             EmberwaveStatus::InvalidArgument
         );
         assert!(last_error().contains("track"), "{}", last_error());
@@ -1378,6 +1393,7 @@ fn encoded_from_memory(
     let [y, cb, cr] = [0, 1, 2].map(|plane| EmberwaveSourcePlane {
         data: planes[plane].as_ptr(),
         stride: widths[plane],
+        size: planes[plane].len(),
     });
     // SAFETY: a live encoder, planes of its sizes, and a frame of the length
     // passed.
@@ -1650,6 +1666,7 @@ fn encoded_from_rgb(
     let rgb = EmberwaveSourcePlane {
         data: pixels.as_ptr(),
         stride: 4 * width,
+        size: pixels.len(),
     };
     // SAFETY: a live encoder, a picture of its size, and a frame of the
     // length passed.

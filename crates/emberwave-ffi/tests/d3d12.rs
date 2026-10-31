@@ -336,6 +336,7 @@ fn expected(
         let target = EmberwavePlane {
             data: rgb.as_mut_ptr(),
             stride: width * 3,
+            size: rgb.len(),
         };
         let status = emberwave_decoder_decode_rgb(decoder, ptr::null(), target);
         assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
@@ -343,6 +344,7 @@ fn expected(
         let [y, cb, cr] = [0, 1, 2].map(|i| EmberwavePlane {
             data: planes[i].as_mut_ptr(),
             stride: sizes[i].0,
+            size: planes[i].len(),
         });
         let status = emberwave_decoder_decode_yuv(decoder, y, cb, cr);
         assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
@@ -396,6 +398,7 @@ fn a_client_reads_pictures_and_planes_after_the_fence() {
                 wait_value: host.value,
                 signal_fence: host.shared_fence,
                 signal_value: host.value + 1,
+                ..Default::default()
             };
             host.value += 1;
             // SAFETY: a live decoder and texture, and live fences.
@@ -414,6 +417,7 @@ fn a_client_reads_pictures_and_planes_after_the_fence() {
                 wait_value: host.value,
                 signal_fence: host.shared_fence,
                 signal_value: host.value + 1,
+                ..Default::default()
             };
             host.value += 1;
             // SAFETY: a live decoder and textures, and live fences.
@@ -446,6 +450,7 @@ fn a_client_reads_pictures_and_planes_after_the_fence() {
             wait_value: held,
             signal_fence: host.shared_fence,
             signal_value: held + 1,
+            ..Default::default()
         };
         // SAFETY: a live decoder and texture, and live fences.
         let status = unsafe {
@@ -620,6 +625,7 @@ fn a_hosts_shared_planes_are_encoded_after_the_fence() {
         let [y, cb, cr] = [0, 1, 2].map(|i| EmberwaveSourcePlane {
             data: picture[i].as_ptr(),
             stride: if i == 0 { size.0 } else { chroma.0 },
+            size: picture[i].len(),
         });
         // SAFETY: a live encoder, planes of its sizes, and a frame of the
         // length passed.
@@ -649,6 +655,7 @@ fn a_hosts_shared_planes_are_encoded_after_the_fence() {
                     wait_value: held,
                     signal_fence: host.shared_fence,
                     signal_value: held + 1,
+                    ..Default::default()
                 },
             };
             let thread = std::thread::spawn(move || {
@@ -672,6 +679,7 @@ fn a_hosts_shared_planes_are_encoded_after_the_fence() {
             wait_value: written,
             signal_fence: host.shared_fence,
             signal_value: written + 1,
+            ..Default::default()
         };
         host.value = written + 1;
         let planar = encode(as_planes, [sources[0], sources[1], sources[2]], &sync);
@@ -681,6 +689,7 @@ fn a_hosts_shared_planes_are_encoded_after_the_fence() {
             wait_value: host.value,
             signal_fence: host.shared_fence,
             signal_value: host.value + 1,
+            ..Default::default()
         };
         host.value += 1;
         let nv12 = encode(as_nv12, [sources[0], cbcr, ptr::null_mut()], &sync);
@@ -786,6 +795,7 @@ fn a_hosts_shared_bgra_picture_is_encoded_as_rgb() {
         let picture = EmberwaveSourcePlane {
             data: bgra.as_ptr(),
             stride: 4 * size.0,
+            size: bgra.len(),
         };
         // SAFETY: a live encoder, a picture of its size, and a frame of the
         // length passed.
@@ -807,6 +817,7 @@ fn a_hosts_shared_bgra_picture_is_encoded_as_rgb() {
             wait_value: written,
             signal_fence: host.shared_fence,
             signal_value: written + 1,
+            ..Default::default()
         };
         host.value = written + 1;
         let mut frame = vec![0u8; 9_000];

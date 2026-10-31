@@ -20,6 +20,20 @@
 //!   not from new ones without end.
 //! - A panic inside emberwave is caught and reported as
 //!   `EMBERWAVE_STATUS_INTERNAL`. Destroy the object it happened in.
+//! - Later versions may add statuses: treat any status but
+//!   `EMBERWAVE_STATUS_OK` as a failure.
+//! - A struct passed by pointer starts with `struct_size`, which the caller
+//!   sets to `sizeof` the struct, as its header declares it, before the call:
+//!   for the structs it passes in and for those it gets filled in. emberwave
+//!   reads and writes no more bytes than that, and takes members a shorter
+//!   struct lacks as zeros, their defaults, so that a program built with an
+//!   older header works with a newer library (decision D69).
+//! - Callbacks the caller gives emberwave must not call emberwave.
+//! - `EMBERWAVE_VERSION` is the version of the header,
+//!   `emberwave_version_number()` that of the library.
+//! - The calls on Metal, Vulkan and Direct3D objects of the caller's are
+//!   provisional: until a client has used them, a minor version may change
+//!   them (decision D69).
 
 use std::cell::RefCell;
 use std::ffi::{CString, c_char, c_void};
@@ -36,15 +50,16 @@ use emberwave_core::gpu::{
     Decoder, Encoder, GpuContext, GpuError, GpuOptions, QueueTurns, TexturePicture,
 };
 
-/// The result of a call.
+/// The result of a call. Later versions may add statuses: treat any but
+/// `EMBERWAVE_STATUS_OK` as a failure.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmberwaveStatus {
     /// The call succeeded.
     Ok = 0,
-    /// A pointer was `NULL`, a value out of range, an output buffer too
-    /// small, or an object that does not fit the call, such as a texture of
-    /// another device, size or kind.
+    /// A pointer was `NULL`, a value out of range, a struct's `struct_size`
+    /// too small, or an object that does not fit the call, such as a texture
+    /// of another device, size or kind.
     InvalidArgument = 1,
     /// The data is not a PyroWave stream this decoder can take: malformed, of
     /// another picture size or chroma format, or not a start of frame header
@@ -62,6 +77,55 @@ pub enum EmberwaveStatus {
     DeviceLost = 6,
     /// A bug in emberwave. Destroy the object the call was made on.
     Internal = 7,
+    /// The system lacks the graphics API of the call, which makes a context
+    /// on it or wraps one of its objects: Metal's off Apple's systems,
+    /// Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off
+    /// Windows. The calls that take what such a context made give
+    /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` for a context of another kind.
+    Unsupported = 8,
+    /// An output array or buffer of the caller's, or an encode's budget, is
+    /// too small. Where the call can tell how much it needs, it stores that
+    /// where its documentation says.
+    BufferTooSmall = 9,
+}
+
+/// The major version of emberwave that this header belongs to.
+pub const EMBERWAVE_VERSION_MAJOR: u32 = 0;
+/// The minor version of emberwave that this header belongs to.
+pub const EMBERWAVE_VERSION_MINOR: u32 = 16;
+/// The patch version of emberwave that this header belongs to.
+pub const EMBERWAVE_VERSION_PATCH: u32 = 0;
+/// The version this header belongs to as one number, major times 10000 plus
+/// minor times 100 plus patch: 1600 for 0.16.0. `emberwave_version_number()`
+/// gives the library's, which differs when a program runs with another
+/// library than the one it was built for.
+pub const EMBERWAVE_VERSION: u32 = 1600;
+
+/// The library's version as `EMBERWAVE_VERSION` numbers it, from the crate's.
+const VERSION_NUMBER: u32 = decimal(env!("CARGO_PKG_VERSION_MAJOR")) * 10000
+    + decimal(env!("CARGO_PKG_VERSION_MINOR")) * 100
+    + decimal(env!("CARGO_PKG_VERSION_PATCH"));
+
+// The header's version is the crate's: a release changes both.
+const _: () = assert!(
+    VERSION_NUMBER == EMBERWAVE_VERSION
+        && EMBERWAVE_VERSION
+            == EMBERWAVE_VERSION_MAJOR * 10000
+                + EMBERWAVE_VERSION_MINOR * 100
+                + EMBERWAVE_VERSION_PATCH,
+    "EMBERWAVE_VERSION* is not the crate's version"
+);
+
+/// The number written in decimal `digits`.
+const fn decimal(digits: &str) -> u32 {
+    let bytes = digits.as_bytes();
+    let mut value = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        value = value * 10 + (bytes[at] - b'0') as u32;
+        at += 1;
+    }
+    value
 }
 
 /// 4:2:0: the chroma planes have half the width and height of the luma plane,
@@ -151,6 +215,8 @@ pub const EMBERWAVE_PLANE_RGB: u32 = 4;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveContextOptions {
+    /// `sizeof(EmberwaveContextOptions)` (decision D69).
+    pub struct_size: u32,
     /// `EMBERWAVE_BACKEND_*` values combined with `|`, or
     /// `EMBERWAVE_BACKEND_ANY`.
     pub backends: u32,
@@ -160,8 +226,11 @@ pub struct EmberwaveContextOptions {
 
 /// What a stream says about its pictures.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EmberwaveStreamInfo {
+    /// `sizeof(EmberwaveStreamInfo)`, set by the caller before the call
+    /// (decision D69).
+    pub struct_size: u32,
     /// Width of the pictures in pixels.
     pub width: u32,
     /// Height of the pictures in pixels.
@@ -184,8 +253,11 @@ pub struct EmberwaveStreamInfo {
 
 /// The sizes of the planes a decoder writes or an encoder reads.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EmberwaveFrameInfo {
+    /// `sizeof(EmberwaveFrameInfo)`, set by the caller before the call
+    /// (decision D69).
+    pub struct_size: u32,
     /// Width of the luma plane, and of the picture.
     pub width: u32,
     /// Height of the luma plane, and of the picture.
@@ -207,12 +279,17 @@ pub struct EmberwavePlane {
     /// Bytes from the start of one row to the start of the next: at least the
     /// width of the plane, or three times the width for RGB.
     pub stride: usize,
+    /// Bytes that may be written from `data` on: at least `stride` times the
+    /// rows less one, plus a row.
+    pub size: usize,
 }
 
 /// The colour conversion of `emberwave_decoder_decode_rgb`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveColor {
+    /// `sizeof(EmberwaveColor)` (decision D69).
+    pub struct_size: u32,
     /// An `EMBERWAVE_MATRIX_*` value.
     pub matrix: u32,
     /// An `EMBERWAVE_RANGE_*` value.
@@ -228,6 +305,8 @@ pub struct EmberwaveColor {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveSignalling {
+    /// `sizeof(EmberwaveSignalling)` (decision D69).
+    pub struct_size: u32,
     /// `EMBERWAVE_MATRIX_BT709` or `EMBERWAVE_MATRIX_BT2020`: the format
     /// cannot signal BT.601.
     pub matrix: u32,
@@ -239,8 +318,6 @@ pub struct EmberwaveSignalling {
     pub primaries: u32,
     /// An `EMBERWAVE_TRANSFER_*` value.
     pub transfer: u32,
-    /// Zeros: room for what later versions may add.
-    pub reserved: [u32; 3],
 }
 
 /// One plane of a picture to encode, in the caller's memory.
@@ -252,6 +329,9 @@ pub struct EmberwaveSourcePlane {
     /// Bytes from the start of one row to the start of the next: at least the
     /// width of the plane.
     pub stride: usize,
+    /// Bytes that may be read from `data` on: at least `stride` times the
+    /// rows less one, plus a row.
+    pub size: usize,
 }
 
 /// One packet of a frame: where it starts in the frame and how many bytes it
@@ -264,6 +344,18 @@ pub struct EmberwavePacket {
     /// Bytes of the packet.
     pub size: usize,
 }
+
+// The threads the header promises: a context is used by several threads at
+// once, and decoders, encoders and textures move between threads. A change
+// that broke this would fail to build, not mislead callers (decision D69).
+const _: () = {
+    const fn shared<T: Send + Sync>() {}
+    const fn movable<T: Send>() {}
+    shared::<EmberwaveContext>();
+    movable::<EmberwaveDecoder>();
+    movable::<EmberwaveEncoder>();
+    movable::<EmberwaveTexture>();
+};
 
 /// A GPU device, shared by the decoders and encoders created on it. Creating
 /// one compiles the shaders, so make one and keep it.
@@ -326,9 +418,9 @@ pub struct EmberwaveDecoder {
 
 /// A texture on a decoder's GPU device that the decodes into textures fill
 /// with the picture, `emberwave_decoder_decode_texture` and
-/// `emberwave_decoder_submit_texture`, or with one of its planes,
+/// `emberwave_decoder_submit_texture_metal`, or with one of its planes,
 /// `emberwave_decoder_decode_plane_textures` and
-/// `emberwave_decoder_submit_plane_textures`, and their `_vulkan` and
+/// `emberwave_decoder_submit_plane_textures_metal`, and their `_vulkan` and
 /// `_d3d12` forms, for the caller's graphics API to read on the GPU.
 /// emberwave makes it (`emberwave_texture_create`,
 /// `emberwave_texture_create_plane`), wraps a Metal texture or a Vulkan
@@ -598,8 +690,9 @@ impl From<GpuError> for Failure {
             GpuError::Device(_) | GpuError::Readback(_) => EmberwaveStatus::Gpu,
             GpuError::DeviceLost(_) => EmberwaveStatus::DeviceLost,
             GpuError::IncompleteFrame { .. } | GpuError::Bitstream(_) => EmberwaveStatus::Bitstream,
-            // Planes or a budget the encoder cannot take, from
-            // emberwave_encoder_encode; a texture a decode cannot fill.
+            GpuError::Encode(EncodeError::BudgetTooSmall { .. }) => EmberwaveStatus::BufferTooSmall,
+            // Planes the encoder cannot take, from emberwave_encoder_encode;
+            // a texture a decode cannot fill.
             GpuError::Encode(_) | GpuError::Texture(_) => EmberwaveStatus::InvalidArgument,
         };
         Self(status, error.to_string())
@@ -610,6 +703,162 @@ impl From<BitstreamError> for Failure {
     fn from(error: BitstreamError) -> Self {
         Self(EmberwaveStatus::Bitstream, error.to_string())
     }
+}
+
+/// A struct of the C API that starts with `struct_size` (decision D69).
+///
+/// # Safety
+///
+/// The type is `repr(C)`, its first member is the `u32` `struct_size`, and
+/// any bytes are a value of it, zeros its defaults: its members are
+/// integers, raw pointers and optional function pointers.
+unsafe trait Versioned: Copy {
+    /// The struct's name, for errors.
+    const NAME: &'static str;
+    /// The least `struct_size` a caller may give: where the last member of
+    /// the struct's first layout, that of 0.17.0, ends. A member added later
+    /// lies past it.
+    const FIRST_SIZE: usize;
+}
+
+/// Makes each struct [`Versioned`], given the last member of its first
+/// layout, which never changes, and its last member now, which changes when
+/// a member is added. It checks at compile time that `struct_size` comes
+/// first, and that no padding follows the last member: a member added there
+/// would leave the struct's size, and so `struct_size`, as it was, and the
+/// library would read it from the padding of an older caller's struct.
+macro_rules! versioned {
+    ($($name:ident { first_ends_with: $first:ident: $first_ty:ty, ends_with: $last:ident: $last_ty:ty }),* $(,)?) => {$(
+        // SAFETY: repr(C), `struct_size` first, which the assertions below
+        // check, and integers, raw pointers and optional function pointers
+        // only.
+        unsafe impl Versioned for $name {
+            const NAME: &'static str = stringify!($name);
+            const FIRST_SIZE: usize =
+                std::mem::offset_of!($name, $first) + std::mem::size_of::<$first_ty>();
+        }
+
+        const _: () = {
+            assert!(std::mem::offset_of!($name, struct_size) == 0);
+            assert!(
+                std::mem::offset_of!($name, $last) + std::mem::size_of::<$last_ty>()
+                    == std::mem::size_of::<$name>(),
+                "padding after the last member"
+            );
+            assert!(<$name as Versioned>::FIRST_SIZE <= std::mem::size_of::<$name>());
+        };
+
+        /// Zeros, the defaults, with `struct_size` set.
+        impl Default for $name {
+            fn default() -> Self {
+                // SAFETY: zeros are a value of a `Versioned` struct.
+                let mut value: Self = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+                value.struct_size = std::mem::size_of::<Self>() as u32;
+                value
+            }
+        }
+    )*};
+}
+
+versioned!(
+    EmberwaveContextOptions { first_ends_with: flags: u32, ends_with: flags: u32 },
+    EmberwaveStreamInfo { first_ends_with: frame_rate_den: u32, ends_with: frame_rate_den: u32 },
+    EmberwaveFrameInfo { first_ends_with: chroma_height: u32, ends_with: chroma_height: u32 },
+    EmberwaveColor { first_ends_with: chroma_siting: u32, ends_with: chroma_siting: u32 },
+    EmberwaveSignalling { first_ends_with: transfer: u32, ends_with: transfer: u32 },
+    EmberwaveVulkanInstance {
+        first_ends_with: extensions: *const *const c_char,
+        ends_with: extensions: *const *const c_char
+    },
+    EmberwaveVulkanDevice { first_ends_with: user: *mut c_void, ends_with: user: *mut c_void },
+    EmberwaveVulkanImage { first_ends_with: user: *mut c_void, ends_with: user: *mut c_void },
+    EmberwaveVulkanSync { first_ends_with: signal_value: u64, ends_with: signal_value: u64 },
+    EmberwaveD3D12Sync { first_ends_with: signal_value: u64, ends_with: signal_value: u64 },
+);
+
+/// The `struct_size` of the struct at `ptr`, `what` to the caller, checked
+/// to be at least the struct's first size.
+///
+/// # Safety
+///
+/// `ptr` points to a struct of `T`'s kind, whose first member is
+/// `struct_size`.
+unsafe fn struct_size<T: Versioned>(ptr: *const T, what: &str) -> Result<usize, Failure> {
+    // SAFETY: an aligned `T` starts with a `u32`, as the caller promises.
+    let size = unsafe { ptr.cast::<u32>().read() } as usize;
+    if size < T::FIRST_SIZE {
+        return Err(Failure::argument(format!(
+            "{what}.struct_size is {size}, less than the {} bytes of an {}: set it to sizeof({})",
+            T::FIRST_SIZE,
+            T::NAME,
+            T::NAME
+        )));
+    }
+    Ok(size)
+}
+
+/// The struct at `ptr`, `None` for `NULL`: the bytes its `struct_size`
+/// covers, up to the size this version knows, and zeros, the defaults, for
+/// the members past them, which a caller built with an older header lacks.
+///
+/// # Safety
+///
+/// `ptr` is `NULL` or points to `struct_size` readable bytes of a struct of
+/// `T`'s kind.
+unsafe fn read_struct<T: Versioned>(ptr: *const T, what: &str) -> Result<Option<T>, Failure> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: as the caller promises.
+    let size = unsafe { struct_size(ptr, what) }?;
+    let mut value = std::mem::MaybeUninit::<T>::zeroed();
+    // SAFETY: the caller's struct has `size` readable bytes, and as many of
+    // them as `T` has go into the zeroed value, which any bytes are a value
+    // of (`Versioned`).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            ptr.cast::<u8>(),
+            value.as_mut_ptr().cast::<u8>(),
+            size.min(std::mem::size_of::<T>()),
+        );
+        Ok(Some(value.assume_init()))
+    }
+}
+
+/// [`read_struct`] for a struct that may not be `NULL`.
+///
+/// # Safety
+///
+/// As for [`read_struct`].
+unsafe fn read_given<T: Versioned>(ptr: *const T, what: &str) -> Result<T, Failure> {
+    // SAFETY: as the caller promises.
+    unsafe { read_struct(ptr, what) }?.ok_or_else(|| Failure::argument(format!("{what} is NULL")))
+}
+
+/// Writes `value` to the struct at `out`, `what` to the caller: the members
+/// after `struct_size`, which stays the caller's, as far as its size covers.
+///
+/// # Safety
+///
+/// `out` is `NULL` or points to `struct_size` writable bytes of a struct of
+/// `T`'s kind.
+unsafe fn write_struct<T: Versioned>(out: *mut T, what: &str, value: T) -> Result<(), Failure> {
+    if out.is_null() {
+        return Err(Failure::argument(format!("{what} is NULL")));
+    }
+    // SAFETY: as the caller promises.
+    let size = unsafe { struct_size(out, what) }?.min(std::mem::size_of::<T>());
+    let skip = std::mem::size_of::<u32>();
+    // SAFETY: `size` is at least the first size, so past `struct_size`, and
+    // the caller's struct has that many writable bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&value as *const T).cast::<u8>().add(skip),
+            out.cast::<u8>().add(skip),
+            size - skip,
+        );
+    }
+    Ok(())
 }
 
 /// Runs the body of an API function: keeps the message of a failure for
@@ -767,8 +1016,8 @@ unsafe fn conversion(
     color: *const EmberwaveColor,
 ) -> Result<ColorParams, Failure> {
     // SAFETY: as the caller promises.
-    match unsafe { color.as_ref() } {
-        Some(color) => color_params(color),
+    match unsafe { read_struct(color, "color") }? {
+        Some(color) => color_params(&color),
         None => Ok(decoder
             .decoder
             .start_of_frame()
@@ -789,9 +1038,6 @@ fn creation_failure(error: GpuError) -> Failure {
 }
 
 fn signalling(value: &EmberwaveSignalling) -> Result<Signalling, Failure> {
-    if value.reserved != [0; 3] {
-        return Err(Failure::argument("signalling.reserved is not zero"));
-    }
     Ok(Signalling {
         color_primaries: match value.primaries {
             EMBERWAVE_PRIMARIES_SRGB => ColorPrimaries::Srgb,
@@ -835,8 +1081,8 @@ fn signalling(value: &EmberwaveSignalling) -> Result<Signalling, Failure> {
 ///
 /// # Safety
 ///
-/// `source.data` is `NULL` or points to `stride * (rows - 1) + row_bytes`
-/// readable bytes that stay unchanged while the slice is used.
+/// `source.data` is `NULL` or points to `source.size` readable bytes that
+/// stay unchanged while the slice is used.
 unsafe fn source_plane<'a>(
     source: &EmberwaveSourcePlane,
     name: &str,
@@ -862,6 +1108,12 @@ unsafe fn source_plane<'a>(
                 "{name} spans more memory than a pointer can address"
             ))
         })?;
+    if source.size < span {
+        return Err(Failure::argument(format!(
+            "{name}.size is {}, less than the {span} bytes its {rows} rows span",
+            source.size
+        )));
+    }
     // SAFETY: not NULL, not too large, and the caller promises the bytes.
     Ok(unsafe { std::slice::from_raw_parts(source.data, span) })
 }
@@ -876,6 +1128,7 @@ fn chroma_code(chroma: ChromaSubsampling) -> u32 {
 fn stream_info(stream: &SequenceHeader) -> EmberwaveStreamInfo {
     let color = ColorParams::from_stream(stream);
     EmberwaveStreamInfo {
+        struct_size: std::mem::size_of::<EmberwaveStreamInfo>() as u32,
         width: stream.width,
         height: stream.height,
         chroma: chroma_code(stream.chroma),
@@ -958,8 +1211,8 @@ fn color_params(color: &EmberwaveColor) -> Result<ColorParams, Failure> {
 }
 
 /// Checks that `target` takes `rows` rows of `row_bytes` bytes: its pointer is
-/// not `NULL`, its stride is at least a row, and the last byte is
-/// addressable.
+/// not `NULL`, its stride is at least a row, and its size reaches the last
+/// byte, which is addressable.
 fn check_target(
     target: &EmberwavePlane,
     name: &str,
@@ -979,11 +1232,20 @@ fn check_target(
         .stride
         .checked_mul(rows.saturating_sub(1))
         .and_then(|bytes| bytes.checked_add(row_bytes))
-        .filter(|&bytes| bytes <= isize::MAX as usize);
-    if span.is_none() {
-        return Err(Failure::argument(format!(
-            "{name} spans more memory than a pointer can address"
-        )));
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| {
+            Failure::argument(format!(
+                "{name} spans more memory than a pointer can address"
+            ))
+        })?;
+    if target.size < span {
+        return Err(Failure(
+            EmberwaveStatus::BufferTooSmall,
+            format!(
+                "{name}.size is {}, less than the {span} bytes its {rows} rows span",
+                target.size
+            ),
+        ));
     }
     Ok(())
 }
@@ -1014,6 +1276,14 @@ unsafe fn copy_row(line: &[u8], row: usize, target: &EmberwavePlane) {
 pub extern "C" fn emberwave_version() -> *const c_char {
     const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     VERSION.as_ptr().cast()
+}
+
+/// The version of the library as one number, as `EMBERWAVE_VERSION` numbers
+/// the header's: 1600 for 0.16.0. A program compares the two to learn that
+/// it runs with another library than the one it was built for.
+#[unsafe(no_mangle)]
+pub extern "C" fn emberwave_version_number() -> u32 {
+    VERSION_NUMBER
 }
 
 /// Describes the last failure on the calling thread, or is empty if no call on
@@ -1053,7 +1323,7 @@ pub unsafe extern "C" fn emberwave_probe_pwv1(
             ..stream_info(&header.stream)
         };
         // SAFETY: as the caller promises.
-        unsafe { output(info, "info", described) }
+        unsafe { write_struct(info, "info", described) }
     })
 }
 
@@ -1077,7 +1347,9 @@ pub unsafe extern "C" fn emberwave_probe_packet(
         let bytes = unsafe { input(data, size) }?;
         match Header::parse(bytes)? {
             // SAFETY: as the caller promises.
-            Header::StartOfFrame(stream) => unsafe { output(info, "info", stream_info(&stream)) },
+            Header::StartOfFrame(stream) => unsafe {
+                write_struct(info, "info", stream_info(&stream))
+            },
             Header::Block(_) => Err(Failure(
                 EmberwaveStatus::Bitstream,
                 "the packet starts with a block, not with a start of frame header".into(),
@@ -1112,8 +1384,8 @@ pub unsafe extern "C" fn emberwave_context_create(
         // SAFETY: as the caller promises.
         unsafe { output(context, "context", std::ptr::null_mut()) }?;
         // SAFETY: as the caller promises.
-        let gpu_options = match unsafe { options.as_ref() } {
-            Some(options) => gpu_options(options)?,
+        let gpu_options = match unsafe { read_struct(options, "options") }? {
+            Some(options) => gpu_options(&options)?,
             None => GpuOptions::default(),
         };
         let created = GpuContext::new(&gpu_options)?;
@@ -1127,12 +1399,12 @@ pub unsafe extern "C" fn emberwave_context_create(
 /// `device` is an `id<MTLDevice>` and `queue` an `id<MTLCommandQueue>` of it,
 /// which emberwave retains while the context, or anything made on it, lives.
 /// emberwave's GPU work then goes onto the caller's queue, and
-/// `emberwave_decoder_submit_texture` and
-/// `emberwave_decoder_submit_plane_textures` need not wait for it: Metal runs
+/// `emberwave_decoder_submit_texture_metal` and
+/// `emberwave_decoder_submit_plane_textures_metal` need not wait for it: Metal runs
 /// the command buffers the caller commits to the queue after such a call
 /// after the decode, and a decode after the command buffers committed before
 /// it, for the textures they share (decision D43). Only on iPhones, iPads and
-/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+/// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 /// `NULL`.
 ///
 /// The queue is shared:
@@ -1306,7 +1578,7 @@ type LockKey = Option<(usize, usize, usize)>;
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 unsafe fn metal_context(_device: *mut c_void, _queue: *mut c_void) -> Result<GpuContext, Failure> {
     Err(Failure(
-        EmberwaveStatus::NoGpu,
+        EmberwaveStatus::Unsupported,
         "Metal contexts are made on iPhones, iPads and Macs only".into(),
     ))
 }
@@ -1326,19 +1598,21 @@ pub type EmberwaveVkGetInstanceProcAddr = Option<
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveVulkanInstance {
-    /// `vkGetInstanceProcAddr` of the loader the instance was made with.
-    pub get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
-    /// The `VkInstance`.
-    pub instance: *mut c_void,
+    /// `sizeof(EmberwaveVulkanInstance)` (decision D69).
+    pub struct_size: u32,
     /// The `apiVersion` the instance was made with, such as
     /// `VK_API_VERSION_1_3`: at least the physical device's, up to 1.3,
     /// which wgpu uses.
     pub api_version: u32,
+    /// How many names `extensions` holds.
+    pub extension_count: u32,
+    /// `vkGetInstanceProcAddr` of the loader the instance was made with.
+    pub get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
+    /// The `VkInstance`.
+    pub instance: *mut c_void,
     /// The instance extensions it was made with: `extension_count` names, or
     /// `NULL` for none.
     pub extensions: *const *const c_char,
-    /// How many names `extensions` holds.
-    pub extension_count: u32,
 }
 
 /// A Vulkan device of the caller's, and the queue of it that emberwave is to
@@ -1346,8 +1620,10 @@ pub struct EmberwaveVulkanInstance {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveVulkanDevice {
+    /// `sizeof(EmberwaveVulkanDevice)` (decision D69).
+    pub struct_size: u32,
     /// The instance the device was made with.
-    pub instance: EmberwaveVulkanInstance,
+    pub instance: *const EmberwaveVulkanInstance,
     /// The `VkPhysicalDevice` the device was made on.
     pub physical_device: *mut c_void,
     /// The `VkDevice`, made with the extensions and features that
@@ -1371,9 +1647,11 @@ pub struct EmberwaveVulkanDevice {
     /// from any thread. `NULL`, with `unlock_queue` `NULL` too, if nothing
     /// else uses the queue during emberwave's calls. Every context on one
     /// queue takes the same `lock_queue`, `unlock_queue` and `user`, which
-    /// stay valid until everything made on those contexts is destroyed.
+    /// stay valid until everything made on those contexts is destroyed. It
+    /// must not call emberwave.
     pub lock_queue: Option<unsafe extern "C" fn(user: *mut c_void)>,
-    /// Frees the caller's lock of the queue that `lock_queue` took.
+    /// Frees the caller's lock of the queue that `lock_queue` took. It must
+    /// not call emberwave.
     pub unlock_queue: Option<unsafe extern "C" fn(user: *mut c_void)>,
     /// Passed to `lock_queue` and `unlock_queue`.
     pub user: *mut c_void,
@@ -1386,6 +1664,8 @@ pub struct EmberwaveVulkanDevice {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveVulkanImage {
+    /// `sizeof(EmberwaveVulkanImage)` (decision D69).
+    pub struct_size: u32,
     /// The `VkImage`.
     pub image: u64,
     /// Its `VkFormat`: `VK_FORMAT_B8G8R8A8_UNORM` or
@@ -1405,8 +1685,8 @@ pub struct EmberwaveVulkanImage {
     /// into it or encode from it has completed: from then on the caller may
     /// destroy the image and free its memory. From any thread, perhaps
     /// during another call of emberwave's on the context, or in the destroy
-    /// of its last decoder, encoder or context. `NULL` if the caller knows
-    /// that moment otherwise.
+    /// of its last decoder, encoder or context, and so it must not call
+    /// emberwave. `NULL` if the caller knows that moment otherwise.
     pub release: Option<unsafe extern "C" fn(user: *mut c_void)>,
     /// Passed to `release`.
     pub user: *mut c_void,
@@ -1422,8 +1702,13 @@ pub struct EmberwaveVulkanImage {
 /// holds up every later submission to the queue, the caller's too, as the
 /// decode's waits at every stage.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EmberwaveVulkanSync {
+    /// `sizeof(EmberwaveVulkanSync)` (decision D69).
+    pub struct_size: u32,
+    /// `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
+    /// combined with `|` for timeline semaphores, or 0 for binary ones.
+    pub flags: u32,
     /// A `VkSemaphore` the decode's GPU work waits for, such as one the
     /// caller signals once its reads of the textures are done, or 0 for
     /// none.
@@ -1435,9 +1720,6 @@ pub struct EmberwaveVulkanSync {
     pub signal_semaphore: u64,
     /// For a timeline `signal_semaphore`, the value to signal it to.
     pub signal_value: u64,
-    /// `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
-    /// combined with `|` for timeline semaphores, or 0 for binary ones.
-    pub flags: u32,
 }
 
 /// `wait_semaphore` of an `EmberwaveVulkanSync` is a timeline semaphore, to
@@ -1472,6 +1754,8 @@ pub struct EmberwaveD3D12Fence {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EmberwaveD3D12Sync {
+    /// `sizeof(EmberwaveD3D12Sync)` (decision D69).
+    pub struct_size: u32,
     /// A fence the call's GPU work waits for, such as one the caller signals
     /// once its own work on the textures is done, or `NULL`.
     pub wait_fence: *const EmberwaveD3D12Fence,
@@ -1482,17 +1766,6 @@ pub struct EmberwaveD3D12Sync {
     pub signal_fence: *const EmberwaveD3D12Fence,
     /// The value `signal_fence` is set to.
     pub signal_value: u64,
-}
-
-impl Default for EmberwaveD3D12Sync {
-    fn default() -> Self {
-        Self {
-            wait_fence: std::ptr::null(),
-            wait_value: 0,
-            signal_fence: std::ptr::null(),
-            signal_value: 0,
-        }
-    }
 }
 
 /// What emberwave needs a Vulkan device of the caller's to have enabled:
@@ -1517,43 +1790,46 @@ pub struct EmberwaveVulkanRequirements {
 /// `VK_KHR_get_physical_device_properties2` it learns less of a device and
 /// uses fewer of its features. `VK_KHR_surface` goes with the
 /// `VK_KHR_swapchain` that `emberwave_vulkan_requirements_create` lists on
-/// devices that have it. With `names` `NULL`, stores their number in
-/// `*count`; otherwise writes them to `names`, which has room for `*count`,
-/// or gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the number needed in
-/// `*count` if that is too few. The names stay valid as long as the process.
-/// Only where wgpu runs on Vulkan; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+/// devices that have it. Stores their number in `*count`, and with `names`
+/// not `NULL` writes them there too, which has room for `capacity` names; if
+/// that is too few, nothing is written to `names` and the result is
+/// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, as for `emberwave_frame_packets`.
+/// The counts are `uint32_t`, as Vulkan's are. The names stay valid as long
+/// as the process. Only where wgpu runs on Vulkan; elsewhere
+/// `EMBERWAVE_STATUS_UNSUPPORTED`.
 ///
 /// # Safety
 ///
 /// `get_instance_proc_addr` is `NULL` or a loader's `vkGetInstanceProcAddr`,
-/// `count` points to a `uint32_t`, and `names` is `NULL` or points to
-/// `*count` pointers that may be written.
+/// `names` is `NULL` or points to `capacity` pointers that may be written,
+/// and `count` points to a `uint32_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_vulkan_instance_extensions(
     get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
     names: *mut *const c_char,
+    capacity: u32,
     count: *mut u32,
 ) -> EmberwaveStatus {
     run(|| {
-        if count.is_null() {
-            return Err(Failure::argument("count is NULL"));
-        }
+        // SAFETY: as the caller promises.
+        unsafe { output(count, "count", 0) }?;
         let wanted = vulkan_instance_extensions(get_instance_proc_addr)?;
-        // SAFETY: as the caller promises.
-        let room = unsafe { count.read() };
-        // SAFETY: as the caller promises.
+        // SAFETY: checked by output() above.
         unsafe { count.write(wanted.len() as u32) };
         if names.is_null() {
             return Ok(());
         }
-        if (room as usize) < wanted.len() {
-            return Err(Failure::argument(format!(
-                "names has room for {room} names, not the {} needed",
-                wanted.len()
-            )));
+        if (capacity as usize) < wanted.len() {
+            return Err(Failure(
+                EmberwaveStatus::BufferTooSmall,
+                format!(
+                    "capacity is {capacity}, less than the {} names",
+                    wanted.len()
+                ),
+            ));
         }
         for (at, name) in wanted.iter().enumerate() {
-            // SAFETY: room for `room` pointers, as the caller promises.
+            // SAFETY: `at` is below `capacity`, as the caller promises room for.
             unsafe { names.add(at).write(name.as_ptr()) };
         }
         Ok(())
@@ -1589,8 +1865,8 @@ fn vulkan_instance_extensions(
 /// `emberwave_vulkan_requirements_features` gives. Make the device with
 /// them, and with whatever else the caller needs. Only where wgpu runs on
 /// Vulkan, on Linux, Android and 64-bit Windows; elsewhere
-/// `EMBERWAVE_STATUS_NO_GPU`.
-/// `EMBERWAVE_STATUS_NO_GPU` too for a physical device wgpu cannot use.
+/// `EMBERWAVE_STATUS_UNSUPPORTED`. `EMBERWAVE_STATUS_NO_GPU` for a physical
+/// device wgpu cannot use.
 ///
 /// # Safety
 ///
@@ -1608,11 +1884,9 @@ pub unsafe extern "C" fn emberwave_vulkan_requirements_create(
         // SAFETY: as the caller promises.
         unsafe { output(requirements, "requirements", std::ptr::null_mut()) }?;
         // SAFETY: as the caller promises.
-        let Some(instance) = (unsafe { instance.as_ref() }) else {
-            return Err(Failure::argument("instance is NULL"));
-        };
+        let instance = unsafe { read_given(instance, "instance") }?;
         // SAFETY: as the caller promises.
-        let made = unsafe { vulkan_requirements(instance, physical_device) }?;
+        let made = unsafe { vulkan_requirements(&instance, physical_device) }?;
         // SAFETY: checked by the first output() above.
         unsafe { requirements.write(Box::into_raw(Box::new(made))) };
         Ok(())
@@ -1690,7 +1964,7 @@ pub unsafe extern "C" fn emberwave_vulkan_requirements_destroy(
 /// work on the caller's queue (decision D61). The device keeps belonging to
 /// the caller, who destroys it after the context and everything made on it.
 /// Only where wgpu runs on Vulkan, on Linux, Android and 64-bit Windows;
-/// elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+/// elsewhere `EMBERWAVE_STATUS_UNSUPPORTED`.
 ///
 /// The device must have been made with the extensions and the features of
 /// `emberwave_vulkan_requirements_create`. A lacking extension is
@@ -1716,14 +1990,16 @@ pub unsafe extern "C" fn emberwave_vulkan_requirements_destroy(
 /// - The decodes that wait return once the GPU is done. Those that do not
 ///   wait are `emberwave_decoder_submit_texture_vulkan` and
 ///   `emberwave_decoder_submit_plane_textures_vulkan`, which order the work
-///   with semaphores; `emberwave_decoder_submit_texture` and
-///   `emberwave_decoder_submit_plane_textures` are for Metal contexts only.
+///   with semaphores; `emberwave_decoder_submit_texture_metal` and
+///   `emberwave_decoder_submit_plane_textures_metal` are for Metal contexts only.
 ///
 /// # Safety
 ///
 /// `device` is `NULL` or points to an `EmberwaveVulkanDevice` that describes
 /// a live device made as above, with a queue of that family and index, and
-/// callbacks that may be called from any thread. `context` points to where
+/// callbacks that may be called from any thread; its `instance` is `NULL`
+/// or points to an `EmberwaveVulkanInstance` with its `struct_size` set.
+/// `context` points to where
 /// the new context is stored; it is set to `NULL` when the call fails.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_context_create_vulkan(
@@ -1734,11 +2010,9 @@ pub unsafe extern "C" fn emberwave_context_create_vulkan(
         // SAFETY: as the caller promises.
         unsafe { output(context, "context", std::ptr::null_mut()) }?;
         // SAFETY: as the caller promises.
-        let Some(device) = (unsafe { device.as_ref() }) else {
-            return Err(Failure::argument("device is NULL"));
-        };
+        let device = unsafe { read_given(device, "device") }?;
         // SAFETY: as the caller promises.
-        let created = unsafe { vulkan_context(device) }?;
+        let created = unsafe { vulkan_context(&device) }?;
         // SAFETY: checked by the first output() above.
         unsafe { context.write(EmberwaveContext::boxed(created, false, true, false)) };
         Ok(())
@@ -1879,12 +2153,10 @@ pub unsafe extern "C" fn emberwave_texture_from_vulkan_source(
             let encoder =
                 unsafe { encoder.as_ref() }.ok_or_else(|| Failure::argument("encoder is NULL"))?;
             // SAFETY: as the caller promises.
-            let Some(image) = (unsafe { image.as_ref() }) else {
-                return Err(Failure::argument("image is NULL"));
-            };
+            let image = unsafe { read_given(image, "image") }?;
             require_vulkan(encoder.vulkan, "encoder")?;
             // SAFETY: as the caller promises.
-            let wrapped = unsafe { vulkan_import(&Wrapping::encoder(encoder, holds), image) }?;
+            let wrapped = unsafe { vulkan_import(&Wrapping::encoder(encoder, holds), &image) }?;
             // SAFETY: checked by the first output() above.
             unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
             Ok(())
@@ -1914,12 +2186,10 @@ unsafe fn texture_from_vulkan(
             // SAFETY: as the caller promises.
             let decoder = unsafe { live(decoder) }?;
             // SAFETY: as the caller promises.
-            let Some(image) = (unsafe { image.as_ref() }) else {
-                return Err(Failure::argument("image is NULL"));
-            };
+            let image = unsafe { read_given(image, "image") }?;
             require_vulkan(decoder.vulkan, "decoder")?;
             // SAFETY: as the caller promises.
-            let wrapped = unsafe { vulkan_import(&Wrapping::decoder(decoder, plane), image) }?;
+            let wrapped = unsafe { vulkan_import(&Wrapping::decoder(decoder, plane), &image) }?;
             // SAFETY: checked by the first output() above.
             unsafe { texture.write(Box::into_raw(Box::new(wrapped))) };
             Ok(())
@@ -2528,7 +2798,7 @@ unsafe fn d3d12_fences(
     textures: &[&EmberwaveTexture],
 ) -> Result<Box<dyn emberwave_core::gpu::SubmissionHooks>, Failure> {
     // SAFETY: as the caller promises.
-    let sync = unsafe { sync.as_ref() }.copied().unwrap_or_default();
+    let sync = unsafe { read_struct(sync, "sync") }?.unwrap_or_default();
     // SAFETY: as the caller promises.
     let (wait, signal) = unsafe { (sync.wait_fence.as_ref(), sync.signal_fence.as_ref()) };
     for (fence, name) in [(wait, "wait_fence"), (signal, "signal_fence")] {
@@ -2628,7 +2898,7 @@ unsafe fn d3d12_import(
 #[cfg(not(windows))]
 fn d3d12_elsewhere() -> Failure {
     Failure(
-        EmberwaveStatus::NoGpu,
+        EmberwaveStatus::Unsupported,
         "Direct3D 12 exists on Windows only".into(),
     )
 }
@@ -2640,7 +2910,7 @@ fn d3d12_elsewhere() -> Failure {
 /// `sync` is `NULL` or points to an `EmberwaveVulkanSync`.
 unsafe fn vulkan_sync(sync: *const EmberwaveVulkanSync) -> Result<EmberwaveVulkanSync, Failure> {
     // SAFETY: as the caller promises.
-    let sync = unsafe { sync.as_ref() }.copied().unwrap_or_default();
+    let sync = unsafe { read_struct(sync, "sync") }?.unwrap_or_default();
     let known = EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE;
     if sync.flags & !known != 0 {
         return Err(Failure::argument(format!(
@@ -2794,7 +3064,7 @@ unsafe fn vulkan_context(_device: &EmberwaveVulkanDevice) -> Result<GpuContext, 
 )))]
 fn vulkan_elsewhere() -> Failure {
     Failure(
-        EmberwaveStatus::NoGpu,
+        EmberwaveStatus::Unsupported,
         "Vulkan contexts are made on Linux, Android and 64-bit Windows only".into(),
     )
 }
@@ -2819,7 +3089,7 @@ mod vulkan {
     use super::{
         EmberwaveStatus, EmberwaveTexture, EmberwaveVkGetInstanceProcAddr, EmberwaveVulkanDevice,
         EmberwaveVulkanImage, EmberwaveVulkanInstance, EmberwaveVulkanRequirements,
-        EmberwaveVulkanSync, Failure, Holds, Wrapping, queue_turns,
+        EmberwaveVulkanSync, Failure, Holds, Wrapping, queue_turns, read_given,
     };
 
     /// What keeps the chain of an `EmberwaveVulkanRequirements` alive.
@@ -3069,7 +3339,9 @@ mod vulkan {
             )
         }?;
         // SAFETY: as the caller promises.
-        let adapter = unsafe { adapter(&device.instance, device.physical_device) }?;
+        let instance = unsafe { read_given(device.instance, "device.instance") }?;
+        // SAFETY: as the caller promises.
+        let adapter = unsafe { adapter(&instance, device.physical_device) }?;
         let descriptor = GpuContext::device_descriptor(&adapter, &GpuOptions::default());
         let (open, turns) = {
             // SAFETY: only read.
@@ -3857,6 +4129,7 @@ pub unsafe extern "C" fn emberwave_decoder_info(
         let layout = unsafe { live(decoder) }?.decoder.layout();
         let (chroma_width, chroma_height) = layout.plane_size(Component::Cb);
         let described = EmberwaveFrameInfo {
+            struct_size: std::mem::size_of::<EmberwaveFrameInfo>() as u32,
             width: layout.width(),
             height: layout.height(),
             chroma: chroma_code(layout.chroma()),
@@ -3864,7 +4137,7 @@ pub unsafe extern "C" fn emberwave_decoder_info(
             chroma_height,
         };
         // SAFETY: as the caller promises.
-        unsafe { output(info, "info", described) }
+        unsafe { write_struct(info, "info", described) }
     })
 }
 
@@ -4017,9 +4290,9 @@ pub unsafe extern "C" fn emberwave_decoder_clear(decoder: *mut EmberwaveDecoder)
 /// # Safety
 ///
 /// `decoder` is a live decoder that no other thread is using. Each plane's
-/// `data` points to `stride * (height - 1) + width` bytes that may be
-/// written, with the sizes of `emberwave_decoder_info`, and the planes do
-/// not overlap.
+/// `data` points to `size` bytes that may be written, `size` being at least
+/// `stride * (height - 1) + width` for the sizes of
+/// `emberwave_decoder_info`, and the planes do not overlap.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
     decoder: *mut EmberwaveDecoder,
@@ -4077,7 +4350,8 @@ pub unsafe extern "C" fn emberwave_decoder_decode_yuv(
 ///
 /// `decoder` is a live decoder that no other thread is using, `color` is
 /// `NULL` or points to an `EmberwaveColor`, and `rgb.data` points to
-/// `stride * (height - 1) + 3 * width` bytes that may be written.
+/// `rgb.size` bytes that may be written, `rgb.size` being at least
+/// `stride * (height - 1) + 3 * width`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_decoder_decode_rgb(
     decoder: *mut EmberwaveDecoder,
@@ -4196,7 +4470,7 @@ pub unsafe extern "C" fn emberwave_texture_create_plane(
 /// `emberwave_texture_create`'s: a texture of a `CVPixelBuffer` from a
 /// `CVMetalTextureCache`, to hand to an `AVSampleBufferDisplayLayer`, one the
 /// caller made, or a drawable (decision D44). Only on iPhones, iPads and
-/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+/// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 /// `NULL`.
 ///
 /// The texture is on the device of the decoder's context
@@ -4299,7 +4573,7 @@ pub unsafe extern "C" fn emberwave_texture_from_metal_plane(
 /// of an NV12 pixel buffer holds them, or `EMBERWAVE_PLANE_RGB` for the
 /// whole picture in `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm`,
 /// as a BGRA pixel buffer holds it (decision D65). Only on iPhones, iPads and
-/// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+/// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 /// `NULL`.
 ///
 /// The texture is on the device of the encoder's context
@@ -4559,7 +4833,7 @@ unsafe fn metal_import(
     _metal: *mut c_void,
 ) -> Result<EmberwaveTexture, Failure> {
     Err(Failure(
-        EmberwaveStatus::NoGpu,
+        EmberwaveStatus::Unsupported,
         "Metal textures exist on iPhones, iPads and Macs only".into(),
     ))
 }
@@ -4723,7 +4997,7 @@ fn require_tracked(texture: &EmberwaveTexture, name: &str) -> Result<(), Failure
 ///
 /// As for `emberwave_decoder_decode_texture`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn emberwave_decoder_submit_texture(
+pub unsafe extern "C" fn emberwave_decoder_submit_texture_metal(
     decoder: *mut EmberwaveDecoder,
     color: *const EmberwaveColor,
     texture: *const EmberwaveTexture,
@@ -4750,7 +5024,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_texture(
 
 /// Decodes the frame received so far into the plane textures `y`, `cb` and
 /// `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
-/// the work is on the queue, as `emberwave_decoder_submit_texture` does: only
+/// the work is on the queue, as `emberwave_decoder_submit_texture_metal` does: only
 /// for a decoder whose context was made by `emberwave_context_create_metal`,
 /// and textures whose hazards Metal tracks. Vulkan and Direct3D contexts have
 /// `emberwave_decoder_submit_plane_textures_vulkan` and
@@ -4760,7 +5034,7 @@ pub unsafe extern "C" fn emberwave_decoder_submit_texture(
 ///
 /// As for `emberwave_decoder_decode_plane_textures`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures(
+pub unsafe extern "C" fn emberwave_decoder_submit_plane_textures_metal(
     decoder: *mut EmberwaveDecoder,
     y: *const EmberwaveTexture,
     cb: *const EmberwaveTexture,
@@ -5038,8 +5312,8 @@ pub unsafe extern "C" fn emberwave_encoder_create(
         };
         let chroma = chroma_subsampling(chroma)?;
         // SAFETY: as the caller promises.
-        let signalling = match unsafe { signalling.as_ref() } {
-            Some(value) => self::signalling(value)?,
+        let signalling = match unsafe { read_struct(signalling, "signalling") }? {
+            Some(value) => self::signalling(&value)?,
             None => Signalling::default(),
         };
         let created = Encoder::new(&context.context, width, height, chroma, signalling)
@@ -5093,6 +5367,7 @@ pub unsafe extern "C" fn emberwave_encoder_info(
         let layout = unsafe { live_encoder(encoder) }?.encoder.layout();
         let (chroma_width, chroma_height) = layout.plane_size(Component::Cb);
         let described = EmberwaveFrameInfo {
+            struct_size: std::mem::size_of::<EmberwaveFrameInfo>() as u32,
             width: layout.width(),
             height: layout.height(),
             chroma: chroma_code(layout.chroma()),
@@ -5100,7 +5375,7 @@ pub unsafe extern "C" fn emberwave_encoder_info(
             chroma_height,
         };
         // SAFETY: as the caller promises.
-        unsafe { output(info, "info", described) }
+        unsafe { write_struct(info, "info", described) }
     })
 }
 
@@ -5110,7 +5385,7 @@ pub unsafe extern "C" fn emberwave_encoder_info(
 /// decoder. The planes have the sizes of `emberwave_encoder_info`, each row
 /// `stride` bytes from the next, and the bytes between the rows are not
 /// read. A budget too small for even the smallest frame is
-/// `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
+/// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL` with the smallest frame's size in
 /// `*size`; nothing is encoded then, and the next frame takes the sequence
 /// number this one would have had. Waits for the GPU.
 ///
@@ -5121,7 +5396,8 @@ pub unsafe extern "C" fn emberwave_encoder_info(
 /// # Safety
 ///
 /// `encoder` is a live encoder that no other thread is using. Each plane's
-/// `data` points to `stride * (height - 1) + width` readable bytes. `frame`
+/// `data` points to `size` readable bytes, `size` being at least
+/// `stride * (height - 1) + width`. `frame`
 /// points to `budget` bytes that may be written, and `size` to a `size_t`;
 /// neither overlaps the planes or the other.
 #[unsafe(no_mangle)]
@@ -5178,8 +5454,9 @@ pub unsafe extern "C" fn emberwave_encoder_encode(
 /// # Safety
 ///
 /// `encoder` is a live encoder that no other thread is using. `rgb.data`
-/// points to `rgb.stride * (height - 1) + 4 * width` readable bytes, at the
-/// size `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
+/// points to `rgb.size` readable bytes, `rgb.size` being at least
+/// `rgb.stride * (height - 1) + 4 * width` at the size
+/// `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
 /// may be written, and `size` to a `size_t`; neither overlaps the picture or
 /// the other.
 #[unsafe(no_mangle)]
@@ -5238,9 +5515,10 @@ fn rgb_order(format: u32) -> Result<RgbOrder, Failure> {
 /// `emberwave_texture_from_vulkan_source`, or textures that decodes put
 /// planes or pictures into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT`
 /// before any work on the GPU, textures shared from Direct3D included, which
-/// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives it too, as for
-/// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
-/// frame then, and the sequence number does not move.
+/// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives
+/// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, as for `emberwave_encoder_encode`,
+/// once the GPU has encoded the picture: no frame then, and the sequence
+/// number does not move.
 ///
 /// Waits for the GPU: when it returns, the GPU has read the textures, and
 /// the caller may write them again or hand them back to a capture's pool.
@@ -5419,7 +5697,7 @@ unsafe fn source_picture<'a>(
 /// boundaries of its blocks, and stores how many in `*count`. With `packets`
 /// not `NULL`, also where each starts in the frame and its size, in order;
 /// with fewer than `*count` places there (`capacity`), nothing is written to
-/// `packets` and the result is `EMBERWAVE_STATUS_INVALID_ARGUMENT`. The first
+/// `packets` and the result is `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`. The first
 /// packet starts with the start of frame header. A block larger than
 /// `max_packet_bytes` gets a packet of its own, as does the rest of a frame
 /// from a malformed block on, so a packet can be larger. A decoder takes the
@@ -5465,10 +5743,13 @@ pub unsafe extern "C" fn emberwave_frame_packets(
             return Ok(());
         }
         if capacity < described.len() {
-            return Err(Failure::argument(format!(
-                "capacity is {capacity}, less than the {} packets of the frame",
-                described.len()
-            )));
+            return Err(Failure(
+                EmberwaveStatus::BufferTooSmall,
+                format!(
+                    "capacity is {capacity}, less than the {} packets of the frame",
+                    described.len()
+                ),
+            ));
         }
         for (i, packet) in described.into_iter().enumerate() {
             // SAFETY: i is below capacity, which the caller promises.
@@ -5482,15 +5763,21 @@ pub unsafe extern "C" fn emberwave_frame_packets(
 mod tests {
     use super::*;
 
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-
+    /// What programs built with the header of 0.17 pass as `struct_size`, on
+    /// 64-bit systems: these sizes may never grow (decision D69).
     #[test]
-    fn handles_may_cross_threads_as_the_header_says() {
-        assert_send::<EmberwaveContext>();
-        assert_sync::<EmberwaveContext>();
-        assert_send::<EmberwaveDecoder>();
-        assert_send::<EmberwaveEncoder>();
+    #[cfg(target_pointer_width = "64")]
+    fn the_first_sizes_of_the_structs_stay() {
+        assert_eq!(EmberwaveContextOptions::FIRST_SIZE, 12);
+        assert_eq!(EmberwaveStreamInfo::FIRST_SIZE, 36);
+        assert_eq!(EmberwaveFrameInfo::FIRST_SIZE, 24);
+        assert_eq!(EmberwaveColor::FIRST_SIZE, 16);
+        assert_eq!(EmberwaveSignalling::FIRST_SIZE, 24);
+        assert_eq!(EmberwaveVulkanInstance::FIRST_SIZE, 40);
+        assert_eq!(EmberwaveVulkanDevice::FIRST_SIZE, 80);
+        assert_eq!(EmberwaveVulkanImage::FIRST_SIZE, 48);
+        assert_eq!(EmberwaveVulkanSync::FIRST_SIZE, 40);
+        assert_eq!(EmberwaveD3D12Sync::FIRST_SIZE, 40);
     }
 
     #[test]
@@ -5524,6 +5811,7 @@ mod tests {
         let plane = |bytes: &mut Vec<u8>, stride| EmberwavePlane {
             data: bytes.as_mut_ptr(),
             stride,
+            size: bytes.len(),
         };
         // SAFETY: a live decoder, and planes as large as their strides say.
         let status = unsafe {
@@ -5608,6 +5896,7 @@ mod tests {
         let source = |plane: &Vec<u8>, stride| EmberwaveSourcePlane {
             data: plane.as_ptr(),
             stride,
+            size: plane.len(),
         };
         let mut frame = vec![0u8; 10_000];
         let mut size = 0;

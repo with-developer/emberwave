@@ -134,6 +134,7 @@ impl Client {
                 emberwave_vulkan_instance_extensions(
                     get_instance_proc_addr,
                     ptr::null_mut(),
+                    0,
                     &mut count
                 ),
                 EmberwaveStatus::Ok,
@@ -145,6 +146,7 @@ impl Client {
                 emberwave_vulkan_instance_extensions(
                     get_instance_proc_addr,
                     names.as_mut_ptr(),
+                    names.len() as u32,
                     &mut count
                 ),
                 EmberwaveStatus::Ok,
@@ -228,6 +230,7 @@ impl Client {
                     api_version: vk::API_VERSION_1_3,
                     extensions: extensions.as_ptr(),
                     extension_count: extensions.len() as u32,
+                    ..Default::default()
                 };
                 let mut requirements = ptr::null_mut();
                 // SAFETY: a live instance and physical device of it, and a
@@ -285,6 +288,7 @@ impl Client {
             api_version: vk::API_VERSION_1_3,
             extensions: self.extensions.as_ptr(),
             extension_count: self.extensions.len() as u32,
+            ..Default::default()
         }
     }
 
@@ -361,8 +365,9 @@ impl Client {
         lock: Option<&QueueLock>,
         get_instance_proc_addr: EmberwaveVkGetInstanceProcAddr,
     ) -> Result<*mut EmberwaveContext, EmberwaveStatus> {
+        let instance = self.described_through(get_instance_proc_addr);
         let described = EmberwaveVulkanDevice {
-            instance: self.described_through(get_instance_proc_addr),
+            instance: &instance,
             physical_device: self.physical_device(),
             device: device.handle().as_raw() as usize as *mut c_void,
             extensions: names.as_ptr(),
@@ -374,6 +379,7 @@ impl Client {
             user: lock.map_or(ptr::null_mut(), |lock| {
                 ptr::from_ref(lock).cast_mut().cast()
             }),
+            ..Default::default()
         };
         let mut context = ptr::null_mut();
         // SAFETY: a live device made with emberwave's requirements, and a
@@ -613,6 +619,7 @@ fn decoded(context: *mut EmberwaveContext, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
                 let plane = |data: &mut [u8], stride| EmberwavePlane {
                     data: data.as_mut_ptr(),
                     stride,
+                    size: data.len(),
                 };
                 assert_eq!(
                     emberwave_decoder_decode_yuv(
@@ -659,6 +666,7 @@ fn encoded(context: *mut EmberwaveContext) -> Vec<u8> {
         let plane = |data: &[u8], stride| EmberwaveSourcePlane {
             data: data.as_ptr(),
             stride,
+            size: data.len(),
         };
         let mut size = 0;
         assert_eq!(
@@ -693,6 +701,7 @@ fn a_context_on_the_callers_device_works_as_one_of_emberwaves() {
     let options = EmberwaveContextOptions {
         backends: EMBERWAVE_BACKEND_VULKAN,
         flags: 0,
+        ..Default::default()
     };
     // SAFETY: options and a pointer to store the context in.
     let status = unsafe { emberwave_context_create(&options, &mut own) };
@@ -767,14 +776,55 @@ fn contexts_on_one_queue_hold_the_callers_lock_around_their_submissions() {
 }
 
 #[test]
+fn instance_extension_names_need_room_for_all() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let get_instance_proc_addr = proc_addr(&client.entry);
+    let mut count = 0;
+    // SAFETY: the loader's vkGetInstanceProcAddr, room for as many names as
+    // the capacity says, and a count to store.
+    unsafe {
+        assert_eq!(
+            emberwave_vulkan_instance_extensions(
+                get_instance_proc_addr,
+                ptr::null_mut(),
+                0,
+                &mut count
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        if count == 0 {
+            return;
+        }
+        let mut names = vec![ptr::null(); count as usize];
+        // One short: nothing is written, and the count says how many.
+        assert_eq!(
+            emberwave_vulkan_instance_extensions(
+                get_instance_proc_addr,
+                names.as_mut_ptr(),
+                count - 1,
+                &mut count
+            ),
+            EmberwaveStatus::BufferTooSmall
+        );
+        assert_eq!(count as usize, names.len());
+        assert!(names.iter().all(|name| name.is_null()));
+    }
+}
+
+#[test]
 fn a_device_without_the_required_extensions_is_refused() {
     let Some(client) = Client::new() else {
         return;
     };
     let (names, device) = client.device();
     let mut context = ptr::null_mut();
+    let instance = client.described();
     let described = |extension_count: u32, lock: bool, unlock: bool| EmberwaveVulkanDevice {
-        instance: client.described(),
+        instance: &instance,
         physical_device: client.physical_device(),
         device: device.handle().as_raw() as usize as *mut c_void,
         extensions: names.as_ptr(),
@@ -784,6 +834,7 @@ fn a_device_without_the_required_extensions_is_refused() {
         lock_queue: lock.then_some(QueueLock::lock as unsafe extern "C" fn(*mut c_void)),
         unlock_queue: unlock.then_some(QueueLock::unlock as unsafe extern "C" fn(*mut c_void)),
         user: ptr::null_mut(),
+        ..Default::default()
     };
     // SAFETY: descriptions of a live device, and a pointer to store a
     // context in, which none of them makes.
@@ -804,6 +855,34 @@ fn a_device_without_the_required_extensions_is_refused() {
             emberwave_context_create_vulkan(ptr::null(), &mut context),
             EmberwaveStatus::InvalidArgument
         );
+        // The device's instance, NULL or too small for an instance.
+        let mut without = described(names.len() as u32, false, false);
+        without.instance = ptr::null();
+        assert_eq!(
+            emberwave_context_create_vulkan(&without, &mut context),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("device.instance is NULL"),
+            "{}",
+            last_error()
+        );
+        let short = EmberwaveVulkanInstance {
+            struct_size: 8,
+            ..instance
+        };
+        let mut shortened = described(names.len() as u32, false, false);
+        shortened.instance = &short;
+        assert_eq!(
+            emberwave_context_create_vulkan(&shortened, &mut context),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(
+            last_error().contains("device.instance.struct_size is 8"),
+            "{}",
+            last_error()
+        );
+        assert!(context.is_null());
         let mut requirements = ptr::null_mut();
         assert_eq!(
             emberwave_vulkan_requirements_create(
@@ -1096,6 +1175,7 @@ fn wrapped(
             layout: vk::ImageLayout::UNDEFINED.as_raw() as u32,
             release: None,
             user: ptr::null_mut(),
+            ..Default::default()
         },
         plane,
     )
@@ -1142,6 +1222,7 @@ fn expected(decoder: *mut EmberwaveDecoder, frame: &[u8]) -> (Vec<u8>, [Vec<u8>;
         let target = EmberwavePlane {
             data: rgb.as_mut_ptr(),
             stride: width * 3,
+            size: rgb.len(),
         };
         assert_eq!(
             emberwave_decoder_decode_rgb(decoder, ptr::null(), target),
@@ -1154,14 +1235,15 @@ fn expected(decoder: *mut EmberwaveDecoder, frame: &[u8]) -> (Vec<u8>, [Vec<u8>;
         );
         let mut planes =
             [width * height, width * height / 4, width * height / 4].map(|size| vec![0u8; size]);
+        let sizes = planes.each_ref().map(|plane| plane.len());
         let [y, cb, cr] = planes.each_mut().map(|plane| plane.as_mut_ptr());
-        let plane = |data, stride| EmberwavePlane { data, stride };
+        let plane = |data, stride, size| EmberwavePlane { data, stride, size };
         assert_eq!(
             emberwave_decoder_decode_yuv(
                 decoder,
-                plane(y, width),
-                plane(cb, width / 2),
-                plane(cr, width / 2)
+                plane(y, width, sizes[0]),
+                plane(cb, width / 2, sizes[1]),
+                plane(cr, width / 2, sizes[2])
             ),
             EmberwaveStatus::Ok
         );
@@ -1419,6 +1501,7 @@ fn images_emberwave_cannot_fill_or_leave_readable_are_refused() {
         layout: vk::ImageLayout::GENERAL.as_raw() as u32,
         release: None,
         user: ptr::null_mut(),
+        ..Default::default()
     };
     let mut texture = ptr::null_mut();
     // SAFETY: a live decoder, and descriptions that are refused.
@@ -1535,6 +1618,7 @@ fn expected_picture(
         let target = EmberwavePlane {
             data: rgb.as_mut_ptr(),
             stride: width * 3,
+            size: rgb.len(),
         };
         assert_eq!(
             emberwave_decoder_decode_rgb(decoder, ptr::null(), target),
@@ -1598,6 +1682,7 @@ fn semaphores_hold_the_decode_back_and_order_the_reads() {
         signal_semaphore: done.as_raw(),
         signal_value: 1,
         flags: EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE,
+        ..Default::default()
     };
     assert_eq!(submit(Some(&sync)), EmberwaveStatus::Ok, "{}", last_error());
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -1712,6 +1797,7 @@ fn a_wrapped_image_is_drawn_into_and_released() {
             layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL.as_raw() as u32,
             release: Some(count_release),
             user: ptr::null_mut(),
+            ..Default::default()
         },
         None,
     )
@@ -2056,6 +2142,7 @@ fn source(
         layout: layout.as_raw() as u32,
         release: None,
         user: ptr::null_mut(),
+        ..Default::default()
     };
     let mut texture = ptr::null_mut();
     // SAFETY: a live encoder, an image made as described, and a pointer to
@@ -2124,6 +2211,7 @@ fn encoded_from_memory(
     let [y, cb, cr] = [0, 1, 2].map(|plane| EmberwaveSourcePlane {
         data: picture[plane].as_ptr(),
         stride: widths[plane] as usize,
+        size: picture[plane].len(),
     });
     // SAFETY: a live encoder, planes of its sizes, and a frame of the length
     // passed.
@@ -2283,6 +2371,7 @@ fn encoded_from_bgra(encoder: *mut EmberwaveEncoder, bgra: &[u8], width: u32) ->
     let rgb = EmberwaveSourcePlane {
         data: bgra.as_ptr(),
         stride: 4 * width as usize,
+        size: bgra.len(),
     };
     // SAFETY: a live encoder, a picture of its size, and a frame of the
     // length passed.
@@ -2435,6 +2524,7 @@ fn semaphores_hold_the_encode_back_until_the_picture_is_written() {
         signal_semaphore: read.as_raw(),
         signal_value: 1,
         flags: EMBERWAVE_SYNC_WAIT_TIMELINE | EMBERWAVE_SYNC_SIGNAL_TIMELINE,
+        ..Default::default()
     };
     go.send(()).expect("the signaller waits");
     let frame = encoded_from_images(encoder, [y, cb, cr], Some(&sync));

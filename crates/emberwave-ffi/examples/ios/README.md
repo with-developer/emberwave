@@ -4,7 +4,7 @@
 
 - **decode into a Metal texture**: a frame's bytes to the picture in a texture, the path of a player (`emberwave_decoder_decode_texture`);
 - **decode into Y, Cb, Cr textures**: the same frames to their planes in three textures, for a player that converts the colours itself (`emberwave_decoder_decode_plane_textures`);
-- **decode on the app's queue**: the same frames into a texture on the app's own command queue, where the call does not wait (`emberwave_context_create_metal`, `emberwave_decoder_submit_texture`), timed until the app's next command buffer, a copy of one pixel standing in for its draw, has read the picture;
+- **decode on the app's queue**: the same frames into a texture on the app's own command queue, where the call does not wait (`emberwave_context_create_metal`, `emberwave_decoder_submit_texture_metal`), timed until the app's next command buffer, a copy of one pixel standing in for its draw, has read the picture;
 - **decode to planes in memory**: the same frames to Y, Cb and Cr planes in CPU memory (`emberwave_decoder_decode_yuv`);
 - **encode from memory**: pictures in CPU memory to frames within the byte budget, on the GPU (`emberwave_encoder_encode`);
 - **HEVC through VideoToolbox**, for comparison, as a Moonlight client decodes a game stream today: the same pictures, encoded by the device's own encoder into a stream at Moonlight's default bit rate and at emberwave's bytes per frame, and decoded by its decoder into NV12 and BGRA textures.

@@ -16,6 +16,20 @@
  *   not from new ones without end.
  * - A panic inside emberwave is reported as EMBERWAVE_STATUS_INTERNAL.
  *   Destroy the object it happened in.
+ * - Later versions may add statuses: treat any status but
+ *   EMBERWAVE_STATUS_OK as a failure.
+ * - A struct passed by pointer starts with struct_size, which the caller
+ *   sets to sizeof the struct before the call: for the structs it passes in
+ *   and for those it gets filled in. emberwave reads and writes no more
+ *   bytes than that, and takes members a shorter struct lacks as zeros, their
+ *   defaults, so that a program built with an older header works with a
+ *   newer library.
+ * - Callbacks given to emberwave must not call emberwave.
+ * - EMBERWAVE_VERSION is the version of this header, and
+ *   emberwave_version_number() that of the library.
+ * - The calls on Metal, Vulkan and Direct3D objects of the caller's are
+ *   provisional: until a client has used them, a minor version may change
+ *   them.
  */
 
 #ifndef EMBERWAVE_H
@@ -26,6 +40,21 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+// The major version of emberwave that this header belongs to.
+#define EMBERWAVE_VERSION_MAJOR 0
+
+// The minor version of emberwave that this header belongs to.
+#define EMBERWAVE_VERSION_MINOR 16
+
+// The patch version of emberwave that this header belongs to.
+#define EMBERWAVE_VERSION_PATCH 0
+
+// The version this header belongs to as one number, major times 10000 plus
+// minor times 100 plus patch: 1600 for 0.16.0. `emberwave_version_number()`
+// gives the library's, which differs when a program runs with another
+// library than the one it was built for.
+#define EMBERWAVE_VERSION 1600
 
 // 4:2:0: the chroma planes have half the width and height of the luma plane,
 // whose width and height are even.
@@ -135,13 +164,14 @@
 // to signal to `signal_value`.
 #define EMBERWAVE_SYNC_SIGNAL_TIMELINE (1 << 1)
 
-// The result of a call.
+// The result of a call. Later versions may add statuses: treat any but
+// `EMBERWAVE_STATUS_OK` as a failure.
 typedef enum EmberwaveStatus {
   // The call succeeded.
   EMBERWAVE_STATUS_OK = 0,
-  // A pointer was `NULL`, a value out of range, an output buffer too
-  // small, or an object that does not fit the call, such as a texture of
-  // another device, size or kind.
+  // A pointer was `NULL`, a value out of range, a struct's `struct_size`
+  // too small, or an object that does not fit the call, such as a texture
+  // of another device, size or kind.
   EMBERWAVE_STATUS_INVALID_ARGUMENT = 1,
   // The data is not a PyroWave stream this decoder can take: malformed, of
   // another picture size or chroma format, or not a start of frame header
@@ -159,6 +189,16 @@ typedef enum EmberwaveStatus {
   EMBERWAVE_STATUS_DEVICE_LOST = 6,
   // A bug in emberwave. Destroy the object the call was made on.
   EMBERWAVE_STATUS_INTERNAL = 7,
+  // The system lacks the graphics API of the call, which makes a context
+  // on it or wraps one of its objects: Metal's off Apple's systems,
+  // Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off
+  // Windows. The calls that take what such a context made give
+  // `EMBERWAVE_STATUS_INVALID_ARGUMENT` for a context of another kind.
+  EMBERWAVE_STATUS_UNSUPPORTED = 8,
+  // An output array or buffer of the caller's, or an encode's budget, is
+  // too small. Where the call can tell how much it needs, it stores that
+  // where its documentation says.
+  EMBERWAVE_STATUS_BUFFER_TOO_SMALL = 9,
 } EmberwaveStatus;
 
 // A GPU device, shared by the decoders and encoders created on it. Creating
@@ -180,9 +220,9 @@ typedef struct EmberwaveEncoder EmberwaveEncoder;
 
 // A texture on a decoder's GPU device that the decodes into textures fill
 // with the picture, `emberwave_decoder_decode_texture` and
-// `emberwave_decoder_submit_texture`, or with one of its planes,
+// `emberwave_decoder_submit_texture_metal`, or with one of its planes,
 // `emberwave_decoder_decode_plane_textures` and
-// `emberwave_decoder_submit_plane_textures`, and their `_vulkan` and
+// `emberwave_decoder_submit_plane_textures_metal`, and their `_vulkan` and
 // `_d3d12` forms, for the caller's graphics API to read on the GPU.
 // emberwave makes it (`emberwave_texture_create`,
 // `emberwave_texture_create_plane`), wraps a Metal texture or a Vulkan
@@ -253,6 +293,9 @@ typedef struct EmberwaveVulkanRequirements EmberwaveVulkanRequirements;
 
 // What a stream says about its pictures.
 typedef struct EmberwaveStreamInfo {
+  // `sizeof(EmberwaveStreamInfo)`, set by the caller before the call
+  // (decision D69).
+  uint32_t struct_size;
   // Width of the pictures in pixels.
   uint32_t width;
   // Height of the pictures in pixels.
@@ -275,6 +318,8 @@ typedef struct EmberwaveStreamInfo {
 
 // How `emberwave_context_create` chooses the GPU.
 typedef struct EmberwaveContextOptions {
+  // `sizeof(EmberwaveContextOptions)` (decision D69).
+  uint32_t struct_size;
   // `EMBERWAVE_BACKEND_*` values combined with `|`, or
   // `EMBERWAVE_BACKEND_ANY`.
   uint32_t backends;
@@ -290,26 +335,30 @@ typedef void (*(*EmberwaveVkGetInstanceProcAddr)(void *instance, const char *nam
 // A Vulkan instance of the caller's (decision D61), made with the
 // extensions of `emberwave_vulkan_instance_extensions` among its own.
 typedef struct EmberwaveVulkanInstance {
-  // `vkGetInstanceProcAddr` of the loader the instance was made with.
-  EmberwaveVkGetInstanceProcAddr get_instance_proc_addr;
-  // The `VkInstance`.
-  void *instance;
+  // `sizeof(EmberwaveVulkanInstance)` (decision D69).
+  uint32_t struct_size;
   // The `apiVersion` the instance was made with, such as
   // `VK_API_VERSION_1_3`: at least the physical device's, up to 1.3,
   // which wgpu uses.
   uint32_t api_version;
+  // How many names `extensions` holds.
+  uint32_t extension_count;
+  // `vkGetInstanceProcAddr` of the loader the instance was made with.
+  EmberwaveVkGetInstanceProcAddr get_instance_proc_addr;
+  // The `VkInstance`.
+  void *instance;
   // The instance extensions it was made with: `extension_count` names, or
   // `NULL` for none.
   const char *const *extensions;
-  // How many names `extensions` holds.
-  uint32_t extension_count;
 } EmberwaveVulkanInstance;
 
 // A Vulkan device of the caller's, and the queue of it that emberwave is to
 // submit to (decision D61).
 typedef struct EmberwaveVulkanDevice {
+  // `sizeof(EmberwaveVulkanDevice)` (decision D69).
+  uint32_t struct_size;
   // The instance the device was made with.
-  struct EmberwaveVulkanInstance instance;
+  const struct EmberwaveVulkanInstance *instance;
   // The `VkPhysicalDevice` the device was made on.
   void *physical_device;
   // The `VkDevice`, made with the extensions and features that
@@ -333,9 +382,11 @@ typedef struct EmberwaveVulkanDevice {
   // from any thread. `NULL`, with `unlock_queue` `NULL` too, if nothing
   // else uses the queue during emberwave's calls. Every context on one
   // queue takes the same `lock_queue`, `unlock_queue` and `user`, which
-  // stay valid until everything made on those contexts is destroyed.
+  // stay valid until everything made on those contexts is destroyed. It
+  // must not call emberwave.
   void (*lock_queue)(void *user);
-  // Frees the caller's lock of the queue that `lock_queue` took.
+  // Frees the caller's lock of the queue that `lock_queue` took. It must
+  // not call emberwave.
   void (*unlock_queue)(void *user);
   // Passed to `lock_queue` and `unlock_queue`.
   void *user;
@@ -346,6 +397,8 @@ typedef struct EmberwaveVulkanDevice {
 // (decision D61), and for `emberwave_texture_from_vulkan_source` (decision
 // D62).
 typedef struct EmberwaveVulkanImage {
+  // `sizeof(EmberwaveVulkanImage)` (decision D69).
+  uint32_t struct_size;
   // The `VkImage`.
   uint64_t image;
   // Its `VkFormat`: `VK_FORMAT_B8G8R8A8_UNORM` or
@@ -365,8 +418,8 @@ typedef struct EmberwaveVulkanImage {
   // into it or encode from it has completed: from then on the caller may
   // destroy the image and free its memory. From any thread, perhaps
   // during another call of emberwave's on the context, or in the destroy
-  // of its last decoder, encoder or context. `NULL` if the caller knows
-  // that moment otherwise.
+  // of its last decoder, encoder or context, and so it must not call
+  // emberwave. `NULL` if the caller knows that moment otherwise.
   void (*release)(void *user);
   // Passed to `release`.
   void *user;
@@ -374,6 +427,8 @@ typedef struct EmberwaveVulkanImage {
 
 // The colour conversion of `emberwave_decoder_decode_rgb`.
 typedef struct EmberwaveColor {
+  // `sizeof(EmberwaveColor)` (decision D69).
+  uint32_t struct_size;
   // An `EMBERWAVE_MATRIX_*` value.
   uint32_t matrix;
   // An `EMBERWAVE_RANGE_*` value.
@@ -392,6 +447,11 @@ typedef struct EmberwaveColor {
 // holds up every later submission to the queue, the caller's too, as the
 // decode's waits at every stage.
 typedef struct EmberwaveVulkanSync {
+  // `sizeof(EmberwaveVulkanSync)` (decision D69).
+  uint32_t struct_size;
+  // `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
+  // combined with `|` for timeline semaphores, or 0 for binary ones.
+  uint32_t flags;
   // A `VkSemaphore` the decode's GPU work waits for, such as one the
   // caller signals once its reads of the textures are done, or 0 for
   // none.
@@ -403,9 +463,6 @@ typedef struct EmberwaveVulkanSync {
   uint64_t signal_semaphore;
   // For a timeline `signal_semaphore`, the value to signal it to.
   uint64_t signal_value;
-  // `EMBERWAVE_SYNC_WAIT_TIMELINE` and `EMBERWAVE_SYNC_SIGNAL_TIMELINE`
-  // combined with `|` for timeline semaphores, or 0 for binary ones.
-  uint32_t flags;
 } EmberwaveVulkanSync;
 
 // Fences for a call on textures shared with the caller's Direct3D 12 or
@@ -419,6 +476,8 @@ typedef struct EmberwaveVulkanSync {
 // hold on the context's queue, which waits for the queue to be idle, never
 // returns.
 typedef struct EmberwaveD3D12Sync {
+  // `sizeof(EmberwaveD3D12Sync)` (decision D69).
+  uint32_t struct_size;
   // A fence the call's GPU work waits for, such as one the caller signals
   // once its own work on the textures is done, or `NULL`.
   const struct EmberwaveD3D12Fence *wait_fence;
@@ -433,6 +492,9 @@ typedef struct EmberwaveD3D12Sync {
 
 // The sizes of the planes a decoder writes or an encoder reads.
 typedef struct EmberwaveFrameInfo {
+  // `sizeof(EmberwaveFrameInfo)`, set by the caller before the call
+  // (decision D69).
+  uint32_t struct_size;
   // Width of the luma plane, and of the picture.
   uint32_t width;
   // Height of the luma plane, and of the picture.
@@ -452,6 +514,9 @@ typedef struct EmberwavePlane {
   // Bytes from the start of one row to the start of the next: at least the
   // width of the plane, or three times the width for RGB.
   size_t stride;
+  // Bytes that may be written from `data` on: at least `stride` times the
+  // rows less one, plus a row.
+  size_t size;
 } EmberwavePlane;
 
 // What the frames of an encoder say about their colours, in every start of
@@ -459,6 +524,8 @@ typedef struct EmberwavePlane {
 // chroma siting; the primaries and the transfer function are for whatever
 // shows the picture.
 typedef struct EmberwaveSignalling {
+  // `sizeof(EmberwaveSignalling)` (decision D69).
+  uint32_t struct_size;
   // `EMBERWAVE_MATRIX_BT709` or `EMBERWAVE_MATRIX_BT2020`: the format
   // cannot signal BT.601.
   uint32_t matrix;
@@ -470,8 +537,6 @@ typedef struct EmberwaveSignalling {
   uint32_t primaries;
   // An `EMBERWAVE_TRANSFER_*` value.
   uint32_t transfer;
-  // Zeros: room for what later versions may add.
-  uint32_t reserved[3];
 } EmberwaveSignalling;
 
 // One plane of a picture to encode, in the caller's memory.
@@ -481,6 +546,9 @@ typedef struct EmberwaveSourcePlane {
   // Bytes from the start of one row to the start of the next: at least the
   // width of the plane.
   size_t stride;
+  // Bytes that may be read from `data` on: at least `stride` times the
+  // rows less one, plus a row.
+  size_t size;
 } EmberwaveSourcePlane;
 
 // One packet of a frame: where it starts in the frame and how many bytes it
@@ -498,6 +566,11 @@ extern "C" {
 
 // The version of emberwave, such as `"0.3.0"`. The string is static.
 const char *emberwave_version(void);
+
+// The version of the library as one number, as `EMBERWAVE_VERSION` numbers
+// the header's: 1600 for 0.16.0. A program compares the two to learn that
+// it runs with another library than the one it was built for.
+uint32_t emberwave_version_number(void);
 
 // Describes the last failure on the calling thread, or is empty if no call on
 // it has failed. The string stays valid until the next failing call on the
@@ -555,12 +628,12 @@ enum EmberwaveStatus emberwave_context_create(const struct EmberwaveContextOptio
 // `device` is an `id<MTLDevice>` and `queue` an `id<MTLCommandQueue>` of it,
 // which emberwave retains while the context, or anything made on it, lives.
 // emberwave's GPU work then goes onto the caller's queue, and
-// `emberwave_decoder_submit_texture` and
-// `emberwave_decoder_submit_plane_textures` need not wait for it: Metal runs
+// `emberwave_decoder_submit_texture_metal` and
+// `emberwave_decoder_submit_plane_textures_metal` need not wait for it: Metal runs
 // the command buffers the caller commits to the queue after such a call
 // after the decode, and a decode after the command buffers committed before
 // it, for the textures they share (decision D43). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 // `NULL`.
 //
 // The queue is shared:
@@ -598,19 +671,22 @@ enum EmberwaveStatus emberwave_context_create_metal(void *device,
 // `VK_KHR_get_physical_device_properties2` it learns less of a device and
 // uses fewer of its features. `VK_KHR_surface` goes with the
 // `VK_KHR_swapchain` that `emberwave_vulkan_requirements_create` lists on
-// devices that have it. With `names` `NULL`, stores their number in
-// `*count`; otherwise writes them to `names`, which has room for `*count`,
-// or gives `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the number needed in
-// `*count` if that is too few. The names stay valid as long as the process.
-// Only where wgpu runs on Vulkan; elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+// devices that have it. Stores their number in `*count`, and with `names`
+// not `NULL` writes them there too, which has room for `capacity` names; if
+// that is too few, nothing is written to `names` and the result is
+// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, as for `emberwave_frame_packets`.
+// The counts are `uint32_t`, as Vulkan's are. The names stay valid as long
+// as the process. Only where wgpu runs on Vulkan; elsewhere
+// `EMBERWAVE_STATUS_UNSUPPORTED`.
 //
 // # Safety
 //
 // `get_instance_proc_addr` is `NULL` or a loader's `vkGetInstanceProcAddr`,
-// `count` points to a `uint32_t`, and `names` is `NULL` or points to
-// `*count` pointers that may be written.
+// `names` is `NULL` or points to `capacity` pointers that may be written,
+// and `count` points to a `uint32_t`.
 enum EmberwaveStatus emberwave_vulkan_instance_extensions(EmberwaveVkGetInstanceProcAddr get_instance_proc_addr,
                                                           const char **names,
+                                                          uint32_t capacity,
                                                           uint32_t *count);
 
 // Lists what a Vulkan device of the caller's must have enabled for
@@ -620,8 +696,8 @@ enum EmberwaveStatus emberwave_vulkan_instance_extensions(EmberwaveVkGetInstance
 // `emberwave_vulkan_requirements_features` gives. Make the device with
 // them, and with whatever else the caller needs. Only where wgpu runs on
 // Vulkan, on Linux, Android and 64-bit Windows; elsewhere
-// `EMBERWAVE_STATUS_NO_GPU`.
-// `EMBERWAVE_STATUS_NO_GPU` too for a physical device wgpu cannot use.
+// `EMBERWAVE_STATUS_UNSUPPORTED`. `EMBERWAVE_STATUS_NO_GPU` for a physical
+// device wgpu cannot use.
 //
 // # Safety
 //
@@ -674,7 +750,7 @@ void emberwave_vulkan_requirements_destroy(struct EmberwaveVulkanRequirements *r
 // work on the caller's queue (decision D61). The device keeps belonging to
 // the caller, who destroys it after the context and everything made on it.
 // Only where wgpu runs on Vulkan, on Linux, Android and 64-bit Windows;
-// elsewhere `EMBERWAVE_STATUS_NO_GPU`.
+// elsewhere `EMBERWAVE_STATUS_UNSUPPORTED`.
 //
 // The device must have been made with the extensions and the features of
 // `emberwave_vulkan_requirements_create`. A lacking extension is
@@ -700,14 +776,16 @@ void emberwave_vulkan_requirements_destroy(struct EmberwaveVulkanRequirements *r
 // - The decodes that wait return once the GPU is done. Those that do not
 //   wait are `emberwave_decoder_submit_texture_vulkan` and
 //   `emberwave_decoder_submit_plane_textures_vulkan`, which order the work
-//   with semaphores; `emberwave_decoder_submit_texture` and
-//   `emberwave_decoder_submit_plane_textures` are for Metal contexts only.
+//   with semaphores; `emberwave_decoder_submit_texture_metal` and
+//   `emberwave_decoder_submit_plane_textures_metal` are for Metal contexts only.
 //
 // # Safety
 //
 // `device` is `NULL` or points to an `EmberwaveVulkanDevice` that describes
 // a live device made as above, with a queue of that family and index, and
-// callbacks that may be called from any thread. `context` points to where
+// callbacks that may be called from any thread; its `instance` is `NULL`
+// or points to an `EmberwaveVulkanInstance` with its `struct_size` set.
+// `context` points to where
 // the new context is stored; it is set to `NULL` when the call fails.
 enum EmberwaveStatus emberwave_context_create_vulkan(const struct EmberwaveVulkanDevice *device,
                                                      struct EmberwaveContext **context);
@@ -1251,9 +1329,9 @@ void emberwave_decoder_clear(struct EmberwaveDecoder *decoder);
 // # Safety
 //
 // `decoder` is a live decoder that no other thread is using. Each plane's
-// `data` points to `stride * (height - 1) + width` bytes that may be
-// written, with the sizes of `emberwave_decoder_info`, and the planes do
-// not overlap.
+// `data` points to `size` bytes that may be written, `size` being at least
+// `stride * (height - 1) + width` for the sizes of
+// `emberwave_decoder_info`, and the planes do not overlap.
 enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decoder,
                                                   struct EmberwavePlane y,
                                                   struct EmberwavePlane cb,
@@ -1277,7 +1355,8 @@ enum EmberwaveStatus emberwave_decoder_decode_yuv(struct EmberwaveDecoder *decod
 //
 // `decoder` is a live decoder that no other thread is using, `color` is
 // `NULL` or points to an `EmberwaveColor`, and `rgb.data` points to
-// `stride * (height - 1) + 3 * width` bytes that may be written.
+// `rgb.size` bytes that may be written, `rgb.size` being at least
+// `stride * (height - 1) + 3 * width`.
 enum EmberwaveStatus emberwave_decoder_decode_rgb(struct EmberwaveDecoder *decoder,
                                                   const struct EmberwaveColor *color,
                                                   struct EmberwavePlane rgb);
@@ -1324,7 +1403,7 @@ enum EmberwaveStatus emberwave_texture_create_plane(const struct EmberwaveDecode
 // `emberwave_texture_create`'s: a texture of a `CVPixelBuffer` from a
 // `CVMetalTextureCache`, to hand to an `AVSampleBufferDisplayLayer`, one the
 // caller made, or a drawable (decision D44). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 // `NULL`.
 //
 // The texture is on the device of the decoder's context
@@ -1387,7 +1466,7 @@ enum EmberwaveStatus emberwave_texture_from_metal_plane(const struct EmberwaveDe
 // of an NV12 pixel buffer holds them, or `EMBERWAVE_PLANE_RGB` for the
 // whole picture in `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm`,
 // as a BGRA pixel buffer holds it (decision D65). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_NO_GPU` for arguments that are not
+// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
 // `NULL`.
 //
 // The texture is on the device of the encoder's context
@@ -1498,13 +1577,13 @@ enum EmberwaveStatus emberwave_decoder_decode_texture(struct EmberwaveDecoder *d
 // # Safety
 //
 // As for `emberwave_decoder_decode_texture`.
-enum EmberwaveStatus emberwave_decoder_submit_texture(struct EmberwaveDecoder *decoder,
-                                                      const struct EmberwaveColor *color,
-                                                      const struct EmberwaveTexture *texture);
+enum EmberwaveStatus emberwave_decoder_submit_texture_metal(struct EmberwaveDecoder *decoder,
+                                                            const struct EmberwaveColor *color,
+                                                            const struct EmberwaveTexture *texture);
 
 // Decodes the frame received so far into the plane textures `y`, `cb` and
 // `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
-// the work is on the queue, as `emberwave_decoder_submit_texture` does: only
+// the work is on the queue, as `emberwave_decoder_submit_texture_metal` does: only
 // for a decoder whose context was made by `emberwave_context_create_metal`,
 // and textures whose hazards Metal tracks. Vulkan and Direct3D contexts have
 // `emberwave_decoder_submit_plane_textures_vulkan` and
@@ -1513,10 +1592,10 @@ enum EmberwaveStatus emberwave_decoder_submit_texture(struct EmberwaveDecoder *d
 // # Safety
 //
 // As for `emberwave_decoder_decode_plane_textures`.
-enum EmberwaveStatus emberwave_decoder_submit_plane_textures(struct EmberwaveDecoder *decoder,
-                                                             const struct EmberwaveTexture *y,
-                                                             const struct EmberwaveTexture *cb,
-                                                             const struct EmberwaveTexture *cr);
+enum EmberwaveStatus emberwave_decoder_submit_plane_textures_metal(struct EmberwaveDecoder *decoder,
+                                                                   const struct EmberwaveTexture *y,
+                                                                   const struct EmberwaveTexture *cb,
+                                                                   const struct EmberwaveTexture *cr);
 
 // Decodes the frame received so far into its Y, Cb and Cr planes in `y`,
 // `cb` and `cr` on the GPU, then waits for the GPU: when this returns,
@@ -1642,7 +1721,7 @@ enum EmberwaveStatus emberwave_encoder_info(struct EmberwaveEncoder *encoder,
 // decoder. The planes have the sizes of `emberwave_encoder_info`, each row
 // `stride` bytes from the next, and the bytes between the rows are not
 // read. A budget too small for even the smallest frame is
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT` with the smallest frame's size in
+// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL` with the smallest frame's size in
 // `*size`; nothing is encoded then, and the next frame takes the sequence
 // number this one would have had. Waits for the GPU.
 //
@@ -1653,7 +1732,8 @@ enum EmberwaveStatus emberwave_encoder_info(struct EmberwaveEncoder *encoder,
 // # Safety
 //
 // `encoder` is a live encoder that no other thread is using. Each plane's
-// `data` points to `stride * (height - 1) + width` readable bytes. `frame`
+// `data` points to `size` readable bytes, `size` being at least
+// `stride * (height - 1) + width`. `frame`
 // points to `budget` bytes that may be written, and `size` to a `size_t`;
 // neither overlaps the planes or the other.
 enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
@@ -1679,8 +1759,9 @@ enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
 // # Safety
 //
 // `encoder` is a live encoder that no other thread is using. `rgb.data`
-// points to `rgb.stride * (height - 1) + 4 * width` readable bytes, at the
-// size `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
+// points to `rgb.size` readable bytes, `rgb.size` being at least
+// `rgb.stride * (height - 1) + 4 * width` at the size
+// `emberwave_encoder_info` gives. `frame` points to `budget` bytes that
 // may be written, and `size` to a `size_t`; neither overlaps the picture or
 // the other.
 enum EmberwaveStatus emberwave_encoder_encode_rgb(struct EmberwaveEncoder *encoder,
@@ -1703,9 +1784,10 @@ enum EmberwaveStatus emberwave_encoder_encode_rgb(struct EmberwaveEncoder *encod
 // `emberwave_texture_from_vulkan_source`, or textures that decodes put
 // planes or pictures into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT`
 // before any work on the GPU, textures shared from Direct3D included, which
-// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives it too, as for
-// `emberwave_encoder_encode`, once the GPU has encoded the picture: no
-// frame then, and the sequence number does not move.
+// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives
+// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, as for `emberwave_encoder_encode`,
+// once the GPU has encoded the picture: no frame then, and the sequence
+// number does not move.
 //
 // Waits for the GPU: when it returns, the GPU has read the textures, and
 // the caller may write them again or hand them back to a capture's pool.
@@ -1746,7 +1828,7 @@ enum EmberwaveStatus emberwave_encoder_encode_textures(struct EmberwaveEncoder *
 // boundaries of its blocks, and stores how many in `*count`. With `packets`
 // not `NULL`, also where each starts in the frame and its size, in order;
 // with fewer than `*count` places there (`capacity`), nothing is written to
-// `packets` and the result is `EMBERWAVE_STATUS_INVALID_ARGUMENT`. The first
+// `packets` and the result is `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`. The first
 // packet starts with the start of frame header. A block larger than
 // `max_packet_bytes` gets a packet of its own, as does the rest of a frame
 // from a malformed block on, so a packet can be larger. A decoder takes the

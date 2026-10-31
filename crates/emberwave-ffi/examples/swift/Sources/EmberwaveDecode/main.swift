@@ -42,7 +42,9 @@ func decode(input: String, output: String) throws {
     let bytes = [UInt8](file)
 
     // The file header says how large the pictures are.
+    // A struct passed by pointer starts with its size, which the caller sets.
     var stream = EmberwaveStreamInfo()
+    stream.struct_size = UInt32(MemoryLayout<EmberwaveStreamInfo>.size)
     try check(emberwave_probe_pwv1(bytes, bytes.count, &stream), "emberwave_probe_pwv1")
 
     // One context per GPU; its decoders share the compiled shaders.
@@ -58,6 +60,7 @@ func decode(input: String, output: String) throws {
         emberwave_decoder_create(context, stream.width, stream.height, stream.chroma, &decoder),
         "emberwave_decoder_create")
     var frame = EmberwaveFrameInfo()
+    frame.struct_size = UInt32(MemoryLayout<EmberwaveFrameInfo>.size)
     try check(emberwave_decoder_info(decoder, &frame), "emberwave_decoder_info")
 
     // The three planes, back to back, as a Y4M frame holds them.
@@ -115,10 +118,12 @@ func decode(input: String, output: String) throws {
 
         try planes.withUnsafeMutableBufferPointer {
             let base = $0.baseAddress!
-            let y = EmberwavePlane(data: base, stride: Int(frame.width))
-            let cb = EmberwavePlane(data: base + lumaBytes, stride: Int(frame.chroma_width))
+            let y = EmberwavePlane(data: base, stride: Int(frame.width), size: lumaBytes)
+            let cb = EmberwavePlane(
+                data: base + lumaBytes, stride: Int(frame.chroma_width), size: chromaBytes)
             let cr = EmberwavePlane(
-                data: base + lumaBytes + chromaBytes, stride: Int(frame.chroma_width))
+                data: base + lumaBytes + chromaBytes, stride: Int(frame.chroma_width),
+                size: chromaBytes)
             try check(
                 emberwave_decoder_decode_yuv(decoder, y, cb, cr), "emberwave_decoder_decode_yuv")
         }
