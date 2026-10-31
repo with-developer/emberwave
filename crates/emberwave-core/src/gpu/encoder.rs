@@ -52,6 +52,7 @@ struct FdwtStage {
 /// GPU time of each stage of an encode, measured with timestamp queries at
 /// the boundaries of its compute passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncodeStageTimings {
     /// The forward transform, all levels, and for a picture in textures
     /// the packing of its samples before.
@@ -73,6 +74,7 @@ impl EncodeStageTimings {
 
 /// Where the time of one encode went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncodeTimings {
     /// CPU time to check the planes and put them where wgpu uploads them
     /// from, and to prepare the GPU work.
@@ -96,6 +98,7 @@ pub struct EncodeTimings {
 /// another mip level goes unnoticed. So does, at times, a texture of another
 /// device, which wgpu may take for one of this device's.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum TexturePicture<'a> {
     /// Y, Cb and Cr, each in an `R8Unorm` texture.
     Planes([&'a wgpu::TextureView; 3]),
@@ -599,6 +602,7 @@ impl Encoder {
     /// the sizes of [`FrameLayout::plane_size`]. A picture that cannot fit
     /// the budget is [`GpuError::Encode`]. It waits for the GPU, so it cannot
     /// run in a browser, where nothing may block.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, GpuError> {
         self.run_encode(Input::Planes(planes, None), budget, false, None)
             .map(|(frame, _)| frame)
@@ -610,6 +614,7 @@ impl Encoder {
     /// bytes at the sizes of [`FrameLayout::plane_size`], and the bytes
     /// between the rows are not read. A stride below the width is
     /// [`EncodeError::PlaneStride`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn encode_strided(
         &mut self,
         planes: [&[u8]; 3],
@@ -624,6 +629,7 @@ impl Encoder {
     /// for benchmarks. The per-stage times are `Some` only if the context was
     /// created with [`GpuOptions::timestamps`](super::GpuOptions::timestamps)
     /// and the device supports them.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn encode_timed(
         &mut self,
         planes: [&[u8]; 3],
@@ -639,6 +645,7 @@ impl Encoder {
     ///
     /// The GPU reads the textures after the work submitted to the queue
     /// before, and is done with them when this returns.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn encode_textures(
         &mut self,
         picture: TexturePicture<'_>,
@@ -652,6 +659,7 @@ impl Encoder {
     /// the submission: for what the submission must carry for the caller's
     /// graphics API, such as a Vulkan semaphore to wait on before the
     /// textures are read (decision D62).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn encode_textures_with(
         &mut self,
         picture: TexturePicture<'_>,
@@ -664,6 +672,7 @@ impl Encoder {
 
     /// Encodes like [`encode_textures`](Self::encode_textures) and says
     /// where the time went, as [`encode_timed`](Self::encode_timed) does.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn encode_textures_timed(
         &mut self,
         picture: TexturePicture<'_>,
@@ -678,6 +687,7 @@ impl Encoder {
     /// keeps, and is converted there as [`TexturePicture::Rgb`] says, into
     /// the frame of the same picture in a texture (decision D65). A picture
     /// smaller than its size and stride say is [`EncodeError::Picture`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn encode_rgb(
         &mut self,
         rgb: &[u8],
@@ -692,6 +702,7 @@ impl Encoder {
     /// Encodes like [`encode_rgb`](Self::encode_rgb) and says where the
     /// time went, as [`encode_timed`](Self::encode_timed) does: the upload
     /// of the picture into the encoder's texture counts as preparation.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn encode_rgb_timed(
         &mut self,
         rgb: &[u8],

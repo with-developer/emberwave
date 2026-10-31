@@ -16,6 +16,7 @@ pub const BACKEND_ENV: &str = "EMBERWAVE_BACKEND";
 
 /// How the adapter is chosen.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GpuOptions {
     /// Backends to consider.
     pub backends: wgpu::Backends,
@@ -26,6 +27,7 @@ pub struct GpuOptions {
     /// Restrict the device to what the WebGPU specification guarantees: the
     /// default limits and no optional features. Used by tests to show that the
     /// shaders are portable.
+    #[doc(hidden)]
     pub strict_webgpu: bool,
     /// Ask for GPU timestamp queries if the adapter has them, so that
     /// [`Decoder::time_frame`](super::Decoder::time_frame) can report the time
@@ -36,6 +38,7 @@ pub struct GpuOptions {
     /// Metal, through the adapter's own format features (decision D52).
     /// Without it, and elsewhere, the decoders copy the planes into the
     /// textures (decision D41). Ignored with `strict_webgpu`.
+    #[doc(hidden)]
     pub plane_stores: bool,
     /// Let the decoders write a frame, and the encoders a picture's planes,
     /// where their shaders read them, on GPUs that share their memory with
@@ -43,6 +46,7 @@ pub struct GpuOptions {
     /// (decisions D53, D54). Without it, and elsewhere, they go into an
     /// upload buffer that the GPU copies from (decisions D30, D34). Ignored
     /// with `strict_webgpu`.
+    #[doc(hidden)]
     pub shared_uploads: bool,
 }
 
@@ -78,11 +82,10 @@ impl GpuOptions {
 }
 
 impl Default for GpuOptions {
-    /// All native backends unless [`BACKEND_ENV`] names others, preferring the
-    /// high-performance GPU. An unusable value of the variable is ignored; use
-    /// [`GpuOptions::from_env`] to be told about it.
+    /// All native backends, preferring the high-performance GPU. The
+    /// environment has no say: [`GpuOptions::from_env`] gives it one.
     fn default() -> Self {
-        Self::from_env().unwrap_or_else(|_| Self::base())
+        Self::base()
     }
 }
 
@@ -256,7 +259,7 @@ impl GpuContext {
     /// caller's, with `wgpu::Adapter::create_device_from_hal`, whose room for
     /// command buffers they share (#126, decision D60). The calls that make
     /// and submit their own command buffers take turns; those that record
-    /// into the caller's encoder, such as `Decoder::encode_rgb`, leave the
+    /// into the caller's encoder, such as `Decoder::record_rgb`, leave the
     /// submission and the turn to the caller, which takes it with
     /// [`QueueTurns::take`].
     ///
@@ -581,7 +584,7 @@ impl QueueTurns {
 
     /// Takes a turn, waiting for it: for work of the caller's own that it
     /// records and submits to the queue alongside emberwave's, such as what
-    /// [`Decoder::encode_rgb`](super::Decoder::encode_rgb) records into the
+    /// [`Decoder::record_rgb`](super::Decoder::record_rgb) records into the
     /// caller's encoder. Hold it from the first command buffer to the
     /// submission, and not while waiting for the GPU.
     pub fn take(&self) -> QueueTurn<'_> {

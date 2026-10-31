@@ -324,9 +324,10 @@ fn errors_are_the_cpu_encoders() {
 #[test]
 fn a_device_limited_to_webgpu_guarantees_encodes_the_same() {
     let context = gpu_or_return!();
-    let options = GpuOptions {
-        strict_webgpu: true,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = GpuOptions::default();
+        options.strict_webgpu = true;
+        options
     };
     let Some(strict) = create_context(&options) else {
         return;
@@ -404,9 +405,10 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
 #[test]
 fn timing_an_encode_reports_where_the_time_goes() {
     // Timestamp queries are optional, so ask for them and accept their absence.
-    let options = GpuOptions {
-        timestamps: true,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = GpuOptions::default();
+        options.timestamps = true;
+        options
     };
     let Some(context) = create_context(&options) else {
         return;
@@ -501,9 +503,10 @@ fn pictures_in_textures_encode_as_the_same_planes_do() {
     // limited to what WebGPU guarantees (decision D32).
     let context = gpu_or_return!();
     let mut contexts = vec![(context.clone(), usize::MAX)];
-    let strict = GpuOptions {
-        strict_webgpu: true,
-        ..GpuOptions::default()
+    let strict = {
+        let mut options = GpuOptions::default();
+        options.strict_webgpu = true;
+        options
     };
     if let Some(strict) = create_context(&strict) {
         contexts.push((strict, 3));
@@ -541,9 +544,10 @@ fn planes_written_in_place_encode_as_uploaded_ones() {
     // upload buffer (decision D54). One encoder takes every kind of picture
     // in turn, and its frames are those of an encoder on the upload path.
     let context = gpu_or_return!();
-    let options = GpuOptions {
-        shared_uploads: false,
-        ..GpuOptions::default()
+    let options = {
+        let mut options = GpuOptions::default();
+        options.shared_uploads = false;
+        options
     };
     let Some(copied) = create_context(&options) else {
         return;
@@ -797,6 +801,7 @@ fn rgb_of(layout: &FrameLayout, source: &[Vec<u8>; 3], order: RgbOrder, stride: 
         let ordered = match order {
             RgbOrder::Rgba => [r, g, b, fourth],
             RgbOrder::Bgra => [b, g, r, fourth],
+            other => panic!("{other:?}"),
         };
         bytes[y * stride + 4 * x..][..4].copy_from_slice(&ordered);
     }
@@ -811,9 +816,10 @@ fn pictures_in_rgb_encode_as_the_planes_they_convert_to_do() {
     // a device limited to what WebGPU guarantees (decision D65).
     let context = gpu_or_return!();
     let mut contexts = vec![(context.clone(), usize::MAX)];
-    let strict = GpuOptions {
-        strict_webgpu: true,
-        ..GpuOptions::default()
+    let strict = {
+        let mut options = GpuOptions::default();
+        options.strict_webgpu = true;
+        options
     };
     if let Some(strict) = create_context(&strict) {
         contexts.push((strict, 2));

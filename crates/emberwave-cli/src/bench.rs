@@ -197,10 +197,12 @@ pub fn run(args: &Args) -> Result<()> {
                     decoder.decode_rgb(frame, &color)?;
                 }
             }
-            Ok(Timings {
-                prepare: start.elapsed(),
-                gpu_wall: Duration::ZERO,
-                stages: None,
+            Ok({
+                let mut timings = Timings::default();
+                timings.prepare = start.elapsed();
+                timings.gpu_wall = Duration::ZERO;
+                timings.stages = None;
+                timings
             })
         } else {
             Ok(decoder.time_frame(frame, output)?)

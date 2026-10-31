@@ -9,6 +9,14 @@
 //!   encoder.
 //!
 //! See `ARCHITECTURE.md` for the design.
+//!
+//! Items hidden from this documentation are there for emberwave's own tests
+//! and tools: they are not part of the API, and any release may change them.
+//! With the `gpu` feature, [`wgpu`] is the version emberwave is built with,
+//! whose types the GPU calls take: use it to share a device or a texture.
+
+#[cfg(feature = "gpu")]
+pub use wgpu;
 
 pub mod bitstream;
 pub mod color;

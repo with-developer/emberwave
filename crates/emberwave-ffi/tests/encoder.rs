@@ -964,6 +964,7 @@ fn rgb_picture(width: u32, height: u32, stride: usize, order: RgbOrder) -> Vec<u
             let pixel = match order {
                 RgbOrder::Rgba => [r, g, b, (state >> 24) as u8],
                 RgbOrder::Bgra => [b, g, r, (state >> 24) as u8],
+                other => panic!("{other:?}"),
             };
             bytes[y * stride + 4 * x..][..4].copy_from_slice(&pixel);
         }
@@ -1010,11 +1011,7 @@ fn pictures_in_rgb_encode_as_the_planes_they_convert_to() {
         transfer: EMBERWAVE_TRANSFER_PQ,
         ..Default::default()
     };
-    let other_params = ColorParams {
-        matrix: ColorMatrix::Bt2020,
-        range: YcbcrRange::Full,
-        chroma_siting: ChromaSiting::Left,
-    };
+    let other_params = ColorParams::new(ColorMatrix::Bt2020, YcbcrRange::Full, ChromaSiting::Left);
     for (width, height, chroma) in SHAPES {
         let layout = FrameLayout::new(width, height, chroma).unwrap();
         for (signalling, params) in [(None, ColorParams::default()), (Some(&other), other_params)] {

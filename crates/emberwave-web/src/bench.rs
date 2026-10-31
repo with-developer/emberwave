@@ -146,7 +146,7 @@ impl Bench {
                 });
         stream
             .decoder
-            .encode_rgb(
+            .record_rgb(
                 &stream.frames[stream.next],
                 &ColorParams::default(),
                 &mut encoder,

@@ -378,9 +378,10 @@ fn decode_to_png_converts_the_decoded_planes_correctly() {
 
     // The same conversion done on the CPU from the Y4M the same decoder wrote.
     let (width, height, [y, cb, cr]) = first_frame(&dir.join(format!("{VECTOR}.y4m")));
-    let params = ColorParams {
-        matrix: ColorMatrix::Bt709,
-        ..ColorParams::default()
+    let params = {
+        let mut params = ColorParams::default();
+        params.matrix = ColorMatrix::Bt709;
+        params
     };
     let expected = yuv_to_rgb8(
         [&y, &cb, &cr],

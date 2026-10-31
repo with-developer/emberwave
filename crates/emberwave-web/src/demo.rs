@@ -56,7 +56,7 @@ impl Demo {
             frame_rate_den: 1,
             reference_bit_depth: 8,
         };
-        let mut file = Vec::with_capacity(pwv1::HEADER_BYTES + FRAMES as usize * (4 + BUDGET));
+        let mut file = Vec::with_capacity(pwv1::FILE_HEADER_BYTES + FRAMES as usize * (4 + BUDGET));
         file.extend_from_slice(&header.to_bytes());
         Ok(Self {
             encoder,

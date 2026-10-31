@@ -207,6 +207,7 @@ impl SequenceHeader {
 
 /// A parsed 8 byte header, told apart by its `extended` bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Header {
     /// Header of a coded 32x32 block.
     Block(BlockHeader),

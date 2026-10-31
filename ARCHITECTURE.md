@@ -487,7 +487,7 @@ PNG output is 8-bit RGB with fast compression. The Y4M writer takes range, chrom
 Nothing in a browser may block, so the player uses only the parts of the decoder that do not wait:
 
 - `GpuContext::from_adapter` creates the device on an adapter that can draw on the canvas. `GpuContext::new`, which blocks, does not exist in the browser build.
-- `Decoder::encode_rgb_to_texture` records the decode and the colour conversion into the player's command encoder and puts the picture into the canvas's texture: by a copy where the canvas allows it and is a multiple of 64 pixels wide, and otherwise by a draw (`draw.wgsl`: one triangle over the canvas, which has the size of the picture, so a fragment reads one word; decisions D40 and D42). One submission per frame, and the picture never leaves the GPU.
+- `Decoder::record_rgb_to_texture` records the decode and the colour conversion into the player's command encoder and puts the picture into the canvas's texture: by a copy where the canvas allows it and is a multiple of 64 pixels wide, and otherwise by a draw (`draw.wgsl`: one triangle over the canvas, which has the size of the picture, so a fragment reads one word; decisions D40 and D42). One submission per frame, and the picture never leaves the GPU.
 - Error scopes cannot be waited for, so in the browser build `with_error_scope` just runs its work. The player catches what the browser reports instead (`on_uncaptured_error`) and shows the first error on the page with the next frame. Pictures wider or taller than the browser can draw (`max_texture_dimension_2d`, 8192 by default) are refused when the file is loaded.
 - The methods that read a frame back or time it wait for the GPU, and are not for the browser. The decoder makes its read-back buffers only when a decode first reads back, so the player has none: 43.5 MiB fewer at 4K.
 - In a browser, dropping a wgpu buffer only lets go of the JavaScript object, and the GPU memory waits for the garbage collector. `Decoder` therefore destroys its large buffers when it is dropped, and the player drops the old stream before it loads the next file: about 110 MiB for a 4K stream.
@@ -1789,3 +1789,38 @@ The last frame's detail, always, gains everything on a still picture and loses u
 **Consequence.**
 - Every C caller changes. It sets `struct_size`, gives planes their `size`, calls the Metal submits by their new names, and checks the new statuses. The C examples, the Swift example, the benchmark app and the tests have been changed.
 - From now on, a minor version can add a member to a struct without breaking a program, as the C API must from 1.0 on.
+
+### 2026-10-31 — D70: The Rust API before 1.0
+
+**Context.** The same audit (#152) found `emberwave-core`'s API hard to grow, and harder to use than it had to be:
+- No enum or struct was `#[non_exhaustive]`, though six releases since 0.1 broke a `match` or a struct literal.
+- `Decoder::encode_rgb` recorded a decode, while `Encoder::encode_rgb` encoded a picture.
+- `GpuOptions::default()` read an environment variable.
+- `set_partial_share` clamped a share that the C API and the browser player refuse.
+- Items for tests were public.
+- Calls that wait for the GPU were built for the browser, where they cannot work.
+
+**Decision.**
+- **`#[non_exhaustive]`** on the enums that grow: `GpuError`, `EncodeError`, `ColorError`, `bitstream::Error`, `bitstream::Header`, `TexturePicture`, `TimedOutput`, `ColorMatrix` and `RgbOrder`.
+- **The same on the structs that grow.**
+  - Callers read the timings, the frames and their planes.
+  - Callers make `GpuOptions`, `ColorParams` and `Signalling` from their `Default` and change them member by member. `ColorParams::new` takes its three members. `Timings` has a `Default` for that too.
+  - The one-bit signalling enums, `Component` and `Band` stay exhaustive, as the format fixes them.
+- **Names.** The decoder's calls that record into the caller's encoder are `record_rgb`, `record_rgb_to_texture` and `record_to_plane_textures`.
+- **No hidden input.** `GpuOptions::default()` is the defaults alone. `GpuOptions::from_env()` reads `EMBERWAVE_BACKEND`, for the command line tool and the C API's `NULL` options.
+- **One rule for the share.** `set_partial_share` returns a `Result`. A share outside 0 to 1, or NaN, is `GpuError::InvalidArgument`, a new variant, as in the C API and the browser player.
+- **One name each.** `pwv1::HEADER_BYTES` is now `FILE_HEADER_BYTES`, apart from the 8 bytes of a frame's header.
+- **Hidden from the docs, and outside the API**, which the crate's docs say:
+  - `shader_sources` and `Decoder::read_band`;
+  - the CPU decoder's dequantiser and transform modules;
+  - the block parser's structures;
+  - the colour module's constants, siting taps and forward matrix;
+  - `GpuOptions`' `strict_webgpu`, `plane_stores` and `shared_uploads`.
+- **Not in the browser build.** The calls that wait for the GPU are not built for wasm32: the decoder's `decode`, `decode_rgb`, `time_frame`, `decode_assembled` and its forms, and `read_band`, and every encode of the GPU encoder. Their helpers may go unused there, which the GPU module allows on wasm32 only.
+- **`wgpu` re-exported** as `emberwave_core::wgpu`: the version emberwave is built with.
+
+**Not done.** About thirty public items take or return wgpu's types, so a new major version of wgpu breaks emberwave's Rust API. Two answers remain for 1.0: follow wgpu's major versions, or split a crate without wgpu types from the interop (#152).
+
+**Consequence.**
+- Rust callers change: a `match` on those enums gains a wildcard arm, and a struct literal of those types becomes a default changed member by member. The recording calls take their new names, and `set_partial_share`'s result is handled.
+- emberwave's own crates and tests have changed with it, and so does emberwave-stream when it moves to the next release.

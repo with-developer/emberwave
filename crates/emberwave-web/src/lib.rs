@@ -126,7 +126,7 @@ pub fn packet_ends(frame: &[u8], max_bytes: usize) -> Vec<u32> {
 /// header that every frame begins with, ends them, so that playing never
 /// meets a frame it cannot read.
 fn playable_frames(file: &Pwv1File<'_>) -> (usize, usize, Option<String>) {
-    let mut end = pwv1::HEADER_BYTES;
+    let mut end = pwv1::FILE_HEADER_BYTES;
     let mut count = 0;
     for frame in file.frames() {
         let reason = match frame {
@@ -263,7 +263,7 @@ impl Player {
         }
         let decoder = self.new_decoder(stream.width, stream.height, stream.chroma)?;
         let mut frames = Vec::with_capacity(count);
-        let mut at = pwv1::HEADER_BYTES;
+        let mut at = pwv1::FILE_HEADER_BYTES;
         while at < end {
             let size = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
             frames.push(at + 4..at + 4 + size as usize);
@@ -286,7 +286,7 @@ impl Player {
             file: bytes,
             end,
             frames,
-            next: pwv1::HEADER_BYTES,
+            next: pwv1::FILE_HEADER_BYTES,
             decoder,
             color: ColorParams::from_stream(&stream),
             follows_frames: false,
@@ -457,17 +457,14 @@ impl Player {
     /// the stream open. Throws for a share outside 0 to 1, and without a
     /// stream.
     pub fn set_partial_share(&mut self, share: f32) -> Result<(), JsError> {
-        if !(0.0..=1.0).contains(&share) {
-            return Err(JsError::new(&format!(
-                "a share of {share} is not from 0 to 1"
-            )));
-        }
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| JsError::new("no stream is open"))?;
-        stream.decoder.set_partial_share(share);
-        Ok(())
+        stream
+            .decoder
+            .set_partial_share(share)
+            .map_err(|error| JsError::new(&error.to_string()))
     }
 
     /// Sets whether a frame drawn in part conceals the blocks of detail it
@@ -647,10 +644,10 @@ impl Player {
         let view = target.texture.create_view(&Default::default());
         stream
             .decoder
-            .encode_rgb_to_texture(frame, &stream.color, &view, &mut encoder)
+            .record_rgb_to_texture(frame, &stream.color, &view, &mut encoder)
             .map_err(js_error)?;
         stream.next = if after >= stream.end {
-            pwv1::HEADER_BYTES
+            pwv1::FILE_HEADER_BYTES
         } else {
             after
         };
