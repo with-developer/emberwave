@@ -92,14 +92,14 @@ pub enum EmberwaveStatus {
 /// The major version of emberwave that this header belongs to.
 pub const EMBERWAVE_VERSION_MAJOR: u32 = 0;
 /// The minor version of emberwave that this header belongs to.
-pub const EMBERWAVE_VERSION_MINOR: u32 = 16;
+pub const EMBERWAVE_VERSION_MINOR: u32 = 17;
 /// The patch version of emberwave that this header belongs to.
 pub const EMBERWAVE_VERSION_PATCH: u32 = 0;
 /// The version this header belongs to as one number, major times 10000 plus
 /// minor times 100 plus patch: 1600 for 0.16.0. `emberwave_version_number()`
 /// gives the library's, which differs when a program runs with another
 /// library than the one it was built for.
-pub const EMBERWAVE_VERSION: u32 = 1600;
+pub const EMBERWAVE_VERSION: u32 = 1700;
 
 /// The library's version as `EMBERWAVE_VERSION` numbers it, from the crate's.
 const VERSION_NUMBER: u32 = decimal(env!("CARGO_PKG_VERSION_MAJOR")) * 10000
