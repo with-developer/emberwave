@@ -48,13 +48,13 @@
 #define EMBERWAVE_VERSION_MINOR 18
 
 // The patch version of emberwave that this header belongs to.
-#define EMBERWAVE_VERSION_PATCH 0
+#define EMBERWAVE_VERSION_PATCH 1
 
 // The version this header belongs to as one number, major times 10000 plus
 // minor times 100 plus patch: 1600 for 0.16.0. `emberwave_version_number()`
 // gives the library's, which differs when a program runs with another
 // library than the one it was built for.
-#define EMBERWAVE_VERSION 1800
+#define EMBERWAVE_VERSION 1801
 
 // 4:2:0: the chroma planes have half the width and height of the luma plane,
 // whose width and height are even.

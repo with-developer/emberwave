@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "emberwave-cli"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "clap",
  "emberwave-core",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "emberwave-core"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "bytemuck",
  "naga",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "emberwave-ffi"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "ash",
  "cbindgen",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "emberwave-web"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "emberwave-core",
  "wasm-bindgen",

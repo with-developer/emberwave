@@ -67,6 +67,8 @@ target/release/emberwave-cli decode testdata/gradient_200x120_420.pwv1 --out-dir
 
 The first build takes a few minutes. The last command prints the adapter it uses and the time of each frame, and leaves `out/gradient_200x120_420_000000.png` to `000002.png`: a colour gradient. The `.pwv1` files in `testdata/` are small streams made by upstream's encoder.
 
+With Rust, the command line decoder also installs from [crates.io](https://crates.io/crates/emberwave-cli) with `cargo install emberwave-cli`, and a Rust project takes the library with `cargo add emberwave-core` ([documentation](https://docs.rs/emberwave-core)).
+
 Without Rust, take `emberwave-cli` for Linux (x86_64), macOS (Apple Silicon) or Windows (x86_64) from the [releases](https://github.com/with-developer/emberwave/releases) and decode a `.pwv1` file from `testdata/` with it. The macOS binary is not signed, so run `xattr -d com.apple.quarantine emberwave-cli` once after downloading it.
 
 ## Usage

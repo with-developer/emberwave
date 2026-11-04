@@ -67,6 +67,8 @@ target/release/emberwave-cli decode testdata/gradient_200x120_420.pwv1 --out-dir
 
 처음 빌드할 때는 몇 분이 걸립니다. 마지막 명령은 사용 중인 어댑터와 프레임별 시간을 출력하고, 색 그러데이션 그림 `out/gradient_200x120_420_000000.png`부터 `000002.png`까지를 만듭니다. `testdata/`의 `.pwv1` 파일은 업스트림 인코더로 만든 작은 스트림입니다.
 
+Rust가 있다면 명령줄 디코더를 [crates.io](https://crates.io/crates/emberwave-cli)에서 `cargo install emberwave-cli`로 설치할 수도 있습니다. Rust 프로젝트에서 라이브러리를 쓰려면 `cargo add emberwave-core`를 실행하세요([문서](https://docs.rs/emberwave-core)).
+
 Rust가 없다면 [릴리스](https://github.com/with-developer/emberwave/releases)에서 Linux(x86_64), macOS(Apple silicon), Windows(x86_64)용 `emberwave-cli`를 내려받아 `testdata/`의 `.pwv1` 파일을 디코딩해 보면 됩니다. macOS 바이너리는 서명이 없으므로, 내려받은 뒤 `xattr -d com.apple.quarantine emberwave-cli`를 한 번 실행하세요.
 
 ## 사용법
