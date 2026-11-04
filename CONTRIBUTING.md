@@ -73,7 +73,7 @@ After a deliberate change to what the encoder writes, `scripts/gen_encoder_vecto
 - **No "fix later" comments.** Open an issue instead.
 - **New dependencies** need a reason in the pull request.
 - **The C API's structs.** A struct the C API takes or fills in through a pointer starts with `struct_size` (decision D69). A member is added at the end, only, and its zero is its default; the struct's `FIRST_SIZE` stays the size it had before. The calls read and write a struct through `read_struct` and `write_struct`, never by dereferencing the pointer.
-- **A release** changes the version in `Cargo.toml` and `EMBERWAVE_VERSION_MAJOR`, `_MINOR`, `_PATCH` and `EMBERWAVE_VERSION` in `crates/emberwave-ffi/src/lib.rs` together, as the build fails otherwise, and regenerates the header.
+- **A release** changes the version in `Cargo.toml` and `EMBERWAVE_VERSION_MAJOR`, `_MINOR`, `_PATCH` and `EMBERWAVE_VERSION` in `crates/emberwave-ffi/src/lib.rs` together, as the build fails otherwise, and regenerates the header. Once its tag's release is out, `cargo publish -p emberwave-core` and then `cargo publish -p emberwave-cli` put the two crates on crates.io; `emberwave-ffi` and `emberwave-web` are not published. `LICENSE` is copied into both crates, so a change to it goes into the copies too.
 
 ## Commits and pull requests
 

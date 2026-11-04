@@ -2,6 +2,10 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.18.1] - 2026-11-04
+
+`emberwave-core` and `emberwave-cli` are on crates.io: `cargo add emberwave-core` for the library, `cargo install emberwave-cli` for the command line decoder. The code is that of 0.18.0.
+
 ## [0.18.0] - 2026-10-31
 
 What a client can ask: how much of a frame has arrived, and which GPU a context runs on, in Rust, through the C API and in the browser player. Nothing breaks.
