@@ -5,9 +5,31 @@
 // scripts/bench_app_on_mac.sh builds and runs it. With -autorun, it makes the
 // short run of CI, and exits with status 1 if anything failed.
 
+import AppKit
 import Foundation
 
-let plan = CommandLine.arguments.contains("-autorun") ? Plan.short : Plan()
+let plan = CommandLine.arguments.contains("-autorun") || CommandLine.arguments.contains("-short") ? Plan.short : Plan()
+// -display: decodes beside a display loop over a screen (issue #81), which
+// needs the application's run loop on the main thread, so the work goes to
+// another one. It covers a screen for a few minutes.
+if CommandLine.arguments.contains("-display") {
+    let application = NSApplication.shared
+    application.setActivationPolicy(.regular)
+    Thread.detachNewThread {
+        do {
+            let report = try runDisplayBenchmark(plan) {
+                FileHandle.standardError.write(Data(($0 + "\n").utf8))
+            }
+            print(report)
+            exit(0)
+        } catch {
+            print("failed: \(error)")
+            exit(1)
+        }
+    }
+    application.run()
+}
+
 do {
     let emberwave = try Emberwave()
     var results: [SizeResult] = []
