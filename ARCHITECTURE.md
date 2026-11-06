@@ -1826,3 +1826,21 @@ The last frame's detail, always, gains everything on a still picture and loses u
 **Consequence.**
 - Rust callers change: a `match` on those enums gains a wildcard arm, and a struct literal of those types becomes a default changed member by member. The recording calls take their new names, and `set_partial_share`'s result is handled.
 - emberwave's own crates and tests have changed with it, and so does emberwave-stream when it moves to the next release.
+
+### 2026-11-06 — D71: A performance model for devices we do not have
+
+**Context.** Measuring on a phone needs the user's phone, unattended, with the keychain unlocked, and the user will not keep supplying devices. A release should still say roughly what it costs elsewhere (#159).
+
+**Decision.** `scripts/perf_model.py` fits `time = fixed + per_pixel x megapixels` for each way (decode into the planes, decode into RGB, encode) on the Apple M3 Max, from the C API runs of 2026-10-26 and 2026-10-27 (release 0.11.0), and estimates other chips by scaling the per-pixel term by their memory bandwidth against the M3 Max's 400 GB/s, keeping the fixed term. BENCHMARKS.md has the result as its own section, "Estimates for other devices", apart from the measured tables and marked as estimated.
+
+**Why bandwidth.** On the one other device measured the same way, the iPhone 17, the per-pixel cost is 5.2 to 5.6 times the M3 Max's. The memory bandwidths, 400 and 68 GB/s, are 5.9 times apart; the GPU cores, 40 and 5, 8 times. A frame is mostly coefficients and planes moving through memory.
+
+**Limits, stated beside the table.**
+- The model overestimates the iPhone 17 by 6 to 16 %, always above, so the table is no better than 15 %.
+- Three points per line show that the lines are straight, not that they predict, and the check is one device.
+- Paced decoding (60 frames a second) is not modelled: its extra 1.7 to 3.0 ms on the M3 Max and 4.6 to 5.9 ms on the iPhone 17 comes from the GPU's power states, and stays measured (#81).
+- The per-pixel term carries the frame's bytes, which grow with the size in the benchmark streams.
+
+**Not done.** Calibrating the bandwidth term on the iPhone (a factor of 0.88 to 0.95) for other chips: it would fit one device and be an extrapolation for all the others.
+
+**Consequence.** No code in the library changes. A new measurement of the M3 Max or the iPhone is entered into the script's table, and the table in BENCHMARKS.md is rewritten with `scripts/perf_model.py --write BENCHMARKS.md`. A device measured later is added as a check.
