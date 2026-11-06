@@ -10,6 +10,7 @@
 import AppKit
 import Emberwave
 import Foundation
+import IOKit.pwr_mgt
 import Metal
 
 extension Emberwave {
@@ -119,7 +120,7 @@ extension Emberwave {
             return end - start
         }
 
-        var clock = FrameClock()
+        var clock = FrameClock(rate: displayStreamRate)
         let warm = now()
         var index = 0
         while index < plan.warmupFrames || now() - warm < plan.warmupMs {
@@ -141,6 +142,11 @@ extension Emberwave {
 /// about every two seconds.
 private let displayStreamRate = 59.5
 
+/// Frames in one beat between that stream and a 60 Hz loop: 2 s, 119 frames. A
+/// run times whole beats, so that where the frames fall against the refreshes
+/// averages out the same in every run.
+let displayBeatFrames = 119
+
 /// One way of decoding to measure with and without a display loop.
 private struct Way {
     let name: String
@@ -150,7 +156,16 @@ private struct Way {
 /// Runs the whole measurement and returns its report. Call off the main
 /// thread, which has to run the application's loop.
 func runDisplayBenchmark(_ plan: Plan, progress: (String) -> Void) throws -> String {
-    FrameClock.rate = displayStreamRate
+    // The displays have to stay on, and be on: an unattended Mac sleeps them,
+    // and then nothing reaches a screen.
+    let activity = ProcessInfo.processInfo.beginActivity(
+        options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled, .userInitiated],
+        reason: "emberwave display-loop benchmark")
+    defer { ProcessInfo.processInfo.endActivity(activity) }
+    var wake: IOPMAssertionID = 0
+    IOPMAssertionDeclareUserActivity(
+        "emberwave display-loop benchmark" as CFString, kIOPMUserActiveLocal, &wake)
+    defer { IOPMAssertionRelease(wake) }
     let emberwave = try Emberwave()
     guard let device = emberwave.device else {
         throw EmberwaveFailure(description: "no Metal device")
@@ -204,9 +219,13 @@ func runDisplayBenchmark(_ plan: Plan, progress: (String) -> Void) throws -> Str
         "Per frame (ms): mean / median / 99th percentile. decode: from the frame's arrival until "
             + "its picture is in textures; to screen: from the frame's arrival until the display "
             + "presented it (presentedTime of its drawable, the first refresh that drew it). "
-            + "skipped: timed frames no refresh drew, because a newer one came first. "
-            + "refreshes: the median time between the display link's calls, and how many calls came "
-            + "more than half an interval late.",
+            + "not drawn: timed frames no refresh drew, because a newer one came first (the last "
+            + "frame has a refresh to be drawn at); not presented: drawn, but the display never "
+            + "presented the drawable. display link: the median time between its calls, and how "
+            + "many came more than half an interval late, from the first timed frame on; the "
+            + "calls' times carry the link thread's own jitter, so a few late ones say little. "
+            + "The frames are whole beats of the stream's drift against a 60 Hz loop. Without a "
+            + "loop, the window is there, black, with nothing drawn in it.",
     ]
     for size in pictureSizes {
         progress("\(size.name): making \(plan.pictures) test pictures")
@@ -214,7 +233,14 @@ func runDisplayBenchmark(_ plan: Plan, progress: (String) -> Void) throws -> Str
         let frames = try emberwave.encodeFrames(size, pictures)
         let rate = hevcRates(size)[0]
         progress("\(size.name): encoding HEVC at \(rate.bitsPerSecond / 1_000_000) Mbit/s")
-        let stream = try? makeHEVCStream(size, rate, pictures, plan)
+        // A Mac without HEVC, as a virtual machine may be, is not a failure; anything
+        // else is.
+        let stream: HEVCStream?
+        do {
+            stream = try makeHEVCStream(size, rate, pictures, plan)
+        } catch let failure as MediaFailure where failure.unavailable {
+            stream = nil
+        }
         if stream == nil {
             lines.append("\(size.name): HEVC not measured, VideoToolbox could not make the stream")
         }
@@ -229,12 +255,23 @@ func runDisplayBenchmark(_ plan: Plan, progress: (String) -> Void) throws -> Str
         if let stream {
             ways.append(
                 Way(name: "HEVC into NV12 textures") {
-                    try hevcPaced(stream, plan, device: device, sink: $0).stats
+                    try hevcPaced(stream, plan, rate: displayStreamRate, device: device, sink: $0).stats
                 })
         }
         lines.append("\(size.name), thermal state \(thermalState()):")
         for refresh in [nil] + loops.map({ Optional($0.rate) }) {
             lines.append(refresh.map { "  display loop at \($0) Hz:" } ?? "  no display loop:")
+            // Without a loop the window is there, black, and nothing draws in it.
+            let idle = refresh == nil ? loops.last?.loop : nil
+            if let idle {
+                DispatchQueue.main.sync { idle.showWindow() }
+                progress("idle window: " + DispatchQueue.main.sync { idle.windowState })
+            }
+            defer {
+                if let idle {
+                    DispatchQueue.main.sync { idle.hideWindow() }
+                }
+            }
             for way in ways {
                 progress("\(size.name): \(way.name), \(refresh.map { "display \($0) Hz" } ?? "no display")")
                 guard let refresh, let loop = loops.first(where: { $0.rate == refresh })?.loop else {
@@ -242,6 +279,13 @@ func runDisplayBenchmark(_ plan: Plan, progress: (String) -> Void) throws -> Str
                     continue
                 }
                 _ = DispatchQueue.main.sync { loop.start(rate: refresh) }
+                guard DispatchQueue.main.sync(execute: { loop.isOnScreen }) else {
+                    let state = DispatchQueue.main.sync { loop.windowState }
+                    _ = DispatchQueue.main.sync { loop.stop() }
+                    throw EmberwaveFailure(
+                        description: "the display loop's window never reached the screen (is it asleep?): "
+                            + state)
+                }
                 let decode: Stats
                 do {
                     decode = try way.run(loop.offer)
@@ -256,9 +300,11 @@ func runDisplayBenchmark(_ plan: Plan, progress: (String) -> Void) throws -> Str
                 } else {
                     text += "; to screen \(Stats(seen.toScreen, total: seen.toScreen.reduce(0, +)))"
                 }
-                text += "; skipped \(seen.skipped) of \(seen.offered); refreshes every "
-                    + String(format: "%.2f ms (%.0f Hz), late %d of %d", seen.interval, 1000 / max(seen.interval, 0.001), seen.late, seen.refreshes)
-                text += "; ticks \(seen.ticks), no picture \(seen.noPicture), no drawable \(seen.noDrawable)"
+                text += "; not drawn \(seen.skipped) of \(seen.offered), not presented \(seen.notPresented)"
+                text += String(
+                    format: "; display link every %.2f ms (%.0f Hz), %d of %d calls late",
+                    seen.interval, 1000 / max(seen.interval, 0.001), seen.late, seen.ticks)
+                text += "; no picture \(seen.noPicture), no drawable \(seen.noDrawable)"
                 lines.append(row(way.name, text, indent: 4))
             }
         }

@@ -68,12 +68,15 @@ struct DisplayOutcome {
     /// the frames that were drawn at all, those timed only.
     let toScreen: [Double]
     /// Frames offered by the decode, those timed only, and how many of them the
-    /// loop never drew because a newer one had come before its next refresh.
+    /// loop never drew because a newer one had come before its next refresh,
+    /// and how many it drew that the display never presented.
     let offered: Int
     let skipped: Int
-    /// Refreshes drawn; the time between the display link's calls, the median
-    /// and the number of calls that came more than half an interval later,
-    /// a sign of a loop that cannot keep up.
+    let notPresented: Int
+    /// From the first timed frame on: refreshes drawn; the time between the
+    /// display link's calls, the median, and the number of calls that came
+    /// more than half an interval later. The calls' times carry the link
+    /// thread's own wake-up jitter, so a few late ones say little.
     let refreshes: Int
     let interval: Double
     let late: Int
@@ -116,7 +119,9 @@ final class DisplayLoop: NSObject {
     private var sequence = 0
     private var drawn = -1
     private var offeredTimed = 0
-    private var skipped = 0
+    private var drawnTimed = 0
+    private var notPresented = 0
+    private var measuring = false
     private var refreshes = 0
     private var intervals: [Double] = []
     private var ticks = 0
@@ -192,6 +197,12 @@ final class DisplayLoop: NSObject {
     /// another input, never takes it.
     var isOnScreen: Bool { window.occlusionState.contains(.visible) }
 
+    /// What the window is doing, for a failure's message.
+    var windowState: String {
+        "\(screenName): window visible \(window.isVisible), on screen \(isOnScreen), "
+            + "on screen named \(window.screen?.localizedName ?? "none"), app active \(NSApp.isActive)"
+    }
+
     /// The picture size the screen is drawn at, for the report.
     var drawableSize: CGSize { layer.drawableSize }
 
@@ -204,6 +215,16 @@ final class DisplayLoop: NSObject {
         latest = Offered(
             sequence: sequence, arrived: arrived, layout: layout, textures: textures, timed: timed)
         if timed {
+            // The statistics of the display link start with the timed frames,
+            // not with the window or the warm-up.
+            if !measuring {
+                measuring = true
+                refreshes = 0
+                intervals = []
+                ticks = 0
+                noPicture = 0
+                noDrawable = 0
+            }
             offeredTimed += 1
         }
         lock.unlock()
@@ -219,7 +240,9 @@ final class DisplayLoop: NSObject {
         sequence = 0
         drawn = -1
         offeredTimed = 0
-        skipped = 0
+        drawnTimed = 0
+        notPresented = 0
+        measuring = false
         refreshes = 0
         intervals = []
         ticks = 0
@@ -230,13 +253,7 @@ final class DisplayLoop: NSObject {
         lock.unlock()
         divider = max(1, Int((Double(maximumRate) / Double(rate)).rounded()))
         counter = 0
-        NSApp.activate()
-        window.orderFrontRegardless()
-        // The window server takes a moment to put it on the screen.
-        let shown = Date(timeIntervalSinceNow: 2)
-        while !window.occlusionState.contains(.visible), Date() < shown {
-            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
-        }
+        showWindow()
         var link: CVDisplayLink?
         CVDisplayLinkCreateWithCGDisplay(displayID, &link)
         if let link {
@@ -254,9 +271,30 @@ final class DisplayLoop: NSObject {
         return maximumRate / divider
     }
 
+    /// Puts the window on the screen without drawing in it, as the rows without
+    /// a display loop have it, so that only the drawing differs between them
+    /// and the others: an app without a window is throttled by the system
+    /// after some seconds. Call on the main thread.
+    func showWindow() {
+        NSApp.activate()
+        window.orderFrontRegardless()
+        // The window server takes a moment to put it on the screen.
+        let shown = Date(timeIntervalSinceNow: 2)
+        while !window.occlusionState.contains(.visible), Date() < shown {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        }
+    }
+
+    /// Hides the window again. Call on the main thread.
+    func hideWindow() {
+        window.orderOut(nil)
+    }
+
     /// Stops drawing, hides the window and says what the loop saw, once the
     /// last pictures have been presented. Call on the main thread.
     func stop() -> DisplayOutcome {
+        // The last frame is drawn at the next refresh.
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
         if let link {
             CVDisplayLinkStop(link)
         }
@@ -270,9 +308,9 @@ final class DisplayLoop: NSObject {
         let median = intervals.sorted()[safe: intervals.count / 2] ?? 0
         let late = intervals.filter { $0 > median * 1.5 }.count
         return DisplayOutcome(
-            toScreen: toScreen, offered: offeredTimed, skipped: skipped, refreshes: refreshes,
-            interval: median, late: late, ticks: ticks, noPicture: noPicture,
-            noDrawable: noDrawable)
+            toScreen: toScreen, offered: offeredTimed, skipped: offeredTimed - drawnTimed,
+            notPresented: notPresented, refreshes: refreshes, interval: median, late: late,
+            ticks: ticks, noPicture: noPicture, noDrawable: noDrawable)
     }
 
     private func tick() {
@@ -322,8 +360,8 @@ final class DisplayLoop: NSObject {
         lock.lock()
         refreshes += 1
         if fresh {
-            if drawn >= 0, frame.timed {
-                skipped += frame.sequence - drawn - 1
+            if frame.timed {
+                drawnTimed += 1
             }
             drawn = frame.sequence
         }
@@ -331,8 +369,14 @@ final class DisplayLoop: NSObject {
         if fresh, frame.timed {
             let arrived = frame.arrived
             drawable.addPresentedHandler { [weak self] drawable in
-                // 0 for a drawable that was never presented.
-                guard drawable.presentedTime > 0, let self else {
+                guard let self else {
+                    return
+                }
+                // 0 for a drawable that was never presented, or was skipped.
+                guard drawable.presentedTime > 0 else {
+                    self.lock.lock()
+                    self.notPresented += 1
+                    self.lock.unlock()
                     return
                 }
                 let latency = drawable.presentedTime * 1000 - arrived

@@ -118,14 +118,18 @@ struct FrameClock {
     /// stream's 60, so that the frames drift across the display's refreshes
     /// as a stream's do, where frames locked to the refresh would all have the
     /// same latency, one of many.
-    static var rate = Double(streamFrameRate)
+    let rate: Double
+
+    init(rate: Double = Double(streamFrameRate)) {
+        self.rate = rate
+    }
 
     mutating func wait() {
         guard let previous = due else {
             due = now()
             return
         }
-        let next = max(previous + 1000 / FrameClock.rate, now())
+        let next = max(previous + 1000 / rate, now())
         due = next
         let delay = next - now()
         guard delay > 0 else {

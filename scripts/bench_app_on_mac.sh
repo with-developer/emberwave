@@ -11,9 +11,11 @@
 #   -autorun  the short run of CI: every size briefly, and the three texture
 #             checks; fails unless the report is complete and they pass
 #   -display  instead of the report above, decodes at 60 frames a second beside
-#             a display loop (issue #81): a borderless window covers the screen
-#             with the highest refresh rate while it runs, a few minutes, and
-#             draws the last picture at 60 and 120 Hz. Leave the Mac alone.
+#             a display loop (issue #81): a borderless window covers a screen
+#             while it runs, a few minutes, and draws the last picture at 60
+#             and at 120 Hz: on the slowest screen that has the rate, and on
+#             the built-in screen when that one takes no window or has more.
+#             It keeps the displays awake. Leave the Mac alone. -short is brief.
 #
 # Needs macOS with Xcode, and the XCFramework with its library for the Mac,
 # which scripts/build_xcframework.sh makes. A full run takes a few minutes:

@@ -301,13 +301,13 @@ func makeHEVCStream(
 /// second, handing each picture to `sink`: the paced decode of `timeHEVC`,
 /// with a display loop beside it.
 func hevcPaced(
-    _ stream: HEVCStream, _ plan: Plan, device: MTLDevice, sink: PictureSink?
+    _ stream: HEVCStream, _ plan: Plan, rate: Double, device: MTLDevice, sink: PictureSink?
 ) throws -> (stats: Stats, hardware: Bool?) {
     let decoder = try settingUp {
         try HEVCDecoder(stream.format, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, device)
     }
     defer { decoder.invalidate() }
-    let stats = try decoder.time(stream.frames, plan, paced: true, sink: sink)
+    let stats = try decoder.time(stream.frames, plan, paced: true, rate: rate, sink: sink)
     return (stats, decoder.hardware)
 }
 
@@ -770,10 +770,11 @@ private final class HEVCDecoder {
     /// the decoder can take after any frame, and the others, each timed; one
     /// after the other, or with `paced` as a stream's frames arrive, the
     /// warm-up too.
-    func time(_ frames: [[UInt8]], _ plan: Plan, paced: Bool = false, sink: PictureSink? = nil)
-        throws -> Stats
-    {
-        var clock = FrameClock()
+    func time(
+        _ frames: [[UInt8]], _ plan: Plan, paced: Bool = false, rate: Double = Double(streamFrameRate),
+        sink: PictureSink? = nil
+    ) throws -> Stats {
+        var clock = FrameClock(rate: rate)
         let warm = now()
         var index = 0
         while index < plan.warmupFrames || now() - warm < plan.warmupMs {

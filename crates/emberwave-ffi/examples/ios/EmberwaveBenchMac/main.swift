@@ -8,7 +8,12 @@
 import AppKit
 import Foundation
 
-let plan = CommandLine.arguments.contains("-autorun") || CommandLine.arguments.contains("-short") ? Plan.short : Plan()
+var plan = CommandLine.arguments.contains("-autorun") || CommandLine.arguments.contains("-short") ? Plan.short : Plan()
+// The display-loop run times whole beats between its stream and a 60 Hz loop:
+// see `displayStreamRate`.
+if CommandLine.arguments.contains("-display") {
+    plan.frames = plan.frames == Plan.short.frames ? displayBeatFrames : 3 * displayBeatFrames
+}
 // -display: decodes beside a display loop over a screen (issue #81), which
 // needs the application's run loop on the main thread, so the work goes to
 // another one. It covers a screen for a few minutes.

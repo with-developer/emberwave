@@ -1859,6 +1859,8 @@ The last frame's detail, always, gains everything on a still picture and loses u
 
 **Result.** Into the planes, emberwave decoded as quickly as or up to 0.8 ms quicker than HEVC into NV12 in the loop (0 to 0.3 ms at 1080p, 0.5 to 0.8 ms at 4K) (BENCHMARKS.md, "In a display loop, on the Mac"). The loop cost emberwave 0.2 to 0.5 ms and HEVC nothing, and did not keep the GPU's clock up. The time to the screen was 17 to 21 ms for all ways and does not tell them apart.
 
+**After the review.** The first runs (in BENCHMARKS.md) were made before it. It found the mean time to the screen of the 60 Hz loop dependent on the run's start phase (the stream and the loop beat every 2 s, so a run times whole beats of 119 frames now), the rows without a loop running in an application with no window on the screen (a black window is kept there now), and nothing guarding against a sleeping or locked screen (the displays are kept awake, and a window that never reaches the screen stops the run). The runs are to be repeated with the changed program, which needs the screen unlocked.
+
 **Not done.** The iPhone half of #81, which needs the phone. A real client's pipeline, with its other threads and a heavier draw. HEVC into BGRA in the loop.
 
 **Consequence.** The shared benchmark code gains a `PictureSink` type, a settable `FrameClock.rate`, and entry points that decode a prepared HEVC stream paced with a sink; the iOS app's behaviour is unchanged. The script's deployment target is macOS 14.
