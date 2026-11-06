@@ -1844,3 +1844,21 @@ The last frame's detail, always, gains everything on a still picture and loses u
 **Not done.** Calibrating the bandwidth term on the iPhone (a factor of 0.88 to 0.95) for other chips: it would fit one device and be an extrapolation for all the others.
 
 **Consequence.** No code in the library changes. A new measurement of the M3 Max or the iPhone is entered into the script's table, and the table in BENCHMARKS.md is rewritten with `scripts/perf_model.py --write BENCHMARKS.md`. A device measured later is added as a check.
+
+### 2026-11-06 — D72: Timing decodes beside a display loop on the Mac
+
+**Context.** The paced rows of BENCHMARKS.md time a decode with the GPU idle between frames. A client draws at every refresh instead, and its decodes share the GPU with that. Issue #81 asked what a decode then takes, for emberwave and for HEVC, and the earlier probes (a second queue blitting a texture, a kick ahead of each frame, a raised QoS) had not settled it.
+
+**Decision.** The benchmark app's Mac front-end gets a `-display` mode (`scripts/bench_app_on_mac.sh -display`), in `EmberwaveBenchMac/DisplayLoop.swift` and `DisplayRun.swift`. A borderless window covers one screen while it runs; a `CVDisplayLink` and a `CAMetalLayer` with two drawables draw the last decoded picture at the screen's refresh. The decode runs on another thread at a stream's pace. Every way (emberwave into Y, Cb and Cr textures and into RGB, HEVC at Moonlight's rate into NV12) runs without the loop and then with a 60 Hz and a 120 Hz loop in the same run, so the loop's cost is a difference within one run. The report adds the time from a frame's arrival to the display's presentation of it.
+
+**Why these choices.**
+- A `CVDisplayLink`, where a `CADisplayLink` of an app that is not in front stayed at 60 calls a second on the 120 Hz screen whatever frame rate range it asked for (62.5 a second in a minimal program, against 124 for the `CVDisplayLink`).
+- The stream arrives at 59.5 frames a second, not 60, so that frames drift across the refreshes. At 60 every frame had the same phase against the display, and the latency of a run was one number between 12 and 25 ms, set by where the run happened to start.
+- The 60 Hz loop draws every second refresh of the 120 Hz screen: the Mac's 60 Hz external monitor took no window (it never reported the window on screen), so the run falls back to the built-in screen when a screen does not take the window.
+- Two drawables, as a client that minds latency has.
+
+**Result.** Into the planes, emberwave decoded as quickly as or up to 0.8 ms quicker than HEVC into NV12 in the loop (0 to 0.3 ms at 1080p, 0.5 to 0.8 ms at 4K) (BENCHMARKS.md, "In a display loop, on the Mac"). The loop cost emberwave 0.2 to 0.5 ms and HEVC nothing, and did not keep the GPU's clock up. The time to the screen was 17 to 21 ms for all ways and does not tell them apart.
+
+**Not done.** The iPhone half of #81, which needs the phone. A real client's pipeline, with its other threads and a heavier draw. HEVC into BGRA in the loop.
+
+**Consequence.** The shared benchmark code gains a `PictureSink` type, a settable `FrameClock.rate`, and entry points that decode a prepared HEVC stream paced with a sink; the iOS app's behaviour is unchanged. The script's deployment target is macOS 14.
