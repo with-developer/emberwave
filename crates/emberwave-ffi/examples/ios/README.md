@@ -67,7 +67,7 @@ Unlock the phone and leave it on the home screen first. With `-run`, the app sta
 
 ## On a Mac
 
-`scripts/bench_app_on_mac.sh` makes the same measurements on a Mac, by the app's own code: it builds `EmberwaveBenchMac`, a command-line front-end, against the XCFramework's library for the Mac, and prints the app's report. The progress goes to the standard error. It needs the XCFramework built by `scripts/build_xcframework.sh`, which has the library for the Mac.
+`scripts/bench_app_on_mac.sh` makes the same measurements on a Mac, by the app's own code: it builds `EmberwaveBenchMac`, a command-line front-end, against the XCFramework's library for the Mac, and prints the app's report. The progress goes to the standard error. It needs the XCFramework built by `scripts/build_xcframework.sh`, which has the library for the Mac. With `-display` it decodes beside a display loop instead (issue #81, decision D72): a borderless window covers a screen for about three minutes, drawing the last picture at 60 and 120 Hz, and the report adds the time to the screen; `-short` makes it brief.
 
 ## In CI
 

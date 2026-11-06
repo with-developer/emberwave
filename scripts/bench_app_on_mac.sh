@@ -6,10 +6,16 @@
 # report of a phone's run (see BENCHMARKS.md). It builds the front-end,
 # examples/ios/EmberwaveBenchMac, with swiftc into target/bench-app-mac.
 #
-# Usage: scripts/bench_app_on_mac.sh [-autorun]
+# Usage: scripts/bench_app_on_mac.sh [-autorun | -display]
 #
 #   -autorun  the short run of CI: every size briefly, and the three texture
 #             checks; fails unless the report is complete and they pass
+#   -display  instead of the report above, decodes at 60 frames a second beside
+#             a display loop (issue #81): a borderless window covers a screen
+#             while it runs, a few minutes, and draws the last picture at 60
+#             and at 120 Hz: on the slowest screen that has the rate, and on
+#             the built-in screen when that one takes no window or has more.
+#             It keeps the displays awake. Leave the Mac alone. -short is brief.
 #
 # Needs macOS with Xcode, and the XCFramework with its library for the Mac,
 # which scripts/build_xcframework.sh makes. A full run takes a few minutes:
@@ -28,15 +34,16 @@ fi
 mkdir -p "$BUILD"
 # The system libraries are words for the shell to split.
 # shellcheck disable=SC2046
-xcrun --sdk macosx swiftc -O -swift-version 5 -target arm64-apple-macos13.0 \
+xcrun --sdk macosx swiftc -O -swift-version 5 -target arm64-apple-macos14.0 \
     -I "$SLICE/Headers/Emberwave" \
     "$APP/EmberwaveBench/Benchmark.swift" "$APP/EmberwaveBench/Scene.swift" \
     "$APP/EmberwaveBench/VideoToolbox.swift" "$APP/EmberwaveBenchMac/main.swift" \
+    "$APP/EmberwaveBenchMac/DisplayLoop.swift" "$APP/EmberwaveBenchMac/DisplayRun.swift" \
     "$SLICE/libemberwave_ffi.a" $(cat target/xcframework/native-static-libs-macos-arm64.txt) \
     -o "$BUILD/emberwave-bench"
 
 if [ "${1:-}" != -autorun ]; then
-    exec "$BUILD/emberwave-bench"
+    exec "$BUILD/emberwave-bench" "$@"
 fi
 "$BUILD/emberwave-bench" -autorun | tee "$BUILD/autorun.log"
 for check in texture plane queue; do

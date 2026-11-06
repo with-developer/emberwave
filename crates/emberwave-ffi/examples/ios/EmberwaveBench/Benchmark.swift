@@ -53,6 +53,23 @@ struct Stats: CustomStringConvertible {
     }
 }
 
+/// How a decoded picture sits in Metal textures.
+enum PictureLayout {
+    /// One texture of colours.
+    case rgb
+    /// Y, Cb and Cr, a texture each: emberwave's plane textures.
+    case planes
+    /// Y, and Cb and Cr interleaved: VideoToolbox's NV12.
+    case nv12
+}
+
+/// Takes a picture the moment its decode is done: when its frame arrived on
+/// `now()`'s clock, its textures, and whether the frame is one of those
+/// timed, not the warm-up's. A display loop draws what it is given.
+typealias PictureSink = (
+    _ arrived: Double, _ layout: PictureLayout, _ textures: [MTLTexture], _ timed: Bool
+) -> Void
+
 /// A picture size and the bytes a frame of it gets: those of the native
 /// benchmarks (BENCHMARKS.md) and of the browser's benchmark page.
 struct PictureSize {
@@ -97,13 +114,22 @@ struct FrameClock {
     private var due: Double?
     private static let timers = DispatchQueue(label: "frame clock", qos: .userInteractive)
     static let spins = ProcessInfo.processInfo.environment["EMBERWAVE_BENCH_SPIN"] == "1"
+    /// Frames a second. A display-loop run detunes it a little from the
+    /// stream's 60, so that the frames drift across the display's refreshes
+    /// as a stream's do, where frames locked to the refresh would all have the
+    /// same latency, one of many.
+    let rate: Double
+
+    init(rate: Double = Double(streamFrameRate)) {
+        self.rate = rate
+    }
 
     mutating func wait() {
         guard let previous = due else {
             due = now()
             return
         }
-        let next = max(previous + 1000 / Double(streamFrameRate), now())
+        let next = max(previous + 1000 / rate, now())
         due = next
         let delay = next - now()
         guard delay > 0 else {

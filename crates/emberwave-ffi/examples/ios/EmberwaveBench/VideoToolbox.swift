@@ -266,6 +266,51 @@ private func timeHEVC(
         pacedBGRA: pacedBGRA)
 }
 
+/// An HEVC stream of `pictures`, ready to decode as often as wanted: a keyframe
+/// and then the frames that depend on it, as `timeHEVC` makes them, and the
+/// parameter sets to decode them.
+struct HEVCStream {
+    let frames: [[UInt8]]
+    let format: CMVideoFormatDescription
+}
+
+/// Encodes the stream of `pictures` at `rate` for `hevcPaced`.
+func makeHEVCStream(
+    _ size: PictureSize, _ rate: HEVCRate, _ pictures: [[[UInt8]]], _ plan: Plan
+) throws -> HEVCStream {
+    let encoder = try settingUp { try HEVCEncoder(size, rate, pictures) }
+    defer { encoder.invalidate() }
+    var warmed = 0
+    let warm = now()
+    while warmed < plan.warmupFrames || now() - warm < plan.warmupMs {
+        _ = try encoder.encode()
+        warmed += 1
+    }
+    var frames = [try encoder.encode(keyframe: true).bytes]
+    for _ in 0..<plan.frames {
+        let frame = try encoder.encode()
+        guard !frame.keyframe else {
+            throw MediaFailure(description: "the encoder made a keyframe of its own")
+        }
+        frames.append(frame.bytes)
+    }
+    return HEVCStream(frames: frames, format: try encoder.parameterSets())
+}
+
+/// Decodes `stream` into NV12 textures as a stream's frames arrive, 60 a
+/// second, handing each picture to `sink`: the paced decode of `timeHEVC`,
+/// with a display loop beside it.
+func hevcPaced(
+    _ stream: HEVCStream, _ plan: Plan, rate: Double, device: MTLDevice, sink: PictureSink?
+) throws -> (stats: Stats, hardware: Bool?) {
+    let decoder = try settingUp {
+        try HEVCDecoder(stream.format, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, device)
+    }
+    defer { decoder.invalidate() }
+    let stats = try decoder.time(stream.frames, plan, paced: true, rate: rate, sink: sink)
+    return (stats, decoder.hardware)
+}
+
 /// The value of a VideoToolbox session's property, `nil` if it has none.
 private func property(_ session: VTSession, _ key: CFString) -> CFTypeRef? {
     var value: CFTypeRef?
@@ -562,7 +607,7 @@ private final class HEVCDecoder {
     private let format: CMVideoFormatDescription
     private let pixelFormat: OSType
     private let textureCache: CVMetalTextureCache
-    private var shown: [CVMetalTexture] = []
+    private(set) var shown: [CVMetalTexture] = []
 
     init(_ format: CMVideoFormatDescription, _ pixelFormat: OSType, _ device: MTLDevice) throws {
         self.format = format
@@ -711,20 +756,34 @@ private final class HEVCDecoder {
         return textures
     }
 
+    /// Hands the picture just decoded to `sink`, in the textures it was wrapped in.
+    private func offer(_ sink: PictureSink?, _ arrived: Double, timed: Bool) {
+        guard let sink else {
+            return
+        }
+        let textures = shown.compactMap { CVMetalTextureGetTexture($0) }
+        sink(arrived, pixelFormat == kCVPixelFormatType_32BGRA ? .rgb : .nv12, textures, timed)
+    }
+
     /// Times the decoding of `frames`, a keyframe and the frames after it: a
     /// warm-up over them in order, untimed, then the keyframe, untimed, which
     /// the decoder can take after any frame, and the others, each timed; one
     /// after the other, or with `paced` as a stream's frames arrive, the
     /// warm-up too.
-    func time(_ frames: [[UInt8]], _ plan: Plan, paced: Bool = false) throws -> Stats {
-        var clock = FrameClock()
+    func time(
+        _ frames: [[UInt8]], _ plan: Plan, paced: Bool = false, rate: Double = Double(streamFrameRate),
+        sink: PictureSink? = nil
+    ) throws -> Stats {
+        var clock = FrameClock(rate: rate)
         let warm = now()
         var index = 0
         while index < plan.warmupFrames || now() - warm < plan.warmupMs {
             if paced {
                 clock.wait()
             }
+            let arrived = now()
             _ = try decode(frames[index % frames.count])
+            offer(sink, arrived, timed: false)
             index += 1
         }
         if paced {
@@ -737,7 +796,9 @@ private final class HEVCDecoder {
             if paced {
                 clock.wait()
             }
+            let arrived = now()
             let (picture, time) = try decode(frame)
+            offer(sink, arrived, timed: true)
             times.append(time)
             last.insert(picture, at: 0)
             if last.count > 4 {
