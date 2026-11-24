@@ -25,8 +25,16 @@ if [ "$HAVE" != "$WANT" ]; then
     exit 1
 fi
 
+# The source paths that panic messages name, remapped as scripts/build_npm.sh
+# does, so that the wasm says nothing about the machine that built it and is
+# the npm package's, byte for byte (decision D76). This replaces RUSTFLAGS
+# for this build.
+CARGO_SOURCES=${CARGO_HOME:-$HOME/.cargo}
+SEP=$'\x1f'
+export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=/home${SEP}--remap-path-prefix=$CARGO_SOURCES=/cargo${SEP}--remap-path-prefix=$ROOT=/emberwave"
 cargo build --release --locked --target wasm32-unknown-unknown -p emberwave-web \
     --manifest-path "$ROOT/Cargo.toml"
+unset CARGO_ENCODED_RUSTFLAGS
 wasm-bindgen --target web --no-typescript --out-dir "$ROOT/web/pkg" \
     "$TARGET_DIR/wasm32-unknown-unknown/release/emberwave_web.wasm"
 

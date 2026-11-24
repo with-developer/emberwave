@@ -109,6 +109,10 @@ C API를 쓰면 클라이언트는 패킷을 받는 대로 넘겨 호출자의 �
 
 iPhone, iPad, Mac 앱을 위해서는 릴리스마다 정적 라이브러리를 XCFramework(`Emberwave.xcframework`)로도 제공하며, Swift에서는 `import Emberwave`로 씁니다. Metal 클라이언트는 그림을 GPU 텍스처 한 장에 그리게 하거나 Y, Cb, Cr 평면을 텍스처 세 장에 담게 한 뒤, 그 `id<MTLTexture>`를 읽을 수 있습니다([GPU의 그림](crates/emberwave-ffi/README.md#pictures-on-the-gpu-metal)). [`examples/swift`](crates/emberwave-ffi/examples/swift)는 이 프레임워크로 Swift에서 파일을 디코딩하는 예제이고, [`examples/ios`](crates/emberwave-ffi/examples/ios)는 iPhone·iPad용 벤치마크 앱입니다. CI는 예제와 앱을 이 프레임워크로 iOS 시뮬레이터에서 실행합니다([iPhone, iPad, Mac 앱](crates/emberwave-ffi/README.md#iphone-ipad-and-mac-apps)).
 
+### 웹 페이지에서 쓰기
+
+[브라우저 플레이어](https://with-developer.github.io/emberwave/)는 WebGPU로 디코딩해 캔버스에 그리는 WebAssembly 모듈입니다([`ARCHITECTURE.md`](ARCHITECTURE.md#browser-player)). 플레이어 페이지(`web/`)용으로는 `scripts/build_web.sh`가 빌드합니다. 다른 페이지에서 쓸 수 있도록 `scripts/build_npm.sh`가 같은 모듈을 TypeScript 선언과 함께 npm 패키지로 묶어 `target/npm/emberwave-web`에 만들고, `scripts/check_npm.sh`가 이를 검사합니다. 페이지에서 쓰는 방법은 [패키지의 README](crates/emberwave-web/npm/README.md)에 있습니다. 이 패키지는 아직 npm에 올리지 않았습니다. npm에서 쓸 이름과 게시 여부는 관리자가 정합니다(결정 D76). 그전까지는 `npm pack target/npm/emberwave-web --pack-destination target/npm`으로 만든 압축 파일을 프로젝트에 설치해 쓸 수 있습니다.
+
 ## 성능
 
 <!-- bench-summary:begin (scripts/bench.sh가 생성합니다. 고쳐도 덮어씁니다) -->
@@ -158,7 +162,7 @@ iPhone 17의 Safari에서는 [벤치마크 페이지](https://with-developer.git
 - [ ] **안정된 C·Rust API.** 정리된 것: C API가 프로그램을 깨지 않고 늘어나는 규칙(결정 D69), Rust API의 모양(D70), 공유 라이브러리가 헤더의 함수만 내보내는 것(macOS에서 Objective-C 이름 4개만 예외, D73)와 공유 라이브러리 이름에 주 버전이 들어 있는 것(D75). GPU 코드는 `emberwave-wgpu`라는 별도 크레이트로 옮겨서, `emberwave-core`의 API에는 wgpu 타입이 없습니다([D75](ARCHITECTURE.md), [#165](https://github.com/with-developer/emberwave/issues/165)). `emberwave-wgpu`의 버전은 wgpu를 따라가며, 아직 crates.io에는 없습니다. 남은 것: 클라이언트 자신의 Metal·Vulkan·Direct3D 객체를 받는 호출은 실제로 쓰이기 전까지 잠정입니다.
 - [ ] **실제로 쓰이는 클라이언트 하나.** 별도 저장소의 브라우저 클라이언트 `emberwave-stream`이 Mac의 화면을 같은 Mac의 탭으로 스트리밍하는 것까지 됩니다. 로컬 네트워크를 건너는 것은 아직 보이지 못했습니다. 두 번째 기기가 필요하거나, 루프백 에뮬레이터로 대신해도 된다는 판단이 필요합니다.
 - [ ] **스트림 속도에서 업스트림과 같은 수준의 디코딩.** 4K는 도달했고, 1080p는 0.15~0.3 ms 느립니다([#150](https://github.com/with-developer/emberwave/issues/150)).
-- [ ] **패키지.** crates.io에는 `emberwave-core`와 `emberwave-cli` 0.19.0이 올라가 있습니다. 아직 없는 것은 브라우저 플레이어용 패키지와, Swift용으로 저장소 루트에 두는 `Package.swift`입니다(결정 D64: 릴리스 워크플로를 바꿔야 합니다).
+- [ ] **패키지.** crates.io에는 `emberwave-core`와 `emberwave-cli` 0.19.0이 올라가 있습니다. 브라우저 플레이어 모듈은 npm 패키지 `emberwave-web`으로 준비되어 있고 CI가 빌드와 검사를 하지만, 아직 올리지 않았습니다. 패키지 이름과 첫 게시는 관리자가 정합니다(결정 D76). 아직 없는 것은 Swift용으로 저장소 루트에 두는 `Package.swift`입니다(결정 D64: 릴리스 워크플로를 바꿔야 합니다).
 
 ## 저장소 구성
 
