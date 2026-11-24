@@ -2,7 +2,9 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.20.0] - 2026-11-25
+
+The GPU decoder and encoder are a crate of their own, `emberwave-wgpu`, so that `emberwave-core` has no wgpu in its API, and the browser player is ready as an npm package. **A change for Rust users of the GPU code**: its paths change (below). The C API, the shared library, the CLI and the browser player behave as in 0.19.0.
 
 ### Added
 - The browser player's module as an npm package, ready to publish and not published (decision D76): `scripts/build_npm.sh` builds it into `target/npm/emberwave-web`, with TypeScript declarations and a README for web pages, and `scripts/check_npm.sh`, which CI runs, installs its archive into a scratch project and checks it there. The name proposed for npm is `emberwave-web`; the maintainer confirms it before the first publish. The package and the pages' module are built with the source paths that panic messages name remapped, so that the wasm names no directory of the machine that built it.

@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/with-developer/emberwave"
@@ -22,8 +22,8 @@ publish = false
 [workspace.dependencies]
 # emberwave-wgpu uses hidden items of the core, so the two go together: the
 # exact version.
-emberwave-core = { path = "crates/emberwave-core", version = "=0.19.0" }
-emberwave-wgpu = { path = "crates/emberwave-wgpu", version = "=0.19.0" }
+emberwave-core = { path = "crates/emberwave-core", version = "=0.20.0" }
+emberwave-wgpu = { path = "crates/emberwave-wgpu", version = "=0.20.0" }
 thiserror = "2"
 proptest = "1"
 # Native backends only: GLES would need EGL and the browser backend is for the
