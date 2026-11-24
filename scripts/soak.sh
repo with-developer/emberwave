@@ -2,7 +2,7 @@
 # Decodes 1000 4K frames and watches the memory of the process: half of the
 # leak check of milestone M5. The other half, which counts the GPU resources,
 # is the ignored test a_thousand_4k_frames_leave_no_trace in
-# crates/emberwave-core/tests/gpu.rs.
+# crates/emberwave-wgpu/tests/gpu.rs.
 #
 # Usage: scripts/soak.sh [frames]      (default 1000)
 #

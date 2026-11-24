@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status (v0.19.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in `emberwave_core::gpu` and the colour conversion in `emberwave_core::color`. The encoder runs on the CPU (`emberwave_core::encode`) and on the GPU (`emberwave_core::gpu`). `emberwave-cli` decodes and encodes files with them, `emberwave-web` plays them in a browser, also packet by packet as a stream arrives, and `emberwave-ffi` offers the decoder and the GPU encoder to C, also as an XCFramework for iPhone, iPad and Mac apps, and hands Metal clients the decoded picture in a texture, or its planes in three, also into the client's own textures and on its own queue without waiting, where calls take turns at its command buffers; it runs on a client's own Vulkan device and images as well, shares textures and fences with Direct3D 12 and 11 devices on Windows, and encodes a host's pictures straight from its textures, in RGB as captures hold them too; on Metal the planes are stored straight into the textures, and on Apple silicon the frames are written where the shaders read them. A decoder can keep the last frame's detail in the blocks a frame drawn in part lacks, where the picture is still. Decode and encode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
+> **Status (v0.19.0).** The bitstream format is documented below and implemented by `emberwave_core::bitstream`, with a slow CPU reference decoder in `emberwave_core::cpu`, the wgpu/WGSL decoder in the crate `emberwave-wgpu` and the colour conversion in `emberwave_core::color`. The encoder runs on the CPU (`emberwave_core::encode`) and on the GPU (`emberwave-wgpu`). `emberwave-core` has no wgpu in its dependencies or its API, so that its version need not follow wgpu's (D75). `emberwave-cli` decodes and encodes files with them, `emberwave-web` plays them in a browser, also packet by packet as a stream arrives, and `emberwave-ffi` offers the decoder and the GPU encoder to C, also as an XCFramework for iPhone, iPad and Mac apps, and hands Metal clients the decoded picture in a texture, or its planes in three, also into the client's own textures and on its own queue without waiting, where calls take turns at its command buffers; it runs on a client's own Vulkan device and images as well, shares textures and fences with Direct3D 12 and 11 devices on Windows, and encodes a host's pictures straight from its textures, in RGB as captures hold them too; on Metal the planes are stored straight into the textures, and on Apple silicon the frames are written where the shaders read them. A decoder can keep the last frame's detail in the blocks a frame drawn in part lacks, where the picture is still. Decode and encode times are in `BENCHMARKS.md`. The decision log at the end is kept up to date.
 
 ## Overview
 
@@ -22,13 +22,16 @@ bytes ──► [CPU] packet parser ──► block table + payload words
 
 Steps that upstream runs on the CPU stay on the CPU, and steps that upstream runs on the GPU stay on the GPU. Parity with the reference comes before any optimisation.
 
+The crate `emberwave-core`:
+
 | Module | What it is |
 |---|---|
 | `bitstream` | Pure Rust, GPU independent: headers, block layout, packet assembly, PWV1 files. Never panics on malformed input. This is the CPU stage. |
 | `cpu` | Dequantisation and inverse DWT as plain sequential Rust, following `bitstream.md` literally. A test oracle and the yardstick for shader stages, not a product feature. |
 | `color` | The YCbCr to RGB conversion: matrices, range handling and chroma siting, with a CPU implementation that the shader is tested against. And the encoder's RGB to Y'CbCr conversion in integers (`rgb_to_ycbcr8`, `ForwardMatrix`, `RgbOrder`, D65), which `gather_rgb.wgsl` matches to the bit. |
 | `encode` | The encoder on the CPU, plain sequential Rust: forward DWT, quantisation, rate control and packing, the reference of the GPU encoder; and `packets`, which splits a frame at its blocks for a network. |
-| `gpu` | wgpu pipelines and WGSL shaders for the GPU stages (cargo feature `gpu`, on by default). |
+
+The crate `emberwave-wgpu` (until D75, the `gpu` module of `emberwave-core`) holds the wgpu pipelines and the WGSL shaders of the GPU stages: `GpuContext`, the GPU `Decoder` and `Encoder`, and `wgpu` re-exported, the version it is built with. It uses some items of the core that are hidden from its documentation, and the two crates take each other's exact version.
 
 ## Bitstream format
 
@@ -300,7 +303,7 @@ The gap to the default precision is the reference decoder's own FP16 storage. In
 
 ## GPU pipeline
 
-`gpu::Decoder` decodes frames of one size and chroma format. The memory every decode uses, the pyramid, the block offsets and the packed planes, is allocated when it is created and reused for every frame, and the payload buffer grows when a frame needs more room. What only some decodes need, the upload and read-back buffers, the RGB picture and concealment's copy of the coarsest level, is made by the first decode that needs it and then reused. The encoder's GPU pipeline, `gpu::Encoder`, is described under [Encoder](#on-the-gpu).
+`emberwave_wgpu::Decoder` decodes frames of one size and chroma format. The memory every decode uses, the pyramid, the block offsets and the packed planes, is allocated when it is created and reused for every frame, and the payload buffer grows when a frame needs more room. What only some decodes need, the upload and read-back buffers, the RGB picture and concealment's copy of the coarsest level, is made by the first decode that needs it and then reused. The encoder's GPU pipeline, `emberwave_wgpu::Encoder`, is described under [Encoder](#on-the-gpu).
 
 ### Stages
 
@@ -424,7 +427,7 @@ The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: n
 
 - `tests/shaders.rs` validates the WGSL of every shader with naga using an empty capability set, without a GPU, and checks the entry points, the workgroup sizes and memory.
 - `tests/gpu.rs` and `tests/gpu_encoder.rs` create a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decode a vector on it, and encode pictures on it.
-- The rounding rule of the last level is checked on the real backend against the CPU's, on inputs that are exact ties: a unit test of `gpu::decoder` cuts `to_unorm8` out of `idwt.wgsl` and runs it.
+- The rounding rule of the last level is checked on the real backend against the CPU's, on inputs that are exact ties: a unit test of `emberwave_wgpu`'s decoder module cuts `to_unorm8` out of `idwt.wgsl` and runs it.
 
 Outside those tests a context asks for the default limits with two exceptions. Buffers and textures may be as large as the adapter allows. No limit goes beyond the adapter's, since some adapters fall short of a default the shaders do not need. Metal gives the iOS Simulator, and Apple GPUs before the A11, 15 inter-stage variables, one fewer than WebGPU's default, and the shaders use none (D36).
 
@@ -512,7 +515,7 @@ CI builds the module as Pages does and instantiates it in Node (`scripts/check_w
 |---|---|---|
 | `EmberwaveContext` | `GpuContext` | A GPU device and the compiled shaders, shared by its decoders and encoders |
 | `EmberwaveDecoder` | `Decoder` | Assembles the packets of one stream and decodes its frames |
-| `EmberwaveEncoder` | `gpu::Encoder` | Encodes the pictures of one stream into frames within a byte budget |
+| `EmberwaveEncoder` | `emberwave_wgpu::Encoder` | Encodes the pictures of one stream into frames within a byte budget |
 
 A decoder or an encoder holds the device it was made on, so it may outlive its context. The functions:
 
@@ -556,7 +559,7 @@ Frames from upstream's Metal encoder signal BT.709, full range and centred chrom
 
 ## Encoder
 
-`emberwave_core::encode` turns 8-bit pictures into frames of bitstream v1 within a byte budget, on the CPU, and `gpu::Encoder` does the same on the GPU ([On the GPU](#on-the-gpu)); `emberwave-cli encode` runs either on a Y4M file. The CPU encoder is the reference for the GPU's, as `emberwave_core::cpu` is for the GPU decoder, and like that it is plain sequential Rust. Its frames decode with any decoder of the format: the tests check emberwave's against upstream's, and the vectors in `testdata/encoder/` carry upstream's decode of emberwave's streams.
+`emberwave_core::encode` turns 8-bit pictures into frames of bitstream v1 within a byte budget, on the CPU, and `emberwave_wgpu::Encoder` does the same on the GPU ([On the GPU](#on-the-gpu)); `emberwave-cli encode` runs either on a Y4M file. The CPU encoder is the reference for the GPU's, as `emberwave_core::cpu` is for the GPU decoder, and like that it is plain sequential Rust. Its frames decode with any decoder of the format: the tests check emberwave's against upstream's, and the vectors in `testdata/encoder/` carry upstream's decode of emberwave's streams.
 
 The format fixes the transform and what the decoder does with the numbers; the rest is the encoder's choice:
 
@@ -591,7 +594,7 @@ PSNR is not what either encoder minimises: both minimise the squared error of th
 
 ### On the GPU
 
-`gpu::Encoder` runs the same steps as compute shaders, so that a picture goes to the GPU once and its frame comes back once. The CPU writes the planes into an upload buffer the encoder keeps from frame to frame and maps again before each, or on Apple silicon into the planes buffer itself (D54), the passes below run in one submission after the copy of the planes, if there is one, and the summary of the rate control and the payload come back in one read-back. The CPU writes the start of frame header in front of the payload. A picture that is in GPU memory already, in textures (`Encoder::encode_textures`), takes the place of the upload: `gather.wgsl` packs the textures into the same planes at the start of the transform's pass, so the frame is the same bytes (decision D32). A picture in RGB, in a texture or uploaded into one from CPU memory, is converted into those planes by `gather_rgb.wgsl` in its place (decision D65).
+`emberwave_wgpu::Encoder` runs the same steps as compute shaders, so that a picture goes to the GPU once and its frame comes back once. The CPU writes the planes into an upload buffer the encoder keeps from frame to frame and maps again before each, or on Apple silicon into the planes buffer itself (D54), the passes below run in one submission after the copy of the planes, if there is one, and the summary of the rate control and the payload come back in one read-back. The CPU writes the start of frame header in front of the payload. A picture that is in GPU memory already, in textures (`Encoder::encode_textures`), takes the place of the upload: `gather.wgsl` packs the textures into the same planes at the start of the transform's pass, so the frame is the same bytes (decision D32). A picture in RGB, in a texture or uploaded into one from CPU memory, is converted into those planes by `gather_rgb.wgsl` in its place (decision D65).
 
 | Stage | Shaders | Dispatches | What it does |
 |---|---|---|---|
@@ -1820,7 +1823,7 @@ The last frame's detail, always, gains everything on a still picture and loses u
   - the colour module's constants, siting taps and forward matrix;
   - `GpuOptions`' `strict_webgpu`, `plane_stores` and `shared_uploads`.
 - **Not in the browser build.** The calls that wait for the GPU are not built for wasm32: the decoder's `decode`, `decode_rgb`, `time_frame`, `decode_assembled` and its forms, and `read_band`, and every encode of the GPU encoder. Their helpers may go unused there, which the GPU module allows on wasm32 only.
-- **`wgpu` re-exported** as `emberwave_core::wgpu`: the version emberwave is built with.
+- **`wgpu` re-exported** as `emberwave_core::wgpu`: the version emberwave is built with. (Since D75, as `emberwave_wgpu::wgpu`.)
 
 **Not done.** About thirty public items take or return wgpu's types, so a new major version of wgpu breaks emberwave's Rust API. Two answers remain for 1.0: follow wgpu's major versions, or split a crate without wgpu types from the interop (#152).
 
@@ -1929,6 +1932,8 @@ The last frame's detail, always, gains everything on a still picture and loses u
 5. The release workflow publishes core, wgpu, cli in that order, once the maintainer has taken the name.
 
 **Risks.** The hidden surface drifts between the two crates; the tests' relative paths to `testdata` stay valid, as the new crate sits at the same depth; rustdoc links from `cpu` to `gpu` become plain text; the move is large (about 14,000 lines) but mechanical, which `git mv` keeps in the history; a published `emberwave-core` 0.18.1 has the `gpu` feature that later versions do not, which no known user has used.
+
+**Steps 1 and 2, done together (2026-11-24).** The move came first, so that the compiler named what the core has to open, and then one pull request took both steps. The core opens more than the six items found by searching: the modules `encode::{fdwt, quant, rate}` (all their items), `encode::{Bands, Block32, pristine_blocks, stream_header, next_sequence, start_of_frame, check_planes, check_strided_planes}`, the CPU encoder's `transform` and `quantise`, and `color::check_rgb`, every one `#[doc(hidden)] pub`. The GPU code matches `RgbOrder`, which is `non_exhaustive`, so it now has an arm for an order it does not know, which returns `GpuError::InvalidArgument`; its tests build `Signalling` and `ColorParams` field by field or through `ColorParams::new`, as a crate outside the core has to. The shaders are 15, not 13. `emberwave-core` and `emberwave-wgpu` take each other's exact version (`=` in the workspace), and CI checks that the core does not depend on wgpu. The workspace's tests pass in the same number as before the move (the core's 141 unit tests are now 109 in the core and 32 in `emberwave-wgpu`).
 
 **Consequence.** The checklist item "stable C and Rust APIs" in the README can close when the library's name carries its version and the split has landed, or earlier, if the maintainer decides to ship 1.0 with option 1's plain statement instead; the data above is what that choice would weigh. No code moves with this entry.
 

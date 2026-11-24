@@ -14,8 +14,8 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams, RgbOrder, rgb_to_ycbcr8};
 use emberwave_core::encode::{self, Signalling};
-use emberwave_core::gpu::{Encoder, GpuContext, GpuOptions};
 use emberwave_ffi::*;
+use emberwave_wgpu::{Encoder, GpuContext, GpuOptions};
 
 fn last_error() -> String {
     // SAFETY: emberwave_last_error always returns a C string.

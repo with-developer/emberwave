@@ -18,10 +18,15 @@
 //!
 //! A frame decodes with any decoder of bitstream v1, upstream's included.
 
-pub(crate) mod fdwt;
+// The stages that emberwave-wgpu's GPU encoder shares with this one: hidden,
+// not part of the API (decision D75).
+#[doc(hidden)]
+pub mod fdwt;
 pub(crate) mod pack;
-pub(crate) mod quant;
-pub(crate) mod rate;
+#[doc(hidden)]
+pub mod quant;
+#[doc(hidden)]
+pub mod rate;
 mod weights;
 
 use thiserror::Error;
@@ -128,7 +133,8 @@ pub enum EncodeError {
 /// levels. They come first in block index order, every level's bands
 /// before those of the next finer level, so they are the blocks below the
 /// index returned (decision D58).
-pub(crate) fn pristine_blocks(layout: &FrameLayout) -> u32 {
+#[doc(hidden)]
+pub fn pristine_blocks(layout: &FrameLayout) -> u32 {
     const {
         // One band would be the coarsest LL band alone, whose blocks the
         // detail bands of each component interleave: not a prefix.
@@ -146,11 +152,13 @@ pub(crate) fn pristine_blocks(layout: &FrameLayout) -> u32 {
 /// The wavelet coefficients of a picture: `[component][level][band]`,
 /// row-major at the size of the level's bands; empty where a component has
 /// no such band.
-pub(crate) type Bands = [[[Vec<f32>; 4]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
+#[doc(hidden)]
+pub type Bands = [[[Vec<f32>; 4]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
 
 /// One quantised 32x32 block and what the rate control needs to know of it.
 #[derive(Debug, Clone)]
-pub(crate) struct Block32 {
+#[doc(hidden)]
+pub struct Block32 {
     pub index: u32,
     pub quant: BandQuant,
     pub blocks8: Blocks8,
@@ -272,7 +280,8 @@ impl Encoder {
     }
 
     /// The forward transform of a picture whose planes have the right sizes.
-    pub(crate) fn transform(&self, planes: [&[u8]; 3]) -> Bands {
+    #[doc(hidden)]
+    pub fn transform(&self, planes: [&[u8]; 3]) -> Bands {
         let layout = &self.layout;
         let mut bands: Bands = Default::default();
         for (component, plane) in Component::ALL.into_iter().zip(planes) {
@@ -307,7 +316,8 @@ impl Encoder {
 
     /// Quantises the coefficients: every block of the frame, in block index
     /// order, with its costs.
-    pub(crate) fn quantise(&self, bands: &Bands) -> Vec<Block32> {
+    #[doc(hidden)]
+    pub fn quantise(&self, bands: &Bands) -> Vec<Block32> {
         let layout = &self.layout;
         let pristine = pristine_blocks(layout);
         let mut blocks = Vec::with_capacity(layout.block_count() as usize);
@@ -354,7 +364,8 @@ impl Encoder {
 }
 
 /// The header of a PWV1 file of a stream of `layout` with `signalling`.
-pub(crate) fn stream_header(layout: &FrameLayout, signalling: &Signalling) -> SequenceHeader {
+#[doc(hidden)]
+pub fn stream_header(layout: &FrameLayout, signalling: &Signalling) -> SequenceHeader {
     SequenceHeader {
         width: layout.width(),
         height: layout.height(),
@@ -372,13 +383,15 @@ pub(crate) fn stream_header(layout: &FrameLayout, signalling: &Signalling) -> Se
 
 /// The sequence number of the frame after one numbered `sequence`. The first
 /// frame is number 1, as with upstream's encoder.
-pub(crate) fn next_sequence(sequence: u8) -> u8 {
+#[doc(hidden)]
+pub fn next_sequence(sequence: u8) -> u8 {
     (sequence + 1) & 0x7
 }
 
 /// The start of frame header of frame `sequence` of `stream`, which carries
 /// `total_blocks` blocks.
-pub(crate) fn start_of_frame(
+#[doc(hidden)]
+pub fn start_of_frame(
     stream: &SequenceHeader,
     sequence: u8,
     total_blocks: u32,
@@ -396,7 +409,8 @@ pub(crate) fn start_of_frame(
 }
 
 /// An error unless `planes` have the sizes of [`FrameLayout::plane_size`].
-pub(crate) fn check_planes(layout: &FrameLayout, planes: [&[u8]; 3]) -> Result<(), EncodeError> {
+#[doc(hidden)]
+pub fn check_planes(layout: &FrameLayout, planes: [&[u8]; 3]) -> Result<(), EncodeError> {
     for (component, plane) in Component::ALL.into_iter().zip(planes) {
         let (width, height) = layout.plane_size(component);
         let expected = width as usize * height as usize;
@@ -415,9 +429,8 @@ pub(crate) fn check_planes(layout: &FrameLayout, planes: [&[u8]; 3]) -> Result<(
 /// with their rows `strides` bytes apart: each at least its width, and at
 /// least `(height - 1) * stride + width` bytes in the plane. For the GPU
 /// encoder's strided input.
-#[cfg(feature = "gpu")]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) fn check_strided_planes(
+#[doc(hidden)]
+pub fn check_strided_planes(
     layout: &FrameLayout,
     planes: [&[u8]; 3],
     strides: [usize; 3],

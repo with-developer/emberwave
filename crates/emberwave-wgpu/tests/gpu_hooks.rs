@@ -6,14 +6,12 @@
 //! They need a GPU or a software Vulkan driver (lavapipe), and skip without
 //! one unless `EMBERWAVE_REQUIRE_GPU` is set.
 
-#![cfg(feature = "gpu")]
-
 mod common;
 
 use common::{shared_context, vector_frames};
 use emberwave_core::bitstream::Component;
 use emberwave_core::encode::Signalling;
-use emberwave_core::gpu::{Decoder, Encoder, SubmissionHooks, TexturePicture};
+use emberwave_wgpu::{Decoder, Encoder, SubmissionHooks, TexturePicture};
 
 /// Notes what the call ran, in order.
 #[derive(Default)]

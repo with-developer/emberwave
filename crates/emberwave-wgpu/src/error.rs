@@ -58,11 +58,11 @@ pub enum GpuError {
 
     /// The bitstream is malformed.
     #[error(transparent)]
-    Bitstream(#[from] crate::bitstream::Error),
+    Bitstream(#[from] emberwave_core::bitstream::Error),
 
     /// The planes or the budget do not suit the encoder.
     #[error(transparent)]
-    Encode(#[from] crate::encode::EncodeError),
+    Encode(#[from] emberwave_core::encode::EncodeError),
     /// A texture of a [`TexturePicture`](super::TexturePicture) cannot hold
     /// its plane: its format, size, dimension, samples or usage.
     #[error("unsuitable texture: {0}")]

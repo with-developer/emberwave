@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use emberwave_core::bitstream::Pwv1File;
-use emberwave_core::gpu::{Decoder, TimedOutput, Timings};
+use emberwave_wgpu::{Decoder, TimedOutput, Timings};
 
 use crate::stats::Summary;
 use crate::{ColorArgs, GpuArgs, Result, chroma_name};

@@ -16,7 +16,7 @@ use crate::bitstream::consts::{
 use crate::bitstream::{Band, BandLayout, ChromaSubsampling, Component};
 
 /// Numbers of dropped bit-planes the rate control chooses from: 0 to 15.
-pub(crate) const DROP_STEPS: usize = 16;
+pub const DROP_STEPS: usize = 16;
 
 /// Coefficients of an 8x8 block.
 pub(crate) const BLOCK8_VALUES: usize = SUBBLOCKS_PER_BLOCK8 * VALUES_PER_SUBBLOCK;
@@ -67,7 +67,7 @@ pub(crate) fn band_exponent(component: Component, level: usize, band: Band) -> i
 
 /// How a band is quantised: its capped exponent and its distortion weight.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct BandQuant {
+pub struct BandQuant {
     /// The capped bit exponent: coefficients are quantised as `c * 2^exponent`.
     pub exponent: i32,
     /// What a squared coefficient error of the band counts for in the rate
@@ -76,12 +76,7 @@ pub(crate) struct BandQuant {
 }
 
 impl BandQuant {
-    pub(crate) fn new(
-        chroma: ChromaSubsampling,
-        component: Component,
-        level: usize,
-        band: Band,
-    ) -> Self {
+    pub fn new(chroma: ChromaSubsampling, component: Component, level: usize, band: Band) -> Self {
         let class = match (component, chroma) {
             (Component::Y, _) => 0,
             (_, ChromaSubsampling::Yuv420) => 1,
@@ -96,7 +91,7 @@ impl BandQuant {
     /// The most bit-planes a block of the band may drop: the decoder's block
     /// scale is `2^(4 - (quant_code >> 3))`, and the exponent `4 + b - q` of
     /// the quant code cannot go below zero.
-    pub(crate) fn max_drop(&self) -> u8 {
+    pub fn max_drop(&self) -> u8 {
         (self.exponent + MAX_SCALE_EXP).clamp(0, DROP_STEPS as i32 - 1) as u8
     }
 
@@ -143,7 +138,7 @@ pub(crate) fn gather_block8(
 
 /// One quantised 8x8 block and what dropping bit-planes does to it.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Block8 {
+pub struct Block8 {
     /// The 8x8 scale code, so that the scale is `code / 8 + 0.25`.
     pub scale_code: u8,
     /// Magnitudes in coefficient order, with no plane dropped.
@@ -298,7 +293,7 @@ pub(crate) fn analyse_block8(
 }
 
 /// The 8x8 blocks of one 32x32 block, those that carry anything.
-pub(crate) type Blocks8 = [Option<Block8>; BLOCK8_PER_BLOCK];
+pub type Blocks8 = [Option<Block8>; BLOCK8_PER_BLOCK];
 
 #[cfg(test)]
 mod tests {

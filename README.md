@@ -155,7 +155,7 @@ Next, each in a release when it is ready:
 
 1.0.0 has no date. It is the promise that the C and Rust APIs stay compatible, and it will be tagged when the four things below are true; the maintainer makes that call.
 
-- [ ] **Stable C and Rust APIs.** Settled: the rules by which the C API grows without breaking programs (decision D69), the shape of the Rust API (D70), and the shared library exporting the header's functions and nothing else, apart from four Objective-C names on macOS (D73), and the shared library's name carrying the major version (D75). Decided and still to do ([D75](ARCHITECTURE.md), [#165](https://github.com/with-developer/emberwave/issues/165)): the GPU code will move into a crate of its own, `emberwave-wgpu`, so that `emberwave-core` has no wgpu type in its API (about thirty public items take or return wgpu's types today, which a new major version of wgpu would break). Open: the calls on a client's own Metal, Vulkan and Direct3D objects are provisional until a client has used them.
+- [ ] **Stable C and Rust APIs.** Settled: the rules by which the C API grows without breaking programs (decision D69), the shape of the Rust API (D70), and the shared library exporting the header's functions and nothing else, apart from four Objective-C names on macOS (D73), and the shared library's name carrying the major version (D75). The GPU code is a crate of its own, `emberwave-wgpu`, so that `emberwave-core` has no wgpu type in its API ([D75](ARCHITECTURE.md), [#165](https://github.com/with-developer/emberwave/issues/165)); `emberwave-wgpu`'s version follows wgpu's, and it is not on crates.io yet. Open: the calls on a client's own Metal, Vulkan and Direct3D objects are provisional until a client has used them.
 - [ ] **One client in real use.** `emberwave-stream`, the browser client in a repository of its own, streams a Mac's screen to a tab on the same Mac. Across a local network it is not shown yet: that needs a second device, or the loopback emulator accepted in its place.
 - [ ] **Decoding at a stream's pace level with upstream's.** 4K is there; 1080p is 0.15 to 0.3 ms behind ([#150](https://github.com/with-developer/emberwave/issues/150)).
 - [ ] **Packages.** On crates.io: `emberwave-core` and `emberwave-cli`, 0.19.0. Not yet: a package for the browser player, and a `Package.swift` at the root of the repository for Swift (decision D64: the release workflow would have to change).
@@ -164,7 +164,8 @@ Next, each in a release when it is ready:
 
 | Path | Purpose |
 |---|---|
-| `crates/emberwave-core` | Bitstream parser, CPU reference decoder, colour conversion, the wgpu/WGSL decoder, and the encoder on the CPU and the GPU |
+| `crates/emberwave-core` | Bitstream parser, CPU reference decoder, colour conversion and the CPU encoder, without a GPU |
+| `crates/emberwave-wgpu` | The wgpu/WGSL decoder and the GPU encoder (decision D75) |
 | `crates/emberwave-cli` | `emberwave-cli` command line tool |
 | `crates/emberwave-ffi` | The C API: header, library and C examples |
 | `crates/emberwave-web`, `web/` | The browser player and its benchmark: WebAssembly module and pages |

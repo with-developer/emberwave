@@ -1,33 +1,20 @@
 [package]
 name = "emberwave-core"
-description = "PyroWave bitstream parser, and wgpu/WGSL decoder and encoder"
+description = "PyroWave bitstream parser, CPU decoder and encoder, without a GPU: the GPU decoder and encoder are emberwave-wgpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
-keywords = ["pyrowave", "video", "codec", "wavelet", "wgpu"]
-categories = ["multimedia::video", "multimedia::encoding", "graphics"]
-
-[features]
-default = ["gpu"]
-# The wgpu decoder and encoder. Without it only the bitstream parser, the CPU
-# reference decoder and the CPU encoder are built.
-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+keywords = ["pyrowave", "video", "codec", "wavelet"]
+categories = ["multimedia::video", "multimedia::encoding"]
 
 [dependencies]
 thiserror.workspace = true
-wgpu = { workspace = true, optional = true }
-pollster = { workspace = true, optional = true }
-bytemuck = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
-naga.workspace = true
-# The tests count wgpu's live resources to show that decoding allocates
-# nothing per frame; the counters cost a little, so only tests turn them on.
-wgpu = { workspace = true, features = ["counters"] }
 
 [lints]
 workspace = true

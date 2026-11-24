@@ -7,8 +7,6 @@
 //! Like `tests/gpu.rs`, they skip without a GPU unless
 //! `EMBERWAVE_REQUIRE_GPU` is set.
 
-#![cfg(feature = "gpu")]
-
 mod common;
 
 use common::{
@@ -21,7 +19,7 @@ use emberwave_core::bitstream::{
 use emberwave_core::color::{ColorError, RgbOrder, rgb_to_ycbcr8, yuv_to_rgb8};
 use emberwave_core::cpu::decode_frame;
 use emberwave_core::encode::{self, EncodeError, Signalling};
-use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, TexturePicture};
+use emberwave_wgpu::{Decoder, Encoder, GpuContext, GpuError, TexturePicture};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {

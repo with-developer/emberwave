@@ -104,7 +104,7 @@ pub(crate) fn forward_2d(mut image: Vec<f32>, width: usize, height: usize) -> Le
 
 /// An 8-bit sample as the transform takes it: scaled to `[0, 1]`, less the DC
 /// shift that the decoder adds back.
-pub(crate) fn sample_level(sample: u8) -> f32 {
+pub fn sample_level(sample: u8) -> f32 {
     f32::from(sample) / 255.0 - DC_SHIFT
 }
 

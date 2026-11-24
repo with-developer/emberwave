@@ -46,7 +46,7 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams, RgbOrder};
 use emberwave_core::encode::{self, EncodeError, Signalling};
-use emberwave_core::gpu::{
+use emberwave_wgpu::{
     Decoder, Encoder, GpuContext, GpuError, GpuOptions, QueueTurns, TexturePicture,
 };
 
@@ -2880,7 +2880,7 @@ unsafe fn d3d12_fences(
     sync: *const EmberwaveD3D12Sync,
     context_id: u64,
     textures: &[&EmberwaveTexture],
-) -> Result<Box<dyn emberwave_core::gpu::SubmissionHooks>, Failure> {
+) -> Result<Box<dyn emberwave_wgpu::SubmissionHooks>, Failure> {
     // SAFETY: as the caller promises.
     let sync = unsafe { read_struct(sync, "sync") }?.unwrap_or_default();
     // SAFETY: as the caller promises.
@@ -2909,7 +2909,7 @@ fn d3d12_hooks(
     wait: Option<(&EmberwaveD3D12Fence, u64)>,
     signal: Option<(&EmberwaveD3D12Fence, u64)>,
     shared: Vec<wgpu::Texture>,
-) -> Box<dyn emberwave_core::gpu::SubmissionHooks> {
+) -> Box<dyn emberwave_wgpu::SubmissionHooks> {
     Box::new(d3d12::Fences::new(wait, signal, shared))
 }
 
@@ -2920,9 +2920,9 @@ fn d3d12_hooks(
     _wait: Option<(&EmberwaveD3D12Fence, u64)>,
     _signal: Option<(&EmberwaveD3D12Fence, u64)>,
     _shared: Vec<wgpu::Texture>,
-) -> Box<dyn emberwave_core::gpu::SubmissionHooks> {
+) -> Box<dyn emberwave_wgpu::SubmissionHooks> {
     struct Nothing;
-    impl emberwave_core::gpu::SubmissionHooks for Nothing {
+    impl emberwave_wgpu::SubmissionHooks for Nothing {
         fn before_submit(&mut self, _queue: &wgpu::Queue) {}
         fn after_submit(&mut self, _queue: &wgpu::Queue, _submitted: bool) {}
     }
@@ -3088,9 +3088,9 @@ fn vulkan_semaphores(sync: EmberwaveVulkanSync) -> vulkan::Semaphores {
     target_os = "android",
     all(windows, target_pointer_width = "64")
 )))]
-fn vulkan_semaphores(_sync: EmberwaveVulkanSync) -> impl emberwave_core::gpu::SubmissionHooks {
+fn vulkan_semaphores(_sync: EmberwaveVulkanSync) -> impl emberwave_wgpu::SubmissionHooks {
     struct Nothing;
-    impl emberwave_core::gpu::SubmissionHooks for Nothing {
+    impl emberwave_wgpu::SubmissionHooks for Nothing {
         fn before_submit(&mut self, _queue: &wgpu::Queue) {}
         fn after_submit(&mut self, _queue: &wgpu::Queue, _submitted: bool) {}
     }
@@ -3165,7 +3165,7 @@ mod vulkan {
     use std::ffi::{CStr, c_char, c_void};
 
     use ash::vk::{self, Handle};
-    use emberwave_core::gpu::{
+    use emberwave_wgpu::{
         CallerQueueLock, GpuContext, GpuOptions, PLANE_FORMAT, QueueTurns, SubmissionHooks,
     };
     use wgpu::hal::api::Vulkan;
@@ -3773,7 +3773,7 @@ mod d3d12 {
     use std::ffi::c_void;
     use std::sync::Arc;
 
-    use emberwave_core::gpu::{GpuContext, GpuOptions, PLANE_FORMAT, QueueTurns, SubmissionHooks};
+    use emberwave_wgpu::{GpuContext, GpuOptions, PLANE_FORMAT, QueueTurns, SubmissionHooks};
     use wgpu::hal::api::Dx12;
     use windows::Win32::Foundation::{HANDLE, LUID};
     use windows::Win32::Graphics::Direct3D12::{
@@ -4848,7 +4848,7 @@ unsafe fn metal_import(
     let (width, height) = wrapping.size();
     let format = metal.pixelFormat();
     let format = match wrapping.holds {
-        Holds::Plane(_) if format == MTLPixelFormat::R8Unorm => emberwave_core::gpu::PLANE_FORMAT,
+        Holds::Plane(_) if format == MTLPixelFormat::R8Unorm => emberwave_wgpu::PLANE_FORMAT,
         Holds::Chroma if format == MTLPixelFormat::RG8Unorm => wgpu::TextureFormat::Rg8Unorm,
         Holds::Picture if format == MTLPixelFormat::RGBA8Unorm => wgpu::TextureFormat::Rgba8Unorm,
         Holds::Picture if format == MTLPixelFormat::BGRA8Unorm => wgpu::TextureFormat::Bgra8Unorm,

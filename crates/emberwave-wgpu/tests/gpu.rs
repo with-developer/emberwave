@@ -4,8 +4,6 @@
 //! skip, unless `EMBERWAVE_REQUIRE_GPU` is set, which turns a missing adapter
 //! into a failure; CI sets it on the job that installs lavapipe.
 
-#![cfg(feature = "gpu")]
-
 mod common;
 
 use common::{
@@ -21,7 +19,7 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams, yuv_to_rgb8};
 use emberwave_core::cpu;
-use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuError, TEXTURE_FORMATS, TimedOutput};
+use emberwave_wgpu::{Decoder, Frame, GpuContext, GpuError, TEXTURE_FORMATS, TimedOutput};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
@@ -535,7 +533,7 @@ fn planes_drawn_into_textures_are_the_decoded_planes() {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: emberwave_core::gpu::PLANE_FORMAT,
+                format: emberwave_wgpu::PLANE_FORMAT,
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             })
@@ -678,7 +676,7 @@ fn plane_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: emberwave_core::gpu::PLANE_FORMAT,
+        format: emberwave_wgpu::PLANE_FORMAT,
         usage,
         view_formats: &[],
     })
@@ -1100,7 +1098,7 @@ fn an_incomplete_frame_is_an_error_until_it_is_allowed_to_be_partial() {
 
     let error = decoder.decode(&cut[..end]).unwrap_err();
     assert!(
-        matches!(error, emberwave_core::gpu::GpuError::IncompleteFrame { .. }),
+        matches!(error, emberwave_wgpu::GpuError::IncompleteFrame { .. }),
         "{error}"
     );
 
@@ -1959,8 +1957,8 @@ fn timing_a_frame_reports_where_the_time_goes() {
     let mut decoder = decoder_for(&context, &layout);
 
     for output in [
-        emberwave_core::gpu::TimedOutput::Yuv,
-        emberwave_core::gpu::TimedOutput::Rgb(ColorParams::default()),
+        emberwave_wgpu::TimedOutput::Yuv,
+        emberwave_wgpu::TimedOutput::Rgb(ColorParams::default()),
     ] {
         let timings = decoder.time_frame(&frames[0], output).unwrap();
         assert!(timings.gpu_wall > std::time::Duration::ZERO);
@@ -1972,7 +1970,7 @@ fn timing_a_frame_reports_where_the_time_goes() {
                 // A short stage can be below the timer's resolution and read as
                 // zero, but the whole decode cannot.
                 assert!(stages.total() > std::time::Duration::ZERO);
-                let rgb = matches!(output, emberwave_core::gpu::TimedOutput::Rgb(_));
+                let rgb = matches!(output, emberwave_wgpu::TimedOutput::Rgb(_));
                 assert_eq!(stages.yuv2rgb.is_some(), rgb);
                 // The GPU cannot take longer than the wall clock around it.
                 assert!(stages.total() <= timings.gpu_wall + timings.prepare);
@@ -2139,7 +2137,7 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
 /// every way in turn, leave the GPU resources as they were after the first
 /// frames. It needs the streams of `scripts/gen_bench_data.sh` and takes a
 /// while, so it only runs on request:
-/// `cargo test --release -p emberwave-core --test gpu -- --ignored --nocapture`.
+/// `cargo test --release -p emberwave-wgpu --test gpu -- --ignored --nocapture`.
 /// `scripts/soak.sh` watches the memory of the process for the same purpose.
 #[test]
 #[ignore = "decodes 1000 4K frames; needs scripts/gen_bench_data.sh"]

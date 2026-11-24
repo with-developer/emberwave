@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 use emberwave_core::bitstream::ChromaSubsampling;
 use emberwave_core::color::ColorParams;
 use emberwave_core::encode::{self, Signalling};
-use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions};
+use emberwave_wgpu::{Decoder, GpuContext, GpuOptions};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::js_sys::Promise;
 

@@ -70,9 +70,17 @@ jobs:
       # The crates carry copies of LICENSE and THIRD_PARTY_NOTICES.md (decision D75).
       - run: scripts/check_license_copies.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # The parser and the CPU decoder alone, which emberwave-core is without
-      # its default `gpu` feature.
-      - run: cargo clippy -p emberwave-core --no-default-features --all-targets -- -D warnings
+      # emberwave-core has no wgpu in its dependencies, so none in its API: the
+      # GPU code is emberwave-wgpu (decision D75).
+      - name: The core does not depend on wgpu
+        run: |
+          # The tree first, so that a failing cargo stops the step; then any
+          # crate of wgpu's or naga's family (wgpu-types holds the API types).
+          tree=$(cargo tree -p emberwave-core -e normal --target all --prefix none)
+          if grep -E '^(wgpu|naga)[ -]' <<< "$tree"; then
+            echo "emberwave-core depends on wgpu: the GPU code belongs to emberwave-wgpu" >&2
+            exit 1
+          fi
       # The README's figures are drawn by a script: they must be what it draws.
       - run: python3 -B scripts/readme_figures.py && git diff --exit-code docs/images
 
@@ -112,7 +120,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The browser player, and the core as the browser sees it: no blocking
       # calls, no clock.
-      - run: cargo clippy --target wasm32-unknown-unknown -p emberwave-web -p emberwave-core -- -D warnings
+      - run: cargo clippy --target wasm32-unknown-unknown -p emberwave-web -p emberwave-wgpu -p emberwave-core -- -D warnings
       # wasm-bindgen-cli has to be the version of the wasm-bindgen crate in
       # Cargo.lock, so the cache follows the lock file, as in pages.yml.
       - name: Cache wasm-bindgen-cli
@@ -181,7 +189,7 @@ jobs:
       # Prints which adapter the GPU tests run on, how long creating a decoder
       # takes (shader compilation) and how close the GPU is to the CPU.
       - name: Report the GPU adapter
-        run: cargo test -p emberwave-core --test gpu inverse_transform -- --nocapture
+        run: cargo test -p emberwave-wgpu --test gpu inverse_transform -- --nocapture
       - run: cargo test --workspace
       # The C example, built with CMake against the shared library that the
       # build above made, decodes every test vector.

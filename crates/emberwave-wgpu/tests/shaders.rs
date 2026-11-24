@@ -4,9 +4,7 @@
 //! optional feature: no subgroup operations, no 16-bit floats or integers, no
 //! atomics on floats and so on.
 
-#![cfg(feature = "gpu")]
-
-use emberwave_core::gpu::shader_sources;
+use emberwave_wgpu::shader_sources;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
 fn validate(name: &str, source: &str) -> naga::Module {

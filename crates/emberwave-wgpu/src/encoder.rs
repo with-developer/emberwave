@@ -1,4 +1,4 @@
-//! The wgpu encoder: the CPU encoder's stages ([`crate::encode`]) as compute
+//! The wgpu encoder: the CPU encoder's stages ([`emberwave_core::encode`]) as compute
 //! shaders, so that a picture goes up once and its frame comes back once.
 //!
 //! The picture comes from CPU memory through an upload buffer, or from
@@ -19,11 +19,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES};
-use crate::bitstream::{ChromaSubsampling, Component, FrameLayout, SequenceHeader};
-use crate::color::{RgbOrder, check_rgb};
-use crate::encode::fdwt::sample_level;
-use crate::encode::{
+use emberwave_core::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES};
+use emberwave_core::bitstream::{ChromaSubsampling, Component, FrameLayout, SequenceHeader};
+use emberwave_core::color::{RgbOrder, check_rgb};
+use emberwave_core::encode::fdwt::sample_level;
+use emberwave_core::encode::{
     EncodeError, Signalling, check_planes, check_strided_planes, next_sequence, start_of_frame,
     stream_header,
 };
@@ -115,7 +115,7 @@ pub enum TexturePicture<'a> {
     /// texture of the picture's size, as a screen capture holds it; alpha is
     /// not read. The encoder converts it to Y'CbCr as it reads it, by the
     /// matrix, range and chroma siting of its [`Signalling`], into the planes
-    /// that [`rgb_to_ycbcr8`](crate::color::rgb_to_ycbcr8) makes of the same
+    /// that [`rgb_to_ycbcr8`](emberwave_core::color::rgb_to_ycbcr8) makes of the same
     /// picture in CPU memory (decision D65). R', G' and B' are taken as the
     /// texture stores them, with their transfer function: a texture of an
     /// sRGB format, whose reads undo it, is not taken. Nor is a view of
@@ -171,6 +171,13 @@ impl RgbUpload {
         let format = match order {
             RgbOrder::Rgba => wgpu::TextureFormat::Rgba8Unorm,
             RgbOrder::Bgra => wgpu::TextureFormat::Bgra8Unorm,
+            // A later core could add an order; this crate takes its own
+            // version of the core, so there is none it does not know.
+            other => {
+                return Err(GpuError::InvalidArgument(format!(
+                    "the RGB order {other:?} is not one this encoder knows"
+                )));
+            }
         };
         with_error_scope(device, || Self {
             order,
@@ -251,7 +258,7 @@ const MIN_PAYLOAD_WORDS: u64 = 16 * 1024;
 const SUMMARY_BYTES: u64 = std::mem::size_of::<RateSummary>() as u64 + 8;
 
 /// Encodes pictures of one size and chroma format into PyroWave frames on
-/// the GPU, as [`crate::encode::Encoder`] does on the CPU.
+/// the GPU, as [`emberwave_core::encode::Encoder`] does on the CPU.
 ///
 /// All GPU memory is allocated up front and reused for every picture, apart
 /// from the payload buffer, which grows when a frame's budget needs more.
@@ -596,7 +603,7 @@ impl Encoder {
 
     /// Encodes one picture into a frame of at most `budget` bytes: a start of
     /// frame header and the coded blocks in block index order, as a PWV1 file
-    /// stores a frame and as [`crate::encode::Encoder::encode`] makes it.
+    /// stores a frame and as [`emberwave_core::encode::Encoder::encode`] makes it.
     ///
     /// `planes` are the Y, Cb and Cr samples, row-major without padding, at
     /// the sizes of [`FrameLayout::plane_size`]. A picture that cannot fit

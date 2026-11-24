@@ -107,7 +107,7 @@ pub const CONCEALMENT_THRESHOLD: f32 = 0.03;
 /// them, and keeps what the last decode left of the frame's detail, so that
 /// a frame drawn in part conceals the blocks it lacks where the picture is
 /// still (decision D66). The GPU decoder does the same with
-/// [`set_concealment`](crate::gpu::Decoder::set_concealment).
+/// `emberwave_wgpu::Decoder::set_concealment`.
 #[derive(Debug, Clone, Default)]
 pub struct Concealer {
     /// The coefficients the last decode left, and the layout of its frames.
@@ -122,7 +122,7 @@ impl Concealer {
 
     /// The coefficients the last decode left, concealment included, as the
     /// GPU decoder's pyramid holds them after the same decode
-    /// (`gpu::Decoder::read_band` reads the bands that are not LL, and the
+    /// (`emberwave_wgpu::Decoder::read_band` reads the bands that are not LL, and the
     /// coarsest LL). For tests: its type is the dequantiser's.
     #[doc(hidden)]
     pub fn bands(&self) -> Option<&Bands> {

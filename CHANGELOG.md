@@ -2,6 +2,11 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **A change for Rust users of the GPU decoder and encoder**: they are the crate `emberwave-wgpu` now, `emberwave_wgpu::Decoder` where it was `emberwave_core::gpu::Decoder`, with the same names, and `emberwave_wgpu::wgpu` where it was `emberwave_core::wgpu`. `emberwave-core` has no `gpu` feature and no wgpu in its dependencies or its API, so that its version need not follow wgpu's (decision D75). The C API, the CLI and the browser player do not change. `emberwave-wgpu` is not on crates.io yet.
+
 ## [0.19.0] - 2026-11-19
 
 The shared library's name carries the major version, and the road to 1.0 is written down. **A change for programs that link the shared library**: the library now names itself `libemberwave_ffi.so.0` on Linux and `@rpath/libemberwave_ffi.0.dylib` on macOS (the 0 is emberwave's major version, 1 from 1.0.0, when it starts to mean the ABI), so a program linked from this version on records that name and needs that file at run time. The release archives hold it, with `libemberwave_ffi.so` and `.dylib` as links to it, so programs linked before still find the unversioned name. Windows, the static libraries and the XCFramework are unchanged.

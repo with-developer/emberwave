@@ -34,7 +34,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use emberwave_core::bitstream::{ChromaSiting, SequenceHeader, YcbcrRange};
 use emberwave_core::color::{ColorMatrix, ColorParams};
-use emberwave_core::gpu::{GpuContext, GpuOptions, parse_backends};
+use emberwave_wgpu::{GpuContext, GpuOptions, parse_backends};
 
 /// The error type of the command line tool: anything that can be printed.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

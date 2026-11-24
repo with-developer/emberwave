@@ -11,8 +11,8 @@ use std::ptr;
 use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
 use emberwave_core::bitstream::{FrameLayout, Header, Pwv1File};
 use emberwave_core::color::ColorParams;
-use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions};
 use emberwave_ffi::*;
+use emberwave_wgpu::{Decoder, GpuContext, GpuOptions};
 
 fn testdata(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

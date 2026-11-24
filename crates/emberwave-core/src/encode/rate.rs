@@ -55,7 +55,7 @@ pub(crate) fn key(distortion: f32, saving: u16) -> u16 {
 
 /// What the rate control knows of one 32x32 block.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct BlockCost {
+pub struct BlockCost {
     /// Size in words with 0 to 15 planes dropped; 0 when nothing is left to
     /// send, except for the blocks of the coarsest level, which every frame
     /// carries: at least `pack::EMPTY_BLOCK_WORDS` (decision D58). Never
@@ -122,7 +122,7 @@ pub(crate) fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
 /// How many planes each block drops so that all of them together take at
 /// most `budget_words`, or `None` if they do not fit even with every block
 /// dropping all it may.
-pub(crate) fn choose(costs: &[BlockCost], budget_words: u64) -> Option<Vec<u8>> {
+pub fn choose(costs: &[BlockCost], budget_words: u64) -> Option<Vec<u8>> {
     // Each block starts at the best drop that costs what dropping none does.
     let mut drops: Vec<u8> = costs.iter().map(|cost| points(cost)[0]).collect();
     let total: u64 = costs.iter().map(|cost| u64::from(cost.words[0])).sum();

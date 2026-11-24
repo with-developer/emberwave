@@ -5,7 +5,7 @@
 //! most of all), so a [`GpuContext`](super::GpuContext) builds them on first
 //! use and hands out the same ones afterwards.
 
-use crate::bitstream::ChromaSubsampling;
+use emberwave_core::bitstream::ChromaSubsampling;
 
 use super::decoder::PLANE_FORMAT;
 use super::error::GpuError;
