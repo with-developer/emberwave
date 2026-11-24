@@ -76,6 +76,12 @@ async function packageModule(project) {
       throw new Error(`the package's package.json points to ${path}, which it does not hold`);
     }
   }
+  // TypeScript takes the first condition that applies, so "types" comes
+  // first, and it is the declarations that are checked below.
+  const main = shipped.exports?.["."] ?? {};
+  if (Object.keys(main)[0] !== "types" || main.types !== shipped.types) {
+    throw new Error(`the package's exports["."] does not start with "types": ${JSON.stringify(shipped.types)}`);
+  }
   const text = readFileSync(join(root, shipped.types), "utf8");
   for (const declaration of [
     "export class Player ",

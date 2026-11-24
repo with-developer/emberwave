@@ -77,9 +77,14 @@ rm -rf "$OUT"
 wasm-bindgen --target web --out-dir "$OUT" \
     "$TARGET_DIR/wasm32-unknown-unknown/release/emberwave_web.wasm"
 rm "$OUT/emberwave_web_bg.wasm.d.ts"
-for path in "$HOME/" "$ROOT/"; do
-    if LC_ALL=C grep -q -a -F -- "$path" "$OUT/emberwave_web_bg.wasm"; then
-        echo "the wasm names $path, which the package must not ship" >&2
+# The directories of this machine that the wasm must not name, but for one
+# that is a replacement itself, as a repository mounted at /emberwave is.
+for path in "$HOME" "$CARGO_SOURCES" "$ROOT" "$TARGET_DIR"; do
+    case $path in
+        / | /home | /cargo | /emberwave) continue ;;
+    esac
+    if LC_ALL=C grep -q -a -F -- "$path/" "$OUT/emberwave_web_bg.wasm"; then
+        echo "the wasm names $path/, which the package must not ship" >&2
         rm -rf "$OUT"
         exit 1
     fi
