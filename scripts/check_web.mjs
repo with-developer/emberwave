@@ -6,15 +6,17 @@
 //
 //     node scripts/check_web.mjs
 //
-// Given a project's directory, it checks the npm package installed there
-// instead, the project's one dependency (decision D76): its files are those
-// that ship, its declarations declare the module's exports, and the module,
-// imported through the package's "exports" as a page's code would, does what
-// the pages' does. scripts/check_npm.sh makes such a project.
+// Given a scratch project's directory, it checks the npm package installed
+// there instead, the project's one dependency (decision D76): its files are
+// those that ship, every file its package.json points to is one of them, its
+// declarations declare the module's exports, and the module, imported by the
+// package's name as a page's code would, does what the pages' does.
+// scripts/check_npm.sh makes such a project; the check writes one file into
+// it, the module that imports the package.
 //
 //     node scripts/check_web.mjs PROJECT_DIR
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -50,22 +52,31 @@ async function packageModule(project) {
     throw new Error(`${project} has ${names.length} dependencies, not the package alone`);
   }
   const [name] = names;
-  // Node resolves the names through the package's "exports", whose
-  // conditions, "types" and "default", are the same for require and import.
+  // Node resolves these through the package's "exports".
   const require = createRequire(join(project, "package.json"));
-  const entry = require.resolve(name);
   const wasm = require.resolve(`${name}/emberwave_web_bg.wasm`);
   const own = require.resolve(`${name}/package.json`);
-  const files = readdirSync(dirname(own)).sort();
+  const root = dirname(own);
+  const files = readdirSync(root).sort();
   if (files.join() !== PACKAGE_FILES.join()) {
     throw new Error(`the package holds ${files.join(", ")}, not ${PACKAGE_FILES.join(", ")}`);
   }
-  const { version, types } = JSON.parse(readFileSync(own, "utf8"));
-  const declarations = join(dirname(own), types ?? "");
-  if (!types || !existsSync(declarations)) {
-    throw new Error(`the package's "types", ${types}, is not one of its files`);
+  const shipped = JSON.parse(readFileSync(own, "utf8"));
+  // Checked here, as Node since 20.19 and 22.7 loads the glue as an ES module
+  // without it too, by its syntax; bundlers and older Node do not.
+  if (shipped.type !== "module") {
+    throw new Error(`the package's "type" is ${shipped.type}, not "module"`);
   }
-  const text = readFileSync(declarations, "utf8");
+  // Every path that package.json gives, "exports" included, under any
+  // condition, is one of the files.
+  const leaves = (value) =>
+    typeof value === "string" ? [value] : Object.values(value ?? {}).flatMap(leaves);
+  for (const path of [shipped.main, shipped.module, shipped.types, ...leaves(shipped.exports)]) {
+    if (typeof path !== "string" || !existsSync(join(root, path))) {
+      throw new Error(`the package's package.json points to ${path}, which it does not hold`);
+    }
+  }
+  const text = readFileSync(join(root, shipped.types), "utf8");
   for (const declaration of [
     "export class Player ",
     "export class Demo ",
@@ -75,13 +86,17 @@ async function packageModule(project) {
     "export default function ",
   ]) {
     if (!text.includes(declaration)) {
-      throw new Error(`${types} lacks "${declaration.trim()}"`);
+      throw new Error(`${shipped.types} lacks "${declaration.trim()}"`);
     }
   }
-  // The package's "type": "module" makes Node load the glue as what it is.
-  const module = await import(pathToFileURL(entry).href);
+  // Imported by its name, from a module in the project, so that Node's ES
+  // module resolution finds it as it would a page's import.
+  const importer = join(project, "check-import.mjs");
+  writeFileSync(importer, `export * from ${JSON.stringify(name)};\n` +
+    `export { default } from ${JSON.stringify(name)};\n`);
+  const module = await import(pathToFileURL(importer).href);
   module.initSync({ module: readFileSync(wasm) });
-  console.log(`the npm package ${name} ${version} installs with its ${files.length} files and declarations`);
+  console.log(`the npm package ${name} ${shipped.version} installs with its ${files.length} files and declarations`);
   return module;
 }
 

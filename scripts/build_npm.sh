@@ -28,13 +28,16 @@ README=$ROOT/crates/emberwave-web/npm/README.md
 # crate's version, which is the workspace's.
 TARGET_DIR=
 VERSION=
-{ IFS= read -r TARGET_DIR && IFS= read -r VERSION; } < <(
+{ IFS= read -r TARGET_DIR; IFS= read -r VERSION; } < <(
     cargo metadata --format-version 1 --no-deps --manifest-path "$ROOT/Cargo.toml" |
         node -e 'const metadata = JSON.parse(require("fs").readFileSync(0, "utf8"));
             console.log(metadata.target_directory);
             console.log(metadata.packages.find((p) => p.name === "emberwave-web").version);'
-)
-test -n "$TARGET_DIR" && test -n "$VERSION"
+) || true
+if [ -z "$TARGET_DIR" ] || [ -z "$VERSION" ]; then
+    echo "found no target directory or version in cargo's metadata (needs cargo and node)" >&2
+    exit 1
+fi
 
 WANT=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3 }' "$ROOT/Cargo.lock")
 HAVE=$(wasm-bindgen --version 2>/dev/null | awk '{ print $2 }' || true)
@@ -50,8 +53,20 @@ if ! grep -q "^npm install $NAME\$" "$README" || ! grep -q "from \"$NAME\";" "$R
     exit 1
 fi
 
+# The wasm keeps the paths of the source files its panic messages name,
+# which on a personal machine are under the user's home directory. The
+# package is built with them remapped, so that it says nothing about the
+# machine that built it; the check after wasm-bindgen fails if one is left.
+# scripts/build_web.sh remaps them alike, so that the pages' wasm is this
+# one and cargo builds it once. Last match wins: the home directory, then
+# cargo's sources, then this repository. Separated by 0x1f, so that a path
+# may hold spaces; this replaces RUSTFLAGS for this build.
+CARGO_SOURCES=${CARGO_HOME:-$HOME/.cargo}
+SEP=$'\x1f'
+export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=/home${SEP}--remap-path-prefix=$CARGO_SOURCES=/cargo${SEP}--remap-path-prefix=$ROOT=/emberwave"
 cargo build --release --locked --target wasm32-unknown-unknown -p emberwave-web \
     --manifest-path "$ROOT/Cargo.toml"
+unset CARGO_ENCODED_RUSTFLAGS
 
 rm -rf "$OUT"
 # The pages' target, an ES module whose default export fetches the wasm from
@@ -62,6 +77,13 @@ rm -rf "$OUT"
 wasm-bindgen --target web --out-dir "$OUT" \
     "$TARGET_DIR/wasm32-unknown-unknown/release/emberwave_web.wasm"
 rm "$OUT/emberwave_web_bg.wasm.d.ts"
+for path in "$HOME/" "$ROOT/"; do
+    if LC_ALL=C grep -q -a -F -- "$path" "$OUT/emberwave_web_bg.wasm"; then
+        echo "the wasm names $path, which the package must not ship" >&2
+        rm -rf "$OUT"
+        exit 1
+    fi
+done
 
 cp "$README" "$OUT/README.md"
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$OUT/"

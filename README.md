@@ -111,7 +111,7 @@ For apps on iPhones, iPads and Macs, each release also has the static library as
 
 ### In a web page
 
-The [browser player](https://with-developer.github.io/emberwave/) is a WebAssembly module that decodes with WebGPU and draws on a canvas ([`ARCHITECTURE.md`](ARCHITECTURE.md#browser-player)). `scripts/build_web.sh` builds it for the player's page in `web/`. For other pages, `scripts/build_npm.sh` builds the same module as an npm package, with TypeScript declarations, into `target/npm/emberwave-web`, and `scripts/check_npm.sh` checks it; [its README](crates/emberwave-web/npm/README.md) shows how a page uses it. The package is not on npm yet: its name there and its publishing are the maintainer's to decide (decision D76). Until then, a project can install the archive that `npm pack target/npm/emberwave-web` makes.
+The [browser player](https://with-developer.github.io/emberwave/) is a WebAssembly module that decodes with WebGPU and draws on a canvas ([`ARCHITECTURE.md`](ARCHITECTURE.md#browser-player)). `scripts/build_web.sh` builds it for the player's page in `web/`. For other pages, `scripts/build_npm.sh` builds the same module as an npm package, with TypeScript declarations, into `target/npm/emberwave-web`, and `scripts/check_npm.sh` checks it; [its README](crates/emberwave-web/npm/README.md) shows how a page uses it. The package is not on npm yet: its name there and its publishing are the maintainer's to decide (decision D76). Until then, a project can install the archive that `npm pack target/npm/emberwave-web --pack-destination target/npm` makes.
 
 ## Performance
 

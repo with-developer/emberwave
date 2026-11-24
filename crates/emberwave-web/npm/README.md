@@ -25,9 +25,8 @@ await init();
 const canvas = document.querySelector("canvas");
 const player = await Player.create(canvas);
 const bytes = new Uint8Array(await (await fetch("stream.pwv1")).arrayBuffer());
-console.log(player.load(bytes)); // the size, the frames and the frame rate
-canvas.width = player.width();
-canvas.height = player.height();
+// Sizes the canvas to the pictures, and describes the stream.
+console.log(player.load(bytes));
 
 // The file's frames in turn, at the stream's frame rate, looping.
 const interval = 1000 / player.frame_rate();
@@ -47,7 +46,8 @@ requestAnimationFrame(function frame(now) {
 ## Play a stream as packets arrive
 
 ```js
-player.open_stream(1920, 1080, false, 60); // 4:2:0; true for 4:4:4
+// 4:2:0 (true for 4:4:4) at 60 frames a second; sizes the canvas too.
+player.open_stream(1920, 1080, false, 60);
 
 // For each packet of the frame being assembled, in any order. The transport
 // numbers its frames: it ignores packets of frames older than this one.
@@ -70,7 +70,8 @@ player.drop_packets();
 - If `player.is_lost()`, the GPU device is gone: make a new player.
 - `Demo` draws and encodes a demo stream on the CPU, and `Bench` times the decoding on the browser's GPU, as the player's pages do.
 - The TypeScript declarations, `emberwave_web.d.ts`, document every method.
-- The version is emberwave's. Before 1.0.0 the API may change between minor versions; [the changelog](https://github.com/with-developer/emberwave/blob/main/CHANGELOG.md) says what changed.
+- The version is emberwave's. This module's API may change between minor versions; [the changelog](https://github.com/with-developer/emberwave/blob/main/CHANGELOG.md) says what changed.
+- The examples import the package by its name, as a bundler resolves it; a page without one maps the name to `emberwave_web.js` with an import map.
 
 ## License
 

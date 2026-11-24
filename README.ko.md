@@ -111,7 +111,7 @@ iPhone, iPad, Mac 앱을 위해서는 릴리스마다 정적 라이브러리를 
 
 ### 웹 페이지에서 쓰기
 
-[브라우저 플레이어](https://with-developer.github.io/emberwave/)는 WebGPU로 디코딩해 캔버스에 그리는 WebAssembly 모듈입니다([`ARCHITECTURE.md`](ARCHITECTURE.md#browser-player)). 플레이어 페이지(`web/`)용으로는 `scripts/build_web.sh`가 빌드합니다. 다른 페이지에서 쓸 수 있도록 `scripts/build_npm.sh`가 같은 모듈을 TypeScript 선언과 함께 npm 패키지로 묶어 `target/npm/emberwave-web`에 만들고, `scripts/check_npm.sh`가 이를 검사합니다. 페이지에서 쓰는 방법은 [패키지의 README](crates/emberwave-web/npm/README.md)에 있습니다. 이 패키지는 아직 npm에 올리지 않았습니다. npm에서 쓸 이름과 게시 여부는 관리자가 정합니다(결정 D76). 그전까지는 `npm pack target/npm/emberwave-web`으로 만든 압축 파일을 프로젝트에 설치해 쓸 수 있습니다.
+[브라우저 플레이어](https://with-developer.github.io/emberwave/)는 WebGPU로 디코딩해 캔버스에 그리는 WebAssembly 모듈입니다([`ARCHITECTURE.md`](ARCHITECTURE.md#browser-player)). 플레이어 페이지(`web/`)용으로는 `scripts/build_web.sh`가 빌드합니다. 다른 페이지에서 쓸 수 있도록 `scripts/build_npm.sh`가 같은 모듈을 TypeScript 선언과 함께 npm 패키지로 묶어 `target/npm/emberwave-web`에 만들고, `scripts/check_npm.sh`가 이를 검사합니다. 페이지에서 쓰는 방법은 [패키지의 README](crates/emberwave-web/npm/README.md)에 있습니다. 이 패키지는 아직 npm에 올리지 않았습니다. npm에서 쓸 이름과 게시 여부는 관리자가 정합니다(결정 D76). 그전까지는 `npm pack target/npm/emberwave-web --pack-destination target/npm`으로 만든 압축 파일을 프로젝트에 설치해 쓸 수 있습니다.
 
 ## 성능
 
