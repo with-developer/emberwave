@@ -74,7 +74,10 @@ jobs:
       # GPU code is emberwave-wgpu (decision D75).
       - name: The core does not depend on wgpu
         run: |
-          if cargo tree -p emberwave-core -e normal --prefix none | grep -E '^(wgpu|naga) '; then
+          # The tree first, so that a failing cargo stops the step; then any
+          # crate of wgpu's or naga's family (wgpu-types holds the API types).
+          tree=$(cargo tree -p emberwave-core -e normal --target all --prefix none)
+          if grep -E '^(wgpu|naga)[ -]' <<< "$tree"; then
             echo "emberwave-core depends on wgpu: the GPU code belongs to emberwave-wgpu" >&2
             exit 1
           fi

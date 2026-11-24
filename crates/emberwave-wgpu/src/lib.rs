@@ -19,9 +19,13 @@
 //! [`Decoder::decode`] and the [`Encoder`]'s encodes, are not built for
 //! wasm32; the decoder's `record_*` and `submit_*` calls are.
 
-// The calls left out of the browser build leave their helpers unused there;
-// the native builds check for code that is dead everywhere.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+// The calls left out of the browser build leave their helpers unused there,
+// and the docs link to them (decision D70); the native builds check for code
+// that is dead everywhere and for broken links.
+#![cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, unused_imports, rustdoc::broken_intra_doc_links)
+)]
 
 pub use wgpu;
 

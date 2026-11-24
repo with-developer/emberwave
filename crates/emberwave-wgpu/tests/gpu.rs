@@ -2137,7 +2137,7 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
 /// every way in turn, leave the GPU resources as they were after the first
 /// frames. It needs the streams of `scripts/gen_bench_data.sh` and takes a
 /// while, so it only runs on request:
-/// `cargo test --release -p emberwave-core --test gpu -- --ignored --nocapture`.
+/// `cargo test --release -p emberwave-wgpu --test gpu -- --ignored --nocapture`.
 /// `scripts/soak.sh` watches the memory of the process for the same purpose.
 #[test]
 #[ignore = "decodes 1000 4K frames; needs scripts/gen_bench_data.sh"]

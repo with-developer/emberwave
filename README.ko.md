@@ -155,7 +155,7 @@ iPhone 17의 Safari에서는 [벤치마크 페이지](https://with-developer.git
 
 1.0.0의 날짜는 정하지 않았습니다. 1.0.0은 C·Rust API를 호환되게 유지하겠다는 약속이고, 아래 네 가지가 갖춰지면 태그를 달며, 그 판단은 관리자가 합니다.
 
-- [ ] **안정된 C·Rust API.** 정리된 것: C API가 프로그램을 깨지 않고 늘어나는 규칙(결정 D69), Rust API의 모양(D70), 공유 라이브러리가 헤더의 함수만 내보내는 것(macOS에서 Objective-C 이름 4개만 예외, D73)와 공유 라이브러리 이름에 주 버전이 들어 있는 것(D75). 정했고 아직 할 일([D75](ARCHITECTURE.md), [#165](https://github.com/with-developer/emberwave/issues/165)): GPU 코드를 `emberwave-wgpu`라는 별도 크레이트로 옮겨 `emberwave-core`의 API에는 wgpu 타입이 없게 합니다(지금은 공개 항목 약 서른 개가 wgpu 타입을 받거나 돌려주므로 wgpu의 새 주 버전이 나오면 깨집니다). 남은 것: 클라이언트 자신의 Metal·Vulkan·Direct3D 객체를 받는 호출은 실제로 쓰이기 전까지 잠정입니다.
+- [ ] **안정된 C·Rust API.** 정리된 것: C API가 프로그램을 깨지 않고 늘어나는 규칙(결정 D69), Rust API의 모양(D70), 공유 라이브러리가 헤더의 함수만 내보내는 것(macOS에서 Objective-C 이름 4개만 예외, D73)와 공유 라이브러리 이름에 주 버전이 들어 있는 것(D75). GPU 코드는 `emberwave-wgpu`라는 별도 크레이트로 옮겨서, `emberwave-core`의 API에는 wgpu 타입이 없습니다([D75](ARCHITECTURE.md), [#165](https://github.com/with-developer/emberwave/issues/165)). `emberwave-wgpu`의 버전은 wgpu를 따라가며, 아직 crates.io에는 없습니다. 남은 것: 클라이언트 자신의 Metal·Vulkan·Direct3D 객체를 받는 호출은 실제로 쓰이기 전까지 잠정입니다.
 - [ ] **실제로 쓰이는 클라이언트 하나.** 별도 저장소의 브라우저 클라이언트 `emberwave-stream`이 Mac의 화면을 같은 Mac의 탭으로 스트리밍하는 것까지 됩니다. 로컬 네트워크를 건너는 것은 아직 보이지 못했습니다. 두 번째 기기가 필요하거나, 루프백 에뮬레이터로 대신해도 된다는 판단이 필요합니다.
 - [ ] **스트림 속도에서 업스트림과 같은 수준의 디코딩.** 4K는 도달했고, 1080p는 0.15~0.3 ms 느립니다([#150](https://github.com/with-developer/emberwave/issues/150)).
 - [ ] **패키지.** crates.io에는 `emberwave-core`와 `emberwave-cli` 0.19.0이 올라가 있습니다. 아직 없는 것은 브라우저 플레이어용 패키지와, Swift용으로 저장소 루트에 두는 `Package.swift`입니다(결정 D64: 릴리스 워크플로를 바꿔야 합니다).

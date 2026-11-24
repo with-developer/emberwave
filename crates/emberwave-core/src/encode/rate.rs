@@ -17,7 +17,7 @@
 use super::quant::DROP_STEPS;
 
 /// Number of keys.
-pub const KEYS: usize = 512;
+pub(crate) const KEYS: usize = 512;
 
 /// 2^`exponent` as an exact `f32`, for exponents in the normal range.
 fn exact_pow2(exponent: i32) -> f32 {
@@ -37,7 +37,7 @@ fn threshold(key: usize) -> f32 {
 /// The key of a step that adds `distortion` and saves `saving` words: the
 /// highest threshold it reaches, 0 for none (including a step that adds no
 /// distortion at all).
-pub fn key(distortion: f32, saving: u16) -> u16 {
+pub(crate) fn key(distortion: f32, saving: u16) -> u16 {
     let saving = f32::from(saving);
     let reaches = |key: usize| distortion >= saving * threshold(key);
     // The thresholds increase: find the first one above 0 not reached.
@@ -70,7 +70,7 @@ pub struct BlockCost {
 
 /// A step of a block: drop planes up to `drop`, saving `saving` words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Step {
+pub(crate) struct Step {
     pub key: u16,
     pub block: u32,
     pub drop: u8,
@@ -80,7 +80,7 @@ pub struct Step {
 /// The numbers of planes a block may drop that are worth considering: for
 /// each size the block can have, the one with the least distortion (the
 /// fewest planes on a tie). Sizes decrease along the list.
-pub fn points(cost: &BlockCost) -> Vec<u8> {
+pub(crate) fn points(cost: &BlockCost) -> Vec<u8> {
     let mut points: Vec<u8> = Vec::new();
     for drop in 0..=cost.max_drop.min(DROP_STEPS as u8 - 1) {
         let (words, distortion) = (
@@ -102,7 +102,7 @@ pub fn points(cost: &BlockCost) -> Vec<u8> {
 /// Appends the steps of block `block` in the order they must be applied:
 /// from each of its [`points`] to the next. A step's key is at least that of
 /// the step before it.
-pub fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
+pub(crate) fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
     let mut previous_key = 0u16;
     for pair in points(cost).windows(2) {
         let (from, to) = (usize::from(pair[0]), usize::from(pair[1]));
