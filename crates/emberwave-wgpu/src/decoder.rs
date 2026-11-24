@@ -9,12 +9,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::bitstream::consts::DECOMPOSITION_LEVELS;
-use crate::bitstream::packet::{DEFAULT_MINIMUM_PACKET_RATIO, DEFAULT_PRISTINE_BANDS};
-use crate::bitstream::{
+use emberwave_core::bitstream::consts::DECOMPOSITION_LEVELS;
+use emberwave_core::bitstream::packet::{DEFAULT_MINIMUM_PACKET_RATIO, DEFAULT_PRISTINE_BANDS};
+use emberwave_core::bitstream::{
     Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout, SequenceHeader,
 };
-use crate::color::ColorParams;
+use emberwave_core::color::ColorParams;
 
 use super::context::{
     AfterSubmit, ConcealPipeline, GpuContext, QueueTurns, SubmissionHooks, notice_loss, submit,
@@ -847,11 +847,11 @@ impl Decoder {
     /// lacks, off by default (decision D66). Where the coarsest level
     /// around such a block, which every frame drawn in part has whole,
     /// changed by at most
-    /// [`CONCEALMENT_THRESHOLD`](crate::cpu::CONCEALMENT_THRESHOLD) since
+    /// [`CONCEALMENT_THRESHOLD`](emberwave_core::cpu::CONCEALMENT_THRESHOLD) since
     /// the last decode, the picture is taken to be still there, and the
     /// block keeps the last frame's coefficients: the frame shows the detail
     /// it lost. Elsewhere the block is zero, as without concealment. Whole
-    /// frames decode as before. [`cpu::Concealer`](crate::cpu::Concealer)
+    /// frames decode as before. [`cpu::Concealer`](emberwave_core::cpu::Concealer)
     /// does the same on the CPU, to the last bit of the coefficients.
     ///
     /// Measured with the CPU's, frames drawn from 40 to 60 % of their blocks
@@ -2146,7 +2146,7 @@ mod tests {
     use wgpu::util::DeviceExt;
 
     use super::*;
-    use crate::gpu::context::test_context;
+    use crate::context::test_context;
 
     /// Runs `to_unorm8` of `idwt.wgsl`, the rounding of the last level, on
     /// `values` on the GPU and returns the 8-bit levels. The function is cut out
@@ -2432,8 +2432,8 @@ mod tests {
         if test_context().is_none() {
             return;
         }
-        let context = GpuContext::new(&crate::gpu::GpuOptions::from_env().unwrap_or_default())
-            .expect("a context");
+        let context =
+            GpuContext::new(&crate::GpuOptions::from_env().unwrap_or_default()).expect("a context");
         let chroma = ChromaSubsampling::Yuv420;
         let mut decoder = Decoder::new(&context, 64, 32, chroma).unwrap();
         decoder

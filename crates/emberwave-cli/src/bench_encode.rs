@@ -7,7 +7,7 @@ use emberwave_core::bitstream::consts::HEADER_BYTES;
 use emberwave_core::bitstream::{ChromaSubsampling, Component, FrameLayout};
 use emberwave_core::color::{RgbOrder, yuv_to_rgb8};
 use emberwave_core::encode::{self, Signalling};
-use emberwave_core::gpu;
+use emberwave_wgpu as gpu;
 
 use crate::bench::{Series, json_object, ms, parse_seconds, print_table, quote, warm_up};
 use crate::{Backend, GpuArgs, Result, chroma_name, y4m};

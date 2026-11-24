@@ -388,12 +388,8 @@ impl ForwardMatrix {
 
 /// An error if `bytes` of an RGB picture of `width` x `height` pixels, four
 /// bytes each, with rows `stride` bytes apart, do not hold it.
-pub(crate) fn check_rgb(
-    bytes: usize,
-    stride: usize,
-    width: u32,
-    height: u32,
-) -> Result<(), ColorError> {
+#[doc(hidden)]
+pub fn check_rgb(bytes: usize, stride: usize, width: u32, height: u32) -> Result<(), ColorError> {
     let row = u64::from(width) * 4;
     if (stride as u64) < row && height > 1 {
         return Err(ColorError::StrideTooSmall { stride, row });

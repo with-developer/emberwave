@@ -12,7 +12,7 @@ use emberwave_core::bitstream::{
     ChromaSubsampling, ColorPrimaries, Pwv1Header, SequenceHeader, TransferFunction, YcbcrTransform,
 };
 use emberwave_core::encode::{self, Signalling};
-use emberwave_core::gpu;
+use emberwave_wgpu as gpu;
 
 use crate::stats::Summary;
 use crate::{Backend, GpuArgs, Result, chroma_name, siting_name, y4m};

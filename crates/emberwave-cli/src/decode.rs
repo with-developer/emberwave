@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use clap::ValueEnum;
 use emberwave_core::bitstream::Pwv1File;
-use emberwave_core::gpu::Decoder;
+use emberwave_wgpu::Decoder;
 
 use crate::stats::Summary;
 use crate::{ColorArgs, GpuArgs, MatrixChoice, RangeChoice, Result, read_file, y4m};

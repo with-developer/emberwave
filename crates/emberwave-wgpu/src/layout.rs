@@ -6,12 +6,14 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::bitstream::consts::{BANDS_PER_LEVEL, DECOMPOSITION_LEVELS, NUM_COMPONENTS};
-use crate::bitstream::{Band, ChromaSiting, ChromaSubsampling, Component, FrameLayout, YcbcrRange};
-use crate::color::{
+use emberwave_core::bitstream::consts::{BANDS_PER_LEVEL, DECOMPOSITION_LEVELS, NUM_COMPONENTS};
+use emberwave_core::bitstream::{
+    Band, ChromaSiting, ChromaSubsampling, Component, FrameLayout, YcbcrRange,
+};
+use emberwave_core::color::{
     CHROMA_CENTRE, CHROMA_SCALE, ColorParams, ForwardMatrix, INV_255, LUMA_BLACK, LUMA_SCALE,
 };
-use crate::encode::quant::{BandQuant, DROP_STEPS};
+use emberwave_core::encode::quant::{BandQuant, DROP_STEPS};
 
 use super::GpuError;
 
@@ -224,7 +226,7 @@ pub(crate) struct ConcealParams {
     /// component.
     pub coarse_width: u32,
     pub coarse_height: u32,
-    /// [`CONCEALMENT_THRESHOLD`](crate::cpu::CONCEALMENT_THRESHOLD).
+    /// [`CONCEALMENT_THRESHOLD`](emberwave_core::cpu::CONCEALMENT_THRESHOLD).
     pub threshold: f32,
     pub pad: u32,
 }
@@ -257,7 +259,7 @@ impl ConcealParams {
         }
         params.coarse_width = width;
         params.coarse_height = height;
-        params.threshold = crate::cpu::CONCEALMENT_THRESHOLD;
+        params.threshold = emberwave_core::cpu::CONCEALMENT_THRESHOLD;
         params
     }
 
@@ -323,7 +325,7 @@ impl QuantParams {
         params.band_count = count as u32;
         params.block_count = layout.block_count();
         params.grid_width = grid_for(u64::from(layout.block_count())).0;
-        params.pristine_blocks = crate::encode::pristine_blocks(layout);
+        params.pristine_blocks = emberwave_core::encode::pristine_blocks(layout);
         params
     }
 
@@ -334,7 +336,7 @@ impl QuantParams {
 }
 
 /// What `equant.wgsl` writes for every block: the CPU encoder's
-/// [`BlockCost`](crate::encode::rate::BlockCost) in 32-bit words.
+/// [`BlockCost`](emberwave_core::encode::rate::BlockCost) in 32-bit words.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub(crate) struct CostRecord {
@@ -347,12 +349,12 @@ pub(crate) struct CostRecord {
 impl CostRecord {
     /// The record as the CPU encoder's rate control takes it, or `None` if a
     /// number does not fit its type, which no shader writes.
-    pub(crate) fn to_cost(self) -> Option<crate::encode::rate::BlockCost> {
+    pub(crate) fn to_cost(self) -> Option<emberwave_core::encode::rate::BlockCost> {
         let mut words = [0u16; DROP_STEPS];
         for (word, &value) in words.iter_mut().zip(&self.words) {
             *word = u16::try_from(value).ok()?;
         }
-        Some(crate::encode::rate::BlockCost {
+        Some(emberwave_core::encode::rate::BlockCost {
             words,
             distortion: self.distortion,
             max_drop: u8::try_from(self.max_drop).ok()?,
@@ -360,7 +362,7 @@ impl CostRecord {
     }
 
     /// The CPU encoder's record in 32-bit words.
-    pub(crate) fn from_cost(cost: &crate::encode::rate::BlockCost) -> Self {
+    pub(crate) fn from_cost(cost: &emberwave_core::encode::rate::BlockCost) -> Self {
         Self {
             words: cost.words.map(u32::from),
             distortion: cost.distortion,
@@ -728,7 +730,7 @@ mod tests {
     use std::mem::size_of;
 
     use super::*;
-    use crate::bitstream::ChromaSubsampling;
+    use emberwave_core::bitstream::ChromaSubsampling;
 
     fn layout_420() -> FrameLayout {
         FrameLayout::new(200, 120, ChromaSubsampling::Yuv420).unwrap()
@@ -972,16 +974,12 @@ mod tests {
 
     #[test]
     fn yuv_params_describe_the_packed_planes_and_the_conversion() {
-        use crate::bitstream::{ChromaSiting, YcbcrRange};
-        use crate::color::ColorMatrix;
+        use emberwave_core::bitstream::{ChromaSiting, YcbcrRange};
+        use emberwave_core::color::ColorMatrix;
 
         let layout = layout_420(); // 200x120, chroma 100x60
         let buffers = BufferLayout::new(&layout).unwrap();
-        let color = ColorParams {
-            matrix: ColorMatrix::Bt2020,
-            range: YcbcrRange::Full,
-            chroma_siting: ChromaSiting::Left,
-        };
+        let color = ColorParams::new(ColorMatrix::Bt2020, YcbcrRange::Full, ChromaSiting::Left);
         let p = YuvParams::new(&layout, &buffers, &color);
 
         assert_eq!((p.width, p.height, p.chroma_420), (200, 120, 1));

@@ -17,7 +17,7 @@
 use super::quant::DROP_STEPS;
 
 /// Number of keys.
-pub(crate) const KEYS: usize = 512;
+pub const KEYS: usize = 512;
 
 /// 2^`exponent` as an exact `f32`, for exponents in the normal range.
 fn exact_pow2(exponent: i32) -> f32 {
@@ -37,7 +37,7 @@ fn threshold(key: usize) -> f32 {
 /// The key of a step that adds `distortion` and saves `saving` words: the
 /// highest threshold it reaches, 0 for none (including a step that adds no
 /// distortion at all).
-pub(crate) fn key(distortion: f32, saving: u16) -> u16 {
+pub fn key(distortion: f32, saving: u16) -> u16 {
     let saving = f32::from(saving);
     let reaches = |key: usize| distortion >= saving * threshold(key);
     // The thresholds increase: find the first one above 0 not reached.
@@ -55,7 +55,7 @@ pub(crate) fn key(distortion: f32, saving: u16) -> u16 {
 
 /// What the rate control knows of one 32x32 block.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct BlockCost {
+pub struct BlockCost {
     /// Size in words with 0 to 15 planes dropped; 0 when nothing is left to
     /// send, except for the blocks of the coarsest level, which every frame
     /// carries: at least `pack::EMPTY_BLOCK_WORDS` (decision D58). Never
@@ -70,7 +70,7 @@ pub(crate) struct BlockCost {
 
 /// A step of a block: drop planes up to `drop`, saving `saving` words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Step {
+pub struct Step {
     pub key: u16,
     pub block: u32,
     pub drop: u8,
@@ -80,7 +80,7 @@ pub(crate) struct Step {
 /// The numbers of planes a block may drop that are worth considering: for
 /// each size the block can have, the one with the least distortion (the
 /// fewest planes on a tie). Sizes decrease along the list.
-pub(crate) fn points(cost: &BlockCost) -> Vec<u8> {
+pub fn points(cost: &BlockCost) -> Vec<u8> {
     let mut points: Vec<u8> = Vec::new();
     for drop in 0..=cost.max_drop.min(DROP_STEPS as u8 - 1) {
         let (words, distortion) = (
@@ -102,7 +102,7 @@ pub(crate) fn points(cost: &BlockCost) -> Vec<u8> {
 /// Appends the steps of block `block` in the order they must be applied:
 /// from each of its [`points`] to the next. A step's key is at least that of
 /// the step before it.
-pub(crate) fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
+pub fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
     let mut previous_key = 0u16;
     for pair in points(cost).windows(2) {
         let (from, to) = (usize::from(pair[0]), usize::from(pair[1]));
@@ -122,7 +122,7 @@ pub(crate) fn steps(block: u32, cost: &BlockCost, out: &mut Vec<Step>) {
 /// How many planes each block drops so that all of them together take at
 /// most `budget_words`, or `None` if they do not fit even with every block
 /// dropping all it may.
-pub(crate) fn choose(costs: &[BlockCost], budget_words: u64) -> Option<Vec<u8>> {
+pub fn choose(costs: &[BlockCost], budget_words: u64) -> Option<Vec<u8>> {
     // Each block starts at the best drop that costs what dropping none does.
     let mut drops: Vec<u8> = costs.iter().map(|cost| points(cost)[0]).collect();
     let total: u64 = costs.iter().map(|cost| u64::from(cost.words[0])).sum();

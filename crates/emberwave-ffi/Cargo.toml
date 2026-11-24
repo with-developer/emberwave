@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 emberwave-core.workspace = true
+emberwave-wgpu.workspace = true
 wgpu.workspace = true
 
 # A context on the caller's own Metal device and queue

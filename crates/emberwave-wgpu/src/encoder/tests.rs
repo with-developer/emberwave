@@ -1,12 +1,12 @@
 //! The GPU encoder's stages against the CPU encoder's (decision D29).
 
 use super::*;
-use crate::bitstream::{Band, FrameAssembler};
-use crate::cpu::decode_frame;
-use crate::encode::rate::{self, BlockCost};
-use crate::encode::{Bands, Encoder as CpuEncoder};
-use crate::gpu::context::test_context;
-use crate::gpu::resources::{entry, read_back, uniform_buffer};
+use crate::context::test_context;
+use crate::resources::{entry, read_back, uniform_buffer};
+use emberwave_core::bitstream::{Band, FrameAssembler};
+use emberwave_core::cpu::decode_frame;
+use emberwave_core::encode::rate::{self, BlockCost};
+use emberwave_core::encode::{Bands, Encoder as CpuEncoder};
 
 use ChromaSubsampling::{Yuv420, Yuv444};
 
@@ -782,6 +782,7 @@ fn rgb_picture(width: u32, height: u32, stride: usize, order: RgbOrder, seed: u3
             let pixel = match order {
                 RgbOrder::Rgba => [r, g, b, (noise >> 24) as u8],
                 RgbOrder::Bgra => [b, g, r, (noise >> 24) as u8],
+                other => unreachable!("an RGB order the tests do not know: {other:?}"),
             };
             bytes[y * stride + 4 * x..][..4].copy_from_slice(&pixel);
         }
@@ -798,17 +799,17 @@ fn gathering_rgb_writes_the_words_of_its_converted_planes() {
     let Some(context) = test_context() else {
         return;
     };
-    use crate::bitstream::{ChromaSiting, YcbcrRange, YcbcrTransform};
+    use emberwave_core::bitstream::{ChromaSiting, YcbcrRange, YcbcrTransform};
     let mut signallings = Vec::new();
     for ycbcr_transform in [YcbcrTransform::Bt709, YcbcrTransform::Bt2020] {
         for ycbcr_range in [YcbcrRange::Limited, YcbcrRange::Full] {
             for chroma_siting in [ChromaSiting::Center, ChromaSiting::Left] {
-                signallings.push(Signalling {
-                    ycbcr_transform,
-                    ycbcr_range,
-                    chroma_siting,
-                    ..Signalling::default()
-                });
+                // Signalling is non_exhaustive in the core: set its fields.
+                let mut signalling = Signalling::default();
+                signalling.ycbcr_transform = ycbcr_transform;
+                signalling.ycbcr_range = ycbcr_range;
+                signalling.chroma_siting = chroma_siting;
+                signallings.push(signalling);
             }
         }
     }
@@ -817,7 +818,7 @@ fn gathering_rgb_writes_the_words_of_its_converted_planes() {
             let mut gpu = Encoder::new(context, width, height, chroma, signalling).unwrap();
             let seed = (shape * 8 + index) as u32;
             let rgba = rgb_picture(width, height, 4 * width as usize, RgbOrder::Rgba, seed);
-            let planes = crate::color::rgb_to_ycbcr8(
+            let planes = emberwave_core::color::rgb_to_ycbcr8(
                 &rgba,
                 4 * width as usize,
                 RgbOrder::Rgba,

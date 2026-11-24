@@ -16,10 +16,10 @@ use crate::bitstream::consts::{
 use crate::bitstream::{Band, BandLayout, ChromaSubsampling, Component};
 
 /// Numbers of dropped bit-planes the rate control chooses from: 0 to 15.
-pub(crate) const DROP_STEPS: usize = 16;
+pub const DROP_STEPS: usize = 16;
 
 /// Coefficients of an 8x8 block.
-pub(crate) const BLOCK8_VALUES: usize = SUBBLOCKS_PER_BLOCK8 * VALUES_PER_SUBBLOCK;
+pub const BLOCK8_VALUES: usize = SUBBLOCKS_PER_BLOCK8 * VALUES_PER_SUBBLOCK;
 
 /// The largest bit exponent of a band: coefficients are scaled by at most
 /// `2^12` before quantisation, which keeps every block within 15 base
@@ -56,7 +56,7 @@ const INVERSE_SCALES: [f32; MAX_SCALE_CODE as usize + 1] = {
 /// in `c * 2^b` costs about the same in the picture in every band, as `4^b`
 /// follows the energy the inverse transform gives a coefficient of the band.
 /// Low-pass bands and coarser levels get more bits, chroma one bit less.
-pub(crate) fn band_exponent(component: Component, level: usize, band: Band) -> i32 {
+pub fn band_exponent(component: Component, level: usize, band: Band) -> i32 {
     let band_bits = match band {
         Band::Ll => 2,
         Band::Hl | Band::Lh => 1,
@@ -67,7 +67,7 @@ pub(crate) fn band_exponent(component: Component, level: usize, band: Band) -> i
 
 /// How a band is quantised: its capped exponent and its distortion weight.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct BandQuant {
+pub struct BandQuant {
     /// The capped bit exponent: coefficients are quantised as `c * 2^exponent`.
     pub exponent: i32,
     /// What a squared coefficient error of the band counts for in the rate
@@ -76,12 +76,7 @@ pub(crate) struct BandQuant {
 }
 
 impl BandQuant {
-    pub(crate) fn new(
-        chroma: ChromaSubsampling,
-        component: Component,
-        level: usize,
-        band: Band,
-    ) -> Self {
+    pub fn new(chroma: ChromaSubsampling, component: Component, level: usize, band: Band) -> Self {
         let class = match (component, chroma) {
             (Component::Y, _) => 0,
             (_, ChromaSubsampling::Yuv420) => 1,
@@ -96,13 +91,13 @@ impl BandQuant {
     /// The most bit-planes a block of the band may drop: the decoder's block
     /// scale is `2^(4 - (quant_code >> 3))`, and the exponent `4 + b - q` of
     /// the quant code cannot go below zero.
-    pub(crate) fn max_drop(&self) -> u8 {
+    pub fn max_drop(&self) -> u8 {
         (self.exponent + MAX_SCALE_EXP).clamp(0, DROP_STEPS as i32 - 1) as u8
     }
 
     /// The quant code of a block of the band that drops `drop` bit-planes:
     /// block scale `2^(drop - b)`, mantissa zero.
-    pub(crate) fn quant_code(&self, drop: u8) -> u8 {
+    pub fn quant_code(&self, drop: u8) -> u8 {
         ((self.exponent + MAX_SCALE_EXP - i32::from(drop)) as u8) << QUANT_MANTISSA_BITS
     }
 }
@@ -110,7 +105,7 @@ impl BandQuant {
 /// The position of coefficient `index` (subblock, then value) in its 8x8
 /// block: subblocks run down two columns of four, values down the two rows
 /// of a subblock's four columns (`bitstream.md`, "Decoding 8x8 blocks").
-pub(crate) fn value_position(index: usize) -> (usize, usize) {
+pub fn value_position(index: usize) -> (usize, usize) {
     let (subblock, value) = (index / VALUES_PER_SUBBLOCK, index % VALUES_PER_SUBBLOCK);
     let x = subblock / 4 * SUBBLOCK_WIDTH + value / SUBBLOCK_HEIGHT;
     let y = subblock % 4 * SUBBLOCK_HEIGHT + value % SUBBLOCK_HEIGHT;
@@ -120,7 +115,7 @@ pub(crate) fn value_position(index: usize) -> (usize, usize) {
 /// The coefficients of the 8x8 block `raster` (0 to 15, row-major) of the
 /// 32x32 block at (`block_x`, `block_y`) of a band, in coefficient order.
 /// Positions outside the band are zero.
-pub(crate) fn gather_block8(
+pub fn gather_block8(
     band: &[f32],
     layout: &BandLayout,
     block_x: u32,
@@ -143,7 +138,7 @@ pub(crate) fn gather_block8(
 
 /// One quantised 8x8 block and what dropping bit-planes does to it.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Block8 {
+pub struct Block8 {
     /// The 8x8 scale code, so that the scale is `code / 8 + 0.25`.
     pub scale_code: u8,
     /// Magnitudes in coefficient order, with no plane dropped.
@@ -166,17 +161,17 @@ pub(crate) struct Block8 {
 impl Block8 {
     /// Whether the block is coded with `drop` planes dropped: some subblock
     /// keeps a plane above the base. Otherwise every magnitude is zero.
-    pub(crate) fn active(&self, drop: u8) -> bool {
+    pub fn active(&self, drop: u8) -> bool {
         self.plane_bytes[usize::from(drop)] != 0
     }
 
     /// Bit-planes of subblock `subblock` with `drop` planes dropped.
-    pub(crate) fn subblock_planes(&self, subblock: usize, drop: u8) -> u8 {
+    pub fn subblock_planes(&self, subblock: usize, drop: u8) -> u8 {
         self.planes[subblock].saturating_sub(drop)
     }
 
     /// Base bit-planes with `drop` planes dropped.
-    pub(crate) fn base_planes(&self, drop: u8) -> u8 {
+    pub fn base_planes(&self, drop: u8) -> u8 {
         self.base.saturating_sub(drop)
     }
 }
@@ -191,10 +186,7 @@ impl Block8 {
 /// puts the reconstruction in the middle of each step. The base bit-planes
 /// are all but the top three of the largest magnitude, and each 4x2
 /// subblock has as many more as its own largest magnitude needs, 0 to 3.
-pub(crate) fn analyse_block8(
-    coefficients: &[f32; BLOCK8_VALUES],
-    quant: &BandQuant,
-) -> Option<Block8> {
+pub fn analyse_block8(coefficients: &[f32; BLOCK8_VALUES], quant: &BandQuant) -> Option<Block8> {
     let resolution = exact_pow2(quant.exponent);
     let scaled = coefficients.map(|c| (c * resolution).abs());
     let largest = scaled.iter().copied().fold(0.0f32, f32::max);
@@ -298,7 +290,7 @@ pub(crate) fn analyse_block8(
 }
 
 /// The 8x8 blocks of one 32x32 block, those that carry anything.
-pub(crate) type Blocks8 = [Option<Block8>; BLOCK8_PER_BLOCK];
+pub type Blocks8 = [Option<Block8>; BLOCK8_PER_BLOCK];
 
 #[cfg(test)]
 mod tests {

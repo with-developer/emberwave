@@ -1,4 +1,11 @@
-//! The wgpu pipelines.
+//! The GPU decoder and encoder of emberwave, a portable port of the PyroWave
+//! low-latency intra-frame wavelet video codec, in wgpu and WGSL, on top of
+//! `emberwave-core`'s bitstream, CPU reference and colour code.
+//!
+//! [`wgpu`] is the version this crate is built with, whose types the GPU
+//! calls take: use it to share a device or a texture. A new major version of
+//! wgpu changes them, and this crate's major version with it; the core has no
+//! wgpu type in its API (decision D75).
 //!
 //! [`GpuContext`] creates the device, [`Decoder`] decodes frames on it and
 //! [`Encoder`] encodes pictures. The shaders are plain WGSL that uses only what
@@ -15,6 +22,8 @@
 // The calls left out of the browser build leave their helpers unused there;
 // the native builds check for code that is dead everywhere.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
+pub use wgpu;
 
 mod context;
 mod decoder;

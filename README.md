@@ -164,7 +164,8 @@ Next, each in a release when it is ready:
 
 | Path | Purpose |
 |---|---|
-| `crates/emberwave-core` | Bitstream parser, CPU reference decoder, colour conversion, the wgpu/WGSL decoder, and the encoder on the CPU and the GPU |
+| `crates/emberwave-core` | Bitstream parser, CPU reference decoder, colour conversion and the CPU encoder, without a GPU |
+| `crates/emberwave-wgpu` | The wgpu/WGSL decoder and the GPU encoder (decision D75) |
 | `crates/emberwave-cli` | `emberwave-cli` command line tool |
 | `crates/emberwave-ffi` | The C API: header, library and C examples |
 | `crates/emberwave-web`, `web/` | The browser player and its benchmark: WebAssembly module and pages |

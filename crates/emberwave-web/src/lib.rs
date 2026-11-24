@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use emberwave_core::bitstream::{ChromaSubsampling, Pwv1File, YcbcrRange, consts, pwv1};
 use emberwave_core::color::{ColorMatrix, ColorParams};
 use emberwave_core::encode;
-use emberwave_core::gpu::{Decoder, GpuContext, GpuOptions, TEXTURE_FORMATS};
+use emberwave_wgpu::{Decoder, GpuContext, GpuOptions, TEXTURE_FORMATS};
 use wasm_bindgen::prelude::*;
 
 mod bench;

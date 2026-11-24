@@ -16,11 +16,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-CI runs two more lints, for code that builds only without the `gpu` feature or only for the browser, and a check on Rust 1.87. The lints need the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`):
+CI runs one more lint, for code that builds only for the browser, a check that `emberwave-core` does not depend on wgpu (the GPU code is `emberwave-wgpu`, decision D75), and a check on Rust 1.87. The lint needs the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`):
 
 ```sh
-cargo clippy -p emberwave-core --no-default-features --all-targets -- -D warnings
-cargo clippy --target wasm32-unknown-unknown -p emberwave-web -p emberwave-core -- -D warnings
+cargo clippy --target wasm32-unknown-unknown -p emberwave-web -p emberwave-wgpu -p emberwave-core -- -D warnings
+cargo tree -p emberwave-core -e normal --prefix none | grep -E '^(wgpu|naga) '   # must print nothing
 ```
 
 ## Tests
@@ -30,13 +30,13 @@ cargo clippy --target wasm32-unknown-unknown -p emberwave-web -p emberwave-core 
 | Unit tests | `src/` of each crate | Parser, CPU decoder, colour conversion, CLI helpers |
 | Vectors | `crates/emberwave-core/tests/vectors.rs` | The CPU decoder against upstream's decodes of the committed vectors |
 | Robustness | `crates/emberwave-core/tests/robustness.rs` | Malformed input never panics (proptest) |
-| Shaders | `crates/emberwave-core/tests/shaders.rs` | The WGSL validates with naga without any optional capability, and the workgroup variables are the reviewed ones, without a GPU |
-| GPU | `crates/emberwave-core/tests/gpu.rs` | The GPU decoder against the CPU decoder and against upstream, on a real adapter |
+| Shaders | `crates/emberwave-wgpu/tests/shaders.rs` | The WGSL validates with naga without any optional capability, and the workgroup variables are the reviewed ones, without a GPU |
+| GPU | `crates/emberwave-wgpu/tests/gpu.rs` | The GPU decoder against the CPU decoder and against upstream, on a real adapter |
 | CLI | `crates/emberwave-cli/tests/cli.rs` | The `emberwave-cli` binary end to end |
 | C API | `crates/emberwave-ffi/tests/api.rs`, `tests/encoder.rs`, `tests/header.rs`, `tests/exports.rs`, `tests/thread_end.rs` | The C functions called through raw pointers against the Rust decoder and encoder; the committed header against cbindgen's output; the shared library's export table against the header (macOS and Linux, needs `nm`; it builds the library through cargo); threads that end while contexts live |
-| GPU interop | `crates/emberwave-ffi/tests/metal.rs`, `tests/vulkan.rs`, `tests/d3d12.rs`, `crates/emberwave-core/tests/gpu_hooks.rs` | The C API on a client's own Metal queue and textures (macOS), Vulkan device and images (Linux's lavapipe, under the validation layer), and Direct3D 11 textures and fences (Windows' WARP); the order of the submission hooks on every backend |
+| GPU interop | `crates/emberwave-ffi/tests/metal.rs`, `tests/vulkan.rs`, `tests/d3d12.rs`, `crates/emberwave-wgpu/tests/gpu_hooks.rs` | The C API on a client's own Metal queue and textures (macOS), Vulkan device and images (Linux's lavapipe, under the validation layer), and Direct3D 11 textures and fences (Windows' WARP); the order of the submission hooks on every backend |
 | Encoder | `crates/emberwave-core/tests/encoder.rs`, `src/encode/` | The encoder makes the committed bytes again, its frames fit their budgets, and emberwave decodes them as upstream does |
-| GPU encoder | `crates/emberwave-core/tests/gpu_encoder.rs`, `src/gpu/encoder/tests.rs` | Each stage of the GPU encoder given the CPU encoder's input, against the CPU's output; whole frames against the committed vectors, on a real adapter; pictures in textures against the same pictures in CPU memory |
+| GPU encoder | `crates/emberwave-wgpu/tests/gpu_encoder.rs`, `src/encoder/tests.rs` | Each stage of the GPU encoder given the CPU encoder's input, against the CPU's output; whole frames against the committed vectors, on a real adapter; pictures in textures against the same pictures in CPU memory |
 | C example | `scripts/check_c_example.sh` | The C examples, built with CMake against the shared library: one decodes every vector, the other encodes two of the encoder's sources and decodes its packets again (CI runs it after the tests) |
 | iPhone app | `scripts/check_ios_app.sh` | The benchmark app of `examples/ios`, built for iPhones and for the iOS Simulator, where it runs a short benchmark and reads a texture of `emberwave_decoder_decode_texture` back through Metal (CI's macOS job `XCFramework`) |
 | XCFramework | `scripts/check_xcframework.sh` | The C examples and the Swift example, linked with each static library of the XCFramework, on the Mac and in an iOS Simulator, as `check_c_example.sh` runs them; for iPhones and iPads they are linked only (CI's macOS job `XCFramework`) |

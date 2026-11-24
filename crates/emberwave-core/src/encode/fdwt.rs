@@ -12,7 +12,7 @@ use crate::cpu::idwt::{ALPHA, BETA, DELTA, GAMMA, INV_K, K, PADDING, mirror};
 /// hold the low-pass and odd positions the high-pass samples, as the inverse
 /// transform takes them. The line length must be even and larger than the
 /// padding, which holds for every level of a valid frame.
-pub(crate) fn forward_line(line: &mut [f32], extended: &mut Vec<f32>) {
+pub fn forward_line(line: &mut [f32], extended: &mut Vec<f32>) {
     let len = line.len();
     debug_assert!(
         len > PADDING && len.is_multiple_of(2),
@@ -54,7 +54,7 @@ pub(crate) fn forward_line(line: &mut [f32], extended: &mut Vec<f32>) {
 
 /// The four bands of one level, each half the width and height of its input.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Level {
+pub struct Level {
     /// Low-pass in both directions; the next level's input.
     pub ll: Vec<f32>,
     /// High-pass horizontally (odd columns).
@@ -68,7 +68,7 @@ pub(crate) struct Level {
 /// One level of the 2-D forward transform of a `width` x `height` image,
 /// row-major: rows first, then columns, then the samples sorted into the four
 /// bands, as [`crate::cpu::idwt::inverse_2d`] expects them.
-pub(crate) fn forward_2d(mut image: Vec<f32>, width: usize, height: usize) -> Level {
+pub fn forward_2d(mut image: Vec<f32>, width: usize, height: usize) -> Level {
     let mut extended = Vec::new();
     for row in image.chunks_exact_mut(width) {
         forward_line(row, &mut extended);
@@ -104,7 +104,7 @@ pub(crate) fn forward_2d(mut image: Vec<f32>, width: usize, height: usize) -> Le
 
 /// An 8-bit sample as the transform takes it: scaled to `[0, 1]`, less the DC
 /// shift that the decoder adds back.
-pub(crate) fn sample_level(sample: u8) -> f32 {
+pub fn sample_level(sample: u8) -> f32 {
     f32::from(sample) / 255.0 - DC_SHIFT
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn sample_level(sample: u8) -> f32 {
 /// ([`sample_level`]), padded to `aligned_width` x `aligned_height` by
 /// repeating the last column and the last row. Repeating the edge keeps the
 /// padding from adding detail that would cost bits.
-pub(crate) fn pad_plane(
+pub fn pad_plane(
     samples: &[u8],
     width: usize,
     height: usize,

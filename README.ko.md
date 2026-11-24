@@ -166,7 +166,8 @@ iPhone 17의 Safari에서는 [벤치마크 페이지](https://with-developer.git
 
 | 경로 | 내용 |
 |---|---|
-| `crates/emberwave-core` | 비트스트림 파서, CPU 레퍼런스 디코더, 색 변환, wgpu/WGSL 디코더, CPU·GPU 인코더 |
+| `crates/emberwave-core` | 비트스트림 파서, CPU 레퍼런스 디코더, 색 변환, CPU 인코더(GPU 없이) |
+| `crates/emberwave-wgpu` | wgpu/WGSL 디코더와 GPU 인코더(결정 D75) |
 | `crates/emberwave-cli` | 명령줄 도구 `emberwave-cli` |
 | `crates/emberwave-ffi` | C API: 헤더, 라이브러리, C 예제 |
 | `crates/emberwave-web`, `web/` | 브라우저 플레이어와 벤치마크: WebAssembly 모듈과 페이지 |
