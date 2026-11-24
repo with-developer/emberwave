@@ -5,18 +5,93 @@
 // shows before it is published.
 //
 //     node scripts/check_web.mjs
+//
+// Given a project's directory, it checks the npm package installed there
+// instead, the project's one dependency (decision D76): its files are those
+// that ship, its declarations declare the module's exports, and the module,
+// imported through the package's "exports" as a page's code would, does what
+// the pages' does. scripts/check_npm.sh makes such a project.
+//
+//     node scripts/check_web.mjs PROJECT_DIR
 
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
-const pkg = new URL("../web/pkg/", import.meta.url);
-// The glue is an ES module in a .js file, which Node takes for CommonJS
-// without a package.json saying otherwise: imported from its text instead.
-const glue = readFileSync(new URL("emberwave_web.js", pkg));
-const module = await import(`data:text/javascript;base64,${glue.toString("base64")}`);
-module.initSync({ module: readFileSync(new URL("emberwave_web_bg.wasm", pkg)) });
+// What the package ships, as its package.json's "files" says, with
+// package.json itself.
+const PACKAGE_FILES = [
+  "LICENSE",
+  "README.md",
+  "THIRD_PARTY_NOTICES.md",
+  "emberwave_web.d.ts",
+  "emberwave_web.js",
+  "emberwave_web_bg.wasm",
+  "package.json",
+];
+
+// The module of the pages, from web/pkg/.
+async function pagesModule() {
+  const pkg = new URL("../web/pkg/", import.meta.url);
+  // The glue is an ES module in a .js file, which Node takes for CommonJS
+  // without a package.json saying otherwise: imported from its text instead.
+  const glue = readFileSync(new URL("emberwave_web.js", pkg));
+  const module = await import(`data:text/javascript;base64,${glue.toString("base64")}`);
+  module.initSync({ module: readFileSync(new URL("emberwave_web_bg.wasm", pkg)) });
+  return module;
+}
+
+// The module of the npm package installed in `project`.
+async function packageModule(project) {
+  const manifest = JSON.parse(readFileSync(join(project, "package.json"), "utf8"));
+  const names = Object.keys(manifest.dependencies ?? {});
+  if (names.length !== 1) {
+    throw new Error(`${project} has ${names.length} dependencies, not the package alone`);
+  }
+  const [name] = names;
+  // Node resolves the names through the package's "exports", whose
+  // conditions, "types" and "default", are the same for require and import.
+  const require = createRequire(join(project, "package.json"));
+  const entry = require.resolve(name);
+  const wasm = require.resolve(`${name}/emberwave_web_bg.wasm`);
+  const own = require.resolve(`${name}/package.json`);
+  const files = readdirSync(dirname(own)).sort();
+  if (files.join() !== PACKAGE_FILES.join()) {
+    throw new Error(`the package holds ${files.join(", ")}, not ${PACKAGE_FILES.join(", ")}`);
+  }
+  const { version, types } = JSON.parse(readFileSync(own, "utf8"));
+  const declarations = join(dirname(own), types ?? "");
+  if (!types || !existsSync(declarations)) {
+    throw new Error(`the package's "types", ${types}, is not one of its files`);
+  }
+  const text = readFileSync(declarations, "utf8");
+  for (const declaration of [
+    "export class Player ",
+    "export class Demo ",
+    "export class Bench ",
+    "export function packet_ends(",
+    "export function initSync(",
+    "export default function ",
+  ]) {
+    if (!text.includes(declaration)) {
+      throw new Error(`${types} lacks "${declaration.trim()}"`);
+    }
+  }
+  // The package's "type": "module" makes Node load the glue as what it is.
+  const module = await import(pathToFileURL(entry).href);
+  module.initSync({ module: readFileSync(wasm) });
+  console.log(`the npm package ${name} ${version} installs with its ${files.length} files and declarations`);
+  return module;
+}
+
+const project = process.argv[2];
+const module = project ? await packageModule(project) : await pagesModule();
 
 const { Demo, Player, Bench, packet_ends } = module;
 for (const [name, value] of [
+  ["init", module.default],
+  ["initSync", module.initSync],
   ["Player.create", Player?.create],
   ["Player.max_file_bytes", Player?.max_file_bytes],
   ["Player.prototype.set_partial_share", Player?.prototype.set_partial_share],

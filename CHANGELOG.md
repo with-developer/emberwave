@@ -4,6 +4,9 @@ All notable changes to emberwave. The format follows [Keep a Changelog](https://
 
 ## [Unreleased]
 
+### Added
+- The browser player's module as an npm package, ready to publish and not published (decision D76): `scripts/build_npm.sh` builds it into `target/npm/emberwave-web`, with TypeScript declarations and a README for web pages, and `scripts/check_npm.sh`, which CI runs, installs its archive into a scratch project and checks it there. The name proposed for npm is `emberwave-web`; the maintainer confirms it before the first publish.
+
 ### Changed
 - **A change for Rust users of the GPU decoder and encoder**: they are the crate `emberwave-wgpu` now, `emberwave_wgpu::Decoder` where it was `emberwave_core::gpu::Decoder`, with the same names, and `emberwave_wgpu::wgpu` where it was `emberwave_core::wgpu`. `emberwave-core` has no `gpu` feature and no wgpu in its dependencies or its API, so that its version need not follow wgpu's (decision D75). The C API, the CLI and the browser player do not change. `emberwave-wgpu` is not on crates.io yet.
 

@@ -138,6 +138,12 @@ jobs:
       # broken one would otherwise show only once it is published.
       - run: scripts/build_web.sh
       - run: node scripts/check_web.mjs
+      # The same module as an npm package, ready to publish but not published
+      # (decision D76): what it would ship, and that it installs from its
+      # archive and instantiates as a page's dependency. The build above
+      # leaves cargo nothing to do.
+      - run: scripts/build_npm.sh
+      - run: scripts/check_npm.sh
 
   build-test:
     needs: changes
